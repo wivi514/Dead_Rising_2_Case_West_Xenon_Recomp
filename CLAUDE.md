@@ -68,6 +68,8 @@ inferences from a **count** or a **truncated listing**.
 | Kernel-call order | ✅ **set-exact prefix of A5, 0 real divergences** (part 2, finding 27) |
 | First picture (W4) | ✅ **RENDERS** — Capcom logo, then the animated title screen at ~31 fps, `CW_VKDRAW=1`. Shader cache covered the whole frontend, 0 misses |
 | **Gameplay** | ✅ **IT PLAYS** — 20,765-frame drive: gameplay, cinematics with subtitles, full HUD, pause menu. 26.2 M draws, 0 truncated IBs, only **2** shader-cache misses (finding 28) |
+| **Intro → safehouse** | ✅ **playable, with zombie combat**, and "pretty much exactly like Xenia" — **and better in one place: a cutscene Xenia truncates plays through here** (operator, finding 29, gotcha 320) |
+| Save/load | ✅ **behaviourally confirmed** — saved and loaded inside a real session (finding 29). Part 1's confirmation was static only |
 | HUD/menu text | ❌ damaged — **PARKED.** The operator is fixing this in Case Zero and will say when to import it. Do not investigate or fix it here |
 
 **~~Part 2's first job is the spin~~ — RETRACTED, and by the measurement it asked for.**
@@ -126,11 +128,13 @@ attribution to another, and a name is not a call site.** Both are in
 
 ## Transferable gotchas
 
-**THE FULL NUMBERED LEDGER IS `docs/gotchas.md` — 315 entries, copied verbatim from Case
-Zero on 2026-08-15, and every "gotcha N" reference resolves there.** New entries from
-this port continue at 316. Read it **before making a measurement claim, adding an
-instrument, believing a zero, or trusting a number an earlier session wrote down**; those
-four situations produced almost all of it.
+**THE FULL NUMBERED LEDGER IS `docs/gotchas.md` — entries 1–319 copied verbatim from Case
+Zero on 2026-08-15, and every "gotcha N" reference resolves there.** New entries from this
+port continue at **321**; **320 is the first written here rather than inherited.** (An
+earlier version of this paragraph said "315 entries, continue at 316" — the file already ran
+to 319. Gotcha 13 applies to this file too.) Read it **before making a measurement claim,
+adding an instrument, believing a zero, or trusting a number an earlier session wrote down**;
+those four situations produced almost all of it.
 
 Note that entries naming a Case Zero file, env var, address or count are *pointers into
 the sibling repo*, not claims about this one.
@@ -448,6 +452,13 @@ Full detail and evidence in `docs/bootstrap-2026-08-15.md` §6.
   Case Zero is a *second implementation of the same engine*, which makes it a genuine
   cross-check for anything shared — and makes it worthless as an oracle for anything it
   got wrong, which is a list nobody has finished writing.
+- **AND XENIA IS NOT A CEILING (gotcha 320, finding 29).** Separate the two kinds of ground
+  truth. For **what the guest did** — kernel call order, file reads, PM4 packets, shader
+  microcode — the capture wins, because those are the guest's own bytes. For the emulator's
+  **output** — audio continuity, timing, presentation — it does not automatically win, and
+  this port has already passed it: **Xenia truncates a cutscene's dialogue that our runtime
+  plays through.** So "it differs from the capture" is a question, not a verdict, and an A/B
+  that scores "closer to Xenia" as better will actively regress what we already get right.
 
 ### Things not to do
 

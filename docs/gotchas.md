@@ -3114,3 +3114,26 @@ From phase C part 18 (the frame rate — and none of it was work):
      Before accepting "this needs a play session", check the menus, the
      attract loop and the title backdrop — they are usually the same renderer on
      the same assets, and the screenshot set was captured there first.
+
+320. **THE ORACLE HAS ITS OWN DEFECTS — A DIVERGENCE FROM XENIA IS NOT
+     AUTOMATICALLY YOUR BUG, AND ONCE YOU PASS IT THE ORACLE STOPS BEING A
+     CEILING.** The first entry written from Case West rather than copied into
+     it. Every earlier gotcha about oracles (172, 268) warns that an oracle you
+     wrote yourself is worthless; this is the opposite edge of the same knife.
+     On the drive that took this port from the intro to the safehouse, **Xenia
+     cut a cutscene's dialogue off partway and our runtime played it through**.
+     Not a difference in our favour by luck — a defect in the reference.
+     Consequences, in the order they bite:
+     (a) **"It differs from the capture" is a question, not a verdict.** Before
+     spending a part chasing a divergence, ask whether the CAPTURE is the thing
+     that is wrong, and say which way the evidence points.
+     (b) **A capture is still ground truth for what the GUEST did** — kernel call
+     order, file reads, PM4 packets, shader microcode — because those are the
+     guest's own bytes. It is NOT automatically ground truth for the OUTPUT
+     (audio continuity, timing, presentation), which is the emulator's own work
+     and can be wrong.
+     (c) **Do not "fix" a pass into a match.** Once behaviour exceeds the oracle
+     on some axis, an A/B that scores "closer to Xenia" as better will actively
+     regress it. Score against the GAME's intended behaviour, and record the axis
+     where the oracle is known-worse so a later part does not helpfully undo it.
+     Recorded in this port at finding 29.

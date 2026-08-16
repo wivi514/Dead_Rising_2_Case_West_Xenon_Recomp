@@ -889,3 +889,57 @@ a defect list, not a bring-up list** — and the first item on it belongs to Cas
 
 `truncated=0` across 363 M packets is the counter that would have caught findings 37-39's
 dropped-fence class returning at gameplay scale. It did not return.
+
+---
+
+## 29. **Intro to safehouse, playable — and in one place BETTER than the oracle** — operator, 2026-08-16
+
+**Provenance: this is the operator's own play session, reported directly.** It is not a
+number measured off a log, and it is recorded as what it is — a behavioural observation from
+the person driving, which in this port has repeatedly been better evidence than what was
+asked for.
+
+What they did and what happened:
+
+- **Played the whole intro through to the safehouse**, including **zombie combat**.
+- **"Runs pretty much exactly like Xenia"** — the first end-to-end behavioural comparison
+  this port has against its reference, and it is a pass.
+- **Saved and loaded, and it worked perfectly.** Part 1 confirmed the save layer *statically*
+  from A3 (`content.cpp` needs no functional change, finding 24). This is the first
+  **behavioural** confirmation: a real save written and read back inside a real session.
+- **In one place it is BETTER than Xenia: a cutscene whose dialogue Xenia CUTS OFF partway
+  plays through correctly on our runtime.**
+
+### That last point is a methodological change, and it is why this finding matters
+
+Every measurement discipline in this project treats the captures as ground truth. That is
+still right **for what the guest did** — kernel call order, file reads, PM4 packets, shader
+microcode — because those are the guest's own bytes, recompiled from the same image.
+
+It is **not** automatically right for the **output**. Audio continuity, timing and
+presentation are the emulator's own work, and the emulator can be wrong. Here it is: Xenia
+truncates dialogue that our runtime plays in full.
+
+Three consequences, now written up as **gotcha 320**:
+
+1. **"It differs from the capture" is a question, not a verdict.** Ask whether the capture is
+   the thing that is wrong before spending a part on the difference.
+2. **Keep the two kinds of ground truth apart.** Guest-side bytes: the capture wins. Emulator
+   output: it does not automatically win.
+3. **Do not fix a pass into a match.** An A/B that scores "closer to Xenia" as better will
+   regress the dialogue we already get right. Score against the *game's* intended behaviour,
+   and record the axis where the oracle is known-worse so a later part does not helpfully
+   undo it.
+
+This also retires, in passing, a worry the port never got to test: the **XMA audio** path and
+the **cinematic** path both work well enough to carry a full intro — and gotcha 267, the
+physical-address DMA trap that cost Case Zero its entire audio subsystem for 28 parts, did
+not bite here.
+
+### Still open after this session
+
+- **The HUD/menu text defect** (finding 28) — the operator's own work in Case Zero; not to be
+  investigated here.
+- **Two missing pixel shaders** (finding 28), to be picked up by rebuilding the bank from our
+  own runtime's dump.
+- Everything past the safehouse is unmeasured.
