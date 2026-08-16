@@ -1259,3 +1259,112 @@ The new areas meant new material, and `CW_SHADER_DUMP` was on — so the bank re
 finding 32 (**439 → 443**) already includes them. That is why a session reaching new places
 produced only **three** misses: the rebuild consumed the very dumps that session wrote. Any
 future drive into genuinely new material should keep the dump on for the same reason.
+
+---
+
+## 34. **B2 DECODED — 14.46 GiB of gameplay PM4, and our command processor covers all of it** — part 2, 2026-08-16
+
+B2 was captured on 2026-08-15 and had **never been decoded**. `docs/part2-kickoff.md` §3 listed
+it as owed and said why it was waiting: *"it is the gameplay PM4 ground truth, waiting on a
+renderer to compare against."* There is a renderer now, and a noise floor (finding 30), so it
+was decoded.
+
+### The stream is intact
+
+`tools/xtr_walk.py stats`, 221 s:
+
+```
+15,527,183,189 bytes (14.46 GiB)   header version 1, title 58410B00
+437,132,465 commands   ·   12,766 frames   ·   1,187.8 KiB of stream per frame
+   208,864,949 PacketStart      14,559,128 MemoryRead      372,822 IndirectBufferStart
+     4,028,736 MemoryWrite          28,147 PrimaryBufferStart
+             1 EdramSnapshot            1 Registers            1 GammaRamp
+
+integrity: head walkable from 48, NO DESYNCS — the whole stream parsed as a
+           single sequence.  verdict: INTACT
+```
+
+A 14.46 GiB capture parsing end to end with zero desyncs also re-proves the 2 GiB `.xtr`
+cliff fix at ~7x the old limit, which B2's notes flagged as a side benefit.
+
+### The PM4 census, and the decoder's own self-check
+
+`tools/xtr_pm4_census.py --verify`, 291 s:
+
+```
+208,864,949 packets  =  95,285,671 type0 (register write runs)
+                      + 50,541,798 type2 (nop)
+                      + 63,037,480 type3 (opcode)
+
+21 DISTINCT TYPE-3 OPCODES, and ZERO the decoder cannot name.
+```
+
+```
+16,556,491  0x60 SET_BIN_MASK_LO      2,653,182  0x36 DRAW_INDX_2      50,342  0x62 SET_BIN_SELECT_LO
+12,681,319  0x22 DRAW_INDX            2,457,680  0x3B INVALIDATE_STATE 12,769  0x21 REG_RMW
+ 8,619,389  0x46 EVENT_WRITE          1,048,128  0x3C WAIT_REG_MEM     12,767  0x63 SET_BIN_SELECT_HI
+ 7,840,564  0x5A EVENT_WRITE_EXT        423,855  0x61 SET_BIN_MASK_HI  12,766  0x64 XE_SWAP
+ 3,674,341  0x27 IM_LOAD                411,088  0x2D SET_CONSTANT        256  0x45 COND_WRITE
+ 3,340,647  0x2F LOAD_ALU_CONSTANT      372,816  0x3F INDIRECT_BUFFER        1  0x48 ME_INIT
+ 2,706,085  0x2B IM_LOAD_IMMEDIATE      108,454  0x58 EVENT_WRITE_SHD
+                                         54,540  0x54 INTERRUPT
+```
+
+**The self-check passed on 63,037,480 type-3 packets with 0 unexplained length mismatches.**
+Two independent things encode the same length — the trace's own `PacketStart.count` and the
+PM4 header's count-1 field — so this is the decoder's bit layout being validated against
+Xenia's, on this title, at scale. That matters because a wrong shift would land opcodes on
+*other real opcodes* and produce a confidently wrong histogram (gotcha 30 applied to a
+decoder). The one allowance is documented and narrow: Xenia records `0x3F INDIRECT_BUFFER`
+one dword short.
+
+### **The result that closes a scope question: we implement all 21**
+
+Every opcode B2 sends has a case in `runtime/gpu/pm4.cpp`:
+
+```
+0x21 0x22 0x27 0x2B 0x2D 0x2F 0x36 0x3B 0x3C 0x3F 0x45 0x46 0x48
+0x54 0x58 0x5A 0x60 0x61 0x62 0x63 0x64      -> 21/21 HANDLED
+```
+
+**The check was controlled** (gotcha 25 — a grep that cannot match is not a clean result):
+`0x99`, `0x7F` and `0x13` all report NOT FOUND, so the test can fail.
+
+So **the command processor's opcode surface for gameplay is closed**, measured rather than
+assumed. Nothing the guest sends over a full gameplay drive is unimplemented. That is the
+question B2 was captured to answer.
+
+### The per-frame draw profile
+
+```
+12,731 of 12,766 frames draw (99.7%)
+p5 176 · p25 800 · p50 1,169 · p75 1,511 · p90 1,949 · p95 2,621 · p99 4,692 · max 5,944
+mean over drawing frames: 1,204
+```
+
+**Our runtime sits in the same distribution.** Finding 28's session was 26,276,829 draws over
+20,765 frames = **1,265/frame mean against hardware's 1,204** — within ~5% — and the Case 1-3
+session's sampled windows (1,384 / 1,443 / 3,029 draws/frame) all fall between hardware's p50
+and p95.
+
+**This is a scale agreement, NOT a matched A/B, and must not be quoted as one.** The evidence
+rules require two arms of ONE renderer producing the SAME draw set; these are different
+drives of different content on different implementations. What it establishes is that our
+renderer's per-frame workload is the same *shape* as hardware's — which is the sanity check
+that would have caught a renderer dropping or duplicating whole classes of draw, and it
+passes. Finding 30's 1.40% noise floor does **not** apply here; it is a same-drive figure.
+
+### Two things worth noting for later
+
+- **`SET_BIN_MASK_LO` is the most common type-3 opcode in the game — 16.5 M, more than
+  `DRAW_INDX`'s 12.7 M**, i.e. ~1.08 bin-mask writes per draw. The two-tile binning is a
+  per-draw decision at gameplay scale, not an occasional one, which is the context
+  `gpu/vd.cpp`'s ring trace already argues for reading `predicated out=` next to the draw
+  count rather than alone.
+- **50.5 M type-2 NOPs** — a quarter of all packets. Consistent with finding 39's swap
+  padding idiom, which the title uses deliberately and which our `VdSwap` reproduces.
+
+### Now decoded, and what is still not
+
+`docs/part2-kickoff.md` §3's GPU list is down to one item: **eight of the nine B4 frames
+remain unanalysed** — the reference set for the hardest surface classes.
