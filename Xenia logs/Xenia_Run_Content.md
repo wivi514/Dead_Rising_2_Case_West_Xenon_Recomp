@@ -297,3 +297,68 @@ BINK result above.
 Files: `trace.0.gz` 167 KB (→32 MiB, 19,487 executed by the operator's count / 19,195 by
 mine — I additionally require `end > start`), `xenia_C2.log.gz` 126 MB (correlation log),
 `cw_shaders_C2.zip` (415 distinct shaders), `C2_NOTES.txt`.
+
+
+---
+
+## A4 + W1/W2/B4 — analyst pass, 2026-08-15
+
+Findings **17–21** in `docs/xenia-capture-analysis.md`.
+
+### ★ BINK IS SOLVED — and it needs no host code (finding 17)
+
+Frame `01_W1_intro_800a_bik__f4412` decodes as a 4-vertex fullscreen quad binding:
+
+```
+ s0 0DF87000 1280x720 k_8 tiled=0 pitchBlk=40  -> Y
+ s1 0DEF5000  640x360 k_8 tiled=0 pitchBlk=24  -> U        (pitch 768, PADDED)
+ s2 0DF3E000  640x360 k_8 tiled=0 pitchBlk=24  -> V
+ s3 17CBE000    80x45 k_8_8_8_8  -> tone map     s4 1783C000 1024x32 -> 32^3 colour LUT
+```
+
+converted by the guest's own 144-byte pixel shader `ps_a9f83f703af104b5` (three `tfetch2D`
++ a `mad` against constant coefficients = a YUV→RGB matrix), which is **already in our
+cache**. Confirmed five ways: 4:2:0 dimensions; the shader's colour matrix; a luma
+histogram piling up on **16** (studio-swing black level); a dump of exactly 1280×720×1
+bytes; and **the plane rendering pixel-for-pixel identical to the frame-locked PNG** —
+including the typewriter cursor, so the text is baked into the video, not drawn live.
+The provenance gate passes (no RESOLVE to the address ⇒ guest-uploaded, a sound oracle).
+
+**Your attribution on this frame was right and my first read of it was wrong** — see the
+next item. With finding 14 (137 `BINK` functions execute as guest code), the entire Bink
+stack is already ours: no movie player to write, no colour conversion, no ffmpeg fallback.
+The only requirements are to **honour `tiled=0`** and to read chroma at its **padded 768
+pitch**.
+
+### A tooling trap that nearly buried it (finding 18)
+
+`xtr_draw_bindings.py` lists the **top 12 draws by vertex count**. Every Bink draw is a
+**4-vertex fullscreen quad**, so all of them sort to the bottom and the first pass over this
+frame reported "no video-sized texture in the frame". A vertex-count sort is backwards for
+post-process, UI and video work. The tool now takes `--max-draws`; **use `--csv` before
+concluding any texture is absent.**
+
+### A4 (finding 19)
+
+No idle Bink — zero `.bik` over the 5-minute idle, as you observed on screen. The title is
+an animated 3D scene, and the log is **64% GPU lines** against Case Zero's ~69%: the same
+shape, so the title screen should be as cheap a test bed here as it was there. §X.3
+answered. No new shaders — A4's 54 distinct is exactly the boot set.
+
+### Shaders (finding 20)
+
+W session 416 distinct, A4 54; **union now 439** (was 435). Rebuilt: 439 translated, zero
+failures, dim census 0 disagreements.
+
+**+3 from nine world frames, against +49 from C2's one new zone.** That is the useful
+lesson rather than a disappointment: the W drive covered many new *places* inside a
+material set A2/C2 had already visited. **New geometry is not new shaders; a new material
+set is.** Which makes the gap you flagged — **no outdoors frame** — the one most likely to
+move the number.
+
+### B4's eight world frames
+
+On disk, indexed, not yet analysed beyond the Bink pair: monitor bank, bathroom mirror,
+monitor wall, two StoragePens crowds, lab interior with glass, plus the two in-world
+monitor frames. They are the reference set for the renderer's hardest surface classes and
+they will be read against our output once there is one.

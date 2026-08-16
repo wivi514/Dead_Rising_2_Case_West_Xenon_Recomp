@@ -36,7 +36,8 @@ Done in session 1 — reproducible from a clean clone with the Commands section 
 | Jump tables | ✅ 205 tables / 5,791 labels, both code sections |
 | Recompilation | ✅ **58,448 functions**, 228 TUs, **zero** `jump outside function`, **zero** dropped branches |
 | Coverage oracle | ✅ **104 entry points** recovered from C1+C2; config at 135 overrides |
-| Shader cache | ✅ **435 shaders, 435 translated, 0 failures** — W4's hardest input already exists |
+| Shader cache | ✅ **439 shaders, 439 translated, 0 failures** — W4's hardest input already exists |
+| Bink (W3) | ✅ **SOLVED — no host code needed** (finding 17); honour `tiled=0` and the padded chroma pitch |
 | Kernel import surface | ✅ 247 names, measured against Case Zero's 244 |
 | Recompiler gates | ✅ dropped branches and unlowered switches both clean (W0.1, W0.2) |
 | Runtime | ❌ nothing yet — `runtime/` does not exist |
@@ -180,7 +181,33 @@ The summary of that request, for reference:
 Priority if the list is too much for one sitting: A1 alone first, then the one Bink
 frame, then B1+B1b, then C1.
 
-## W3 — Bink: the one genuinely new subsystem
+## W3 — Bink: ~~the one genuinely new subsystem~~ **SOLVED, and it needs no host code**
+
+> **CLOSED 2026-08-15 by capture W1 (finding 17).** Everything below is kept as the record
+> of how it was reasoned about; the answer is this box.
+>
+> The intro frame decodes as a 4-vertex fullscreen quad binding **three linear `k_8`
+> planes** — Y 1280×720 (pitch 1280) and U/V 640×360 (pitch **768**, padded) — plus the
+> title's usual tone-map and colour-LUT textures, converted to RGB by **the guest's own
+> pixel shader** `ps_a9f83f703af104b5` (144 bytes: three `tfetch2D` and a `mad` against
+> constant coefficients). That shader is already in our cache.
+>
+> So the whole stack is already ours: container read = the VFS (from **inside the STFS
+> package**), decode = recompiled guest code (finding 14, 137 `BINK` functions execute),
+> output = ordinary linear textures, conversion = a guest shader we translate, composite =
+> the normal post chain. **There is no movie player to write and no ffmpeg fallback.**
+>
+> **The one real requirement: honour `tiled=0`.** These planes are linear; detiling them
+> produces a scrambled block pattern (which is exactly what this analysis produced on its
+> first, wrong attempt). And read chroma at its **padded 768 pitch**, not at 640, or it
+> shears.
+>
+> Confirmed five ways — 4:2:0 dimensions, the shader's colour matrix, a luma histogram
+> piling up on **16** (studio-swing black), a dump of exactly 1280×720×1 bytes, and the
+> plane rendering **pixel-for-pixel identical to the on-screen frame**. The text and
+> typewriter cursor are baked into the video, not drawn live.
+
+## W3 (historical) — Bink: the one genuinely new subsystem
 
 The evidence is in bootstrap §6 and it is not a string inference this time: four Bink
 sections (one executable), ten `.bik` files totalling 66 MB, a

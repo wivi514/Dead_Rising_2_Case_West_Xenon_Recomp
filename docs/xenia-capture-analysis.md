@@ -4,8 +4,10 @@
 disagrees with it, it wins.** Findings are numbered and never renumbered; a retraction is
 written *in place* under the finding it retracts, not deleted.
 
-Round 1 partial delivery: **2026-08-15**, session 2. Delivered: **A1, B1, B1b, C1, A2, B2,
-C2** plus a set of boot-logo screenshots. Still outstanding: **A3, A4, A5, B4, W1/W2, E**.
+Round 1 delivery: **2026-08-15**, session 2. Delivered: **A1, A2, A4, B1, B1b, B2, C1, C2,
+W1, W2, B4** plus boot-logo screenshots — i.e. all of round 1 **except A3 (save round trip)
+and A5 (high-frequency)**, which is what remains outstanding. E (screenshots) is satisfied
+in substance by the frame-locked PNGs that came with W/B4.
 What each file is: `Xenia logs/Xenia_Run_Content.md`. What was asked and why:
 `docs/xenia-capture-requests.md`.
 
@@ -360,3 +362,145 @@ which is below this title's image base (`0x82000000`) entirely — that address 
 No action: `coverage_to_function_overrides.py` bounds the executed set to our image, so they
 were never candidates. Recorded only so the range is not read as evidence about the title
 next time. The *upper* end of that range is the interesting half, and it is finding 14.
+
+---
+
+*Findings 17-21 added the same day, from captures **A4** (title idle) and **W_B4** (nine
+place-anchored single-frame F4 captures with frame-locked PNGs).*
+
+## 17. **BINK IS SOLVED. It needs no new host subsystem at all.**
+
+This is the most consequential finding in the round, and it collapses W3 from a subsystem
+to an already-satisfied requirement. Frame `01_W1_intro_800a_bik__f4412.xtr` — the New Game
+intro, fullscreen — decodes as follows.
+
+**Draw 150** is a 4-vertex fullscreen quad, `vs_d6aceb8914b9cbe9` / `ps_a9f83f703af104b5`,
+binding five textures:
+
+```
+ s0  0DF87000  1280x720  fmt=2 (k_8)      tiled=0  pitchBlk=40  -> Y  (luma)
+ s1  0DEF5000   640x360  fmt=2 (k_8)      tiled=0  pitchBlk=24  -> U  (chroma)
+ s2  0DF3E000   640x360  fmt=2 (k_8)      tiled=0  pitchBlk=24  -> V  (chroma)
+ s3  17CBE000    80x45   fmt=6 (k_8_8_8_8) tiled=1              -> tone-map / luminance
+ s4  1783C000  1024x32   fmt=6 (k_8_8_8_8) tiled=1              -> 32^3 colour LUT, unwrapped
+```
+
+A 1280×720 luma with two 640×360 chroma planes is **4:2:0 YUV**. And the pixel shader is
+144 bytes of microcode that does exactly what that implies:
+
+```
+tfetch2D r3.x___, r0.xy, tf2        ; V
+tfetch2D r3._x__, r0.xy, tf1        ; U
+tfetch2D r3.__x_, r0.xy, tf0        ; Y
+mad r2.xyz_, r3.zyxx, c254.zxyy, c255.xyzz    ; YUV -> RGB, coefficients in constants
+```
+
+**Five independent lines of evidence, so this is not one reading:**
+
+1. the plane **dimensions** are 4:2:0 (1× luma, 2× quarter-area chroma);
+2. the **shader** fetches three single-channel textures and applies a colour matrix;
+3. the luma's **byte histogram clusters hard at 16** — 475,892 of 921,600 texels, i.e.
+   studio-swing black level (Y ∈ 16..235). A texture that was not video luma has no reason
+   to pile up on exactly 16;
+4. the dump is **exactly 921,600 bytes** = 1280×720×1, confirming k_8 at one byte/texel;
+5. **rendering the plane reproduces the on-screen frame pixel-for-pixel** — read *linear*,
+   the luma is the intro text, scanlines and all.
+
+And the provenance gate passes: the trace issues **no RESOLVE** to `0DF87000`, so these are
+guest memory the title uploaded — a sound oracle, not a snapshot from before the surface
+existed (gotcha: the shadow-atlas trap in the sibling port).
+
+### What this means for W3
+
+Put together with finding 14 (the decoder runs as recompiled guest code, 137 functions):
+
+| layer | who does it | status |
+|---|---|---|
+| container read | VFS, from inside the STFS package | already built for `.big` |
+| video decode | **guest code** — the recompiled `BINK` section | free (finding 14) |
+| output surface | three ordinary **linear `k_8`** textures in guest memory | nothing special |
+| YUV → RGB | **the guest's own pixel shader** `ps_a9f83f703af104b5` | already in our cache |
+| composite | the title's normal tone-map + colour-LUT post chain | same as every frame |
+
+**There is no host-side movie player to write, no colour conversion, and no ffmpeg
+fallback needed.** W3 reduces to "do not break any of the above" — and its one real
+requirement is that the renderer **honours `tiled=0`**, because these are the frames'
+linear planes and detiling them produces exactly the scrambled block pattern this analysis
+produced on its first, wrong attempt.
+
+Two details a renderer will need and nothing else records:
+- **chroma pitch is padded**: `pitchBlk=24` → 768 texels for a 640-wide plane; luma
+  `pitchBlk=40` → 1280, i.e. exact. Reading chroma at width-as-pitch will shear it.
+- the **text and the typewriter cursor are baked into the video**, not drawn live. The
+  on-screen frame and the luma plane agree glyph for glyph.
+
+## 18. The top-N-by-vertex-count default hid all of it — a tooling trap
+
+`xtr_draw_bindings.py` lists only the **top 12 draws by vertex count**. Every Bink draw is
+a **4-vertex fullscreen quad**, which sorts to the *bottom* of that order, so the first pass
+over this frame reported "no video-sized texture in the frame — 13 distinct textures, all
+render targets or post-process" and was **completely wrong**: the full CSV has 20 distinct
+textures over 155 bindings, and the three that matter were among the 7 the cap dropped.
+
+**A vertex-count sort is exactly backwards for post-process, UI and video work**, which is
+where the interesting draws are small and the boring ones are large. The tool now takes
+`--max-draws` (default unchanged) with that warning in its help text.
+
+*The general form, and it is gotcha 3 again: a listing that truncates is a detector with a
+threshold, and its silence is a detection failure, not a fact. Use `--csv` before concluding
+anything is absent.*
+
+## 19. A4: no idle Bink, and the title screen is an animated 3D scene
+
+The title screen runs no attract-loop movie — **zero `.bik` opened across a 5-minute idle**,
+confirming the operator's on-screen observation, and closing the "free §W capture" the
+request had speculated A4 might offer.
+
+But it is not a static image either: the character periodically plays a photo-taking
+animation, and the idle log is **GPU-dominated — 804,080 `G>` lines of 1,249,855 (64%)**,
+with 255,996 `XmaContext` lines (20%). Case Zero's A4 was ~69% GPU: **the same shape**.
+
+Two consequences, both good: the title screen should be as cheap and stable a test bed here
+as it was there (it is where most of that port's instrument work was validated), and it
+introduces **no new shaders** — A4's set is 54 distinct, identical to the A1/B1 boot set, so
+the idle scene is the same frontend material already compiled at boot.
+
+This answers the request's §X.3.
+
+## 20. The shader bank is 439, and B4's nine world frames added only 3
+
+```
+W session (9 F4 frames across the facility) : 416 distinct
+A4 (title idle)                             :  54 distinct, = the boot set exactly
+union of all nine dumps                     : 439   (was 435)
+```
+
+Rebuilt: 1,808 blobs in → **439 distinct → 439 translated, zero failures**; dim census 345
+2D / 111 cube, **0 disagreements**.
+
+**+3 is a much smaller step than C2's +49**, and that is informative rather than
+disappointing: the W drive covered the security office, a bathroom, a control room, two
+StoragePens crowd scenes and a lab — i.e. a lot of *places* but all within the Phenotrans
+material set that A2 and C2 had already visited. **New geometry is not new shaders; a new
+material set is.** The one part of the map that would likely still move the number is
+**outdoors**, which the W drive never reached and which the notes flag as the gap.
+
+## 21. B4 delivered eight world frames, and what they are for
+
+Not yet analysed beyond the Bink pair — recorded so the next session knows what is on disk
+and does not re-request it. All are **self-contained single-frame `.xtr` + frame-locked
+1280×720 PNG**, `trace_gpu_stream` off so the frame `.xtr` actually writes:
+
+| # | frame | why it was asked for |
+|---|---|---|
+| 02, 03 | `807_monitors.bik` on an in-world monitor | Bink as a **texture on geometry** — a different binding from W1's fullscreen |
+| 04 | security office, camera-feed monitor bank | many small screens |
+| 05 | bathroom **mirror** with two figures reflected | planar reflection — one of the sibling port's hardest surface classes |
+| 06 | control room, full **wall** of monitors | the monitor worst case |
+| 07 | StoragePens crowd from a catwalk | CrowdEngine + grating transparency |
+| 08 | lab interior with **glass** observation windows | interior + glass |
+| 09 | receiving area, **large** zombie crowd | the CrowdEngine worst case |
+
+**Not captured: any outdoors frame** — the drive stayed in Phenotrans interiors. Flagged by
+the operator rather than left to be discovered, and it is the one gap worth a future ask
+(see also finding 20).
