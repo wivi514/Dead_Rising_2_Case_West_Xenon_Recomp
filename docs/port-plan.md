@@ -84,14 +84,27 @@ Revisit extraction at W6, with two working ports to diff.
 What has to change, in rough order of certainty:
 
 - `PPC_IMAGE_*`/entry point and every `CaseZero` path → `CaseWest`.
-- **The env-var prefix.** Case Zero's instruments are all `CZ_*` (`CZ_VKDRAW`,
-  `CZ_SHADER_DUMP`, `CZ_AUTOCHUCK`, ~100 of them, documented in its
-  `docs/instruments.md`). **Recommendation: rename to `CW_*` mechanically at copy time.**
-  The operator runs both ports on the same machine and an exported `CZ_VKDRAW` reaching
-  the wrong binary is a debugging session lost to a cause nobody would look for. The cost
-  is that every instrument reference in Case Zero's docs reads one letter off — which is
-  a documentation inconvenience, not a defect. **This is a decision for the operator, not
-  a settled item.**
+- **The env-var prefix → `CW_*`. DECIDED by the operator 2026-08-15, not an open item.**
+  Case Zero's instruments are all `CZ_*` (`CZ_VKDRAW`, `CZ_SHADER_DUMP`, `CZ_AUTOCHUCK`,
+  ~100 of them, documented in its `docs/instruments.md`); they are renamed mechanically at
+  transplant time. The reason is that the operator runs both ports on the same machine and
+  an exported `CZ_VKDRAW` reaching the wrong binary is a debugging session lost to a cause
+  nobody would look for. The accepted cost is that every instrument reference in Case
+  Zero's docs reads one letter off here.
+
+  Three things this touches beyond `sed`, and all three are the kind of thing a bulk
+  rename misses silently:
+
+  1. **`CZ_` appears inside string literals**, not only in identifiers — `getenv("CZ_…")`
+     is the whole mechanism. A rename that only catches identifiers changes the code and
+     not the behaviour, and the arm then reads as "no effect" rather than as "not wired".
+  2. **The binary and the C++ symbol prefix change too** — `cz_runtime` → `cw_runtime`,
+     `CZ_TIMEBASE_HZ`, `CZ_UNIMPLEMENTED_IMPORT`, `CZ_HAVE_SDL`. `tools/gen_import_stubs.py`
+     already emits `CW_UNIMPLEMENTED_IMPORT` in this repo.
+  3. **Every arm must be shown to engage.** Gotcha 151: an arm with no counter cannot be
+     shown to have engaged, and a renamed-but-unread variable is exactly that failure. The
+     gate for this step is not "it compiles" — it is that a known arm still visibly changes
+     what it always changed. Pick one with an obvious effect and check both directions.
 - `kernel/imports.cpp` — the 244 shared imports transfer; add the **three new ones**:
   `DbgBreakPoint`, `NtCreateMutant`, `NtReleaseMutant`. The mutant pair is a real
   synchronisation primitive and must be implemented properly, not stubbed — a mutant that
@@ -117,28 +130,42 @@ surprises live.
 **This is the long pole and it is not on the critical path of W0/W1, so request it
 now.** Every port in this workspace has been carried by these captures, and the renderer
 literally cannot start without the shader microcode dump. Captures run on Windows and
-only the operator can produce them (Case Zero memory: `xenia-captures-run-on-windows`).
+only the operator can produce them (memory: `xenia-captures-run-on-windows`).
 
-The round-1 set that worked for Case Zero, translated to this title:
+> **WRITTEN AND READY: `docs/xenia-capture-requests.md` (round 1, 2026-08-15).** It is
+> deliberately shorter than Case Zero's round 1 because that port closed several of the
+> questions a first round exists to ask — its §0 lists what is NOT being re-captured and
+> why. It adds a Bink section (§W) that has no Case Zero equivalent, three pre-registered
+> questions (§X), and asks for A1 alone first. The index captures land in is
+> `Xenia logs/Xenia_Run_Content.md`, which is tracked.
+
+The summary of that request, for reference:
 
 | id | what | why it is the authority |
 |---|---|---|
-| **A1** | boot → title, L3 log, **+ `dump_shaders`** | the kernel-call order that `imports.cpp` is written against, and the first shader bank |
-| **A2** | gameplay, **+ `dump_shaders`** | the shaders that actually reach a rendered world; A1's are a subset |
-| **A5** | A1's drive at high-frequency logging | `NtReadFile` is `kHighFrequency` and **invisible at plain L3** — A5, not A1, is the `.big` read oracle |
-| **B1** | GPU `.xtr` boot → title (+ same-run correlation log) | the PM4 stream ground truth |
-| **B2** | GPU `.xtr` gameplay | ditto, for a real scene |
-| **C1/C2** | `--trace_function_data` coverage, boot and gameplay | recovers guest functions reached only through vtables — no `bl` points at them and they carry no `.pdata`, so `PPC_CALL_INDIRECT_FUNC` dies at runtime without this |
-| **E** | screenshots | the only evidence channel for "does it look right" |
+| **A1** | boot → title, L3 log — **delivered alone, first** | the kernel-call order `imports.cpp` is written against, the licence-mask check, and the first shader bank |
+| **A2** | gameplay, solo | the shaders that reach a rendered world (A1's are a subset), plus streaming, threads and the XMA lifecycle |
+| **A3** | save round trip **+ the physical save file** | the save shape; the title ID and layout differ from Case Zero even though the protocol should transfer |
+| **A4** | long title-screen idle | makes the per-frame steady state legible against A1's noisy boot |
+| **A5** | A1's drive at high frequency, `flush_log=false` | the only view of the synchronisation surface — and therefore of `NtCreateMutant`/`NtReleaseMutant`, two of this title's three new imports |
+| **B1** | GPU `.xtr` boot → title (+ same-run L3 log) | the PM4 stream ground truth |
+| **B1b** | B1 again, unchanged | the determinism control. Without it there is no way to tell a real defect from run-to-run noise, and a sibling port spent time treating noise as signal |
+| **B2** | GPU `.xtr` gameplay | ditto, for a real scene. Watch the 2 GiB cliff |
+| **B4** | place-anchored **single-frame** F4 traces + frame-locked PNGs | Safehouse, SecureLab, StoragePens (the crowd worst case), LivingResearch, glass/monitors. Self-contained: each holds the actual bytes of every texture the frame sampled |
+| **C1/C2** | `--trace_function_data` coverage, boot and gameplay | recovers guest functions reached only through vtables — no `bl` points at them and they carry no `.pdata`, so `PPC_CALL_INDIRECT_FUNC` dies at runtime without this. **Pays off before any runtime exists** |
+| **D** | `dump_shaders` | not a separate run — a flag on every run above. The renderer's only input |
+| **W1/W2** | one frame with a **Bink logo on screen**; one with an **in-world monitor** | the output-surface seam, which is where the Bink work actually is (W3 below) |
+| **E** | screenshots at known points | the only evidence channel for "does it look right" |
 
-**Two traps to state in the request itself**, both learned the hard way in Case Zero:
+**Two traps stated in the request itself**, both learned the hard way in Case Zero:
 
 - **The trial trap.** `license_mask` defaults to 0, so Xenia boots the *trial*, whose
   boot differs measurably. Every run must be the full game (`license_mask = 1`).
-- **A capture of the Bink boot logo is worth asking for specifically** (W3), because it
-  is the first thing the title does and nothing else in the set will exercise it.
+- **A capture of the Bink boot logo is asked for specifically** (§W1, and W3 here),
+  because it is the first thing the title does and nothing else in the set exercises it.
 
-Write this up as `docs/xenia-capture-requests.md` before asking, in Case Zero's format.
+Priority if the list is too much for one sitting: A1 alone first, then the one Bink
+frame, then B1+B1b, then C1.
 
 ## W3 — Bink: the one genuinely new subsystem
 

@@ -36,7 +36,7 @@ comes next is **`docs/port-plan.md`**. Those two are the whole project memory ri
 | Recompilation | ✅ 58,345 functions, 228 TUs, **zero** `jump outside function`, **zero** dropped branches |
 | Import surface | ✅ 247 names = Case Zero's 244 **+ 3** |
 | Runtime | ❌ does not exist yet |
-| Xenia ground truth | ❌ **no capture of this title exists** |
+| Xenia ground truth | ❌ **no capture of this title exists** — round 1 requested, `docs/xenia-capture-requests.md` |
 
 Nothing has been compiled by a C++ compiler and nothing has been checked against
 hardware.
@@ -165,10 +165,22 @@ corrected position rather than repeating the fix.
   - **`bootstrap-2026-08-15.md`** — day 1. Every number in this file was measured on
     *this* image. Read it first.
   - **`port-plan.md`** — what to do next, as items W0–W8 with gates and costs.
+  - **`xenia-capture-requests.md`** — round 1, written 2026-08-15, **open and unfulfilled**.
+    Nothing in this port has been checked against hardware. Its §0 records what Case Zero
+    already answered and is deliberately not re-captured; §W is Bink and has no Case Zero
+    equivalent; §X is three pre-registered questions.
   - **`gotchas.md`** — the 315-entry transferable ledger. Every "gotcha N" resolves here.
   - `reusability.md` — the tier list for what may be extracted into shared code, and the
     two rules governing it. Relevant at W6, not before.
 - `runtime/` — **does not exist yet.** W1 creates it by transplanting Case Zero's.
+  **Its instruments are renamed `CZ_*` → `CW_*` at transplant time** (operator's decision,
+  2026-08-15) so an exported variable cannot reach the wrong port's binary on a machine
+  that runs both. The prefix appears inside string literals as well as identifiers, so the
+  gate for that rename is that a known arm still visibly changes what it always changed —
+  not that it compiles (gotcha 151).
+- `Xenia logs/` — captures land here (gitignored); the index
+  `Xenia logs/Xenia_Run_Content.md` **is** tracked and is the only thing that survives a
+  lost capture. Empty so far.
 - Recompiler TOOL at `~/GithubRepo/XenonRecomp` (built at `build/`; **carries local
   patches, including the devkit-AES-key fix this title needs** — see Case Zero's
   `docs/xenonrecomp-upstream-bugs.md`). Shader translator at `~/GithubRepo/XenosRecomp`
