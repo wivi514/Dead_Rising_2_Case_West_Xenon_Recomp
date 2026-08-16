@@ -185,13 +185,12 @@ spinning thread is in.
 
 **Still owed:**
 
-- **B1/B1b determinism is UNESTABLISHED** (finding 12). The ~6% size delta is *not* a
-  verdict; a real check needs the per-frame `.xtr` decoder, which has **not** been brought
-  across from Case Zero (`tools/xtr_determinism.py` was copied but never run). **Until it
-  runs, this port has no noise floor for GPU stream comparison** — and Asura's Wrath spent
-  real time treating noise as signal for exactly that reason. Do this before the first
-  frame-to-frame A/B, not after.
-- **`kernel_call_diff.py` has never been run here** (see §2).
+- ~~**B1/B1b determinism is UNESTABLISHED**~~ — **DONE, finding 30.** The baseline is
+  **1.40%** on the worst aggregate and 0.30% on draws. Also: a frame-INDEXED GPU gate is
+  **not viable** on this title (87.9% frame agreement, +2 phase lag on 77% of frames) — gate
+  on per-era aggregates.
+- ~~**`kernel_call_diff.py` has never been run here**~~ — **DONE, finding 27**, and its
+  inherited kHighFrequency mask was wrong and is fixed.
 - **B2's 14.8 GiB gameplay stream has never been decoded.** It is the gameplay PM4 ground
   truth, waiting on a renderer to compare against.
 - **Eight of the nine B4 frames are unanalysed** — monitor bank, bathroom mirror, monitor
