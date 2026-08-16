@@ -1028,3 +1028,112 @@ and this one: somebody varied it.
   truth and it is *newly* actionable, because there is now a renderer to compare it against.
 - **Eight of the nine B4 frames are unanalysed** — the reference set for the hardest surface
   classes.
+
+---
+
+## 31. **The coverage traces have a 124 KB hole — and a positive control is the only reason we know** — part 2, 2026-08-16
+
+### The question that led here
+
+W0.3 lists 59 sites XenonRecomp could not translate: 39 unrecognized instructions over six
+mnemonics plus 20 `float16_4` pack sites. Re-measured on the current `ppc/`, both counts hold
+**exactly**:
+
+```
+14 vminsw   13 vpkshss   8 vavgsw   2 stdux   1 vpkshss128   1 stvebx   = 39
+20 x "Unexpected float16_4 pack instruction"
+```
+
+An unimplemented instruction is not a build failure and not a crash — the emitted function is
+missing that instruction's effect and runs anyway, so it is a **silent wrong-execution trap**.
+
+**But 59 sites are not 59 problems: they land in exactly SEVEN functions.**
+
+```
+sub_825D75B0  28 sites  vminsw / vpkshss / vpkshss128   saturating vector pack
+sub_825D9B50   1 site   stvebx
+sub_825E0290   4 sites  vavgsw    (references vperm byte tables at 0x82095120)
+sub_825E05D0   4 sites  vavgsw    (sibling of the above)
+sub_825E6808  20 sites  float16_4 pack — the whole cluster is ONE function
+sub_825EB5C0   1 site   stdux
+sub_825ED6C0   1 site   stdux
+```
+
+`docs/port-plan.md` guessed the `float16_4` cluster was "probably one guest function". It is.
+`sub_825E6808` gates on `r6 == 4` and `r4 == 2` before doing its work — a component-count and
+type check, i.e. a **vertex/element format converter**, which is what a half-float packer
+should look like.
+
+So the real question is not "how do we implement six mnemonics" but **"do these seven
+functions ever run?"** A function that never executes carries no risk, and XenonRecomp is
+**shared with the other three ports**, so changing it is not a unilateral call.
+
+### The answer the coverage traces give is WRONG
+
+Asked of C1 (11,680 executed functions) and C2 (19,484), all seven come back **never
+executed**. That is a clean, plausible, decisive-looking answer, and acting on it would have
+retired W0.3 entirely.
+
+**The positive control refutes it.** Functions with independent evidence that they execute:
+
+```
+sub_825B5B90   EXEC in C1 and C2   vblank callback — our own log shows it called 8,060x
+sub_825D7D20   NOT FOUND           XGI user-context builder — kernel/imports.cpp derived its
+                                   struct layout by READING THIS FUNCTION, and our runtime
+                                   sets XGI contexts at boot every run
+sub_825D9358   NOT FOUND           the XamTaskSchedule callback A1 explicitly schedules
+sub_825D91E0   NOT FOUND           pre-arms the overlapped (imports.cpp)
+sub_825C4400   NOT FOUND           XUserWriteAchievements setup (imports.cpp)
+```
+
+Four of five controls are missing from a trace that holds 19,484 functions. So the traces are
+not a census of what executed in that address range.
+
+### The hole, localised
+
+Executed-function density per 64 KB of `.text` in C2:
+
+```
+0x825A0000   189
+0x825B0000   236
+0x825C0000    82
+0x825D0000     8      <- and all 8 are at 825D0A60..825D1028, the very start
+0x825E0000     0      <- nothing at all
+0x825F0000    81
+```
+
+**Zero executed functions between 0x825D1028 and 0x825F0000** — a ~124 KB stretch that
+contains **all seven** gap functions *and* the XAM wrapper code that demonstrably runs.
+
+### Why this matters beyond W0.3
+
+**The 104 recovered entry points came from these traces.** `coverage_to_function_overrides.py`
+uses hardware execution as a function-discovery oracle, and an oracle with a 124 KB blind spot
+cannot have discovered anything there. Whatever indirect-call targets live in that region were
+never proposed, and nothing has noticed because the tool reports what it found, not what it
+could not see. That is gotcha 3 in its purest form — **a zero is a detection failure, not a
+fact** — and it is the third time in this port that a detector's *range* was the thing that
+was wrong.
+
+The cause is not established. The region's low-address neighbours are covered normally, so it
+is not a truncated trace; a 32 MiB preallocated buffer that the tool already trims suggests
+capacity is not it either. **Not chased further, because the question it was blocking now has
+a better instrument.**
+
+### The instrument that replaces it
+
+`runtime/cpu/gap_probe.cpp` — a strong `PPC_FUNC(sub_X)` over each of the seven, forwarding to
+`__imp__sub_X` after one relaxed atomic increment, reported at exit from **both** shutdown
+paths (the SIGTERM handler and the window-close path, which is the one an operator session
+actually takes and which `window.cpp`'s own comment records losing a whole evening's census
+to).
+
+**It has been shown capable of counting (gotcha 30):** adding `sub_825B5B90` as an eighth row
+made it report **11,267** calls on a 70 s boot while all seven real rows stayed 0. The control
+row was then removed.
+
+**Current reading, boot to title screen: all seven are 0.** That is an absence about a drive
+that never left the title screen — exactly the kind this port has misread five times — so the
+report says so in its own output rather than claiming a clearance. **The number that matters
+comes from a gameplay drive**, and the probe is always on, so the next one produces it for
+free.

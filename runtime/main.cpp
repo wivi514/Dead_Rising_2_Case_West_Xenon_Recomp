@@ -32,6 +32,7 @@
 #include <image.h> // XenonUtils: Image::ParseImage (devkit-key + LZX; see gotchas 15/16)
 
 #include "cpu/crash_report.h"
+#include "cpu/gap_probe.h"
 #include "cpu/guest_thread.h"
 #include "cpu/timebase.h"
 #include "gpu/vk_renderer.h"
@@ -186,6 +187,7 @@ int main(int argc, char** argv)
             fprintf(stderr, "\n[host] signal %d — dumping renderer counters and exiting.\n",
                     s);
             ::VkRenderer_DumpStats();
+            ::GapProbe_Report();
             fflush(nullptr);
             std::_Exit(128 + s);
         });

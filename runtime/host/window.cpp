@@ -88,6 +88,7 @@ bool Host_DebugMenuConsumeAction(uint32_t&, int32_t&) { return false; }
 #include <SDL.h>
 
 #include "../gpu/vk_renderer.h"
+#include "../cpu/gap_probe.h"
 
 namespace {
 
@@ -517,6 +518,10 @@ void Shutdown(const char* why)
     // increment them), and the one session that most needs the numbers — a long
     // operator play session — is exactly the one that ends by closing the window.
     ::VkRenderer_DumpStats();
+    // Same reasoning, same path: the operator play session is the run most likely to
+    // reach a function the title only calls somewhere unusual, and it is the run that
+    // ends here rather than through main.
+    ::GapProbe_Report();
     fflush(nullptr);
     // _Exit, not exit: guest threads are still running recompiled code against guest
     // memory, and running static destructors underneath them would turn an ordinary
