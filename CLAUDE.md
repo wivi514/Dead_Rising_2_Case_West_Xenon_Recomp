@@ -358,6 +358,12 @@ Full detail and evidence in `docs/bootstrap-2026-08-15.md` §6.
 - **Commit proactively** — whenever a change is useful on its own or important
   information was learned. End commit messages with:
   `Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>`
+- **Use plain `git commit`. Never pass `-c user.email` / `-c user.name`.** The repo's git
+  config already holds the right identity (`wivi514 <wivi514@hotmail.com>`, the address
+  the GitHub account uses); overriding it can only make it wrong. Doing so once cost a
+  six-commit `filter-repo` rewrite before this repo could be published — and after a push
+  the fix is a force-push that breaks every clone. `git var GIT_AUTHOR_IDENT` is the
+  one-line check.
 - **Document everything** in `docs/` for an outside reader — findings, dead ends,
   formats, retractions. Write it so someone porting a *different* Xbox 360 game can lift
   the technique: say what the idiom or format was, not just what we changed.
