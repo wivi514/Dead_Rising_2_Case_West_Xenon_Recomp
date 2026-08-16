@@ -125,6 +125,30 @@ is still missing something" from "it was never the guard". `CW_VK_NO_DYNAMIC_GUA
 to the pre-import policy and should make the defect come back — that is the test that this
 fix is the thing holding it closed.
 
+---
+
+## PENDING — defects known to be Case Zero's, waiting on a fix there
+
+**These are NOT to be investigated in this port.** They were reported here by the operator
+(2026-08-16, the Case 1-3 session, finding 33) as pre-existing and already known in the
+sibling. Re-deriving them here would duplicate in-flight work and risk landing a different
+fix for the same defect. Watch the named item, import when it closes, add a row above.
+
+| defect here | Case Zero item | state there (checked 2026-08-16) | what to watch |
+|---|---|---|---|
+| **Decals not rendering properly** — minor visual, operator says fix later | **00m** in `docs/open-items.md` | Reported at their part 47, **explicitly NOT investigated**, no captures requested. Theirs to characterise once the performance work lands. | any commit touching decals / the decal draw pass |
+| **Performance** | **00l**, parts 47-48 | Actively in progress. Part 47's A/B reached the two-vblank pacing floor on their headless route. **Their working tree carries uncommitted part-47 work on `vk_renderer.cpp`** — a three-way `record` profiler split and a four-lane `GuardFold`. | that work being committed, then import as a row above |
+
+Their likely handle on decals, recorded so it is not re-derived: decals are a separate draw
+pass with their own blend state, so a draw census plus draw-ID on a frame containing one
+should name the draws in a single capture — and the title screen / menu backdrop is worth
+checking first for a self-servable repro (gotcha 319).
+
+**Note for this port specifically:** gotcha 319 matters more here than in Case Zero now.
+Past Case 1-3 this port has **no Xenia ground truth at all** (finding 33), so a defect that
+reproduces early — on the title screen, in the menus — is worth far more than the same defect
+found in late content, where nothing can adjudicate it.
+
 ### Not imported from the same neighbourhood
 
 Case Zero's working tree also carries **uncommitted part-47 performance work** on this file

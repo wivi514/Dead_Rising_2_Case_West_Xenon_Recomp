@@ -1201,3 +1201,61 @@ here, and the census agreeing on all 443 says the two decodes do not disagree.
 
 `CW_VK_FRAME_DUMP` also ran; its output is what priced the imported UI fix at 12 MB/frame in
 gameplay against 1.0 at the title screen (`docs/imported-fixes.md`).
+
+---
+
+## 33. **CASE 1-3 COMPLETE, NEW AREAS, AND PAST THE ORACLE** — operator, 2026-08-16
+
+**Provenance: the operator's own play session**, the one that carried the imported UI fix and
+three instruments (findings 32 and `docs/imported-fixes.md`).
+
+> *"In this run I reached new areas and completed case 1-3 which is further then what I
+> reached in xenia and didn't have any issue except [decals and performance]."*
+
+### What this establishes
+
+**The port completes Case 1-3.** Not "boots", not "renders", not "plays the intro" — a
+multi-case progression through new areas, with the HUD working, on a build whose only
+reported defects are both **inherited from Case Zero and already known there**.
+
+**And it went FURTHER THAN THE CAPTURE SET.** This is the consequence that matters for
+method, and it is new:
+
+> **From Case 1-3 onward, this port has NO Xenia ground truth, because the operator never
+> drove Xenia that far.** Every capture in round 1 — A2, B2, C2 and the rest — stops short of
+> where the runtime now goes.
+
+That is not a gap to fill by asking for captures. It is a **permanent change in what evidence
+is available for late content**, and it compounds gotcha 320 (*Xenia is not a ceiling*) into
+something sharper:
+
+- **For content the captures cover**, the guest-side bytes are still ground truth: kernel
+  call order, file reads, PM4 packets, shader microcode.
+- **For content past them, there is no oracle at all.** No capture, no A/B against hardware,
+  no "does Xenia show this too?". The only evidence is the game's own intended behaviour,
+  the engine's internal consistency, and the operator's eyes.
+- So **a defect found in late content cannot be triaged the cheap way** the earlier ones were.
+  Findings 27 and 29 were both settled in one grep against a capture; that move is gone past
+  Case 1-3. Budget accordingly, and prefer defects that reproduce EARLY — gotcha 319, *prefer
+  a repro that already has an oracle in the repository*, is now load-bearing rather than a
+  convenience.
+
+### The two defects, and neither is ours
+
+Both were reported as pre-existing and **both are open items in Case Zero**, so neither is to
+be investigated here (see `docs/imported-fixes.md`):
+
+| defect | Case Zero item | state there |
+|---|---|---|
+| **Decals not showing properly** — minor visual | **00m** | operator-reported at part 47, **explicitly NOT investigated**, no captures requested; theirs to characterise after the performance work |
+| **Performance** | **00l / parts 47-48** | actively being worked; part 47's A/B reached the two-vblank pacing floor on the headless route |
+
+**"No issue except" those two, across new areas and a full case, is the headline.** No crash,
+no hang, no missing subsystem, no unsupported-format complaint.
+
+### One thing this session already banked
+
+The new areas meant new material, and `CW_SHADER_DUMP` was on — so the bank rebuild in
+finding 32 (**439 → 443**) already includes them. That is why a session reaching new places
+produced only **three** misses: the rebuild consumed the very dumps that session wrote. Any
+future drive into genuinely new material should keep the dump on for the same reason.

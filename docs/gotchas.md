@@ -3137,3 +3137,32 @@ From phase C part 18 (the frame rate — and none of it was work):
      regress it. Score against the GAME's intended behaviour, and record the axis
      where the oracle is known-worse so a later part does not helpfully undo it.
      Recorded in this port at finding 29.
+
+321. **THE ORACLE RUNS OUT — AND THE DAY YOUR PORT GOES FURTHER THAN THE
+     CAPTURES, YOUR CHEAPEST TRIAGE MOVE DIES WITH IT.** Second entry written
+     from Case West. Gotcha 320 says the emulator is not a ceiling on QUALITY;
+     this one says it is not a ceiling on PROGRESS either, and that the second
+     kind of overtaking costs you something the first does not.
+     Case West completed Case 1-3 through areas the operator had never driven in
+     Xenia. Every capture in the set stops short of there. So for that content
+     there is **no capture, no hardware A/B, and no "does Xenia show this too?"**
+     — and that last one is the move that retired two whole investigations in a
+     single grep earlier in the same port (findings 27 and 29).
+     What to do about it, in order:
+     (a) **Notice the moment it happens and write it down.** It is silent. Nothing
+     fails; the tooling still runs, it just has nothing to compare against, and a
+     capture-shaped question asked about late content gets an empty answer that
+     reads exactly like a clean one (gotcha 3).
+     (b) **Split your defect list by whether an oracle exists for it.** A defect
+     that reproduces on the title screen, in a menu, or anywhere the captures
+     reached is worth several that only appear in late content, because it can be
+     adjudicated at all. This promotes gotcha 319 from a convenience to a
+     selection rule.
+     (c) **Do not fill the gap by requesting captures as a reflex.** Ask what
+     question the capture would answer first (gotcha 18) — and note that asking
+     the operator to re-drive an emulator to a point their own port passes more
+     comfortably may not even be possible.
+     (d) **Past the oracle, the remaining evidence is the game's intended
+     behaviour, the engine's internal consistency, and the operator's eyes.** All
+     three are real; none is a byte comparison. Say which one a late-content claim
+     rests on.
