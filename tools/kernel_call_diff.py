@@ -26,29 +26,47 @@ and A4 all record it as false in their own config dumps. Anyone diffing a runtim
 log against A1 without knowing this sees our runtime "calling functions Xenia never
 called" and goes hunting for a divergence that does not exist.
 
-Case Zero's hidden set is not copied from another port — it is MEASURED, from our
-own captures. A5 is A1's drive re-run with `log_high_frequency_kernel_calls=TRUE`,
-so the names present in A5's first-occurrence list and absent from A1's are exactly
-the ones this title uses that Xenia hides. There are 35 of them (below), and they
-are most of the synchronisation surface: RtlEnterCriticalSection, KeSetEvent,
+The hidden set below is MEASURED ON THIS TITLE (part 2, 2026-08-15), and the
+derivation is not the obvious one — see THE SECOND TRAP. There are 35 names, and
+they are most of the synchronisation surface: RtlEnterCriticalSection, KeSetEvent,
 NtWaitForSingleObjectEx, KeDelayExecutionThread, NtReadFile, VdSwap.
 
 Those names are masked out of OUR side by default, and the script reports how many
 it masked. `--include-high-frequency` unmasks them, for use against A5.
 
-THE SECOND TRAP: A5 is NOT a superset of A1
---------------------------------------------
-It nearly is, and assuming it is would be wrong in a way that reads as a
-divergence. Eleven names appear in A1 and not in A5 — XamShowDeviceSelectorUI,
-XamContentAggregateCreateEnumerator, XamGetOverlappedResult, XamTaskSchedule,
-XMsgInProcessCall and friends — i.e. the whole storage-device-selector path, which
-that drive did not enter. So:
+THE SECOND TRAP: `A5 - A1` IS NOT THE HIDDEN SET
+-------------------------------------------------
+That subtraction is what this script shipped with, inherited from Case Zero, and on
+Case West it is wrong in BOTH directions — because it conflates two different
+reasons a name can be missing from A1:
 
-    A1 is the authority for the boot sequence and everything past it.
-    A5 is the authority for the synchronisation surface, and only for the region
-    it covers.
+    (a) Xenia suppressed it            <- what we want to mask
+    (b) that drive never went there    <- a real path difference, must NOT be masked
 
-Neither capture alone is the gate. Run both.
+On this title `A5 - A1` is 58 names and 23 of them are case (b): A5's drive entered
+the storage-device selector and the XMP/XMsg paths that A1's did not, dragging in
+XamShowDeviceSelectorUI, XamContentAggregateCreateEnumerator, XamTaskSchedule,
+XMsgInProcessCall, XamAlloc, NtCreateMutant and friends. Masking those would hide
+exactly the class of divergence this script exists to catch — the storage path is a
+place a boot can hang.
+
+The discriminator that actually separates (a) from (b): a suppressed name can never
+appear in ANY hf=false capture, however far that drive got. So the hidden set is
+
+    first-occurrence(A5)  -  union(every capture whose log head says hf=false)
+
+which uses all ten other captures instead of one. Regenerate it with `--derive-mask`,
+which reads the flag out of each log head rather than trusting a sidecar config or
+this comment.
+
+Note the direction the old subtraction was wrong in as well: it MISSED
+XMAReleaseContext, which is genuinely suppressed here. An unmasked hidden name shows
+up as a spurious ours-only divergence — the same false alarm, from the other side.
+
+A1 remains the authority for the boot sequence, and A5 only for the region its drive
+covers: five names in the wider union (NtWriteFile, XamContentCreateEx,
+XamContentGetDeviceData, XamShowSigninUI, XGIUserWriteAchievements) are absent from
+A5 entirely. Neither capture alone is the gate. Run both.
 
 THE THIRD TRAP: Xenia's internal helpers wear the same line shape
 ------------------------------------------------------------------
@@ -85,6 +103,7 @@ race, and no runtime reproduces an emulator's scheduling.
 """
 
 import argparse
+import gzip
 import re
 import sys
 from pathlib import Path
@@ -102,32 +121,37 @@ XENIA_CALL = re.compile(r"^[A-Za-z!]> [0-9A-F]+ ([A-Za-z][A-Za-z0-9_]*)\(")
 # called. Repeats use the [kcall+] prefix and are ignored here by construction.
 OURS_CALL = re.compile(r"^\[kcall\] (\w+)$")
 
-# Exports Xenia tags kHighFrequency that CASE ZERO ACTUALLY USES.
+# Exports Xenia tags kHighFrequency THAT CASE WEST ACTUALLY USES.
 #
-# Measured, not inherited: this is exactly `first-occurrence(A5) - first-occurrence(A1)`,
-# A5 being A1's drive with log_high_frequency_kernel_calls=TRUE. Regenerate with
-#
-#   SP=/tmp; L="Xenia logs"
-#   for f in "$L/A1_boot_title_fullgame/cz_run1.log" "$L/A5_highfreq_boot/cz_run5.log"; do
-#       grep -oP '^[A-Za-z!]> [0-9A-F]+ \K[A-Za-z][A-Za-z0-9_]*(?=\()' "$f" | sort -u
-#   done | ... # comm -13 A1 A5
+# Measured on this title's own captures on 2026-08-15 (part 2) with `--derive-mask`,
+# which is the reproduction: A5's names minus the union over all ten hf=false
+# captures. Do NOT regenerate this as `A5 - A1` — that is the inherited derivation and
+# THE SECOND TRAP in the docstring explains why it is wrong in both directions.
 #
 # Deriving it from the captures rather than from a Xenia checkout means it is
 # automatically the intersection with what this title imports, and it stays true to
 # the fork the captures were taken on rather than to whatever Xenia is today.
+#
+# One name is here on a weaker footing than the rest, and is marked: NtSetInformationFile
+# is imported by this image but appears in NO capture at all, A5 included. So it is
+# either suppressed-and-never-called or simply never called, and the captures cannot
+# tell those apart. It is masked because either way Xenia's side shows nothing, so
+# leaving it visible could only ever manufacture an ours-only divergence.
 XENIA_HIGH_FREQUENCY = {
     "KeAcquireSpinLockAtRaisedIrql", "KeDelayExecutionThread", "KeEnterCriticalRegion",
     "KeGetCurrentProcessType", "KeLeaveCriticalRegion", "KeQueryPerformanceFrequency",
     "KeReleaseSpinLockFromRaisedIrql", "KeSetEvent", "KeTlsGetValue",
     "KeWaitForMultipleObjects", "KeWaitForSingleObject", "KfAcquireSpinLock",
     "KfReleaseSpinLock", "MmQueryAddressProtect", "MmQueryStatistics", "NtClearEvent",
-    "NtReadFile", "NtReleaseSemaphore", "NtSetEvent", "NtSetInformationFile",
+    "NtReadFile", "NtReleaseSemaphore", "NtSetEvent",
     "NtWaitForMultipleObjectsEx", "NtWaitForSingleObjectEx", "RtlEnterCriticalSection",
     "RtlInitializeCriticalSectionAndSpinCount", "RtlLeaveCriticalSection",
     "RtlNtStatusToDosError", "RtlTryEnterCriticalSection", "VdSwap",
     "XamContentGetLicenseMask", "XamInputGetState", "XamUserGetSigninState",
     "XAudioGetVoiceCategoryVolume", "XAudioSubmitRenderDriverFrame", "XMACreateContext",
-    "XNotifyGetNext",
+    "XMAReleaseContext", "XNotifyGetNext",
+    # never observed in any capture, including A5 — see the note above
+    "NtSetInformationFile",
 }
 
 
@@ -199,6 +223,77 @@ def report_windows(windows):
         print("SET MATCH: every mismatch is a permutation. Exit 0.")
 
 
+HF_FLAG = re.compile(r"log_high_frequency_kernel_calls\s*=\s*(\w+)")
+
+
+def derive_mask(logdir: Path) -> int:
+    """Re-derive XENIA_HIGH_FREQUENCY from the captures, and diff it against the constant.
+
+    This exists because the constant above arrived from Case Zero with Case Zero's
+    derivation baked in, and was wrong on this title by one name in each direction.
+    A constant nobody can regenerate goes stale silently; this makes it a command.
+
+    The hf flag is read from each log's OWN head, not from the sidecar .toml — only 3
+    of the 11 captures ship a config, and a sidecar can be the wrong run's.
+    """
+    logs = sorted(logdir.glob("*/xenia_*.log.gz")) + sorted(logdir.glob("*/xenia_*.log"))
+    if not logs:
+        sys.exit(f"no xenia_*.log[.gz] under {logdir}")
+
+    visible: set[str] = set()   # names logged by a capture that was NOT hiding them
+    hidden_capable: set[str] = set()   # names seen in an hf=true capture
+    n_true = n_false = 0
+    for log in logs:
+        opener = gzip.open if log.suffix == ".gz" else open
+        names, flag = set(), None
+        with opener(log, "rt", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if flag is None:
+                    m = HF_FLAG.search(line)
+                    if m:
+                        flag = m.group(1).lower() == "true"
+                m = XENIA_CALL.match(line.rstrip("\n"))
+                if m:
+                    names.add(m.group(1))
+        if flag is None:
+            sys.exit(f"{log}: no log_high_frequency_kernel_calls line — cannot classify it")
+        if flag:
+            n_true += 1
+            hidden_capable |= names
+        else:
+            n_false += 1
+            visible |= names
+        print(f"  {log.parent.name:<24} hf={str(flag):<5} {len(names):>4} distinct names")
+
+    if not n_true:
+        sys.exit("no capture has log_high_frequency_kernel_calls=true; cannot derive")
+
+    derived = hidden_capable - visible
+    print(f"\n{n_false} hf=false capture(s) -> {len(visible)} visible names")
+    print(f"{n_true} hf=true capture(s)  -> {len(hidden_capable)} names")
+    print(f"derived hidden set: {len(derived)} names\n")
+    for n in sorted(derived):
+        print(f"    {n}")
+
+    # The constant may legitimately hold names the captures cannot see at all (see the
+    # NtSetInformationFile note); those are reported, not treated as a failure.
+    unseen_anywhere = (XENIA_HIGH_FREQUENCY - derived) - visible
+    stale = (XENIA_HIGH_FREQUENCY - derived) & visible
+    missing = derived - XENIA_HIGH_FREQUENCY
+    print()
+    if unseen_anywhere:
+        print(f"in the constant but in NO capture (harmless, kept): {sorted(unseen_anywhere)}")
+    if stale:
+        print(f"STALE — masked here but VISIBLE to Xenia on this title: {sorted(stale)}")
+    if missing:
+        print(f"MISSING — suppressed on this title but not masked: {sorted(missing)}")
+    if stale or missing:
+        print("\nThe constant does not match the captures. Update XENIA_HIGH_FREQUENCY.")
+        return 1
+    print("Constant agrees with the captures.")
+    return 0
+
+
 def read_lines(path: Path):
     # Xenia logs carry occasional non-UTF-8 bytes from guest strings.
     with path.open("r", encoding="utf-8", errors="replace") as f:
@@ -208,14 +303,24 @@ def read_lines(path: Path):
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--xenia", required=True, type=Path, help="Xenia log_level=3 capture")
-    ap.add_argument("--ours", required=True, type=Path, help="our runtime's stderr log")
+    ap.add_argument("--xenia", type=Path, help="Xenia log_level=3 capture")
+    ap.add_argument("--ours", type=Path, help="our runtime's stderr log")
+    ap.add_argument("--derive-mask", type=Path, metavar="LOGDIR", nargs="?",
+                    const=REPO / "Xenia logs",
+                    help="re-derive XENIA_HIGH_FREQUENCY from every capture under "
+                         "LOGDIR and diff it against the constant; exit 1 if they "
+                         "disagree. Does not run a comparison.")
     ap.add_argument("--limit", type=int, default=0,
                     help="compare only the first N entries")
     ap.add_argument("--include-high-frequency", action="store_true",
                     help="do not mask kHighFrequency names (use with A5, the one "
                          "capture taken with log_high_frequency_kernel_calls=true)")
     args = ap.parse_args()
+
+    if args.derive_mask is not None:
+        sys.exit(derive_mask(args.derive_mask))
+    if not args.xenia or not args.ours:
+        ap.error("--xenia and --ours are both required (or use --derive-mask)")
 
     imports = image_imports()
     visible = imports if args.include_high_frequency else imports - XENIA_HIGH_FREQUENCY
