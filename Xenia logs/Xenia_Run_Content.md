@@ -353,8 +353,12 @@ failures, dim census 0 disagreements.
 **+3 from nine world frames, against +49 from C2's one new zone.** That is the useful
 lesson rather than a disappointment: the W drive covered many new *places* inside a
 material set A2/C2 had already visited. **New geometry is not new shaders; a new material
-set is.** Which makes the gap you flagged — **no outdoors frame** — the one most likely to
-move the number.
+set is.**
+
+*(Corrected later the same day: I read your "no clearly outdoors frame" note as a coverage
+gap and called it the likeliest source of new shaders. **Case West has no outdoors** — it
+is all Phenotrans facility — so there is no unvisited area class, and 439 is more likely
+near-complete than that reading implied.)*
 
 ### B4's eight world frames
 
@@ -437,6 +441,6 @@ consecutive captures.
 
 ### Round 1 is closed
 
-Thirteen captures, all consumed, nothing outstanding. **The one gap is a place, not a
-capture: no drive has ever gone outdoors** — every one stayed in Phenotrans interiors, and
-that is the likeliest remaining source of new shaders.
+Thirteen captures, all consumed, **nothing outstanding and no place gap** — Case West is
+set entirely inside the Phenotrans facility, so these drives cover the game's area classes.
+

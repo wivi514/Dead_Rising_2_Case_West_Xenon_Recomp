@@ -1,7 +1,10 @@
 # Xenia ground-truth captures needed for Case West — request list (round 1)
 
-> **STATUS 2026-08-15: PARTIALLY DELIVERED.** In hand: **A1, B1, B1b, C1, A2, B2** plus
-> boot-logo screenshots. **Outstanding: A3, A4, A5, C2, B4, W1/W2 (retargeted), E.**
+> **STATUS 2026-08-15: ROUND 1 IS COMPLETE.** All 13 captures delivered and consumed in
+> one day — A1, A2, A3, A4, A5, B1, B1b, B2, C1, C2, W1, W2, B4, plus boot-logo
+> screenshots. E is satisfied in substance by the frame-locked PNGs that came with W/B4.
+> **Nothing is outstanding**, and there is no place gap either: Case West is set entirely
+> inside the Phenotrans facility, so these drives cover the game's area classes.
 > What each file is: `Xenia logs/Xenia_Run_Content.md`. **What they taught us:
 > `docs/xenia-capture-analysis.md` — the numbered findings ledger. Read that, not this.**
 >
@@ -9,8 +12,10 @@
 > 1. **§W's premise that the boot Bink is "unmissable and free on A1/B1's drive".** There
 >    is no boot Bink at all — zero `.bik` opened between boot and title. W1 is retargeted;
 >    see the strikethrough in §W1 and finding 4.
-> 2. **§X.1's guess that the mutants "probably belong to co-op".** They are a hot
->    solo-gameplay lock — 32,382 `NtReleaseMutant` calls in one solo session. Finding 3.
+> 2. **§X.1's guess that the mutants "probably belong to co-op".** Wrong twice over: not
+>    co-op (finding 3), and not the audio/streaming loader the replacement guess named
+>    either. **They guard Bink's two decoder worker threads** — 100% of releases fall
+>    inside the `.bik` handle's lifetime. Finding 23.
 > 3. **§X.2's framing.** A solo boot *does* enter the networking stack (Winsock + XNet
 >    title address, 405 polls), just not the session layer. Finding 6.
 >
@@ -19,9 +24,11 @@
 > taken against the wrong premise), and **`dump_shaders` on everything** — 386 distinct
 > shaders, all of which XenosRecomp translated with zero failures.
 >
-> **A5 is now more valuable than when it was written**, and is the top outstanding item
-> after C2: it is the only place the mutants' call sites (finding 3) and Bink's read
-> cadence (finding 5) become visible, because both are `kHighFrequency`.
+> **A5 delivered both of its payloads because the operator deviated from its written
+> spec.** This document asks for A1's *boot* drive; they drove through to gameplay,
+> because A1 had already shown the boot path has neither mutants nor Bink. A boot-only A5
+> would have captured neither of the two things it was for. Findings 22 and 23 exist only
+> because of that — **write the request around the QUESTION, not the drive.**
 
 **Written 2026-08-15, session 1, before any runtime work.** Six of its runs were delivered
 the same day; see the status banner above for what is still open.
@@ -241,7 +248,6 @@ Creek:
 - a **SecureLab** interior;
 - the **StoragePens** (this is the zombie-crowd area — the CrowdEngine's worst case);
 - a **LivingResearch** interior;
-- **outdoors**, if the drive reaches it;
 - anywhere with **a lot of glass, a mirror, or a monitor bank** — those were Case Zero's
   hardest surfaces and a monitor bank is also a §W target.
 

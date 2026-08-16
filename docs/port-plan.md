@@ -156,8 +156,10 @@ inventing something the title does not do. Finding 24.
 ## W2 — Xenia ground truth (operator-dependent, START IT EARLY)
 
 > **STATUS: ROUND 1 IS COMPLETE.** All 13 captures delivered 2026-08-15 and consumed;
-> findings 1-26 in `docs/xenia-capture-analysis.md`. Nothing is outstanding. The one gap
-> is a *place*, not a capture: no drive has gone outdoors.
+> findings 1-26 in `docs/xenia-capture-analysis.md`. **Nothing is outstanding, and there is
+> no place gap either** — Case West is set entirely inside the Phenotrans facility, so the
+> 13 captures cover the game's area classes (operator, 2026-08-15, correcting an earlier
+> note here that called a missing "outdoors" frame a gap).
 
 **This was the long pole and it was not on the critical path of W0/W1, so it was requested
 first.** Every port in this workspace has been carried by these captures, and the renderer

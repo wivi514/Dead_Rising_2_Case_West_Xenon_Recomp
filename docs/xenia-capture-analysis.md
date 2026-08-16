@@ -8,15 +8,18 @@ written *in place* under the finding it retracts, not deleted.
 C2, W1, W2, B4** plus boot-logo screenshots. E (screenshots) is satisfied in substance by
 the frame-locked PNGs that came with W/B4. **Nothing is outstanding.**
 
-The one gap worth a future ask is not a missing capture but a missing *place*: **no drive
-has ever gone outdoors** — every one stayed in Phenotrans interiors. Finding 20 makes that
-the likeliest remaining source of new shaders.
+**Nothing is outstanding, and there is no place gap either.** An earlier version of this
+paragraph called a missing "outdoors" frame the likeliest remaining source of new shaders;
+**the operator corrected it — Case West has no outdoors. The whole game is set inside the
+Phenotrans facility.** See the retraction under finding 20.
 What each file is: `Xenia logs/Xenia_Run_Content.md`. What was asked and why:
 `docs/xenia-capture-requests.md`.
 
-**Round 1 refuted two claims this project had already written down as likely.** Both were
-mine, both were inferences from the image rather than measurements, and both are corrected
-in place in `docs/port-plan.md` and in the memory directory. They are findings 3 and 4.
+**Round 1 refuted FOUR claims this project had already written down as likely** — findings
+3, 4, 18 and 23. All four were mine; three were inferences from a *count* or a *truncated
+listing* rather than measurements, and all are corrected in place in
+`docs/bootstrap-2026-08-15.md`, `docs/port-plan.md` and the memory directory.
+`docs/part2-kickoff.md` §4 states the common lesson.
 
 ---
 
@@ -485,8 +488,19 @@ Rebuilt: 1,808 blobs in → **439 distinct → 439 translated, zero failures**; 
 disappointing: the W drive covered the security office, a bathroom, a control room, two
 StoragePens crowd scenes and a lab — i.e. a lot of *places* but all within the Phenotrans
 material set that A2 and C2 had already visited. **New geometry is not new shaders; a new
-material set is.** The one part of the map that would likely still move the number is
-**outdoors**, which the W drive never reached and which the notes flag as the gap.
+material set is.**
+
+> **RETRACTED, 2026-08-15 (operator):** this finding ended by naming **outdoors** as the
+> part of the map that would still move the number, and the capture notes flagged the same
+> thing as a gap. **Case West has no outdoors** — the entire game takes place inside the
+> Phenotrans facility, so there is no unvisited area class and B4's "big open receiving
+> area" is a large interior, the closest this title comes to an exterior.
+>
+> The error: the delivery *lacked* an outdoors frame, and I read that absence as a gap in
+> the **capture** rather than as a fact about the **game**. It is the same shape as reading
+> A1's zero mutant calls as an attribution (finding 3) and a filename as a call site
+> (finding 4) — **an absence is a fact about what was looked at, not about what exists.**
+> One question to the operator settled it. The +3-vs-+49 lesson above is unaffected.
 
 ## 21. B4 delivered eight world frames, and what they are for
 
@@ -504,9 +518,10 @@ and does not re-request it. All are **self-contained single-frame `.xtr` + frame
 | 08 | lab interior with **glass** observation windows | interior + glass |
 | 09 | receiving area, **large** zombie crowd | the CrowdEngine worst case |
 
-**Not captured: any outdoors frame** — the drive stayed in Phenotrans interiors. Flagged by
-the operator rather than left to be discovered, and it is the one gap worth a future ask
-(see also finding 20).
+**The notes flag "no clearly outdoors frame" — and that is not a gap.** Case West has no
+outdoors at all (operator, correcting finding 20's reading); the drive stayed in Phenotrans
+interiors because that is the whole game. Frame 09's big open receiving area is the closest
+this title comes to an exterior, and it is captured.
 
 ---
 
@@ -650,8 +665,10 @@ at **439**. Consistent with finding 20: both drives covered material A2/C2/W had
 visited. No rebuild was needed.
 
 The bank has now been stable across four consecutive captures, which is the first time
-that has been true — but **outdoors has still never been captured**, and that remains the
-one place the number is likely to move.
+that has been true — and since **Case West has no outdoors** (see finding 20's retraction),
+there is no unvisited area class left to move it. That makes 439 a plausible near-complete
+bank rather than one with a whole biome missing. Still a claim with a shelf life
+(gotcha 13): any run reaching new ground should carry `dump_shaders` regardless.
 
 ## 26. VdSwap is visible at last, and the boot's sync surface has a scale
 

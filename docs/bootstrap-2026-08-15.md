@@ -235,7 +235,10 @@ that are.
   (12 strings) for zombie crowds — both as in Case Zero.
 - **Zones**: the image still carries full-DR2 zone names (`americana`, `atlantica`,
   `arena_stadium`) it does not ship, exactly as Case Zero did, plus Case West's own
-  (`Phenotrans`, `SecureLab`, `StoragePens`, `LivingResearch`, `Safehouse`).
+  (`Phenotrans`, `SecureLab`, `StoragePens`, `LivingResearch`, `Safehouse`). **All of the
+  shipped ones are parts of the Phenotrans facility: this game has no outdoors at all**
+  (operator, 2026-08-15) — which is why the list reads as interiors and why, unlike Case
+  Zero's outdoor Still Creek, there is no exterior area class a capture set could miss.
 - **A debug build is present in the retail image again** — `DebugMenu`,
   `COMMAND_RENDERDEBUGMENU`, `COMMAND_AIDEBUGMENU`, `ShowInDebugMenu`,
   `DontAutoCompleteOnDebugJump`. Case Zero's whole navigation toolchain (DebugJump,

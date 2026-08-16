@@ -22,18 +22,34 @@ West's headline feature is two-player co-op and the image is full of it; nothing
 block single-player on it. `docs/port-plan.md` W7 explains why deferring it is
 low-risk — the import table says so.
 
-## Status: session 1 (2026-08-15), bootstrap only
+## Status — and where a new conversation starts
 
-Everything measured on day 1 is in **`docs/bootstrap-2026-08-15.md`**. The plan for what
-comes next is **`docs/port-plan.md`**. **`docs/xenia-capture-analysis.md` is the numbered
-findings ledger and the authority on any measured number — where another doc disagrees
-with it, it wins.**
+> **THE LIVE HAND-OFF IS `docs/part2-kickoff.md`.** Read it first in a new conversation:
+> it says what already exists (so it is not rebuilt), names the first measurement, and
+> lists the gates that are owed. When a part ends, write the next `part<N>-kickoff.md`,
+> demote this pointer to it, and refresh the memory directory.
 
-**Session 2 (2026-08-15) took delivery of six round-1 captures, and they refuted two
-claims this project had already written down.** The mutants are a hot *solo* lock, not
-co-op (finding 3), and there is **no boot Bink** — a filename was read as a call site
-(finding 4). Both are retracted in place wherever they were claimed. That is the thesis
-risk in this port arriving on schedule: see "The thesis of this port" below.
+## Status: part 1 complete (2026-08-15)
+
+Part 1 was one conversation: bootstrap, the full round-1 capture set, and the runtime
+transplant. Its documents say "session 1" and "session 2" for the two halves; that split
+is internal to part 1.
+
+Day-1 measurements are in **`docs/bootstrap-2026-08-15.md`**; the roadmap is
+**`docs/port-plan.md`**; the transplant record is **`docs/w1-transplant-notes.md`**.
+**`docs/xenia-capture-analysis.md` is the numbered findings ledger and the authority on
+any measured number — where another doc disagrees with it, it wins.**
+
+**Round 1 refuted FOUR claims this project had already written down**, all in part 1 and
+all by measurement: the mutants are not co-op (finding 3) and not audio/streaming either —
+they are **Bink's** (finding 23); there is **no boot Bink**, a filename read as a call site
+(finding 4); and "no video texture in the W1 frame" was my own tooling error, a listing
+truncated to the top 12 draws *by vertex count* when every Bink draw is a 4-vertex quad
+(finding 18). All are retracted in place wherever they were claimed.
+
+That is the thesis risk in this port arriving on schedule — see "The thesis of this port"
+below — and `docs/part2-kickoff.md` §4 draws the common lesson: three of the four were
+inferences from a **count** or a **truncated listing**.
 
 | | state |
 |---|---|
@@ -50,8 +66,9 @@ risk in this port arriving on schedule: see "The thesis of this port" below.
 | Bink | ✅ **SOLVED — the host contributes file I/O and nothing else.** Guest code decodes it on its own 2 threads, a guest shader converts it (findings 14, 17, 22, 23) |
 | Runtime (W1) | ✅ **COMPLETE** — links, boots (58,695 symbols; 60 s, 87 `.big`, vblanks delivered), save layer confirmed. Does not present a frame yet |
 
-Nothing has been compiled by a C++ compiler and nothing has been checked against
-hardware.
+**Part 2's first job is the spin:** the runtime boots and runs but never presents a frame
+— a worker spins on `RtlEnterCriticalSection` 6.8 M times a minute. The first measurement
+is a kernel-call-order diff against capture A1, not a debugger. `docs/part2-kickoff.md` §2.
 
 ## The thesis of this port, and the risk that comes with it
 
@@ -203,7 +220,10 @@ corrected position rather than repeating the fix.
     *this* image. Read it first.
   - **`xenia-capture-analysis.md`** — **the numbered findings ledger.** The authority on
     any measured number; read it before believing a number in any other file here.
-  - **`port-plan.md`** — what to do next, as items W0–W8 with gates and costs.
+  - **`part2-kickoff.md`** — **the LIVE hand-off.** Highest-numbered `part<N>-kickoff.md`
+    always wins on "where the port is"; older ones are history and go stale fast.
+  - **`port-plan.md`** — the roadmap, as items W0–W8 with gates and costs.
+  - **`w1-transplant-notes.md`** — how the runtime came across, what was parked and why.
   - **`xenia-capture-requests.md`** — round 1, written 2026-08-15, **open and unfulfilled**.
     Nothing in this port has been checked against hardware. Its §0 records what Case Zero
     already answered and is deliberately not re-captured; §W is Bink and has no Case Zero
@@ -294,8 +314,9 @@ python3 tools/shader_dim_census.py               # 0 disagreements expected; exi
 drive loaded a second zone, but only 435 → 439 across nine further world frames, because
 those covered new *places* inside a material set already visited. A shader the cache lacks
 is one log line and a silent counter, not a failure. Keep `dump_shaders` on for every
-capture whatever it was asked for. **Outdoors has never been captured** and is the likeliest
-remaining gap.
+capture whatever it was asked for. **There is no outdoors in this game** — Case West is set
+entirely inside the Phenotrans facility, so the captured set covers its area classes and the
+bank is more likely near-complete than a missing-biome reading would suggest.
 ```
 ```
 The census is **two-sided by construction** — the per-slot texture dimension is derivable
@@ -349,6 +370,12 @@ Full detail and evidence in `docs/bootstrap-2026-08-15.md` §6.
   the image still carries DR2's zone names (`americana`, `atlantica`, `arena_stadium`)
   it does not ship, alongside Case West's own (`Phenotrans`, `SecureLab`, `StoragePens`,
   `LivingResearch`, `Safehouse`).
+- **THE WHOLE GAME IS SET INSIDE THE PHENOTRANS FACILITY — there is no outdoors.** Every
+  shipped zone name above is a part of that facility, which is why they read as interiors.
+  This matters for capture planning and for reading the shader bank: unlike Case Zero's
+  outdoor Still Creek there is no exterior area class to be missing, so a capture set that
+  covers the facility covers the game. (Operator, 2026-08-15, correcting a session-2 note
+  that had called a missing "outdoors" frame a coverage gap.)
 - **Middleware**: Havok physics (779 `hkp*` strings), XMA audio, in-house "CrowdEngine"
   for zombie crowds, **and Bink video — really, this time.**
 - **Assets**: 154 `.big` archives, `.bct` textures, `.bcf` fonts. Runtime path
