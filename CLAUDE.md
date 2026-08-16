@@ -70,7 +70,7 @@ inferences from a **count** or a **truncated listing**.
 | **Gameplay** | ✅ **IT PLAYS** — 20,765-frame drive: gameplay, cinematics with subtitles, full HUD, pause menu. 26.2 M draws, 0 truncated IBs, only **2** shader-cache misses (finding 28) |
 | **Intro → safehouse** | ✅ **playable, with zombie combat**, and "pretty much exactly like Xenia" — **and better in one place: a cutscene Xenia truncates plays through here** (operator, finding 29, gotcha 320) |
 | Save/load | ✅ **behaviourally confirmed** — saved and loaded inside a real session (finding 29). Part 1's confirmation was static only |
-| HUD/menu text | ❌ damaged — **PARKED.** The operator is fixing this in Case Zero and will say when to import it. Do not investigate or fix it here |
+| HUD/menu text | ⏳ **fix IMPORTED 2026-08-16** from Case Zero `82d181f` (part 46) — the stream store's guard now earns exactness per stream. The mechanism engages and is priced here (25-30 streams, 1.0 MB/frame); **the defect is not yet re-confirmed fixed in play on this port.** `docs/imported-fixes.md` |
 
 **~~Part 2's first job is the spin~~ — RETRACTED, and by the measurement it asked for.**
 There was no spin to fix. The kernel-call order is a **set-exact prefix of A5's with zero
@@ -247,6 +247,9 @@ corrected position rather than repeating the fix.
     already answered and is deliberately not re-captured; §W is Bink and has no Case Zero
     equivalent; §X is three pre-registered questions.
   - **`gotchas.md`** — the 315-entry transferable ledger. Every "gotcha N" resolves here.
+  - **`imported-fixes.md`** — **every fix taken from Case Zero, with the source commit and
+    the date it landed here**, so a later revision in the sibling can be diffed rather than
+    re-derived. The operator asked for this by name.
   - `reusability.md` — the tier list for what may be extracted into shared code, and the
     two rules governing it. Relevant at W6, not before.
 - `runtime/` — the host runtime, transplanted from Case Zero in W1 (`docs/w1-transplant-notes.md`).
