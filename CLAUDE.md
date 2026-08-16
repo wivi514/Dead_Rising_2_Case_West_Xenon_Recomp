@@ -67,6 +67,8 @@ inferences from a **count** or a **truncated listing**.
 | Runtime (W1) | ✅ **COMPLETE** — links, boots (58,695 symbols; 60 s, 87 `.big`, vblanks delivered), save layer confirmed |
 | Kernel-call order | ✅ **set-exact prefix of A5, 0 real divergences** (part 2, finding 27) |
 | First picture (W4) | ✅ **RENDERS** — Capcom logo, then the animated title screen at ~31 fps, `CW_VKDRAW=1`. Shader cache covered the whole frontend, 0 misses |
+| **Gameplay** | ✅ **IT PLAYS** — 20,765-frame drive: gameplay, cinematics with subtitles, full HUD, pause menu. 26.2 M draws, 0 truncated IBs, only **2** shader-cache misses (finding 28) |
+| HUD/menu text | ❌ damaged — **PARKED.** The operator is fixing this in Case Zero and will say when to import it. Do not investigate or fix it here |
 
 **~~Part 2's first job is the spin~~ — RETRACTED, and by the measurement it asked for.**
 There was no spin to fix. The kernel-call order is a **set-exact prefix of A5's with zero

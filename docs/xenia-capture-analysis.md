@@ -800,3 +800,92 @@ and that single number would have retired the whole investigation before it star
   critical path they were assumed to be on.
 - Nothing here has been checked past the title screen. **Press START and the measurements
   start over** — this finding covers the frontend and says nothing about gameplay.
+
+---
+
+## 28. **THE PORT PLAYS.** Gameplay, cinematics, HUD — from the operator's own drive — part 2, 2026-08-16
+
+Finding 27 established that the frontend renders and closed with "nothing here has been
+checked past the title screen." The operator then drove one, and it went the whole way.
+
+**One session, 20,765 frames, exited cleanly (code 0):**
+
+```
+frames(XE_SWAP)=20,765   draws=26,276,829 (~1,265/frame)   predicated out=110,708
+pm4 packets=363,011,078  interrupts=68,691  indirect buffers truncated=0
+frame: has content 20,448  ·  uniformly black 152  ·  draws handed to renderer 26,236,678
+```
+
+**173 frame dumps sampled every 120 frames. Four are uniformly black**, each an isolated
+single dump with a full scene in the dump either side of it — load/transition moments, not
+a rendering failure. The rest carry 400–1,700 distinct sampled colours.
+
+What the dumps show, and it is the whole game loop:
+
+- **Cinematics** — Frank West and Chuck Greene in the caged corridor, with **subtitles
+  rendering correctly**: *"Well heads up, rookie. We've got more on the way."*
+- **Gameplay** — Chuck in the Phenotrans offices, third-person, with the **complete HUD**:
+  LV/PP/LIFE, the weapon wheel, the partner portrait, the kill counter, the objective
+  banner, and a context button prompt.
+- **The pause menu** — the Phenotrans terminal with its chemical-structure overlay, ID
+  badge, USB stick and syringe, all correct.
+
+Draw load is **~1,265 per frame in gameplay against ~410 on the title screen**, which is the
+scale difference the renderer was never previously exercised at.
+
+### What is NOT clean, and what each thing means
+
+**1. Two pixel shaders missing from the cache.**
+
+```
+[vk] no translated shader for PS e996eabf1264e235 — draws skipped
+[vk] no translated shader for PS 37a7720a1f1710ec — draws skipped
+```
+
+Exactly two, out of a 439-shader bank, across a full gameplay session. This is finding 20's
+rule holding: **new geometry is not new shaders; a new material set is** — and a drive that
+reached material the 13 captures never did found two. It is one log line and a silent
+counter by design, so it must be grepped for and never assumed. The bank is rebuilt from our
+own runtime's dump now that one exists, which `CLAUDE.md`'s Commands section already says is
+the authority on the byte range.
+
+**2. HUD and menu text is damaged — PARKED, NOT DIAGNOSED HERE.**
+
+The objective banner and kill counter render with dark ghosting behind the glyphs, and the
+pause menu's labels come out as overlapping, unreadable strings. **Cinematic subtitles are
+unaffected and render perfectly**, so it is specific to the HUD/menu text path.
+
+**This is not to be investigated or fixed in this port right now.** The operator is working
+the same defect in Case Zero (2026-08-16) and will say when to import the fix. Recorded here
+so the symptom is on the record with the session that showed it, and so nobody re-derives it.
+
+**A candidate mechanism was considered and is NOT being claimed.** `vk_renderer.cpp`'s
+`CW_VK_TEX_REFRESH` comment says it was built for "a font atlas the CPU keeps writing", which
+fits overlapping glyphs well — but the texture guard was **already on and already repairing**
+in this very run:
+
+```
+texture guard: 49,098,926 cache hits checked, 4,847 served an image whose guest bytes had
+CHANGED (0.01%), 4,847 RE-UPLOADED
+```
+
+Guard + revalidate have been default-on since Case Zero part 38, so every stale hit in this
+session was repaired. That **weakens** the font-atlas explanation rather than supporting it,
+and naming it as the cause would be this port's characteristic error one more time —
+attributing from a plausible mechanism instead of a measurement (findings 3, 23). It stays an
+unattributed symptom until the Case Zero work says otherwise.
+
+**3. Nothing else failed loudly.** A grep for `unsupported|unimplemented|refus|FATAL` returns
+682 lines, and **all 682 are false positives**: 681 are the ring trace's own
+`fenceRegressionsRefused=` counter and one is the dispatch table's `refused` count. No
+unsupported packet, format or import fired — which is the gotcha-5 design working, since any
+of those would have named itself.
+
+### Where this leaves the port
+
+The single-player game boots, renders, plays, cinematics run, saves were already confirmed in
+part 1, and Bink needs no host code. **The gap between here and "playable end to end" is now
+a defect list, not a bring-up list** — and the first item on it belongs to Case Zero.
+
+`truncated=0` across 363 M packets is the counter that would have caught findings 37-39's
+dropped-fence class returning at gameplay scale. It did not return.
