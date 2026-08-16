@@ -1,0 +1,329 @@
+# Dead Rising 2: Case West Xenon Recomp — project guide
+
+Static recompilation of the Xbox 360 XBLA title **Dead Rising 2: Case West**
+(Capcom / Blue Castle Games, 2010) using **XenonRecomp** + **XenosRecomp** (hedge-dev's
+faithful recompiler pair, the ones UnleashedRecomp uses).
+
+This is the **fourth** game ported with this pipeline in this workspace, and the first
+one whose direct predecessor is a near-complete port of the *same engine*. Read the
+three before it before re-deriving anything:
+
+- `~/GithubRepo/Dead_Rising_2_Case_Zero_Xenon_Recomp` — **the one that matters here.**
+  Same engine, same studio, same year, same container, same compiler. ~46 parts deep and
+  close to complete. Its `CLAUDE.md` is the project journal and its `docs/` are the
+  methodology.
+- `~/GithubRepo/Fable2XenonRecomp` — the original and the deepest (91k functions → a
+  live rendered world). Its `docs/` hold the reusable methodology.
+- `~/GithubRepo/Asuras_Wrath_Xenon_Recomp` — the second port, which proved the template
+  transfers and consolidated the gotchas into a numbered list.
+
+**Multiplayer / co-op is OUT OF SCOPE for now** (operator's call, 2026-08-15). Case
+West's headline feature is two-player co-op and the image is full of it; nothing may
+block single-player on it. `docs/port-plan.md` W7 explains why deferring it is
+low-risk — the import table says so.
+
+## Status: session 1 (2026-08-15), bootstrap only
+
+Everything measured on day 1 is in **`docs/bootstrap-2026-08-15.md`**. The plan for what
+comes next is **`docs/port-plan.md`**. Those two are the whole project memory right now.
+
+| | state |
+|---|---|
+| Package unpacked | ✅ 305 files, 1.2 GB |
+| Image dumped | ✅ 14 sections, **two of them code** |
+| Save/restore helpers | ✅ all 8 |
+| Jump tables | ✅ 205 tables / 5,791 labels |
+| Recompilation | ✅ 58,345 functions, 228 TUs, **zero** `jump outside function`, **zero** dropped branches |
+| Import surface | ✅ 247 names = Case Zero's 244 **+ 3** |
+| Runtime | ❌ does not exist yet |
+| Xenia ground truth | ❌ **no capture of this title exists** |
+
+Nothing has been compiled by a C++ compiler and nothing has been checked against
+hardware.
+
+## The thesis of this port, and the risk that comes with it
+
+Session 1 measured that Case West is the **same engine, same compiler, same container,
+same asset formats, and a strict superset of Case Zero's kernel imports**. So this is a
+**transplant plus a delta**, not a port from scratch.
+
+**The risk is therefore the inverse of Case Zero's.** There, the danger was not knowing
+anything. Here it is **assuming a Case Zero answer transfers when it does not** — and
+session 1 caught three of those before writing a line of runtime code:
+
+1. **Bink.** Case Zero *retracted* "this game uses Bink" after measuring that no decoder
+   ran and no `.bik` shipped. **Case West genuinely uses Bink**: four Bink sections in
+   the XEX (one executable), ten `.bik` files, a `binkmovieplayer.cpp` wrapper, and
+   `dr2_logo.bik` on the boot path. Applying Case Zero's retraction here would have been
+   exactly backwards.
+2. **Two code sections.** Case Zero has one (`.text`). Case West has `.text` *and*
+   `BINK`. XenonRecomp handles it; two inherited analysis tools did not, and both
+   reported clean runs while skipping a whole section.
+3. **Hardcoded sibling constants.** `find_jumptables.py` and
+   `fix_switch_function_bounds.py` both carried Case Zero's `.text` bounds as defaults.
+   Fixed to read the image's own section map.
+
+That is gotcha 3 in a new dress and it is this port's characteristic failure mode:
+**a tool or a conclusion copied from a sibling port carries that port's constants, and a
+constant wrong in the safe direction reports a clean run over a smaller image.**
+
+## Transferable gotchas
+
+**THE FULL NUMBERED LEDGER IS `docs/gotchas.md` — 315 entries, copied verbatim from Case
+Zero on 2026-08-15, and every "gotcha N" reference resolves there.** New entries from
+this port continue at 316. Read it **before making a measurement claim, adding an
+instrument, believing a zero, or trusting a number an earlier session wrote down**; those
+four situations produced almost all of it.
+
+Note that entries naming a Case Zero file, env var, address or count are *pointers into
+the sibling repo*, not claims about this one.
+
+The ten that bite most often, as one-liners. Each is a summary, not the entry:
+
+3.  **A zero is a detection failure, not a fact.** XenonAnalyse finds zero jump tables on
+    this compiler; our scanner found 205. Applies to every number a detector prints —
+    **including the range the detector was pointed at**, which is how session 1's two
+    tool defects hid.
+5.  **Kernel stubs must fail honestly, never fake success** — and a stub that returns an
+    error but leaves its OUT-PARAMETER untouched is worse than no stub. See also 59 and
+    201: when a return value is a predicate or a computed value, "fail honestly" has no
+    spelling and implementing it is the only correct option.
+7.  **A probe expensive enough to stall the game manufactures the stability it reports.**
+    Every instrument needs its own control — and see 151, an arm with no counter cannot
+    be shown to have engaged, and 223, an instrument on a hot path can cancel the effect
+    it is measuring exactly.
+13. **A capture request, a plan, and your own status note all have a shelf life.**
+    Re-read them against the current ledger before believing their conclusions. **In this
+    port that includes every Case Zero document.**
+25. **A grep that cannot match is not a clean result.** Check the emitter before
+    believing a zero — and 109, a capped or thinned log line is not a count.
+30. **A test that has never failed has not been shown capable of failing.** Break the
+    implementation on purpose and confirm the test screams. Applies to diagnostics and
+    to instruments as much as to tests (94, 158).
+50/51/86. **A rate measured once is a fact about that afternoon, and the control is the
+    old binary run NOW** — not its remembered numbers. 159: a bimodal arm makes every
+    single-run claim a coin flip.
+133/127. **One frame of an animated scene is ONE SAMPLE**, and that applies to LOOKING,
+    not just to measuring.
+172/268. **A retirement is only as good as the ORACLE it was measured on** — and YOUR OWN
+    STUB IS AN ORACLE. Re-ask your earlier A/Bs whenever an upstream defect is fixed.
+267. **A guest structure handed to a DMA device holds PHYSICAL addresses**, and in a flat
+    recompiler map those are not the ones the CPU uses. Cost Case Zero its whole audio
+    subsystem for 28 parts. Print the DESTINATION on every file-IO trace.
+237/238. **A MEAN frame time measures this title's vblank pacing floor, not your change**
+    — read medians and the share of frames pinned to a 16 ms multiple. And **a profiler
+    column that falls to zero is not a saving until you find where the replacement work
+    got charged.**
+
+## Inherited from the earlier ports: shared-decode cross-checks
+
+Everything below is **hardware-level decode**, not title-specific, so a defect found in
+one port is a defect in the others unless this one is written differently. Checking is
+minutes; diagnosing the symptom is days. Case Zero verified both and is correct on both —
+**re-check them here in one grep once `runtime/gpu/` exists.**
+
+| shared decode | correct form |
+|---|---|
+| fetch-constant SIZE field — the endian bits occupy the low 2 bits of `fdw1`, so `fdw1 & 0x7FFFFF` swallows them (reads ~4x too large, permits reads past the buffer, and *under*-reports past ~2^21 dwords) | `(fdw1 >> 2) & 0xFFFFFF` |
+| `num_format_all` INTEGER semantics — a fetch declaring unsigned/integer on `k_8_8_8_8` bound as `R8G8B8A8_UNORM` delivers 0..1 where the guest asked 0..255 (typically packed bone indices, TEXCOORD-wrapped as 360 titles do) | deliver the integer as its own value into a FLOAT input, via `USCALED`/`SSCALED` |
+
+**Confirmed NON-issues — do not chase these.** The guest requests 8-in-32 endian on 100%
+of fetches; `exp_adjust` is declared but zero everywhere; the Xenos compiler emits a
+`yxwz`-shaped destination swizzle on ~87% of 16-bit fetches that compensates the 8-in-32
+pair transposition, and XenosRecomp already honours it.
+
+**That third one was Case Zero's entire striped-material defect class.** Its
+`g_SwappedTexcoords` mask was compensating A SECOND TIME, so 16_16 lightmap UVs arrived
+transposed and baked prop shadows painted as hard-edged black blotches. **For Case West:
+publish NO texcoord swap mask; trust the microcode's own swizzles.** Start from the
+corrected position rather than repeating the fix.
+
+## Layout
+
+- `config/CaseWest.toml` — XenonRecomp main config: helper addresses, plus the function
+  overrides. Currently 33 entries — 21 switch-tail repairs plus 11 truncated-function widenings — and it will grow from three sources that
+  **merge, never replace** each other (`fix_switch_function_bounds.py`,
+  `coverage_to_function_overrides.py`, `find_dropped_branches.py --widen`). Regenerating
+  any of them from a stale `ppc/` silently under-reports; always rebuild `ppc/` from the
+  committed config first.
+- `config/CaseWest_switch_tables.toml` — 205 jump tables (107 absolute, 62 offset8,
+  36 offset16, 5,791 labels) from `tools/find_jumptables.py`, **across both code
+  sections**. XenonAnalyse finds zero on this compiler — see gotcha 3.
+- `assets/package/` — the XBLA STFS package as delivered (gitignored; copyrighted).
+- `assets/game/` — what `tools/extract_stfs.py` unpacked out of it: `default.xex` +
+  `data/` (gitignored).
+- `assets/game/default_image.bin` (+ `.sections`) — the loaded image for offline
+  analysis, from `tools/xex_image_dump`. **The `.sections` sidecar is now an input**, not
+  just a record: two tools read their code ranges out of it.
+- `ppc/` — generated C++ (gitignored; 156 MB, 58,345 functions, regeneratable).
+- `tools/` — analysis scripts, all copied from Case Zero with provenance in their
+  headers. `gdis.py` is the guest disassembler and is usually the right first stop for
+  any question about what the title's own code does. `import_call_sites.py` is the one to
+  reach for when implementing a kernel import: a capture has no return values, so the
+  guest code that consumes the result is the specification.
+- `docs/` — the project's memory:
+  - **`bootstrap-2026-08-15.md`** — day 1. Every number in this file was measured on
+    *this* image. Read it first.
+  - **`port-plan.md`** — what to do next, as items W0–W8 with gates and costs.
+  - **`gotchas.md`** — the 315-entry transferable ledger. Every "gotcha N" resolves here.
+  - `reusability.md` — the tier list for what may be extracted into shared code, and the
+    two rules governing it. Relevant at W6, not before.
+- `runtime/` — **does not exist yet.** W1 creates it by transplanting Case Zero's.
+- Recompiler TOOL at `~/GithubRepo/XenonRecomp` (built at `build/`; **carries local
+  patches, including the devkit-AES-key fix this title needs** — see Case Zero's
+  `docs/xenonrecomp-upstream-bugs.md`). Shader translator at `~/GithubRepo/XenosRecomp`
+  (also patched; Case West inherits those fixes for free).
+
+## Commands
+
+Unpack the game (once):
+```
+python3 tools/extract_stfs.py \
+    "assets/package/58410B00/000D0000/D01128ABB9C7F9694DAE26AC591A269F8480E85A58" \
+    -o assets/game
+./tools/build_xex_image_dump.sh
+./tools/xex_image_dump assets/game/default.xex assets/game/default_image.bin
+```
+The image dump must come **before** any config regeneration: `find_jumptables.py` and
+`fix_switch_function_bounds.py` both read their code ranges from the `.sections` sidecar
+it writes, and both exit rather than guess if it is missing.
+
+Regenerate the recompiled C++ (from repo root; `ppc/` must exist or XenonRecomp
+segfaults in `fwrite`):
+```
+mkdir -p ppc && cd config && ~/GithubRepo/XenonRecomp/build/XenonRecomp/XenonRecomp \
+    CaseWest.toml ~/GithubRepo/XenonRecomp/XenonUtils/ppc_context.h
+```
+
+Regenerate the switch tables — **use our scanner, not XenonAnalyse**:
+```
+python3 tools/find_jumptables.py assets/game/default_image.bin \
+    -o config/CaseWest_switch_tables.toml
+```
+
+Repair function bounds after any switch-table change, then re-run the recompiler and
+confirm the log has zero `jump outside function` lines:
+```
+python3 tools/fix_switch_function_bounds.py --apply
+```
+
+Check for silently dropped direct branches — **not optional after any change to the
+function list**, and the only thing that catches the coverage oracle's loop-header splits
+(gotcha 28). Regenerate `ppc/` between each step. **Not yet run on this title (W0):**
+```
+python3 tools/find_dropped_branches.py            # report both classes
+python3 tools/find_dropped_branches.py --prune    # backward: remove spurious starts
+python3 tools/find_dropped_branches.py --widen    # forward: widen truncated functions
+```
+
+Then check that every switch-shaped `bctr` was actually lowered — the gate for the defect
+class that leaks a callee's non-volatiles into its caller (gotchas 53-55).
+**Exit 1 = a real defect; run it last, and after any config change:**
+```
+python3 tools/find_unlowered_switches.py          # 0 defects expected
+python3 tools/find_unlowered_switches.py --all    # also list benign tail-call thunks
+```
+
+Look inside the game's `.big` archives — 154 of them:
+```
+python3 tools/big_list.py --all --find cc_        # search every archive by entry name
+python3 tools/big_list.py <a.big> --extract <name> --out DIR
+```
+The format is Case Zero's `docs/big-archive-format.md`, confirmed unchanged on this
+title. Read that doc **with its two retractions**: the name table is NOT fixed-width
+outside the shader banks, and a substantial fraction of entries ARE compressed.
+
+## The recompilation contract (identical to all three earlier ports)
+
+- Every guest function → `PPC_FUNC_IMPL(__imp__sub_XXXXXXXX)` taking
+  `(PPCContext& ctx, uint8_t* base)`.
+- Guest 32-bit addresses index into `base`; `PPC_LOAD/STORE_*` swap endianness.
+- Hooks: define a strong `PPC_FUNC(sub_X)` calling `__imp__sub_X(ctx, base)` pre/post.
+
+## Game intel (established 2026-08-15)
+
+Full detail and evidence in `docs/bootstrap-2026-08-15.md` §6.
+
+- **Package**: XContent `LIVE`, content type `0x000D0000` (Arcade Title), STFS volume,
+  305 files, 1.22 GB. Display name `DEADRISING2:CASE WEST`. Title ID `58410B00`,
+  media ID `198BA306`.
+- **XEX**: image base `0x82000000`, entry `0x825AC918`, image size `0xB40000`,
+  `.text 0x82150000 + 0x87BC54` **and `BINK 0x829CBE00 + 0x106B8`**. Encryption 1
+  (**devkit key**), compression 2 (**LZX**). 247 imports.
+- **Internal project name is `deadrisingepilogue`** — 402 build-path strings say
+  `c:\bcg\deadrisingepilogue\`. Shader banks are
+  `data/shaders/deadrisingepilogue-{vs,ps,vd,pd,sc,sd,ss}.big` where Case Zero's were
+  `deadrisingprologue-*`. **Retarget anything keyed on that string.** (And note Case Zero
+  established those banks are `.vo` shader *objects* with build metadata, NOT usable
+  microcode — the renderer's input is Xenia's `dump_shaders`.)
+- **Engine**: Blue Castle Games' in-house engine, shared with the full Dead Rising 2 —
+  the image still carries DR2's zone names (`americana`, `atlantica`, `arena_stadium`)
+  it does not ship, alongside Case West's own (`Phenotrans`, `SecureLab`, `StoragePens`,
+  `LivingResearch`, `Safehouse`).
+- **Middleware**: Havok physics (779 `hkp*` strings), XMA audio, in-house "CrowdEngine"
+  for zombie crowds, **and Bink video — really, this time.**
+- **Assets**: 154 `.big` archives, `.bct` textures, `.bcf` fonts. Runtime path
+  construction (`data/movies/%s`), so the VFS must handle arbitrary paths rather than a
+  fixed manifest.
+- **A debug build is present in the retail image** — `DebugMenu`,
+  `COMMAND_RENDERDEBUGMENU`, `COMMAND_AIDEBUGMENU`, `DontAutoCompleteOnDebugJump`. Case
+  Zero's navigation instruments were built on the equivalent and made the back half of
+  that port measurable; find these early.
+
+## Conventions (same as the three template ports)
+
+- No copyright/license headers in new files (user's own repo — ask before adding any).
+- **Commit proactively** — whenever a change is useful on its own or important
+  information was learned. End commit messages with:
+  `Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>`
+- **Document everything** in `docs/` for an outside reader — findings, dead ends,
+  formats, retractions. Write it so someone porting a *different* Xbox 360 game can lift
+  the technique: say what the idiom or format was, not just what we changed.
+- **Comment code for humans.** Every tool opens with a docstring answering *why it
+  exists* — what went wrong without it. Inline comments explain the non-obvious
+  bit-twiddling and every deliberate exclusion. Generated config files carry a header
+  saying which tool produced them and how to regenerate.
+- **Retract in place.** When a stated finding turns out to be an artifact, say so where
+  it was claimed and explain the artifact.
+- **State the provenance of a copied conclusion.** In this port specifically: when
+  something is believed because Case Zero measured it, say so, and say whether it has
+  been re-measured here. The three session-1 traps were all unmarked inheritance.
+- Measurement discipline from day one: A/B with same-binary arms, gate comparisons,
+  pre-register capture questions.
+
+### Evidence rules (non-negotiable)
+
+- **Measure before inferring.** A hypothesis about guest behaviour is tested against a
+  census over the image, the shader bank or the capture — never argued from
+  documentation, from model knowledge, **or from the sibling port**. Report counts, not
+  impressions.
+- **One change per experiment.** Fixes with distinct predictions land in separate commits
+  and are verified separately.
+- **State the prediction before running it.** Every fix commit records the falsifiable
+  claim it makes, so a run can refute it.
+- **A/B ADMISSIBILITY.** Two configurations are comparable at matched indices only if
+  they are two states of ONE renderer producing the SAME draw set. If one arm renders
+  less — or more — the comparison is inadmissible; say so and fall back to within-run
+  evidence.
+- **Refutation by compensation beats refutation by absence.** When a mechanism is real
+  but compensated somewhere else, record BOTH.
+- **An untrusted path is not an oracle**, and **an oracle must be something you did not
+  write** (gotcha 172/268). This port has an unusual luxury and an unusual hazard here:
+  Case Zero is a *second implementation of the same engine*, which makes it a genuine
+  cross-check for anything shared — and makes it worthless as an oracle for anything it
+  got wrong, which is a list nobody has finished writing.
+
+### Things not to do
+
+- **Do not extract a library from these two ports yet.** `docs/reusability.md`'s rule is
+  to extract after the second implementation forces the seam, and the seam is not visible
+  until this title boots. W6, not before.
+- **Do not bundle independent fixes into one commit.**
+- **Do not treat documentation or prior model output as ground truth over a census** —
+  including this file and including every Case Zero document. Every number in them was
+  measured once and has a shelf life (gotcha 13).
+- **Do not add speculative Xenos coverage.** An unsupported packet, format or import
+  fails LOUDLY with its identifier; it never guesses (gotcha 5).
+- **Do not copy external code before its licence is recorded** in `THIRD_PARTY.md`.
+- **Do not delete the PM4 command processor** when the runtime is transplanted. It is the
+  boot engine and the same-binary control arm for every claim the D3D arm makes.

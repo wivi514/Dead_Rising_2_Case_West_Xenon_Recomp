@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""Repair function boundaries for switches whose case bodies fall outside the
+analyzer-detected function.
+
+Symptom (see docs/runtime.md): XenonRecomp emits
+
+    switch (ctx.r11.u64) {
+    case 0:
+        // ERROR: 0x82A2F4A0
+        return;
+
+when a jump-table label lies outside the recompiled function's byte range. The function
+then silently does nothing for those cases — Fable2's allocator, among ~2,300 other case
+labels, hits this and corrupts itself.
+
+Root cause: the XEX's .pdata (and XenonAnalyse's splitting) treats the inline jump-table
+DATA as a function boundary, so the case bodies land in separate tiny "functions" and the
+switch's home function ends at the bctr.
+
+Fix: emit manual `functions = [{ address, size }]` entries for XenonRecomp's main TOML.
+Manual entries are registered before .pdata parsing, so they take precedence. The correct
+extent is computed to a fixpoint: extend the function to cover every label of every
+switch table whose bctr lies inside the current range (labels can pull in further
+switches).
+
+Usage:
+    python3 tools/fix_switch_function_bounds.py            # prints the TOML block
+    python3 tools/fix_switch_function_bounds.py --apply    # patches config/CaseWest.toml
+
+Provenance: copied from ~/GithubRepo/Asuras_Wrath_Xenon_Recomp/tools (which took it from
+Fable2XenonRecomp); only the repo-specific paths and the .text bounds differ.
+"""
+import bisect
+import glob
+import os
+import re
+import sys
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PPC = os.path.join(REPO, "ppc")
+MAIN_TOML = os.path.join(REPO, "config", "CaseWest.toml")
+SWITCH_TOML = os.path.join(REPO, "config", "CaseWest_switch_tables.toml")
+
+# Which addresses may legitimately be a switch-case label. Labels outside the image's
+# code sections are bogus jump-table detections in data-as-code stretches — widening a
+# function to cover one would swallow half the image, so they are reported and skipped
+# rather than acted on.
+#
+# This was a hardcoded pair of constants (Case Zero's `.text`, 0x82150000..0x829C3564)
+# until 2026-08-15. It is read from the image's own section map now for the same reason
+# `find_jumptables.py` is: Case West has TWO code sections — `.text` and `BINK`, the
+# statically linked RAD movie decoder — and a single hardcoded range would have declared
+# every one of BINK's ten case labels bogus, silently, while reporting a clean run.
+SECTIONS = os.path.join(REPO, "assets", "game", "default_image.bin.sections")
+SECTION_FLAG_CODE = 2   # XenonUtils/section.h: Data = 1, Code = 2
+
+
+def _code_ranges():
+    if not os.path.exists(SECTIONS):
+        sys.exit(f"no section map at {SECTIONS} — run tools/xex_image_dump first")
+    out = []
+    for line in open(SECTIONS):
+        if not line.strip() or line.startswith("#"):
+            continue
+        # Split from the RIGHT: a section name may contain spaces (Case West ships one
+        # literally called "BINKCONS )"), but the last three columns are fixed.
+        parts = line.rsplit(None, 3)
+        if len(parts) == 4 and int(parts[3], 0) & SECTION_FLAG_CODE:
+            out.append((int(parts[1], 16), int(parts[1], 16) + int(parts[2], 16)))
+    if not out:
+        sys.exit(f"{SECTIONS} lists no code sections — check the flags legend")
+    return out
+
+
+CODE_RANGES = _code_ranges()
+CODE_BEGIN = min(lo for lo, _ in CODE_RANGES)
+CODE_END = max(hi for _, hi in CODE_RANGES)
+
+
+def valid_code_addr(a):
+    return any(lo <= a < hi for lo, hi in CODE_RANGES)
+
+
+def parse_function_addresses():
+    addrs = []
+    with open(os.path.join(PPC, "ppc_func_mapping.cpp")) as f:
+        for m in re.finditer(r"\{ 0x([0-9A-Fa-f]+), sub_", f.read()):
+            addrs.append(int(m.group(1), 16))
+    addrs.sort()
+    return addrs
+
+
+def parse_switches():
+    """[(base, [labels...]), ...] from the switch-table TOML."""
+    switches = []
+    with open(SWITCH_TOML) as f:
+        text = f.read()
+    for m in re.finditer(
+        r"\[\[switch\]\]\s*base\s*=\s*0x([0-9A-Fa-f]+)\s*r\s*=\s*\d+\s*"
+        r"(?:default\s*=\s*0x([0-9A-Fa-f]+)\s*)?labels\s*=\s*\[([^\]]*)\]",
+        text,
+    ):
+        base = int(m.group(1), 16)
+        labels = [int(x, 16) for x in re.findall(r"0x([0-9A-Fa-f]+)", m.group(3))]
+        if m.group(2):
+            labels.append(int(m.group(2), 16))
+        switches.append((base, labels))
+    return switches
+
+
+def find_error_functions():
+    """{func_addr: max_error_label} scanned from the generated sources."""
+    result = {}
+    func_re = re.compile(r"PPC_FUNC_IMPL\(__imp__sub_([0-9A-F]+)\)")
+    err_re = re.compile(r"// ERROR: 0x([0-9A-F]+)")
+    for path in glob.glob(os.path.join(PPC, "ppc_recomp.*.cpp")):
+        current = None
+        with open(path) as f:
+            for line in f:
+                fm = func_re.search(line)
+                if fm:
+                    current = int(fm.group(1), 16)
+                    continue
+                em = err_re.search(line)
+                if em and current is not None:
+                    target = int(em.group(1), 16)
+                    if valid_code_addr(target):
+                        lo, hi = result.get(current, (None, 0))
+                        lo = target if lo is None else min(lo, target)
+                        result[current] = (lo, max(hi, target))
+                    else:
+                        result.setdefault(current, (None, 0))
+    return result
+
+
+def main():
+    funcs = parse_function_addresses()
+    switches = parse_switches()
+    errors = find_error_functions()
+
+    def next_func_after(addr):
+        i = bisect.bisect_right(funcs, addr)
+        return funcs[i] if i < len(funcs) else addr + 4
+
+    # Merge with entries already in the TOML (the script runs iteratively: fixing one
+    # round of boundaries can surface the next round in the regenerated sources).
+    existing = {}
+    with open(MAIN_TOML) as f:
+        toml = f.read()
+    block_match = re.search(r"^functions = \[(.*?)^\]\n", toml, re.M | re.S)
+    if block_match:
+        for m in re.finditer(r"address = 0x([0-9A-Fa-f]+), size = 0x([0-9A-Fa-f]+)",
+                             block_match.group(1)):
+            existing[int(m.group(1), 16)] = int(m.group(2), 16)
+
+    def func_containing(addr):
+        i = bisect.bisect_right(funcs, addr)
+        return funcs[i - 1] if i > 0 else addr
+
+    entries = []
+    skipped = []
+    for start, (min_label, max_label) in sorted(errors.items()):
+        if max_label == 0:
+            skipped.append(start) # only bogus labels: data-as-code, leave untouched
+            continue
+        # Labels may point backward, in two different ways, and the fix differs.
+        #
+        #  (a) The analyzer split one original function into fragments and a label
+        #      points into an earlier fragment. That fragment IS a function start,
+        #      so extending down to it is right.
+        #  (b) The analyzer simply began the function a few instructions late, and
+        #      the label lands in the gap. On Case Zero all three residual errors
+        #      were this: the case target sat EXACTLY 4 bytes before the function
+        #      start (0x82670080 vs 0x82670084 — a loop-back to the `addi` that
+        #      advances the cursor, with the analyzer starting at the `lbz` after
+        #      it). Here `func_containing(min_label)` returns the *preceding*
+        #      function, needlessly swallowing it.
+        #
+        # `min(start, min_label)` handles both: in case (a) min_label is itself a
+        # function start so the two agree, and in case (b) it extends down exactly
+        # as far as needed and no further.
+        orig_start = start
+        if min_label is not None and min_label < start:
+            start = min(start, min_label)
+        # NB: compute the end from the ORIGINAL function start, not the widened one.
+        # `next_func_after(start)` after widening returns orig_start itself, so the
+        # entry would end exactly where the real function begins — an entry that
+        # covers neither the `bctr` nor its cases, is silently useless, and merges
+        # to a no-op so the tool reports "0 new this round" while the errors remain.
+        # That is why Case Zero's last 3 errors survived a fixpoint loop.
+        end = next_func_after(max(orig_start, max_label))
+        # Fixpoint: cover the labels of every switch whose bctr is inside the range.
+        while True:
+            new_end = end
+            for base, labels in switches:
+                if start <= base < new_end:
+                    for label in labels:
+                        if valid_code_addr(label) and label >= new_end:
+                            new_end = max(new_end, next_func_after(label))
+            if new_end == end:
+                break
+            end = new_end
+        entries.append((start, end - start))
+    for addr in skipped:
+        print("# skipped sub_%08X (only garbage labels; data-as-code)" % addr, file=sys.stderr)
+
+    newCount = sum(1 for a, s in entries if a not in existing)
+    for addr, size in entries:
+        existing[addr] = max(size, existing.get(addr, 0))
+    entries = sorted(existing.items())
+    print("# %d new this round" % newCount, file=sys.stderr)
+
+    lines = ["functions = ["]
+    for addr, size in entries:
+        lines.append("    { address = 0x%08X, size = 0x%X }," % (addr, size))
+    lines.append("]")
+    block = "\n".join(lines)
+
+    print("# %d functions with out-of-bounds switch cases" % len(entries))
+    if "--apply" in sys.argv:
+        if re.search(r"^functions\s*=", toml, re.M):
+            # Replace the existing generated block (from 'functions = [' to its ']').
+            toml = re.sub(r"^functions = \[[^\]]*\]\n", block + "\n", toml, flags=re.M | re.S)
+        else:
+            # `functions` belongs to the top-level [main] table: insert after its header.
+            toml = toml.replace("[main]\n", "[main]\n" + block + "\n", 1)
+        with open(MAIN_TOML, "w") as f:
+            f.write(toml)
+        print("patched", MAIN_TOML)
+    else:
+        print(block)
+
+
+if __name__ == "__main__":
+    main()

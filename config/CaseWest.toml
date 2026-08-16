@@ -1,0 +1,105 @@
+# Dead Rising 2: Case West — XenonRecomp main config.
+#
+# Title: Dead Rising 2: Case West (Capcom / Blue Castle Games, 2010), XBLA arcade title
+# 58410B00. Shipped as an STFS package, not a disc — unpack it with
+# `tools/extract_stfs.py` before anything here will work.
+#
+# XEX identity (established 2026-08-15, see docs/bootstrap-2026-08-15.md):
+#   image base   0x82000000      entry point 0x825AC918
+#   image size   0xB40000        .text 0x82150000 + 0x87BC54
+#                                BINK  0x829CBE00 + 0x0106B8   <-- a SECOND code section
+#   encryption 1 (**devkit / all-zero key**, NOT the retail key), compression 2 (LZX).
+#
+# The devkit key is the same trap Case Zero hit: stock XenonRecomp hardcodes the retail
+# key and returns an empty Image with no diagnostic when it is wrong. The local
+# XenonRecomp carries the fix (`Xex2LoadImage` tries both keys) — see Case Zero's
+# docs/xenonrecomp-upstream-bugs.md. Recompiling with an unpatched XenonRecomp will
+# fail silently; that is the first thing to check if the run below produces nothing.
+#
+# THE ONE STRUCTURAL DIFFERENCE FROM CASE ZERO, stated here because it is invisible
+# everywhere else: this title statically links the RAD Game Tools Bink decoder, and it
+# arrives as its OWN executable section (`BINK`, 67 KB, SectionFlags_Code) plus three
+# data sections. XenonRecomp recompiles every code section, so this is handled for
+# free by the recompiler — but any *analysis tool* that assumes one code range will
+# silently skip it. `tools/find_jumptables.py` was fixed to read the section map
+# instead; it finds one absolute table in there.
+[main]
+# Function overrides. EMPTY ON PURPOSE — this is the pre-first-recompilation state.
+#
+# It will grow from three sources that MERGE, NEVER REPLACE each other (Case Zero
+# ended at 139 entries):
+#   1. tools/fix_switch_function_bounds.py --apply   switch-tail repairs
+#   2. tools/coverage_to_function_overrides.py       entry points recovered from Xenia
+#                                                    --trace_function_data coverage
+#   3. tools/find_dropped_branches.py --widen        truncated functions widened over
+#                                                    their outlined cold blocks
+# Where two sources name the same address the LARGER size wins, so they compose in any
+# order. Run all three against a `ppc/` regenerated from THIS file — every one of them
+# reads the emitted code to decide what is missing, so a stale `ppc/` makes all three
+# under-report silently, and nothing reports that they did.
+functions = [
+    { address = 0x82171B40, size = 0x9C },
+    { address = 0x82177CF8, size = 0xE0 },
+    { address = 0x8225A9E0, size = 0x78 },
+    { address = 0x8236B6A0, size = 0x78 },
+    { address = 0x82376F58, size = 0x100 },
+    { address = 0x824497A0, size = 0x6C },
+    { address = 0x8250D340, size = 0xA0 },
+    { address = 0x8258DEE0, size = 0x44C },
+    { address = 0x82629038, size = 0xF0 },
+    { address = 0x8265DE70, size = 0x11C },
+    { address = 0x82673D20, size = 0x3F8 },
+    { address = 0x82678F00, size = 0x230 },
+    { address = 0x826A44A8, size = 0xE0 },
+    { address = 0x826A4588, size = 0xE4 },
+    { address = 0x826B7E40, size = 0x25C },
+    { address = 0x82766B20, size = 0x250 },
+    { address = 0x82767380, size = 0x14C },
+    { address = 0x827A69D8, size = 0x130 },
+    { address = 0x827F7788, size = 0x7C },
+    { address = 0x828E0840, size = 0x19C },
+    { address = 0x829187C8, size = 0xE4 },
+    { address = 0x825B0268, size = 0x5C4 },
+    { address = 0x825B13F8, size = 0x850 },
+    { address = 0x825B1AAC, size = 0x19C },
+    { address = 0x825B1AE4, size = 0x164 },
+    { address = 0x8283B040, size = 0x78 },
+    { address = 0x8285B388, size = 0x34 },
+    { address = 0x82881260, size = 0x68 },
+    { address = 0x82887A70, size = 0x114 },
+    { address = 0x8285B340, size = 0x7C },
+    { address = 0x82887A28, size = 0x15C },
+]
+file_path = "../assets/game/default.xex"
+out_directory_path = "../ppc"
+switch_table_file_path = "CaseWest_switch_tables.toml"
+
+# Optimizations OFF until a run works (per XenonRecomp guidance; the same policy as all
+# three ports before this one — turning these on before the boot is correct makes every
+# divergence twice as hard to localise).
+skip_lr = false
+skip_msr = false
+ctr_as_local = false
+xer_as_local = false
+reserved_as_local = false
+cr_as_local = false
+non_argument_as_local = false
+non_volatile_as_local = false
+
+# Register save/restore helpers, found by `tools/find_save_restore.py` (structural
+# ladder scan of the loaded image, 2026-08-15). All eight found in one pass, and the
+# four vector ladders are contiguous — 0x82833730 + 0x94 = 0x828337C4,
+# + 0x204 = 0x828339C8, + 0x94 = 0x82833A5C — which is the cross-check that they are
+# the real ladders and not an 18-rung suffix of a 64-rung one.
+#
+# Same idiom split as Case Zero: the gpr ladders are r1-based and the fpr ladders are
+# r12-based. XenonRecomp does not care, but a scanner with the base register hardcoded
+# reports half of them missing.
+savegprlr_14_address = 0x8282E9F0
+restgprlr_14_address = 0x8282EA40
+savefpr_14_address   = 0x8282EB20
+restfpr_14_address   = 0x8282EB6C
+savevmx_14_address   = 0x82833730
+savevmx_64_address   = 0x828337C4
+restvmx_14_address   = 0x828339C8
+restvmx_64_address   = 0x82833A5C
