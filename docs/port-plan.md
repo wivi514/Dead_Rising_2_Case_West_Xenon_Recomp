@@ -1,5 +1,27 @@
 # Case West port plan
 
+> ## STATUS as of the end of part 2 (2026-08-16) — READ THIS BEFORE THE PLAN
+>
+> **The plan below is largely DONE and is kept for its reasoning, not its task list.**
+> The live hand-off is `docs/part3-kickoff.md`; the authority on any number is
+> `docs/xenia-capture-analysis.md`.
+>
+> | item | state |
+> |---|---|
+> | **W0** recompiler gates | ✅ clean. **W0.3's 59 untranslatable sites live in 7 functions that read ZERO across a full play session** (finding 32) — not urgent, and it is shared XenonRecomp work |
+> | **W1** runtime transplant | ✅ complete, boots, save layer confirmed in play |
+> | **W2** Xenia ground truth | ✅ round 1 complete AND fully consumed — determinism 1.40% (f30), B2 decoded (f34). Only the eight B4 frames remain |
+> | **W3** Bink | ✅ solved; needs no host code |
+> | **W4** first picture | ✅ **done, and far past it — the port completes Case 1-3** (f27, f28, f33) |
+> | **W5** audio | ✅ works in practice — dialogue, cinematics and music carry a full intro, and gotcha 267's DMA trap did not bite (f29). Never separately measured |
+> | **W6** extraction | ⏸ still deliberately not started. The seam is only now visible |
+> | **W7** multiplayer | ⏸ out of scope, unchanged |
+> | **W8** this title's own content | ▶ **this is where the remaining work is** |
+>
+> **What is NOT in this plan and now matters more than most of it:** the two defects
+> inherited from Case Zero (decals, performance), tracked in `docs/imported-fixes.md`;
+> and the fact that **past Case 1-3 there is no Xenia ground truth at all** (gotcha 321).
+
 Written 2026-08-15, at the end of session 1. The evidence behind every claim here is
 `docs/bootstrap-2026-08-15.md`; where the two disagree, the bootstrap doc wins because it
 is the one with measurements in it.

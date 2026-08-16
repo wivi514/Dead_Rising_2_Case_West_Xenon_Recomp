@@ -24,10 +24,25 @@ low-risk — the import table says so.
 
 ## Status — and where a new conversation starts
 
-> **THE LIVE HAND-OFF IS `docs/part2-kickoff.md`.** Read it first in a new conversation:
-> it says what already exists (so it is not rebuilt), names the first measurement, and
-> lists the gates that are owed. When a part ends, write the next `part<N>-kickoff.md`,
+> **THE LIVE HAND-OFF IS `docs/part3-kickoff.md`.** Read it first in a new conversation:
+> it says what already exists (so it is not rebuilt), names where to start, and lists the
+> gates that are run and owed. When a part ends, write the next `part<N>-kickoff.md`,
 > demote this pointer to it, and refresh the memory directory.
+> **`docs/part2-kickoff.md` is superseded** and is kept as the cautionary example: its
+> problem statement was false and part 2 refuted it with the measurement that section
+> itself asked for.
+
+## Status: part 2 complete (2026-08-16) — THE PORT PLAYS
+
+**Case West boots, renders, and completes Case 1-3** — new areas, zombie combat, cinematics
+with subtitles, the full HUD, the pause menu, working save/load. Further than the operator
+ever drove Xenia. The only two defects reported are **both inherited from Case Zero and open
+there** (decals, performance), tracked as PENDING in `docs/imported-fixes.md`.
+
+Part 2's findings are **27-34** and it authored this port's first two gotchas, **320 and
+321**. Its close-out is `docs/part3-kickoff.md`.
+
+**Part 2 began by refuting its own kickoff** — see that file's §5, and the retraction below.
 
 ## Status: part 1 complete (2026-08-15)
 

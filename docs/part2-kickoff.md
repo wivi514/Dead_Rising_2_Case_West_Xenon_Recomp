@@ -1,4 +1,13 @@
-# Part 2 kickoff — the live hand-off
+# Part 2 kickoff — SUPERSEDED, history only
+
+> **⛔ THIS IS NOT THE LIVE HAND-OFF. `docs/part3-kickoff.md` is.**
+> Superseded at the end of part 2 (2026-08-16).
+>
+> **Keep reading it only for §1 (what already exists) — and even that is now behind
+> part 3's own §2.** Its §2 problem statement is FALSE and was refuted by the very
+> measurement it asked for; the retraction is in place below. This file is retained
+> because it is the project's clearest example of a kickoff stating a hypothesis with
+> the confidence of a finding.
 
 **Written at the end of part 1 (2026-08-15).** Part 1 was one long conversation covering
 what its documents call "session 1" (bootstrap) and "session 2" (captures + the runtime
