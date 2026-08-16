@@ -943,3 +943,88 @@ not bite here.
 - **Two missing pixel shaders** (finding 28), to be picked up by rebuilding the bank from our
   own runtime's dump.
 - Everything past the safehouse is unmeasured.
+
+---
+
+## 30. **The GPU determinism baseline: 1.40%.** The noise floor exists at last — part 2, 2026-08-16
+
+`docs/part2-kickoff.md` §3 listed this as owed and said why it blocks everything downstream:
+*"Until it runs, this port has no noise floor for GPU stream comparison — and Asura's Wrath
+spent real time treating noise as signal for exactly that reason."* `tools/xtr_determinism.py`
+had been copied across but **never run here**. It has now been run, on B1 vs B1b — two
+hardware captures of the same boot drive.
+
+```
+B1    866 frames  0.49 GiB (11.4 s)
+B1b   911 frames  0.52 GiB (12.1 s)
+```
+
+### The baseline
+
+```
+comparison window: FIXED PREFIX  B1[0:257]  B1b[0:258]   (final era excluded)
+
+worst aggregate delta : 1.40%  (op2D, SET_CONSTANT)
+draws delta           : 0.30%
+indirect buffers      : 0.09%
+```
+
+**Two hardware runs of one drive differ by 1.40% on the worst aggregate.** Our runtime
+landing inside that band is **not** evidence of correctness; landing outside it is evidence
+of a defect. That is the number every later GPU gate is measured against.
+
+### Three things this settles that were open
+
+**1. The ~6% size delta was never a verdict — confirmed.** Finding 12 recorded the delta and
+refused to call it. The size ratio here is 0.939 and it is **not a determinism metric**: a
+continuous stream emits frames for as long as the run lasts, so size mostly measures how long
+the operator sat on a menu. The final era is 609 frames in B1 and 653 in B1b — that is when
+each run was exited, which is why the tool excludes it. Including it reads 42.7% instead of
+80.0%.
+
+**2. A frame-INDEXED GPU gate is not viable on this title.** Frame-exact agreement is only
+**87.9%** even over the fixed window, and **69.6%** naively:
+
+```
+naive frame-i vs frame-i : 179/257 (69.6%)
+aligned (insert/delete)  : 226/257 (87.9%)
+longest identical run    : 128 frames
+phase lag: +2 on 77.0% of frames, +0 on 8.8%, +1 on 7.1%
+```
+
+A small set of small lags covering most frames is **drift, not divergence** — deterministic
+in content, jittery in phase. So future GPU gates must compare **per-era aggregates**, which
+are robust to drift, and must not compare frame *i* to frame *i*.
+
+**3. `MemoryRead`/`MemoryWrite` counts must stay out of the fingerprint.** They are Xenia
+deciding which guest memory still needs recording — its own dirty-tracking, not the guest's
+behaviour. Folding them in manufactures non-determinism, measured at **42.7% → 16.0%** frame
+agreement. They are reported and explicitly excluded from the verdict.
+
+### The era segmentation, and a sibling constant that actually transferred
+
+The tool segments a run into draw-count regimes and its `--era-threshold` default is
+`50 130 600`, **measured on Case Zero's boot** — another inherited constant of exactly the
+kind that has bitten this port twice (`find_jumptables.py`, `fix_switch_function_bounds.py`).
+So it was checked rather than assumed.
+
+The eras land almost identically on the two runs, which is itself the property that matters:
+
+```
+era mean draws/frame   B1 : 26.0  26.0  56.0  80.0  48.0  87.6  140.0  194.0  455.2  797.5
+                      B1b : 26.9  26.0  46.0  80.0  52.4  87.6  140.0  194.0  457.2  796.3
+```
+
+And the baseline is **insensitive to the threshold**. Re-run at `40 100 500`, `60 150 700`
+and `30 90 300 700`, the comparison window is `[0:257]/[0:258]` **every time** and the verdict
+is 1.40% / 0.30% / 87.9% unchanged. So Case Zero's constant is harmless here — and this is the
+**first inherited constant in this port that has been shown to transfer rather than assumed
+to**. That is the whole difference between the two tools that were silently wrong in part 1
+and this one: somebody varied it.
+
+### What is still owed on the GPU side
+
+- **B2's 14.8 GiB gameplay stream has never been decoded.** It is the gameplay PM4 ground
+  truth and it is *newly* actionable, because there is now a renderer to compare it against.
+- **Eight of the nine B4 frames are unanalysed** — the reference set for the hardest surface
+  classes.
