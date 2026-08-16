@@ -61,8 +61,23 @@
 // The item CONTENT path is not, and cannot be until the runtime reaches gameplay and
 // writes a save. Its layout is derived from the guest's own copy sizes above and from
 // A3 (the save round-trip capture: root name "save", mounts to \Device\Content\N\,
-// one file DR2P000.DSF of exactly 303,104 bytes written in a single NtWriteFile), but
-// derived is not run (gotcha 67).
+// one file **DR2E000.DSF of exactly 1,263,104 bytes (0x134600)** written in a single
+// NtWriteFile), but derived is not run (gotcha 67).
+//
+// CASE WEST's A3, measured 2026-08-15 — the mechanism is Case Zero's exactly, including
+// `XamContentCreateEx` flags 0x00001012 and the \Device\Content\N\ symbolic link that
+// increments per mount. Three differences, none of which this layer has to encode
+// because it is filename-agnostic, but all of which a reader needs:
+//
+//   * the file is **DR2E000.DSF**, not DR2P000.DSF — E for Epilogue (this title's
+//     internal name is `deadrisingepilogue`), P for Prologue;
+//   * the payload is **0x134600 = 1,263,104 bytes**, ~4.2x Case Zero's 0x4A000, and it
+//     is FIXED — both of A3's saves wrote exactly that length;
+//   * **THE SAVE SLOTS LIVE INSIDE THE ONE CONTAINER.** The operator saved to slot 1 and
+//     then slot 3; there is still exactly ONE DR2E000.DSF on disk, its name and size
+//     unchanged, and only its contents differ (md5 21731f11… -> 31202c5d…). So this is a
+//     multi-slot container, NOT one file per slot, and a save layer that tried to map
+//     slots onto filenames would be inventing a scheme the title does not use.
 //
 // RETRACTED IN PLACE: this comment used to end "the dword at scratch+0x140 is neither
 // derived nor guessable, so we write 0 and say so". It is the TITLE ID, it is derivable,
@@ -168,9 +183,10 @@ static_assert(sizeof(GuestEnumMessage) == 32, "sub_825D9358 zeroes and fills 32 
 //
 // One content item is one directory under the save root, named by the content's own
 // fileName. `save:` is then mounted at that directory, so the guest's
-// `NtCreateFile("save:\DR2P000.DSF")` (A3) lands on
-// <saveroot>/<fileName>/DR2P000.DSF. Nothing here invents a container format: the
-// title writes one 303,104-byte blob and we store exactly that blob.
+// `NtCreateFile("save:\DR2E000.DSF")` (A3) lands on
+// <saveroot>/<fileName>/DR2E000.DSF. Nothing here invents a container format: the
+// title writes one 1,263,104-byte blob and we store exactly that blob — and because
+// nothing here parses the blob, the fact that its slots are internal costs us nothing.
 std::filesystem::path g_saveRoot;
 
 struct ContentItem
@@ -608,7 +624,7 @@ static uint32_t XamEnumerate_x(uint32_t handle, uint32_t flags, uint32_t buffer,
 // A3 is the ground truth for the shape:
 //   XamContentCreateEx(00000000, 8209089C(save), 7018F540, 00001012, 0, 0, 0, 0, E42389D0)
 //   -> Registered symbolic link: save: => \Device\Content\1\
-//   -> NtCreateFile(save:\DR2P000.DSF), NtWriteFile(length=0x0004A000)
+//   -> NtCreateFile(save:\DR2E000.DSF), NtWriteFile(length=0x00134600)   [Case West A3]
 // so the export's whole job is to make `save:` mean a directory. The low nibble of
 // `flags` is the disposition, in the CreateFile sense.
 //
@@ -740,7 +756,7 @@ PPC_FUNC(__imp__XamContentCreateEx)
 //   XamUserGetXUID(00000000, 00000001, 7018F2C0)
 //   XamContentCreateInternal(8209089C(save), 7018F2D0, 00000003, 0, 0, 0, 0, 0)
 //   -> Registered symbolic link: save: => \Device\Content\4\
-//   -> NtCreateFile(save:\DR2P000.DSF)   disposition 1 (FILE_OPEN), access 80100080
+//   -> NtCreateFile(save:\DR2E000.DSF)   disposition 1 (FILE_OPEN), access 80100080
 //
 // and the guest's own call site agrees argument for argument. `sub_825D8F30` resolves
 // 0x271 into the global at 0x82A5C87C, and on failure returns that error straight to

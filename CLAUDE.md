@@ -44,11 +44,11 @@ risk in this port arriving on schedule: see "The thesis of this port" below.
 | Recompilation | ✅ 58,345 functions, 228 TUs, **zero** `jump outside function`, **zero** dropped branches |
 | Import surface | ✅ 247 names = Case Zero's 244 **+ 3** |
 | Runtime | ❌ does not exist yet |
-| Xenia ground truth | 🟡 **round 1 nearly complete** — A1/A2/A4/B1/B1b/B2/C1/C2/W1/W2/B4 in hand; **only A3 and A5 open** |
+| Xenia ground truth | ✅ **round 1 COMPLETE** — 13 captures delivered and consumed; nothing outstanding |
 | Coverage oracle | ✅ 104 entry points recovered from C1+C2; config at **135 overrides, 58,448 functions** |
 | Shader cache | ✅ **439 shaders, 439 translated, 0 failures**, dim census 0 disagreements |
-| Bink | ✅ **SOLVED — needs no host code.** Guest code decodes it, a guest shader converts it (finding 17) |
-| Runtime (W1) | ✅ **transplanted, links, and BOOTS** — 58,695 symbols resolved; 60 s with no crash, 87 `.big` opened, vblanks delivered. Does not present a frame yet |
+| Bink | ✅ **SOLVED — the host contributes file I/O and nothing else.** Guest code decodes it on its own 2 threads, a guest shader converts it (findings 14, 17, 22, 23) |
+| Runtime (W1) | ✅ **COMPLETE** — links, boots (58,695 symbols; 60 s, 87 `.big`, vblanks delivered), save layer confirmed. Does not present a frame yet |
 
 Nothing has been compiled by a C++ compiler and nothing has been checked against
 hardware.
@@ -105,6 +105,13 @@ Note that entries naming a Case Zero file, env var, address or count are *pointe
 the sibling repo*, not claims about this one.
 
 The ten that bite most often, as one-liners. Each is a summary, not the entry:
+
+**And the sharpest one this port has produced, because it took three tries:**
+**when an attribution has been wrong twice, stop refining the estimate.** The Bink mutants
+were called co-op (wrong), then audio/streaming (wrong), both from call *counts*. What
+settled it was a thread entry address falling inside a named section, plus 100% containment
+inside a file handle's lifetime — facts that are true or false rather than large or small.
+Findings 3 and 23.
 
 3.  **A zero is a detection failure, not a fact.** XenonAnalyse finds zero jump tables on
     this compiler; our scanner found 205. Applies to every number a detector prints —

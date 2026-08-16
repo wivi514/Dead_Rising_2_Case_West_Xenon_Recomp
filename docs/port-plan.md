@@ -37,7 +37,8 @@ Done in session 1 — reproducible from a clean clone with the Commands section 
 | Recompilation | ✅ **58,448 functions**, 228 TUs, **zero** `jump outside function`, **zero** dropped branches |
 | Coverage oracle | ✅ **104 entry points** recovered from C1+C2; config at 135 overrides |
 | Shader cache | ✅ **439 shaders, 439 translated, 0 failures** — W4's hardest input already exists |
-| Runtime (W1) | ✅ **links and boots**; 4 per-title modules parked, save layer awaiting A3 |
+| Runtime (W1) | ✅ **COMPLETE** — links, boots, save layer confirmed; 4 per-title modules parked |
+| Captures | ✅ **round 1 complete** — 13 captures; nothing outstanding |
 | Bink (W3) | ✅ **SOLVED — no host code needed** (finding 17); honour `tiled=0` and the padded chroma pitch |
 | Kernel import surface | ✅ 247 names, measured against Case Zero's 244 |
 | Recompiler gates | ✅ dropped branches and unlowered switches both clean (W0.1, W0.2) |
@@ -142,12 +143,24 @@ The surprise was not link scale: it was that four modules carry 156 hardcoded Ca
 guest addresses, of which **one exists in this image too** and would have linked silently
 to an unrelated function. They are parked in `runtime/port-pending/`.
 
-**Still open in W1:** `kernel/content.cpp`'s save layer, which needs capture A3.
+~~**Still open in W1:** `kernel/content.cpp`'s save layer, which needs capture A3.~~
+**CLOSED 2026-08-15.** A3 landed and the save layer needed **no functional change** — it is
+filename-agnostic, so this title's `DR2E000.DSF` / 1,263,104-byte container works through
+the existing code. Its comments now describe Case West's measured shape. The one design
+fact worth knowing: **the save slots live INSIDE the single container** (the operator saved
+to slots 1 and 3 and only the file's contents changed), so a slot-per-file scheme would be
+inventing something the title does not do. Finding 24.
+
+**W1 is complete.**
 
 ## W2 — Xenia ground truth (operator-dependent, START IT EARLY)
 
-**This is the long pole and it is not on the critical path of W0/W1, so request it
-now.** Every port in this workspace has been carried by these captures, and the renderer
+> **STATUS: ROUND 1 IS COMPLETE.** All 13 captures delivered 2026-08-15 and consumed;
+> findings 1-26 in `docs/xenia-capture-analysis.md`. Nothing is outstanding. The one gap
+> is a *place*, not a capture: no drive has gone outdoors.
+
+**This was the long pole and it was not on the critical path of W0/W1, so it was requested
+first.** Every port in this workspace has been carried by these captures, and the renderer
 literally cannot start without the shader microcode dump. Captures run on Windows and
 only the operator can produce them (memory: `xenia-captures-run-on-windows`).
 
@@ -201,6 +214,13 @@ frame, then B1+B1b, then C1.
 > package**), decode = recompiled guest code (finding 14, 137 `BINK` functions execute),
 > output = ordinary linear textures, conversion = a guest shader we translate, composite =
 > the normal post chain. **There is no movie player to write and no ffmpeg fallback.**
+>
+> **A5 completed the picture (findings 22 and 23):** the decoder reads its input in
+> **252 sequential 128 KB chunks** from inside the STFS package (NULL `ByteOffset`
+> throughout, so the VFS must hold a per-handle position), and it runs on **its own two
+> guest worker threads** whose entry point is inside the `BINK` section — which is what the
+> four mutants guard. Every layer is the title's own; the host contributes file I/O and
+> nothing else.
 >
 > **The one real requirement: honour `tiled=0`.** These planes are linear; detiling them
 > produces a scrambled block pattern (which is exactly what this analysis produced on its

@@ -4,10 +4,13 @@
 disagrees with it, it wins.** Findings are numbered and never renumbered; a retraction is
 written *in place* under the finding it retracts, not deleted.
 
-Round 1 delivery: **2026-08-15**, session 2. Delivered: **A1, A2, A4, B1, B1b, B2, C1, C2,
-W1, W2, B4** plus boot-logo screenshots — i.e. all of round 1 **except A3 (save round trip)
-and A5 (high-frequency)**, which is what remains outstanding. E (screenshots) is satisfied
-in substance by the frame-locked PNGs that came with W/B4.
+**ROUND 1 IS COMPLETE**, all delivered 2026-08-15: **A1, A2, A3, A4, A5, B1, B1b, B2, C1,
+C2, W1, W2, B4** plus boot-logo screenshots. E (screenshots) is satisfied in substance by
+the frame-locked PNGs that came with W/B4. **Nothing is outstanding.**
+
+The one gap worth a future ask is not a missing capture but a missing *place*: **no drive
+has ever gone outdoors** — every one stayed in Phenotrans interiors. Finding 20 makes that
+the likeliest remaining source of new shaders.
 What each file is: `Xenia logs/Xenia_Run_Content.md`. What was asked and why:
 `docs/xenia-capture-requests.md`.
 
@@ -504,3 +507,161 @@ and does not re-request it. All are **self-contained single-frame `.xtr` + frame
 **Not captured: any outdoors frame** — the drive stayed in Phenotrans interiors. Flagged by
 the operator rather than left to be discovered, and it is the one gap worth a future ask
 (see also finding 20).
+
+---
+
+*Findings 22-26 added from captures **A3** (save round trip) and **A5** (high-frequency),
+which complete round 1. The operator deviated from A5's written spec — it asks for A1's
+boot drive, and they drove through to gameplay instead, because A1 had already proved the
+boot path has neither mutants nor Bink. That deviation is the reason findings 22 and 23
+exist at all.*
+
+## 22. **Bink is STREAMED, sequentially, in 128 KB chunks — and the VFS must hold the position**
+
+A5's `log_high_frequency_kernel_calls` makes `NtReadFile` visible for the first time
+(1,453 calls in the drive; it is `kHighFrequency` and invisible at plain L3). Tracing
+`800a_intro.bik`'s handle end to end:
+
+```
+NtCreateFile(game:\data\movies\800a_intro.bik) -> handle F800025C
+    via StfsContainerDevice::ResolvePath(\data\movies)     i.e. from INSIDE the package
+257 reads, then NtClose
+
+    1 x 0x0000002C  (44)         the Bink header
+    1 x 0x00001284  (4,740)
+    1 x 0x00002CD4  (11,476)
+    1 x 0x00009E78  (40,568)
+    1 x 0x00014ED8  (85,720)
+  252 x 0x00020000  (131,072)    <- the streaming chunk
+
+  total = 33,172,692 bytes = the file's size on disk, EXACTLY, to the byte
+```
+
+**Every one of the 257 reads passes a NULL `ByteOffset` pointer** — not one explicit
+offset in the set. So they are sequential reads from the handle's own file position, and
+**the VFS must maintain a per-handle position**; a layer that expected an explicit offset
+would read the header 257 times.
+
+Three things this settles:
+
+- **streamed, not whole-file** — 252 fixed 128 KB chunks paced across playback, so a
+  runtime that tried to slurp a 33 MB movie up front would change the memory profile and
+  the timing of everything around it;
+- **read exactly once, front to back**, with no seeking back — the byte total matching the
+  file size to zero difference is what proves there is no re-read;
+- **served from inside the STFS container**, not the loose extracted copy, confirming
+  finding 5's `ResolvePath` observation at the read level rather than the open level.
+
+The handle is recycled 11 times across the log, so the window had to be bounded by its
+`Added handle` / `Removed handle` pair before counting. Counting every `F800025C` line
+would have mixed four other files into the total.
+
+## 23. **The mutants are BINK's. Third attribution, and the first two were both wrong.**
+
+Finding 3 refuted "the mutants are co-op" using A2. The replacement guess — recorded in
+A2's own notes and repeated in this ledger — was audio/XMA or the streaming loader, from
+the call volume. **That is also wrong.**
+
+A5 shows all four mutants created in one 20-line burst, and what surrounds them names the
+owner outright:
+
+```
+ExCreateThread(..., xapi=82847D38, start=829D0318, context=829E012C, ...)
+                                        ^^^^^^^^             ^^^^^^^^
+                                        in BINK              in BINKBSS
+KeSetAffinityThread(..., 0x20)          hardware thread 5
+NtCreateMutant -> F8000274
+NtCreateEvent  -> F8000278
+NtResumeThread
+NtCreateMutant -> F800027C
+```
+
+Twice, identically: **two worker threads, each with two mutants and one event, whose entry
+point is inside the `BINK` code section and whose context argument is in `BINKBSS`.**
+
+And the interval test is unambiguous:
+
+```
+NtReleaseMutant total            : 14,614
+  before the .bik is opened      :      1   (the import-table declaration, not a call)
+  DURING the .bik handle's life  : 14,613   = 100.0%
+  after the .bik is closed       :      0
+```
+
+**Zero releases outside the movie.** The mutants exist only while a movie plays.
+
+### Why this one took three attempts, stated because the pattern is the lesson
+
+Each wrong attribution was an inference from a *count* — "Case Zero has no mutants and no
+co-op, so mutants are co-op"; "32,382 calls is a lot, so it must be audio or streaming".
+What settled it was not a bigger count. It was **a structural fact** (a thread entry
+address that falls inside a named section) and **an interval test** (100% containment
+within a file handle's lifetime), neither of which can be produced by staring at a
+frequency table. When an attribution has been wrong twice, stop refining the estimate and
+find something that is true or false rather than large or small.
+
+### What it means for the port
+
+`runtime/kernel/imports.cpp`'s recursive `Mutant` — restored in W1 — sits on the **movie
+decode critical path**, guarding two guest worker threads that run recompiled `BINK` code.
+W1's note that a faked mutant would deadlock "on the hot path, where it will be blamed on
+anything else" is more specific than it knew: it would present as *the intro cinematic
+hangs*, and the Bink decoder would be the last place anyone looked, because finding 17
+established Bink needs no host code.
+
+It also completes the Bink picture. The decoder is guest code (14), on **its own two guest
+threads** (23), reading its input in 128 KB sequential chunks from the STFS container (22),
+writing three linear `k_8` planes that a guest shader converts (17). Every layer is the
+title's own. **The host contributes file I/O and nothing else.**
+
+## 24. A3: the save shape — same mechanism, three differences, slots are internal
+
+The mechanism is Case Zero's exactly, including the `XamContentCreateEx` flags
+(`0x00001012`) and the `\Device\Content\N\` symbolic link that increments per mount.
+
+```
+XamContentCreateEx(0, "save", ..., flags=0x00001012, ...)
+  -> save: => \Device\Content\N\
+  -> NtCreateFile(save:\DR2E000.DSF)
+  -> NtWriteFile(length = 0x134600 = 1,263,104)  one whole-file write
+  -> unregister
+```
+
+| | Case Zero | Case West |
+|---|---|---|
+| file | `DR2P000.DSF` | **`DR2E000.DSF`** — E for Epilogue, P for Prologue |
+| payload | 303,104 B (0x4A000) | **1,263,104 B (0x134600)**, ~4.2x, and FIXED |
+| on disk | a bare file | a folder-package (`DR2E000.DSF/DR2E000.DSF`) — Xenia's STFS-content representation |
+
+**The finding that changes design, and it is the operator's:** they saved to **slot 1 and
+then slot 3**, and there is still exactly **one** `DR2E000.DSF` on disk, name and size
+unchanged, with only its contents differing (md5 `21731f11…` → `31202c5d…`). **The save
+slots live inside the single container.** A save layer that mapped slots onto filenames
+would be inventing a scheme the title does not use.
+
+`runtime/kernel/content.cpp` needed **no functional change** — it is filename-agnostic and
+stores whatever blob the guest writes, so the internal-slot structure costs it nothing.
+Its comments were updated to describe this title's measured shape rather than Case Zero's.
+
+## 25. A3 and A5 added no shaders — the bank stays at 439
+
+A3 dumped 330 distinct and A5 dumped 283; the union across all eleven dumps is unchanged
+at **439**. Consistent with finding 20: both drives covered material A2/C2/W had already
+visited. No rebuild was needed.
+
+The bank has now been stable across four consecutive captures, which is the first time
+that has been true — but **outdoors has still never been captured**, and that remains the
+one place the number is likely to move.
+
+## 26. VdSwap is visible at last, and the boot's sync surface has a scale
+
+Two numbers A5 makes available that no other capture in this round could, recorded for
+whenever they are needed rather than because anything needs them now:
+
+- **`VdSwap` × 5,062**, with the 1280×720 swap parameters — the flip/vsync cadence ground
+  truth. Asura's Wrath could not get this from kernel logs at all.
+- **`NtWaitForSingleObjectEx` × 173,311** and `XamInputGetState` × 34,545 — the whole
+  synchronisation and polling surface, all `kHighFrequency` and therefore absent from
+  A1/A2/A3.
+
+`DbgBreakPoint` is still never called, across every capture in round 1. It stays stubbed.

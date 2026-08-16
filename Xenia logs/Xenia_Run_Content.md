@@ -362,3 +362,81 @@ On disk, indexed, not yet analysed beyond the Bink pair: monitor bank, bathroom 
 monitor wall, two StoragePens crowds, lab interior with glass, plus the two in-world
 monitor frames. They are the reference set for the renderer's hardest surface classes and
 they will be read against our output once there is one.
+
+
+---
+
+## A3 + A5 — analyst pass, 2026-08-15. **ROUND 1 IS COMPLETE.**
+
+Findings **22–26** in `docs/xenia-capture-analysis.md`. Both notes were right and both
+deviations from the written request were improvements.
+
+### A5's deviation is the reason two findings exist
+
+The request specs A5 as *A1's boot drive*. You drove it through to gameplay instead,
+because A1 had already shown the boot path has neither mutants nor Bink — so a boot-only
+A5 would have captured neither of the two things it was for. Both findings below come from
+the part of the drive the request did not ask for.
+
+### ★ The Bink read cadence — streamed, sequential, exact (finding 22)
+
+Traced `800a_intro.bik`'s handle end to end. **257 reads: 252 × 128 KB plus a 44-byte
+header and four sized reads, totalling 33,172,692 bytes — the file's size on disk, to the
+byte.** So it is streamed front to back, read exactly once, with no seeking back.
+
+**Every read passes a NULL `ByteOffset`** — not one explicit offset in the set — so the
+VFS must maintain a **per-handle file position**. A layer expecting an explicit offset
+would read the header 257 times.
+
+One method note for next time: the handle `F800025C` is **recycled 11 times** across the
+log, so the window had to be bounded by its `Added handle`/`Removed handle` pair first.
+Counting every line mentioning that handle would have mixed four other files into the
+total. (Also: the `C2C00B06` in the `NtCreateFile` line is the out-pointer's *prior*
+contents, not the handle.)
+
+### ★ The mutants are BINK's — and this is the third attribution (finding 23)
+
+I said co-op; A2 refuted that. Your A2 notes said audio/XMA or the streaming loader; **that
+is wrong too.** A5 shows all four created in one burst around two `ExCreateThread` calls
+whose **start address `829D0318` is inside the `BINK` code section** and whose context
+argument is in `BINKBSS` — two worker threads, each with two mutants and one event. And
+the interval test is total:
+
+```
+NtReleaseMutant  14,614 total
+  before the .bik opens :      1   (the import-table declaration line, not a call)
+  DURING its handle     : 14,613   = 100.0%
+  after it closes       :      0
+```
+
+The lesson recorded with it: all three attributions until now were inferences from a
+*count*. What settled it was a structural fact and a containment test — things that are
+true or false rather than large or small.
+
+This also means the recursive mutant implemented in W1 sits on the **movie-decode critical
+path**. A faked one would present as *the intro cinematic hangs*, and Bink would be the
+last place anyone looked, since finding 17 says it needs no host code.
+
+### A3 — the save shape (finding 24)
+
+Mechanism identical to Case Zero including the `0x00001012` flags. Three differences:
+`DR2E000.DSF` (E for Epilogue), `0x134600` = 1,263,104 bytes fixed (~4.2×), and a
+folder-package on disk.
+
+**Your slot-1-then-slot-3 observation is the one that changes design:** one physical file,
+name and size unchanged, contents differing — so **the save slots are internal to the
+container**, and a slot-per-file scheme would be inventing something the title does not do.
+`runtime/kernel/content.cpp` needed **no functional change**; it is filename-agnostic, so
+the internal structure costs it nothing. Comments updated to this title's shape.
+
+### Shaders
+
+A3 330 distinct, A5 283 — **union unchanged at 439**. Both drives covered material already
+visited (finding 20 again). No rebuild needed. The bank has now been stable across four
+consecutive captures.
+
+### Round 1 is closed
+
+Thirteen captures, all consumed, nothing outstanding. **The one gap is a place, not a
+capture: no drive has ever gone outdoors** — every one stayed in Phenotrans interiors, and
+that is the likeliest remaining source of new shaders.
