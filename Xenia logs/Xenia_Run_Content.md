@@ -239,13 +239,61 @@ bank**. (Case Zero's shape was A1 120 ⊂ A2 335.)
 
 ### Still outstanding from round 1
 
-**A3** (save round trip + the physical save file), **A4** (title idle), **A5**
-(high-frequency — now more valuable than when requested: it is the only place the mutant
-call sites of finding 3 and the Bink read cadence of finding 5 become visible), **C2**
-(gameplay coverage — will be a superset of C1, so more entry points), **B4**
-(place-anchored single frames), **W1/W2** (retargeted — see below), **E** (screenshots).
+~~**C2**~~ **delivered — see the C2 section below.** Remaining: **A3** (save round trip +
+the physical save file), **A4** (title idle), **A5** (high-frequency — now the most
+valuable of them: it is the only place the mutant call sites of finding 3 and the Bink read
+cadence of finding 5 become visible), **B4** (place-anchored single frames), **W1/W2**
+(retargeted — see below), **E** (screenshots).
 
 **W1 is retargeted and the request document is updated.** There is no boot Bink to
 photograph. The Bink output-surface frame must be taken at the **New Game intro**
 (`800a_intro.bik`) and at the **`807_monitors` screen** in the opening area, as single-frame
 F4 captures with `trace_gpu_stream` **OFF** so the frame `.xtr` is actually written.
+
+
+---
+
+## C2 — gameplay function coverage, driven into a second zone  → `C2_coverage/`
+
+**Delivered 2026-08-15**, shortly after the rest of round 1. Same drive family as A2/B2 but
+driven further: the operator reached and **loaded a whole new zone**, which is why C2's
+executed set jumps well above C1's. `trace_function_data` from boot did not crash, as in C1.
+Flags as C1 plus `dump_shaders=cw_shaders_C2`. Clean exit, `license_mask=1`.
+
+### Analyst pass
+
+Copied and consumed the same day. Findings **13–16** in
+`docs/xenia-capture-analysis.md`. Headlines:
+
+- **C2 ⊃ C1 exactly** — zero C1 addresses missing from C2, as the notes predicted.
+- **+61 net entry points.** The oracle proposed 67 over both traces; the disposal cycle
+  pruned 5, which also cleared the 11 `jump outside function` errors those splits caused.
+  Config is now **135 overrides / 58,448 functions**, all gates clean.
+  **Two of the 5 pruned had already been pruned in the C1 round** — expected, not a
+  regression: fresh coverage re-proposes anything not currently in the config, and the
+  oracle's own docstring predicts the loop. Do not chase it next time.
+- **★ THE BINK DECODER RUNS AS GUEST CODE — 137 functions inside the `BINK` section
+  executed in C2, and ZERO in C1.** The only thing separating those two drives is that C2
+  plays the New Game intro. This turns W3's central hypothesis from an argument about
+  section flags into a measurement, and it points at "wire up the I/O and the output
+  surface" rather than "write a Bink decoder". Two of the 137 needed entry-point recovery
+  and are now in the config; without C2 they would have been indirect-call misses the first
+  time a movie played.
+- **Shaders: the bank grew 386 → 435.** C2 has 415 distinct, **49 of them new**, and A2 has
+  20 that C2 lacks — neither drive is a subset of the other. Rebuilt to
+  **435 translated / 0 failures / 0 dim-census disagreements**. C2 was requested as a
+  *coverage* trace; the 49 shaders came free because `dump_shaders` was on. **Keep it on
+  for every capture, whatever the capture is for.**
+
+### One attribution corrected
+
+The notes read the executed range's low end (`0x80050030`) as "code reached only on the
+new-zone path". It is **two records at `0x80050030..0x80050038`**, below this title's image
+base — that is `xboxkrnl.exe`, another module Xenia traces. Harmless: the oracle bounds
+candidates to our image, so they were never proposed. Noted so the range is not read as
+evidence about the title. The *upper* end of the same range is the real story, and it is the
+BINK result above.
+
+Files: `trace.0.gz` 167 KB (→32 MiB, 19,487 executed by the operator's count / 19,195 by
+mine — I additionally require `end > start`), `xenia_C2.log.gz` 126 MB (correlation log),
+`cw_shaders_C2.zip` (415 distinct shaders), `C2_NOTES.txt`.

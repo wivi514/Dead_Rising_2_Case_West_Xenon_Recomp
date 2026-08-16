@@ -4,8 +4,8 @@
 disagrees with it, it wins.** Findings are numbered and never renumbered; a retraction is
 written *in place* under the finding it retracts, not deleted.
 
-Round 1 partial delivery: **2026-08-15**, session 2. Delivered: **A1, B1, B1b, C1, A2, B2**
-plus a set of boot-logo screenshots. Still outstanding: **A3, A4, A5, C2, B4, W1/W2, E**.
+Round 1 partial delivery: **2026-08-15**, session 2. Delivered: **A1, B1, B1b, C1, A2, B2,
+C2** plus a set of boot-logo screenshots. Still outstanding: **A3, A4, A5, B4, W1/W2, E**.
 What each file is: `Xenia logs/Xenia_Run_Content.md`. What was asked and why:
 `docs/xenia-capture-requests.md`.
 
@@ -157,8 +157,13 @@ oracle** — and `--prune` removed them. One further round of
 **Net: 43 real entry points that no static analysis would ever find**, including
 **`0x825AC918` — the image's own entry point**, which nothing `bl`s to.
 
-Final state: **58,387 functions, 76 function overrides**, zero `jump outside function`,
-zero dropped branches, unlowered-switch gate at 0 defects.
+Final state after C1: **58,387 functions, 74 function overrides**, zero `jump outside
+function`, zero dropped branches, unlowered-switch gate at 0 defects. **Superseded by
+finding 13** once C2 arrived.
+
+*(An earlier version of this paragraph said 76 overrides. That was a `grep -c 'address = '`
+count, which also matches two of the eight `save/restgprlr_*_address` config keys — the
+ones written without column padding. The entry count is 74.)*
 
 The count of import thunks the tool located — **247, at `0x829CACE4..0x829CBC54`** — matches
 the import census exactly and is a free cross-check on both.
@@ -186,6 +191,11 @@ Treat "the bank is complete" as a claim with a shelf life (gotcha 13). Case Zero
 from 335 to 435 and grew on **every** session that reached new ground; these two drives
 cover a boot and one opening area, so every part of Case West nobody has walked into is a
 shader gap nobody has counted.
+
+> **AND THE SHELF LIFE WAS UNDER AN HOUR. Superseded by finding 15**: C2 arrived with a
+> drive that loaded a second zone and brought **49 shaders A2 had never seen**. "A2 alone
+> holds the entire bank" was true of the captures in hand and false of the game. The
+> sentence above was written as a hedge; it should have been written as a prediction.
 
 ## 9. XenosRecomp translates the entire bank with zero failures
 
@@ -254,3 +264,99 @@ which is `tools/xtr_determinism.py` in the Case Zero repo and has not been broug
 or run here. **Open.** Until it runs, this port has no established noise floor for GPU
 stream comparison, and Asura's Wrath spent real time treating noise as signal for exactly
 that reason.
+
+
+---
+
+*Findings 13-16 added the same day, from capture **C2** (gameplay function coverage,
+driven further than A2/B2 — the operator reached and loaded a whole new zone).*
+
+## 13. C2 is a strict superset of C1, and adds 61 more entry points
+
+```
+C1 executed : 11,472 functions          (operator's count 11,681 — see the note below)
+C2 executed : 19,195 functions          (operator's count 19,487)
+C1 addresses absent from C2 : 0         <- strict superset, as predicted
+```
+
+*(The two counts differ because I additionally require `end > start` when reading the
+48-byte records, which drops ~210 and ~290 degenerate entries respectively. Neither count
+is wrong; they measure slightly different things, and nothing downstream depends on the
+difference.)*
+
+Re-running `coverage_to_function_overrides.py` over **both** traces proposed **67** further
+overrides. The disposal cycle removed 5, and one `fix_switch_function_bounds` round cleared
+the 11 `jump outside function` errors the splits had caused — all of which came from the 5,
+since the repair tool itself reported "0 new this round".
+
+**Net +61.** Final state: **58,448 functions, 135 function overrides**, zero
+`jump outside function`, zero dropped branches, unlowered-switch gate at 0 defects.
+
+**Two of the 5 pruned addresses had already been pruned in the C1 round**
+(`0x825F6F9C`, `0x82837740`). That is not a new defect and not a regression: the oracle
+reads the trace and the config, the pruned entries are by definition not in the config, so
+fresh coverage data re-proposes them. `coverage_to_function_overrides.py`'s docstring
+predicts exactly this loop. **Expect it on every future coverage round, and do not treat a
+recurring prune as a problem** — the prune is the disposal step, not a repair that should
+have stuck.
+
+## 14. **The Bink decoder RUNS, as recompiled guest code — 137 functions of it**
+
+The strongest result in this delivery, and it was free — nobody asked for it.
+
+```
+functions executed inside the BINK section (0x829CBE00..0x829DC4B8):
+  C1 (boot -> title)            :   0
+  C2 (gameplay, intro played)   : 137      range 0x829CBE88..0x829DAC50
+```
+
+C2's drive plays the New Game intro (`800a_intro.bik`); C1's stops at the title. So the
+zero and the 137 are the same measurement taken either side of the only event that
+distinguishes them.
+
+**This is direct evidence for W3's working hypothesis**, which until now was an argument
+from section flags: the statically linked RAD decoder is ordinary PowerPC code, XenonRecomp
+translated it along with everything else (`PPC_CODE_SIZE` covers it), and on hardware it
+executes as 137 distinct guest functions on an existing thread — consistent with A2 showing
+no dedicated movie thread (finding 5).
+
+**What it does not establish**, stated so the next session does not over-read it: that our
+*translation* of those 137 is correct, or that the output surface works. It establishes
+that the decode is guest code we already generate, which is what decides whether W3 is "wire
+up I/O and a texture upload" or "write a Bink decoder". It says the former.
+
+Two of the 137 needed entry-point recovery (`0x829D3810`, `0x829D38F0`) and are now in the
+config — i.e. the decoder reaches at least two of its own functions indirectly, and without
+C2 they would have been indirect-call misses the first time a movie played.
+
+## 15. The shader bank grew 386 → 435 on one new zone
+
+```
+C2 distinct shaders          : 415
+  of which NEW (not in A2)   :  49
+A2 shaders absent from C2    :  20      <- neither drive is a subset of the other
+union, all seven dumps       : 435      (was 386)
+```
+
+Rebuilt: 1,338 blobs in → **435 distinct → 435 translated, zero failures**;
+`shader_dim_census.py` reports 341 modules 2D (1,097 declared fetch slots) and 110 cube,
+**0 disagreements**. `assets/shader_spv/` is 12 MB.
+
+This is the sibling port's rule arriving on schedule — *the cache grows on every session
+that reaches new ground* — and it supersedes finding 8's "A2 alone holds the bank". Two
+drives through the same era are not subsets of each other in either direction, which is the
+same shape Case Zero recorded for its A1/A5 pair.
+
+**Carry `dump_shaders` on every future capture, including ones requested for other
+reasons.** C2 was asked for as a coverage trace; 49 shaders came along for free.
+
+## 16. The sub-image addresses in C2 are the kernel module, not new-zone code
+
+C2's notes read its executed range as `0x80050030–0x829DAC50` and attribute the low end to
+"code reached only on the new-zone path". **It is two records at `0x80050030..0x80050038`**,
+which is below this title's image base (`0x82000000`) entirely — that address range is
+`xboxkrnl.exe`, which Xenia traces as another loaded module.
+
+No action: `coverage_to_function_overrides.py` bounds the executed set to our image, so they
+were never candidates. Recorded only so the range is not read as evidence about the title
+next time. The *upper* end of that range is the interesting half, and it is finding 14.

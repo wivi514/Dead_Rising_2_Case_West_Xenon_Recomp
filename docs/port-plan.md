@@ -34,7 +34,9 @@ Done in session 1 — reproducible from a clean clone with the Commands section 
 | Image dumped | ✅ `assets/game/default_image.bin` (+ `.sections`), 14 sections |
 | Save/restore helpers | ✅ all 8, in `config/CaseWest.toml` |
 | Jump tables | ✅ 205 tables / 5,791 labels, both code sections |
-| Recompilation | ✅ 58,345 functions, 228 TUs, **zero** `jump outside function`, **zero** dropped branches |
+| Recompilation | ✅ **58,448 functions**, 228 TUs, **zero** `jump outside function`, **zero** dropped branches |
+| Coverage oracle | ✅ **104 entry points** recovered from C1+C2; config at 135 overrides |
+| Shader cache | ✅ **435 shaders, 435 translated, 0 failures** — W4's hardest input already exists |
 | Kernel import surface | ✅ 247 names, measured against Case Zero's 244 |
 | Recompiler gates | ✅ dropped branches and unlowered switches both clean (W0.1, W0.2) |
 | Runtime | ❌ nothing yet — `runtime/` does not exist |
@@ -197,22 +199,34 @@ consistent with the recompiled-decoder hypothesis below.
 (W4) can be reached without it — but it is the first cinematic in the game, so it is
 between the title screen and all gameplay.
 
-**The lead worth testing first, because if it holds this item nearly vanishes: the
-decoder is already recompiled.** `BINK` is a `SectionFlags_Code` section, XenonRecomp
-translated it along with everything else, and `PPC_CODE_SIZE` covers it. If Bink's
-decode is pure computation over guest memory — which is what a codec mostly is — it
-should simply *run*, and the host work reduces to the I/O the wrapper does and the
-texture upload at the end of it. The two strings that say where that boundary is:
+**~~The lead worth testing first~~ — CONFIRMED by C2 (finding 14), and it nearly halves
+this item: the decoder IS already recompiled and it RUNS.** `BINK` is a
+`SectionFlags_Code` section, XenonRecomp translated it along with everything else,
+`PPC_CODE_SIZE` covers it — and on hardware **137 distinct functions inside that section
+execute** when the New Game intro plays. C1, whose drive stops at the title, ran **zero**
+of them, and playing the intro is the only difference between the two drives.
+
+So the decode is guest code we already generate, and W3 is **"wire up the I/O and the
+output surface"** rather than "write a Bink decoder".
+
+**What this does NOT establish**, so it is not over-read later: that our *translation* of
+those 137 functions is correct, or that the output surface works. Only that the decoder is
+not a hole we have to fill. Two of the 137 are reached indirectly and needed entry-point
+recovery from C2 (`0x829D3810`, `0x829D38F0`) — without that capture they would have been
+indirect-call misses the first time a movie played.
+
+The two strings that say where the host boundary is:
 `ERROR!! You are passing a write combined memory address to Bink!` and
 `cached memory for the Bink texture pointers - see BinkTextures.cpp` — both are about
 GPU-visible memory, i.e. the seam is at the *output surface*, not the decode.
 
 Order of work:
-1. `tools/gdis.py` over `BINK` + the wrapper: find the seam, i.e. which calls leave the
-   recompiled code.
-2. Decide the strategy from what that shows. Only if the recompiled path does not work
-   does the fallback matter — and the fallback is cheap, because the runtime already
-   links ffmpeg for XMA and ffmpeg decodes Bink video and both Bink audio variants.
+1. `tools/gdis.py` over the **137 executed** `BINK` functions + the wrapper: find the seam,
+   i.e. which calls leave the recompiled code. C2's trace supplies that executed set, which
+   is a far better starting list than the whole section.
+2. Decide the strategy from what that shows. The fallback now looks unlikely to be needed,
+   but it stays cheap if it is — the runtime already links ffmpeg for XMA, and ffmpeg
+   decodes Bink video and both Bink audio variants.
 3. **Fail honestly in the meantime.** A movie player that silently reports success will
    hang the boot on a frame that never arrives. Case Zero's own diagnostic exists in the
    guest (`*** BINK MOVIE waiting for heap to free up: %3.2f secs have passed...`) and

@@ -44,9 +44,10 @@ risk in this port arriving on schedule: see "The thesis of this port" below.
 | Recompilation | ✅ 58,345 functions, 228 TUs, **zero** `jump outside function`, **zero** dropped branches |
 | Import surface | ✅ 247 names = Case Zero's 244 **+ 3** |
 | Runtime | ❌ does not exist yet |
-| Xenia ground truth | 🟡 **round 1 PARTIAL** — A1, B1, B1b, C1, A2, B2 in hand; A3/A4/A5/C2/B4/W1/W2/E open |
-| Coverage oracle | ✅ 43 entry points recovered from C1; config at 76 overrides, **58,387 functions** |
-| Shader cache | ✅ **386 shaders, 386 translated, 0 failures**, dim census 0 disagreements |
+| Xenia ground truth | 🟡 **round 1 PARTIAL** — A1, B1, B1b, C1, A2, B2, C2 in hand; A3/A4/A5/B4/W1/W2/E open |
+| Coverage oracle | ✅ 104 entry points recovered from C1+C2; config at **135 overrides, 58,448 functions** |
+| Shader cache | ✅ **435 shaders, 435 translated, 0 failures**, dim census 0 disagreements |
+| Bink | ✅ **measured to run as recompiled guest code** — 137 `BINK`-section functions executed in C2 |
 
 Nothing has been compiled by a C++ compiler and nothing has been checked against
 hardware.
@@ -68,7 +69,8 @@ session 1 caught three of those before writing a line of runtime code:
    **But I then over-corrected**: I wrote that `dr2_logo.bik` plays at boot, purely because
    its name says "logo". Capture A1 opens **zero** `.bik` before the title screen — the boot
    logos are static images. **A filename is not a call site** (finding 4). Bink is real and
-   first plays at the New Game intro.
+   first plays at the New Game intro — and C2 then measured **137 `BINK`-section functions
+   executing** there, so the decoder demonstrably runs as recompiled guest code (finding 14).
 2. **Two code sections.** Case Zero has one (`.text`). Case West has `.text` *and*
    `BINK`. XenonRecomp handles it; two inherited analysis tools did not, and both
    reported clean runs while skipping a whole section.
@@ -175,9 +177,9 @@ corrected position rather than repeating the fix.
 - `assets/game/default_image.bin` (+ `.sections`) — the loaded image for offline
   analysis, from `tools/xex_image_dump`. **The `.sections` sidecar is now an input**, not
   just a record: two tools read their code ranges out of it.
-- `ppc/` — generated C++ (gitignored; 156 MB, 58,387 functions, regeneratable).
-- `assets/shader_spv/` — the SPIR-V cache (gitignored, 10 MB, game-derived): 386 `.spv` +
-  386 `.meta.json`, built from the captures' microcode. Rebuild it with the Commands
+- `ppc/` — generated C++ (gitignored; 156 MB, 58,448 functions, regeneratable).
+- `assets/shader_spv/` — the SPIR-V cache (gitignored, 12 MB, game-derived): 435 `.spv` +
+  435 `.meta.json`, built from the captures' microcode. Rebuild it with the Commands
   section. Microcode dumps live in `~/DR2CW-troubleshooting/ucode-dumps` — **not `/tmp`,
   which is a tmpfs and has silently eaten dumps in the sibling port.**
 - `tools/` — analysis scripts, all copied from Case Zero with provenance in their
@@ -267,9 +269,14 @@ needs this.** Input is the captures' microcode (and, once a runtime exists, its 
 which is the authority on the byte range because the cache key hashes it):
 ```
 python3 tools/xenia_ucode_to_cache.py "Xenia logs"/*/cw_shaders_*/ \
-    ~/DR2CW-troubleshooting/ucode-dumps          # 386 distinct
+    ~/DR2CW-troubleshooting/ucode-dumps          # 435 distinct
 tools/build_shader_spv.sh ~/DR2CW-troubleshooting/ucode-dumps assets/shader_spv
 python3 tools/shader_dim_census.py               # 0 disagreements expected; exit 1 = defect
+```
+**The bank grows on every capture that reaches new ground** — it went 386 → 435 the moment
+one drive loaded a second zone, and a shader the cache lacks is one log line and a silent
+counter, not a failure. Keep `dump_shaders` on for every capture whatever it was asked for.
+```
 ```
 The census is **two-sided by construction** — the per-slot texture dimension is derivable
 both from our ucode parse and from DXC's `OpDecorate` words, so a disagreement means one
