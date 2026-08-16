@@ -1137,3 +1137,67 @@ that never left the title screen — exactly the kind this port has misread five
 report says so in its own output rather than claiming a clearance. **The number that matters
 comes from a gameplay drive**, and the probe is always on, so the next one produces it for
 free.
+
+---
+
+## 32. **W0.3's seven functions did not execute in a full play session — and the bank is 443** — part 2, 2026-08-16
+
+The operator's session with the imported UI fix carried three instruments at once. Two of
+them answered questions that were open.
+
+### The gap probe, on a real gameplay drive: still all zero
+
+`runtime/cpu/gap_probe.cpp` (finding 31) counts calls into the seven functions holding the 59
+instructions XenonRecomp cannot translate. On a session that reached **20,164 frames with
+content** and peaked at **3,029 draws/frame**:
+
+```
+sub_825D75B0   0    vminsw/vpkshss/vpkshss128   28 sites
+sub_825D9B50   0    stvebx                       1
+sub_825E0290   0    vavgsw                       4
+sub_825E05D0   0    vavgsw                       4
+sub_825E6808   0    float16_4 pack              20
+sub_825EB5C0   0    stdux                        1
+sub_825ED6C0   0    stdux                        1
+                                          TOTAL  0
+```
+
+**This is still an absence and it is still not a clearance** — the probe says so in its own
+output, deliberately. But it is a *much better covered* absence than the title-screen reading
+it replaces: a play session through gameplay, cinematics, the HUD and the pause menu, at
+gameplay draw rates, touched none of the seven.
+
+**What that changes:** W0.3's 59 sites are not a live corruption risk on the paths played so
+far, so the shared-XenonRecomp work they imply is **not urgent** and does not block anything.
+It is not retired — the honest statement is "not reached yet", and the probe is always on, so
+every future session tests it again for free. The instrument was shown capable of counting
+before this reading was taken (an eighth control row reported 11,267 calls); a zero here is
+the absence of the call, not the absence of an instrument.
+
+### The shader bank: 439 → 443, and the misses are closed
+
+The same session ran `CW_SHADER_DUMP`, which is the first time this port's bank has been
+rebuilt from **our own runtime's** microcode rather than the captures':
+
+```
+before          439 .spv
+3 misses this session:  PS 0af111338e3bbec4   PS 439de904cbd3264f   VS cb8791c5c3e244df
+after rebuild   443 .spv, 443 translated, ZERO failures
+shader_dim_census.py: 347 2D / 112 cube, "agree on every shader", exit 0
+```
+
+All three missed hashes are now present. Note the misses were **different hashes from the two
+in finding 28's session** — so this is finding 20's rule still holding: a drive that reaches
+new material adds a few shaders, and the count creeps rather than jumps. Five distinct misses
+across two full play sessions, against a bank of 443, is a bank that is very nearly complete.
+
+**Why rebuilding from our own dump matters, and not just for the count.** `CLAUDE.md` records
+that the runtime's own dump is the authority on the byte range, because the cache key hashes
+it — a bank built only from Xenia's dumps could in principle key on a different span and miss
+on shaders it actually holds. This rebuild is the first time that authority has been used
+here, and the census agreeing on all 443 says the two decodes do not disagree.
+
+### The third instrument
+
+`CW_VK_FRAME_DUMP` also ran; its output is what priced the imported UI fix at 12 MB/frame in
+gameplay against 1.0 at the title screen (`docs/imported-fixes.md`).

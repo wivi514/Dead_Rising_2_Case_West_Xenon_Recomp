@@ -62,7 +62,7 @@ inferences from a **count** or a **truncated listing**.
 | Runtime | ❌ does not exist yet |
 | Xenia ground truth | ✅ **round 1 COMPLETE** — 13 captures delivered and consumed; nothing outstanding |
 | Coverage oracle | ✅ 104 entry points recovered from C1+C2; config at **135 overrides, 58,448 functions** |
-| Shader cache | ✅ **439 shaders, 439 translated, 0 failures**, dim census 0 disagreements |
+| Shader cache | ✅ **443 shaders, 443 translated, 0 failures**, dim census 0 disagreements — rebuilt 2026-08-16 from OUR OWN runtime's dump (finding 32) |
 | Bink | ✅ **SOLVED — the host contributes file I/O and nothing else.** Guest code decodes it on its own 2 threads, a guest shader converts it (findings 14, 17, 22, 23) |
 | Runtime (W1) | ✅ **COMPLETE** — links, boots (58,695 symbols; 60 s, 87 `.big`, vblanks delivered), save layer confirmed |
 | Kernel-call order | ✅ **set-exact prefix of A5, 0 real divergences** (part 2, finding 27) |
