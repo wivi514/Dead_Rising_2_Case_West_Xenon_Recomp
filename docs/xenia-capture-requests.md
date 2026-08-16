@@ -1,6 +1,30 @@
 # Xenia ground-truth captures needed for Case West — request list (round 1)
 
-**Written 2026-08-15, session 1, before any runtime work. Nothing has been captured yet.**
+> **STATUS 2026-08-15: PARTIALLY DELIVERED.** In hand: **A1, B1, B1b, C1, A2, B2** plus
+> boot-logo screenshots. **Outstanding: A3, A4, A5, C2, B4, W1/W2 (retargeted), E.**
+> What each file is: `Xenia logs/Xenia_Run_Content.md`. **What they taught us:
+> `docs/xenia-capture-analysis.md` — the numbered findings ledger. Read that, not this.**
+>
+> **Three things in this document were wrong, and are corrected in place below:**
+> 1. **§W's premise that the boot Bink is "unmissable and free on A1/B1's drive".** There
+>    is no boot Bink at all — zero `.bik` opened between boot and title. W1 is retargeted;
+>    see the strikethrough in §W1 and finding 4.
+> 2. **§X.1's guess that the mutants "probably belong to co-op".** They are a hot
+>    solo-gameplay lock — 32,382 `NtReleaseMutant` calls in one solo session. Finding 3.
+> 3. **§X.2's framing.** A solo boot *does* enter the networking stack (Winsock + XNet
+>    title address, 405 polls), just not the session layer. Finding 6.
+>
+> Things this document got right and that mattered: the **trial check** (`license_mask = 1`
+> held on every run), **A1 alone first** (it refuted §W before five more captures were
+> taken against the wrong premise), and **`dump_shaders` on everything** — 386 distinct
+> shaders, all of which XenosRecomp translated with zero failures.
+>
+> **A5 is now more valuable than when it was written**, and is the top outstanding item
+> after C2: it is the only place the mutants' call sites (finding 3) and Bink's read
+> cadence (finding 5) become visible, because both are `kHighFrequency`.
+
+**Written 2026-08-15, session 1, before any runtime work.** Six of its runs were delivered
+the same day; see the status banner above for what is still open.
 
 This is a request to a human at another machine. Xenia is unstable on the Linux box this
 repo lives on, so **nothing here can be run or checked from here** — no cvar can be
@@ -81,7 +105,9 @@ expects, and only then batching the rest, costs one message and can save an even
   had to be discarded entirely (an `ftell` limit in the writer). You fixed this at source
   for Case Zero's B2 — if that fix is still in your fork, say so in the index and ignore
   this; if you are on a fresh build, stop a GPU capture promptly at the end of its drive
-  rather than idling.
+  rather than idling. **Confirmed still fixed 2026-08-15: B2 finalized cleanly at 14.8 GiB,
+  ~2× Case Zero's largest. But the stream grows ~1 GB/min — stop a gameplay stream 1–2
+  minutes after combat starts** unless there is a reason to want more.
 - **A `.xtr` must be running from process start**, not attached later. Frame 0 matters
   more than any other frame.
 
@@ -298,23 +324,37 @@ two guest strings that locate that seam are
 `cached memory for the Bink texture pointers - see BinkTextures.cpp`, both about
 GPU-visible memory. **These captures are what tests that hypothesis.**
 
-### W1 — the boot logos, as a single-frame trace **while a movie is on screen**
+### W1 — ~~the boot logos~~ **the New Game intro**, as a single-frame trace
 
-The boot Bink is unmissable and free: A1/B1's drive already plays it. What is needed
-beyond that is **one F4 single-frame capture with the logo movie actually on screen**,
-plus its frame-locked PNG. That one frame tells us the output surface format, its
-dimensions, how it is bound, and what the draw that presents it looks like — which is
-exactly the seam above.
+> **RETARGETED 2026-08-15 (finding 4).** ~~The boot Bink is unmissable and free: A1/B1's
+> drive already plays it.~~ **There is no boot Bink.** A1 opens zero `.bik` between boot
+> and the title screen, and the delivered PNGs show the boot logos are static images from
+> `data/frontend/ratinglogos.big` / `startup.tex`. The premise was mine and it was a
+> filename read as a call site.
+
+What is needed is **one F4 single-frame capture with a Bink movie actually on screen**,
+plus its frame-locked PNG — taken at the **New Game intro** (`800a_intro.bik`), which A2
+confirmed plays and which is the first Bink in the game.
+
+**Take it with `trace_gpu_stream` OFF.** The delivery established that an F4 press during
+an active stream produces a screenshot but no separate frame `.xtr`, which is why the four
+boot-logo PNGs have no paired trace.
+
+That one frame tells us the output surface format, its dimensions, how it is bound, and
+what the draw that presents it looks like — which is exactly the seam above.
 
 ### W2 — an in-world monitor screen
 
 Same thing, at a **security-room monitor bank or the lounge screen** in the Phenotrans
-facility, if the drive reaches one. These are the `*_monitors.bik` / `cine_*_mov.bik`
+facility. **A2 confirmed `807_monitors.bik` opens in the OPENING AREA**, so this is
+reachable early and is no longer the speculative half of §W — it is the second frame to
+take, right after W1, and with `trace_gpu_stream` off for the same reason. These are the `*_monitors.bik` / `cine_*_mov.bik`
 paths, and they are the interesting case: a movie playing as a **texture on geometry**
 rather than fullscreen, which is a different binding and possibly a different format.
 
-**If you can only get one of W1 and W2, get W1** — it is on the boot path, so it blocks
-earlier.
+**Either one answers the question**; W1 first only because the intro comes first in a
+drive that has to pass through it anyway. Neither is on the boot path, so neither blocks a
+first picture (finding 4).
 
 ### W3 — the kernel/file view, which comes free with A1
 

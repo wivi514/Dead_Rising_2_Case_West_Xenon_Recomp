@@ -204,6 +204,13 @@ needs exactly three more.** `runtime/kernel/imports.cpp` (4,668 lines, written i
 order Case Zero's A1 capture called them) is therefore portable essentially whole, and
 the new work is three names, two of which are a mutant pair.
 
+> **PARTIALLY SUPERSEDED, 2026-08-15 (capture findings 3 and 6).** The census stands —
+> 247 against 244, superset, +3 — but two readings taken from it were wrong. The three new
+> names are **not** co-op: `NtReleaseMutant` is called 32,382 times in a *solo* gameplay
+> session and must be a real primitive (finding 3). And a superset import table does not
+> mean the shared 244 are driven the same way — a solo boot calls
+> `NetDll_XNetGetTitleXnAddr` 405 times (finding 6).
+
 Two cautions on what this measurement does and does not say. It is a census of *names in
 the import table*, so it says the surface matches; it says nothing about whether a given
 import is called with the same arguments, in the same order, or at the same time — and
@@ -259,8 +266,19 @@ evidence is not a string this time:
   that ship (`factslaptop.bik`, `cine_loungescreen_mov.bik`,
   `securityroomB_monitors_mov.bik`) — in-world screens, so this is not only the intro.
 
-This is the one genuinely new subsystem in the port, and it lands on the boot path
-(`dr2_logo.bik`). See the plan's item **W1**.
+This is the one genuinely new subsystem in the port. See the plan's item **W3**.
+
+> **RETRACTED IN PART, 2026-08-15 (capture finding 4): this section said Bink "lands on
+> the boot path (`dr2_logo.bik`)".** It does not. Capture A1 opens **zero** `.bik` files
+> between boot and the title screen, and the four frame-locked PNGs show the boot logos
+> are static images out of `data/frontend/ratinglogos.big` / `startup.tex`. The inference
+> was: the file exists, its name says "logo", therefore it plays at boot — **a filename is
+> not a call site.**
+>
+> **Everything else in this section stands**, and finding 5 confirms the substantive
+> claim: Bink really does run, at the New Game intro (`800a_intro.bik`) and on in-world
+> monitor screens (`807_monitors.bik`), streamed **out of the STFS package** rather than
+> the loose files, with no thread of its own.
 
 ## 7. Two inherited tools were silently wrong on this title
 

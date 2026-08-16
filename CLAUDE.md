@@ -25,7 +25,15 @@ low-risk — the import table says so.
 ## Status: session 1 (2026-08-15), bootstrap only
 
 Everything measured on day 1 is in **`docs/bootstrap-2026-08-15.md`**. The plan for what
-comes next is **`docs/port-plan.md`**. Those two are the whole project memory right now.
+comes next is **`docs/port-plan.md`**. **`docs/xenia-capture-analysis.md` is the numbered
+findings ledger and the authority on any measured number — where another doc disagrees
+with it, it wins.**
+
+**Session 2 (2026-08-15) took delivery of six round-1 captures, and they refuted two
+claims this project had already written down.** The mutants are a hot *solo* lock, not
+co-op (finding 3), and there is **no boot Bink** — a filename was read as a call site
+(finding 4). Both are retracted in place wherever they were claimed. That is the thesis
+risk in this port arriving on schedule: see "The thesis of this port" below.
 
 | | state |
 |---|---|
@@ -36,7 +44,9 @@ comes next is **`docs/port-plan.md`**. Those two are the whole project memory ri
 | Recompilation | ✅ 58,345 functions, 228 TUs, **zero** `jump outside function`, **zero** dropped branches |
 | Import surface | ✅ 247 names = Case Zero's 244 **+ 3** |
 | Runtime | ❌ does not exist yet |
-| Xenia ground truth | ❌ **no capture of this title exists** — round 1 requested, `docs/xenia-capture-requests.md` |
+| Xenia ground truth | 🟡 **round 1 PARTIAL** — A1, B1, B1b, C1, A2, B2 in hand; A3/A4/A5/C2/B4/W1/W2/E open |
+| Coverage oracle | ✅ 43 entry points recovered from C1; config at 76 overrides, **58,387 functions** |
+| Shader cache | ✅ **386 shaders, 386 translated, 0 failures**, dim census 0 disagreements |
 
 Nothing has been compiled by a C++ compiler and nothing has been checked against
 hardware.
@@ -53,9 +63,12 @@ session 1 caught three of those before writing a line of runtime code:
 
 1. **Bink.** Case Zero *retracted* "this game uses Bink" after measuring that no decoder
    ran and no `.bik` shipped. **Case West genuinely uses Bink**: four Bink sections in
-   the XEX (one executable), ten `.bik` files, a `binkmovieplayer.cpp` wrapper, and
-   `dr2_logo.bik` on the boot path. Applying Case Zero's retraction here would have been
-   exactly backwards.
+   the XEX (one executable), ten `.bik` files, a `binkmovieplayer.cpp` wrapper. Applying
+   Case Zero's retraction here would have been exactly backwards.
+   **But I then over-corrected**: I wrote that `dr2_logo.bik` plays at boot, purely because
+   its name says "logo". Capture A1 opens **zero** `.bik` before the title screen — the boot
+   logos are static images. **A filename is not a call site** (finding 4). Bink is real and
+   first plays at the New Game intro.
 2. **Two code sections.** Case Zero has one (`.text`). Case West has `.text` *and*
    `BINK`. XenonRecomp handles it; two inherited analysis tools did not, and both
    reported clean runs while skipping a whole section.
@@ -66,6 +79,13 @@ session 1 caught three of those before writing a line of runtime code:
 That is gotcha 3 in a new dress and it is this port's characteristic failure mode:
 **a tool or a conclusion copied from a sibling port carries that port's constants, and a
 constant wrong in the safe direction reports a clean run over a smaller image.**
+
+**Session 2 added the second half of that failure mode, from the other direction:** two
+claims made here from *this* image — mutants are co-op, Bink is on the boot path — were
+refuted by the first captures. Both were inferences dressed as findings. The shared lesson
+with the three above is one sentence: **an absence measured on one path is not an
+attribution to another, and a name is not a call site.** Both are in
+`docs/xenia-capture-analysis.md` as findings 3 and 4, with what produced each error.
 
 ## Transferable gotchas
 
@@ -155,7 +175,11 @@ corrected position rather than repeating the fix.
 - `assets/game/default_image.bin` (+ `.sections`) — the loaded image for offline
   analysis, from `tools/xex_image_dump`. **The `.sections` sidecar is now an input**, not
   just a record: two tools read their code ranges out of it.
-- `ppc/` — generated C++ (gitignored; 156 MB, 58,345 functions, regeneratable).
+- `ppc/` — generated C++ (gitignored; 156 MB, 58,387 functions, regeneratable).
+- `assets/shader_spv/` — the SPIR-V cache (gitignored, 10 MB, game-derived): 386 `.spv` +
+  386 `.meta.json`, built from the captures' microcode. Rebuild it with the Commands
+  section. Microcode dumps live in `~/DR2CW-troubleshooting/ucode-dumps` — **not `/tmp`,
+  which is a tmpfs and has silently eaten dumps in the sibling port.**
 - `tools/` — analysis scripts, all copied from Case Zero with provenance in their
   headers. `gdis.py` is the guest disassembler and is usually the right first stop for
   any question about what the title's own code does. `import_call_sites.py` is the one to
@@ -164,6 +188,8 @@ corrected position rather than repeating the fix.
 - `docs/` — the project's memory:
   - **`bootstrap-2026-08-15.md`** — day 1. Every number in this file was measured on
     *this* image. Read it first.
+  - **`xenia-capture-analysis.md`** — **the numbered findings ledger.** The authority on
+    any measured number; read it before believing a number in any other file here.
   - **`port-plan.md`** — what to do next, as items W0–W8 with gates and costs.
   - **`xenia-capture-requests.md`** — round 1, written 2026-08-15, **open and unfulfilled**.
     Nothing in this port has been checked against hardware. Its §0 records what Case Zero
@@ -234,6 +260,30 @@ class that leaks a callee's non-volatiles into its caller (gotchas 53-55).
 ```
 python3 tools/find_unlowered_switches.py          # 0 defects expected
 python3 tools/find_unlowered_switches.py --all    # also list benign tail-call thunks
+```
+
+Rebuild the SPIR-V shader cache. **`assets/shader_spv/` is gitignored, so a fresh clone
+needs this.** Input is the captures' microcode (and, once a runtime exists, its own dump,
+which is the authority on the byte range because the cache key hashes it):
+```
+python3 tools/xenia_ucode_to_cache.py "Xenia logs"/*/cw_shaders_*/ \
+    ~/DR2CW-troubleshooting/ucode-dumps          # 386 distinct
+tools/build_shader_spv.sh ~/DR2CW-troubleshooting/ucode-dumps assets/shader_spv
+python3 tools/shader_dim_census.py               # 0 disagreements expected; exit 1 = defect
+```
+The census is **two-sided by construction** — the per-slot texture dimension is derivable
+both from our ucode parse and from DXC's `OpDecorate` words, so a disagreement means one
+of the two decodes is wrong. Keep the dumps out of `/tmp`.
+
+Recover entry points from a Xenia coverage trace, then **always** run the disposal pass —
+the oracle proposes loop headers that split real functions, and only the dropped-branch
+check can tell those from genuine indirect targets:
+```
+python3 tools/coverage_to_function_overrides.py --trace <trace.0> --ppc-dir ppc/ \
+    --image assets/game/default_image.bin --config config/CaseWest.toml --apply
+#   regenerate ppc/, then:
+python3 tools/find_dropped_branches.py --prune    # regenerate again
+python3 tools/fix_switch_function_bounds.py --apply
 ```
 
 Look inside the game's `.big` archives — 154 of them:

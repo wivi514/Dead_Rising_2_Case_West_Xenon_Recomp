@@ -105,10 +105,21 @@ What has to change, in rough order of certainty:
      shown to have engaged, and a renamed-but-unread variable is exactly that failure. The
      gate for this step is not "it compiles" — it is that a known arm still visibly changes
      what it always changed. Pick one with an obvious effect and check both directions.
-- `kernel/imports.cpp` — the 244 shared imports transfer; add the **three new ones**:
-  `DbgBreakPoint`, `NtCreateMutant`, `NtReleaseMutant`. The mutant pair is a real
-  synchronisation primitive and must be implemented properly, not stubbed — a mutant that
-  fakes acquisition is gotcha 5's failure mode with a deadlock at the end of it.
+- `kernel/imports.cpp` — the 244 shared imports transfer; add the **three new ones**.
+  Round 1 measured what they are (findings 3 and 6), which changes this item:
+  - **`NtCreateMutant` / `NtReleaseMutant` are a HOT SOLO-GAMEPLAY LOCK, not co-op.**
+    6 created, **32,382 released** in a 5–10 minute solo session — per-frame or
+    per-resource, volume pointing at audio/XMA or the streaming loader. Real primitives,
+    properly implemented; a mutant that fakes acquisition is gotcha 5 with a deadlock at
+    the end, on the hot path, where it will be blamed on anything else.
+    *(This retracts the plan's earlier guess that they were co-op. A1's zero calls at boot
+    was evidence that boot does not use them — not an attribution to another path.)*
+  - **`DbgBreakPoint` is never called** (0 in both captures). Safe to stub.
+  - **And the shared 244 are not all driven as Case Zero drives them.** A solo boot calls
+    `NetDll_WSAStartup` ×2, `NetDll_XNetStartup` ×1 and `NetDll_XNetGetTitleXnAddr`
+    **×405** — a poll, not an initialisation. Winsock and the XNet title-address query are
+    on the single-player critical path, so "multiplayer is out of scope" cannot be
+    implemented as "make every NetDll call fail" (finding 6).
 - `kernel/content.{h,cpp}` — the save layer. Its header comment derives the whole XAM
   enumerate protocol from the title's own statically-linked `XamEnumerate`; that
   derivation should transfer, but **re-run it against this image** rather than trusting
@@ -172,8 +183,19 @@ frame, then B1+B1b, then C1.
 The evidence is in bootstrap §6 and it is not a string inference this time: four Bink
 sections (one executable), ten `.bik` files totalling 66 MB, a
 `binkmovieplayer.cpp` wrapper with live diagnostics, and runtime path construction
-naming in-world screens beyond the ten shipped files. **`dr2_logo.bik` is on the boot
-path**, so this cannot be deferred to the end the way a cutscene could.
+naming in-world screens beyond the ten shipped files. ~~**`dr2_logo.bik` is on the boot path**, so this cannot be deferred to the end the way a
+cutscene could.~~ **RETRACTED by finding 4 — there is no boot Bink.** A1 opens zero `.bik`
+between boot and title; the boot logos are static images from
+`data/frontend/ratinglogos.big` / `startup.tex`. Bink first plays at the **New Game
+intro** (`800a_intro.bik`) and on **in-world monitor screens** (`807_monitors.bik`,
+reached in the opening area), streamed **out of the STFS package** via
+`StfsContainerDevice::ResolvePath(\data\movies)` rather than from the loose files — so
+the VFS must serve them from the container. No dedicated movie thread is created, which is
+consistent with the recompiled-decoder hypothesis below.
+
+**This lowers W3's urgency but not its size**: it is off the boot path, so a first picture
+(W4) can be reached without it — but it is the first cinematic in the game, so it is
+between the title screen and all gameplay.
 
 **The lead worth testing first, because if it holds this item nearly vanishes: the
 decoder is already recompiled.** `BINK` is a `SectionFlags_Code` section, XenonRecomp
