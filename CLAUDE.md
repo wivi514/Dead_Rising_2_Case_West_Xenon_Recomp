@@ -70,7 +70,7 @@ inferences from a **count** or a **truncated listing**.
 | **Gameplay** | ✅ **IT PLAYS** — 20,765-frame drive: gameplay, cinematics with subtitles, full HUD, pause menu. 26.2 M draws, 0 truncated IBs, only **2** shader-cache misses (finding 28) |
 | **Intro → safehouse** | ✅ **playable, with zombie combat**, and "pretty much exactly like Xenia" — **and better in one place: a cutscene Xenia truncates plays through here** (operator, finding 29, gotcha 320) |
 | Save/load | ✅ **behaviourally confirmed** — saved and loaded inside a real session (finding 29). Part 1's confirmation was static only |
-| HUD/menu text | ⏳ **fix IMPORTED 2026-08-16** from Case Zero `82d181f` (part 46) — the stream store's guard now earns exactness per stream. The mechanism engages and is priced here (25-30 streams, 1.0 MB/frame); **the defect is not yet re-confirmed fixed in play on this port.** `docs/imported-fixes.md` |
+| HUD/menu text | ✅ **FIXED** — imported 2026-08-16 from Case Zero `82d181f` (part 46), **confirmed in play by the operator** ("Ui seems to work really well this time"). Costs ~12 MB/frame of extra hashing in gameplay. `docs/imported-fixes.md` |
 
 **~~Part 2's first job is the spin~~ — RETRACTED, and by the measurement it asked for.**
 There was no spin to fix. The kernel-call order is a **set-exact prefix of A5's with zero

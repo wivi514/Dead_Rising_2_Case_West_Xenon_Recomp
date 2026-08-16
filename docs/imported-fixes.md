@@ -36,7 +36,7 @@ Rules that apply to every row:
 | **Diagnosis commit** | Case Zero `3dea7c1` — *"part 45: THE UI TEXT DEFECT IS THE STREAM STORE'S GUARD"* |
 | **Files changed here** | `runtime/gpu/vk_renderer.cpp` only |
 | **Control arm** | `CW_VK_NO_DYNAMIC_GUARD=1` (Case Zero's `CZ_VK_NO_DYNAMIC_GUARD`) |
-| **Re-measured here?** | **The mechanism engages here and is priced here. The DEFECT ITSELF has not been re-confirmed fixed on this port — that needs an operator play session.** |
+| **Re-measured here?** | **YES — confirmed in play by the operator, 2026-08-16: *"Ui seems to work really well this time."*** Mechanism engages, cost priced, defect confirmed fixed. |
 
 ### The symptom on this port
 
@@ -91,14 +91,39 @@ this title's pacing floor, so the comparison cannot resolve any cost smaller tha
 headroom (gotcha 237: *a mean frame time measures the vblank pacing floor, not your change*).
 A gameplay session at ~1,265 draws/frame is where a real price would show.
 
-### What is still owed on this import
+### CONFIRMED IN PLAY, 2026-08-16 — and the gameplay price
 
-- **Confirm the defect is actually fixed on this port**, in play, by the operator — the same
-  way Case Zero confirmed it. Everything measured here says the *mechanism* runs; nothing
-  here says the *HUD text* is right, because that needs eyes on a gameplay session.
-- If it is NOT fixed, the useful next reading is whether the promotion count rises when the
-  HUD is on screen, and `CW_VK_STREAM_GUARD_EXACT=1` remains the unlimited arm that separates
-  "the guard is still wrong" from "it was never the guard here".
+The operator, on the session launched with this build: **"Ui seems to work really well this
+time."** That is the same class of evidence Case Zero closed its own part 46 on (*"Ui stay
+good the whole time"*), and it is the evidence that matters — the mechanism engaging was
+never in doubt once the counter moved; whether the glyphs are right is a thing only eyes
+settle.
+
+**The gameplay cost, which the title-screen A/B could not see:**
+
+```
+title screen   25-30 streams/frame promoted,  1.0 MB/frame
+gameplay      102-149 streams/frame promoted, 12.0-12.7 MB/frame
+```
+
+So the honest price of this fix on Case West is **~12 MB/frame of extra hashing in
+gameplay**, not the 1.0 the first measurement suggested — a 12x difference, and a good
+reminder that a title-screen arm is not a gameplay arm (gotcha 133: one scene is one sample).
+It remains below Case Zero's ~18 MB/frame, which is consistent with this title having no
+outdoor streaming route.
+
+**What that price buys is not yet separated from what it costs.** Both title-screen arms sat
+on the 32.0 ms two-vblank pacing floor, so no frame-time comparison here has resolved the
+fix's cost at all. If gameplay frame time ever becomes the question, `CW_VK_NO_DYNAMIC_GUARD=1`
+is the same-binary control arm and the A/B must be run **in gameplay at matched draws**, not
+at the title screen.
+
+### If it ever regresses
+
+`CW_VK_STREAM_GUARD_EXACT=1` remains the unlimited arm, which separates "the adaptive guard
+is still missing something" from "it was never the guard". `CW_VK_NO_DYNAMIC_GUARD=1` returns
+to the pre-import policy and should make the defect come back — that is the test that this
+fix is the thing holding it closed.
 
 ### Not imported from the same neighbourhood
 
