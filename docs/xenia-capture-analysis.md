@@ -682,3 +682,121 @@ whenever they are needed rather than because anything needs them now:
   A1/A2/A3.
 
 `DbgBreakPoint` is still never called, across every capture in round 1. It stays stubbed.
+
+---
+
+## 27. **THE RUNTIME WAS NEVER STALLED. It renders the title screen.** — part 2, 2026-08-15
+
+**This retracts part 2's own premise before any work was done on it.**
+`docs/part2-kickoff.md` §2 opened with "the boot **does not present a frame**", named the
+`RtlEnterCriticalSection` spin as the thing to explain, and set the first measurement as a
+kernel-call-order diff. The diff was run. It passed — and running it is what exposed that
+there was nothing to diagnose.
+
+### What was measured, in order
+
+**1. The kernel-call order matches the ground truth.** Against A5 with
+`--include-high-frequency` (the authority on the synchronisation surface, and the right
+oracle for a lock-shaped symptom):
+
+```
+ours 114 distinct calls  ·  A5 129  ·  5 mismatch windows, ALL same-set permutations
+0 REAL divergences  ·  exit 0
+```
+
+Our sequence is a **set-exact prefix** of A5's. The five permutation windows are thread
+races at startup (`KeSetAffinityThread` against the `Vd*` block, `XamUserCheckPrivilege`
+against `XamUserGetXUID`), which is what the script's window analysis exists to classify.
+
+**2. The A1 comparison's two "ours-only" names are A1 being the outlier, not us.**
+Against A1 the masked gate reports a divergence at position 26 and two names we call that
+A1 never does: `XamInputSetState` and `XMsgStartIORequest`. Both appear in **seven** of the
+other captures, and both appear in A5 at the same positions we call them (104 and 114). A1
+is the only capture of the eleven that lacks either. This is gotcha 172/268 in its exact
+form — *an oracle is only as good as its coverage* — and the reason the tool's docstring
+says to run both captures rather than either.
+
+**3. The guest's render loop was running the whole time.** `CW_RING_TRACE=1`, which reports
+the counters the command processor keeps, over a 90 s headless run:
+
+```
+pm4 packets=34,015,150   frames(XE_SWAP)=2,783   draws=2,059,284
+predicated out=5,504     interrupts=8,930        indirect buffers truncated=0
+```
+
+**2,783 frames in 90 s is ~31 fps.** The title was submitting draws and swapping the whole
+time. `truncated=0` is the specific counter that would be nonzero if findings 37-39's
+dropped-fence class had come back; it did not.
+
+**4. The spin is the title's own idiom, and Xenia does it too.** A5 logs
+`RtlEnterCriticalSection` **7,416,110** times across its **5,062** frames — **1,465 enters
+per frame on the emulator**. Ours is 7,143,424 across 2,783 frames, **2,567 per frame**:
+**1.75x**, the same order of magnitude, on a runtime rendering at half A5's frame rate.
+"6.8 M enters in a minute" was never a hang signature; it is what this title's worker
+threads cost per frame. A5 shows the identical `RtlEnter`/`RtlLeave` pair storm on thread
+`F80000E4` in the hundred lines immediately after `XMsgStartIORequest`.
+
+**5. With the renderer switched on, it draws the game.** `CW_VKDRAW=1` had **never been
+run** on this port. First run, no changes to any renderer source:
+
+```
+[vk] device: NVIDIA GeForce RTX 3070 (Vulkan 1.4.341)
+[host] first present: front buffer A0826000, guest says 1280x720
+frame: has content 2,243   ·   frame: uniformly black 6
+draw: handed to the renderer 922,541   ·   grep -c "no translated shader" = 0
+```
+
+The 439-shader cache covered **every** shader the frontend asked for on the first run —
+that gate (`part2-kickoff.md` §2 item 3) passes untouched.
+
+`CW_VK_FRAME_DUMP` writes the presented picture, which is how this was checked rather than
+by a compositor screenshot (`grim` does not work under this KDE session, and the runtime's
+own dump is the better instrument anyway — it captures what was *presented*, not what the
+window manager composited). The dumps show:
+
+- **frame 200: the Capcom logo**, correct colours, on black.
+- **frames 800 onward: the Case West title screen** — Chuck and Frank on the clifftop over
+  the lit Phenotrans facility, purple dusk sky, "PRESS START", the 2010 Capcom copyright
+  line. Correct.
+- **It animates.** ~26% of sampled pixels change between consecutive dumps, steady across
+  fifteen dumps. That confirms finding 19's "the title screen is an animated 3D scene" from
+  our own renderer, and rules out a frozen framebuffer being mistaken for a picture
+  (gotcha 133: one frame is one sample — so this was measured over fifteen).
+
+### What actually happened, and the lesson
+
+The runtime was sitting on the **title screen waiting for someone to press START**. Polling
+`XamInputGetState`/`XamInputSetState` in a loop while worker threads take and release locks
+is *exactly* what that looks like from a kernel log. Every symptom in the kickoff's problem
+statement was a correct observation of a healthy title screen.
+
+The picture was missing because **the renderer is off by default** — `CW_VKDRAW` is unset
+unless asked for, deliberately, so that it stays a true control arm — and the runs that
+produced the "does not present a frame" note were `CW_NO_WINDOW=1` headless runs, which
+print that they present nothing.
+
+**This is finding 18's shape exactly, one part later.** There, a listing truncated to the
+top 12 draws *by vertex count* hid every 4-vertex Bink quad, and the absence was read as
+"no video texture". Here an absence of pixels was read as "the guest never gets there",
+when it was a fact about **which flag was set on the run that was looked at**. The port's
+recurring error is now five for five:
+
+> **An absence is a fact about what was looked at, not about what exists.** Before an
+> absence becomes a work item, ask what would have had to be switched on for the thing to
+> appear at all.
+
+And the corollary this one adds, which is the cheap half: **ask the oracle whether it shows
+the symptom too.** A5 answered "the emulator does 1,465 lock enters per frame" in one grep,
+and that single number would have retired the whole investigation before it started.
+
+### What this changes
+
+- **W4 "first picture" is DONE**, and was already done when part 2 opened — it needed a
+  flag, not a fix.
+- The kickoff's ordered list in §2 is void from item 1. The next real work is downstream of
+  a rendering frontend, not upstream of a hang.
+- **The `float16_4` / unrecognized-instruction gaps (W0.3) did not block the frontend.**
+  They remain silent wrong-execution traps and still need doing, but they are not on the
+  critical path they were assumed to be on.
+- Nothing here has been checked past the title screen. **Press START and the measurements
+  start over** — this finding covers the frontend and says nothing about gameplay.

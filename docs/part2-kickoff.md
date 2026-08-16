@@ -86,7 +86,29 @@ planes are linear) and read chroma at its **padded 768 pitch**, not 640.
 
 ## 2. WHERE TO START — an ordered list, first measurement named
 
-### The problem to solve
+> ### ⛔ RETRACTED IN FULL — there was no problem. See finding 27.
+>
+> **The premise below is wrong and part 2 refuted it with the very measurement this
+> section asked for.** The runtime was never stalled: it renders the Capcom logo and the
+> animated Case West title screen, at ~31 fps, and was sitting on **PRESS START waiting for
+> input**. The kernel-call order is a set-exact prefix of A5's with **zero** real
+> divergences. The `RtlEnterCriticalSection` storm is the title's own idiom — **Xenia does
+> 1,465 lock enters per frame; we do 2,567**, on a runtime running at half A5's frame rate.
+>
+> There was no picture because **the renderer is off unless `CW_VKDRAW=1`**, and the runs
+> behind this note were `CW_NO_WINDOW=1` headless ones. Every symptom listed below is a
+> correct observation of a healthy title screen.
+>
+> **Item 3 below ("once it presents: W4, first picture") is therefore already DONE**, and
+> its gate passed untouched on the first run: `no translated shader` = 0, the 439-shader
+> cache covered the entire frontend.
+>
+> The lesson is this port's fifth of the same kind and is written out in finding 27:
+> *an absence is a fact about what was looked at* — here, about which flag the run had set.
+> The cheap half is cheaper still: **ask the oracle whether it shows the symptom too.** One
+> `grep -c RtlEnterCriticalSection` on A5 would have retired this before it started.
+
+### ~~The problem to solve~~ (retracted — kept verbatim as the record of the error)
 
 The boot **does not present a frame**. It settles into a loop polling
 `XamInputGetState`/`XamInputSetState` while a worker spins hard on
@@ -150,6 +172,16 @@ spinning thread is in.
 | `cw_runtime --smoke` | 58,695 symbols, all mappings sane |
 | `xtr_draw_bindings.py --self-test` | 439/439 hash to their own filenames |
 | the `CZ_`→`CW_` rename | three-way, with a negative control |
+
+**Run and passing, added in part 2:**
+
+| gate | state |
+|---|---|
+| `kernel_call_diff.py --derive-mask` | constant agrees with all 11 captures; fails on purpose both ways |
+| `kernel_call_diff.py` vs A5, `--include-high-frequency` | 5 windows, all permutations, **0 real**, exit 0 |
+| `grep -c "no translated shader"` with `CW_VKDRAW=1` | **0** — the 439-shader cache covers the whole frontend |
+| ring trace `indirect buffers truncated` | **0** |
+| the picture itself | Capcom logo, then the animated title screen, correct |
 
 **Still owed:**
 

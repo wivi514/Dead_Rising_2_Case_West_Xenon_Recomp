@@ -64,11 +64,23 @@ inferences from a **count** or a **truncated listing**.
 | Coverage oracle | ✅ 104 entry points recovered from C1+C2; config at **135 overrides, 58,448 functions** |
 | Shader cache | ✅ **439 shaders, 439 translated, 0 failures**, dim census 0 disagreements |
 | Bink | ✅ **SOLVED — the host contributes file I/O and nothing else.** Guest code decodes it on its own 2 threads, a guest shader converts it (findings 14, 17, 22, 23) |
-| Runtime (W1) | ✅ **COMPLETE** — links, boots (58,695 symbols; 60 s, 87 `.big`, vblanks delivered), save layer confirmed. Does not present a frame yet |
+| Runtime (W1) | ✅ **COMPLETE** — links, boots (58,695 symbols; 60 s, 87 `.big`, vblanks delivered), save layer confirmed |
+| Kernel-call order | ✅ **set-exact prefix of A5, 0 real divergences** (part 2, finding 27) |
+| First picture (W4) | ✅ **RENDERS** — Capcom logo, then the animated title screen at ~31 fps, `CW_VKDRAW=1`. Shader cache covered the whole frontend, 0 misses |
 
-**Part 2's first job is the spin:** the runtime boots and runs but never presents a frame
-— a worker spins on `RtlEnterCriticalSection` 6.8 M times a minute. The first measurement
-is a kernel-call-order diff against capture A1, not a debugger. `docs/part2-kickoff.md` §2.
+**~~Part 2's first job is the spin~~ — RETRACTED, and by the measurement it asked for.**
+There was no spin to fix. The kernel-call order is a **set-exact prefix of A5's with zero
+real divergences**, and the runtime **renders the Capcom logo and the animated title screen
+at ~31 fps** — it was sitting on PRESS START waiting for input. The lock storm is the
+title's own idiom: **Xenia does 1,465 `RtlEnterCriticalSection` per frame, we do 2,567.**
+There was no picture because the renderer is off unless `CW_VKDRAW=1` and the runs behind
+that note were headless. **Finding 27**, and `docs/part2-kickoff.md` §2 carries the
+retraction in place.
+
+That makes five for five on this port's recurring error — **an absence is a fact about what
+was looked at**, here about which flag the run had set — and adds the cheap corollary:
+**ask the oracle whether it shows the symptom too.** One grep on A5 would have retired the
+whole investigation before it started.
 
 ## The thesis of this port, and the risk that comes with it
 
