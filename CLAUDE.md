@@ -48,6 +48,7 @@ risk in this port arriving on schedule: see "The thesis of this port" below.
 | Coverage oracle | ✅ 104 entry points recovered from C1+C2; config at **135 overrides, 58,448 functions** |
 | Shader cache | ✅ **439 shaders, 439 translated, 0 failures**, dim census 0 disagreements |
 | Bink | ✅ **SOLVED — needs no host code.** Guest code decodes it, a guest shader converts it (finding 17) |
+| Runtime (W1) | ✅ **transplanted, links, and BOOTS** — 58,695 symbols resolved; 60 s with no crash, 87 `.big` opened, vblanks delivered. Does not present a frame yet |
 
 Nothing has been compiled by a C++ compiler and nothing has been checked against
 hardware.
@@ -203,12 +204,18 @@ corrected position rather than repeating the fix.
   - **`gotchas.md`** — the 315-entry transferable ledger. Every "gotcha N" resolves here.
   - `reusability.md` — the tier list for what may be extracted into shared code, and the
     two rules governing it. Relevant at W6, not before.
-- `runtime/` — **does not exist yet.** W1 creates it by transplanting Case Zero's.
-  **Its instruments are renamed `CZ_*` → `CW_*` at transplant time** (operator's decision,
-  2026-08-15) so an exported variable cannot reach the wrong port's binary on a machine
-  that runs both. The prefix appears inside string literals as well as identifiers, so the
-  gate for that rename is that a known arm still visibly changes what it always changed —
-  not that it compiles (gotcha 151).
+- `runtime/` — the host runtime, transplanted from Case Zero in W1 (`docs/w1-transplant-notes.md`).
+  **Its instruments are `CW_*`**, renamed at transplant time so an exported variable cannot
+  reach the wrong port's binary on a machine that runs both; the gate for that rename was
+  three-way, including a negative control proving the old `CZ_` name does nothing.
+  Target is `cw_runtime`; the link gate survives as `cw_runtime --smoke`.
+  - `runtime/port-pending/` — **four modules deliberately NOT built**: `guest_probe.cpp`,
+    `debug_tunables.cpp`, `d3d_hooks.cpp`, `d3d_draw.cpp`. They are Case Zero's per-title
+    reverse engineering (the "never shared" tier), and between them they name 156 guest
+    addresses of which **155 do not exist here and one, `sub_82475718`, does** — it would
+    have linked silently to an unrelated function. Read that directory's README before
+    restoring any of them. `debug_tunables_stub.cpp` and `d3d_draw_stub.cpp` keep the seam
+    and report their own absence.
 - `Xenia logs/` — captures land here (gitignored); the index
   `Xenia logs/Xenia_Run_Content.md` **is** tracked and is the only thing that survives a
   lost capture. Empty so far.

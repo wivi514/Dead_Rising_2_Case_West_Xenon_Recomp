@@ -1,0 +1,354 @@
+#include "xex_imports.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+
+#include <xbox.h>
+#include <xex.h>
+
+#include "heap.h"
+#include "klog.h"
+#include "memory.h"
+
+std::atomic<uint32_t> g_keTimeStampBundle{ 0 };
+std::atomic<uint32_t> g_xexHeaderBase{ 0 };
+
+// The xboxkrnl variable exports Case West actually imports.
+//
+// Not a general table copied from a template port — it is exactly the 13 unpaired
+// type-0 descriptors in THIS image's import table, re-verified for Case West against
+// its own A1 dump, which marks variable imports with a `V` and prints the ordinal.
+// Transcribed from `Xenia logs/A1_boot_menu_fullgame/xenia_A1.log.gz`:
+//
+//   V 82000790  266 (614)  KeCertMonitorData         V 82000850  1AE (430)  ExLoadedCommandLine
+//   V 820007F4  1C0 (448)  VdGpuClockInMHz           V 82000854  059 ( 89)  KeDebugMonitorData
+//   V 82000808  1C1 (449)  VdHSIOCalibrationLock     V 82000860  01B ( 27)  ExThreadObjectType
+//   V 82000824  1BF (447)  VdGlobalXamDevice         V 820008A8  00E ( 14)  ExEventObjectType
+//   V 82000828  1BE (446)  VdGlobalDevice            V 820008B4  193 (403)  XexExecutableModuleHandle
+//   V 8200082C  156 (342)  XboxHardwareInfo          V 820008E0  0AD (173)  KeTimeStampBundle
+//   V 820008FC  158 (344)  XboxKrnlVersion
+//
+// **The ADDRESSES differ from Case Zero's and the ORDINALS are identical** — same 13,
+// and Asura's Wrath's set was the same 13 again, across three studios, engines and SDK
+// years. These are what the XDK's static libraries pull in, so the set is a property of
+// the SDK rather than of the title, and this is now the third independent confirmation
+// of that. Do not take it as licence to skip the check: the addresses moved, which is
+// exactly the kind of thing that transfers wrongly if assumed. The same A1 dump also
+// confirms the 247 `F` entries match `ppc_recomp_shared.h` exactly, and it costs one
+// grep.
+//
+// Anything not listed still gets 16 zeroed bytes plus a log line, so a future
+// import-set change is visible rather than silent.
+namespace
+{
+struct KernelVariable
+{
+    const char* name;
+    uint32_t size;
+};
+
+const KernelVariable* LookupKernelVariable(uint32_t ordinal)
+{
+    static const struct { uint32_t ordinal; KernelVariable var; } kVars[] = {
+        { 0x00E, { "ExEventObjectType",         0x20 } }, // OBJECT_TYPE; only its address is used
+        { 0x01B, { "ExThreadObjectType",        0x20 } },
+        { 0x059, { "KeDebugMonitorData",        4    } },
+        { 0x0AD, { "KeTimeStampBundle",         0x18 } }, // {interrupt time, system time, tick count}
+        { 0x156, { "XboxHardwareInfo",          0x10 } },
+        { 0x158, { "XboxKrnlVersion",           8    } },
+        { 0x193, { "XexExecutableModuleHandle", 4    } },
+        { 0x1AE, { "ExLoadedCommandLine",       1024 } },
+        { 0x1BE, { "VdGlobalDevice",            4    } }, // D3D stores its device pointer here
+        { 0x1BF, { "VdGlobalXamDevice",         4    } },
+        { 0x1C0, { "VdGpuClockInMHz",           4    } },
+        { 0x1C1, { "VdHSIOCalibrationLock",     28   } }, // RTL_CRITICAL_SECTION
+        { 0x266, { "KeCertMonitorData",         4    } },
+    };
+    for (const auto& v : kVars)
+        if (v.ordinal == ordinal)
+            return &v.var;
+    return nullptr;
+}
+
+uint32_t AllocateVariable(uint32_t ordinal, const char* libName)
+{
+    const KernelVariable* known = LookupKernelVariable(ordinal);
+    const uint32_t size = known ? known->size : 16;
+    auto* host = static_cast<uint8_t*>(g_heap.Alloc(size));
+    if (!host)
+        return 0;
+    memset(host, 0, size);
+    const uint32_t guest = g_memory.MapVirtual(host);
+
+    switch (ordinal)
+    {
+    case 0x0AD: // KeTimeStampBundle: kept current by the vsync pump from phase 3 on
+        g_keTimeStampBundle = guest;
+        break;
+    case 0x156: // XboxHardwareInfo: {flags, cpu count, ...} — 3 cores x 2 threads
+        host[4] = 6;
+        break;
+    case 0x158: // XboxKrnlVersion — and Case Zero DOES branch on it, so this stopped
+                // being a free constant (the note that used to sit here said that
+                // would be a finding; it is finding 31).
+                //
+                // sub_825D7AC8, the rumble path, reads this struct and takes a
+                // legacy code path only when major == 2, minor == 0 and build <
+                // 5611. The capture's config line is `kernel_build_version = 1888`,
+                // so A1 takes it; the 2.0.14448.0 both template ports report does
+                // not. Matching the capture is the whole basis of the phase gate, so
+                // 1888 it is — and it is also the conservative direction, because a
+                // version is a claim about which XAM entry points exist and ours is
+                // a minimal XAM (gotcha 58: raise a version gate only together with
+                // the exports it unlocks).
+                //
+                // MEASURED, so the claim is not oversold: three 25 s runs at each
+                // value reach 82/85/82 and 85/82/85 visible kernel calls — the same
+                // distribution, and the 82-vs-85 spread is boot timing, not the
+                // version (gotcha 50: one arm is not a measurement). So this is
+                // chosen for faithfulness to the capture's control flow, NOT because
+                // it was observed to get the boot further.
+        *reinterpret_cast<be<uint16_t>*>(host + 0) = 2;
+        *reinterpret_cast<be<uint16_t>*>(host + 2) = 0;
+        *reinterpret_cast<be<uint16_t>*>(host + 4) = 1888;
+        break;
+    case 0x193: // XexExecutableModuleHandle: the guest-resident XEX header block
+        *reinterpret_cast<be<uint32_t>*>(host) = g_xexHeaderBase.load();
+        break;
+    case 0x1AE: // ExLoadedCommandLine
+        strcpy(reinterpret_cast<char*>(host), "default.xex");
+        break;
+    case 0x1C0: // VdGpuClockInMHz
+        *reinterpret_cast<be<uint32_t>*>(host) = 500;
+        break;
+    default:
+        break;
+    }
+
+    fprintf(stderr, "[loader] data import %s!%s (ord 0x%X) -> 0x%08X (%u bytes)\n", libName,
+            known ? known->name : "<UNKNOWN — check the ordinal against xboxkrnl_table.inc>",
+            ordinal, guest, size);
+    return guest;
+}
+} // namespace
+
+uint32_t PublishXexHeaders(const uint8_t* xexFile, size_t xexFileSize)
+{
+    // Xex2Header: magic, moduleFlags, sizeOfHeaders, ... — every optional-header
+    // offset is relative to the module start, so copying the first sizeOfHeaders
+    // bytes verbatim gives a self-consistent block the guest can walk.
+    const uint32_t sizeOfHeaders =
+        __builtin_bswap32(*reinterpret_cast<const uint32_t*>(xexFile + 8));
+    const uint32_t copy =
+        std::min<uint32_t>(sizeOfHeaders, static_cast<uint32_t>(xexFileSize));
+
+    auto* host = static_cast<uint8_t*>(g_heap.Alloc(copy));
+    if (!host)
+        return 0;
+    memcpy(host, xexFile, copy);
+    const uint32_t guest = g_memory.MapVirtual(host);
+    g_xexHeaderBase = guest;
+    fprintf(stderr, "[loader] XEX headers published at %08X (%u bytes)\n", guest, copy);
+    return guest;
+}
+
+void ResolveXexDataImports(const uint8_t* xexFile)
+{
+    const auto* importHeader = reinterpret_cast<const Xex2ImportHeader*>(
+        getOptHeaderPtr(xexFile, XEX_HEADER_IMPORT_LIBRARIES));
+    if (!importHeader)
+    {
+        KLOG("XEX declares no import libraries — nothing to resolve\n");
+        return;
+    }
+
+    // Library name string table (each name padded to 4 bytes).
+    const char* strTable = reinterpret_cast<const char*>(importHeader + 1);
+    const uint32_t numNames = importHeader->numImports;
+    const char* names[32] = {};
+    {
+        size_t offset = 0;
+        for (uint32_t i = 0; i < numNames && i < 32; i++)
+        {
+            names[i] = strTable + offset;
+            offset += ((strlen(strTable + offset) + 1) + 3) & ~3ull;
+        }
+    }
+
+    const auto* library = reinterpret_cast<const Xex2ImportLibrary*>(
+        reinterpret_cast<const char*>(importHeader + 1) + importHeader->sizeOfStringTable);
+
+    uint32_t functions = 0, variables = 0;
+    for (uint32_t lib = 0; lib < numNames; lib++)
+    {
+        const char* libName =
+            library->name < numNames && names[library->name] ? names[library->name] : "?";
+        const auto* descriptors = reinterpret_cast<const Xex2ImportDescriptor*>(library + 1);
+        const uint16_t count = library->numberOfImports;
+
+        for (uint16_t i = 0; i < count; i++)
+        {
+            const uint32_t slotVA = descriptors[i].firstThunk;
+
+            // Descriptors come in two flavours and the VA alone separates them
+            // cleanly: call thunks live in the code section (>= PPC_CODE_BASE),
+            // IAT slots live in the read-only data below it. On this image A1's
+            // dump puts every IAT slot in 0x82000400..0x820007DC (inside `.rdata`)
+            // and every thunk in 0x829C2xxx..0x829C3xxx (inside `.text`).
+            //
+            // (Fable 2 discriminated by looking for the nop/nop/nop/blr word the
+            // loader writes over a thunk. That also works, but it couples this code
+            // to the loader's rewrite — and gotcha 22 is precisely about a scan
+            // that depended on which stage of loading the image was in. The address
+            // ranges are a property of the image itself.)
+            if (slotVA >= PPC_CODE_BASE)
+                continue;
+
+            const bool pairedWithThunk =
+                (i + 1 < count) && descriptors[i + 1].firstThunk >= PPC_CODE_BASE;
+
+            if (pairedWithThunk)
+            {
+                // Function import: point the IAT slot at the call thunk, so an
+                // indirect call through the slot reaches the recompiled dispatcher
+                // (the thunk VA is in PPCFuncMappings, bound to __imp__<Name>).
+                *reinterpret_cast<be<uint32_t>*>(g_memory.Translate(slotVA)) =
+                    descriptors[i + 1].firstThunk;
+                ++functions;
+                continue;
+            }
+
+            // No thunk follows: a kernel-exported *variable*. The slot must hold the
+            // address of real storage — the guest dereferences it.
+            const uint32_t thunkValue =
+                *reinterpret_cast<const uint32_t*>(g_memory.Translate(slotVA));
+            // Xex2LoadImage byte-swapped the type-0 words in place, so guest memory
+            // holds them host-endian: ordinal in the low 16 bits.
+            *reinterpret_cast<be<uint32_t>*>(g_memory.Translate(slotVA)) =
+                AllocateVariable(thunkValue & 0xFFFF, libName);
+            ++variables;
+        }
+
+        library = reinterpret_cast<const Xex2ImportLibrary*>(
+            reinterpret_cast<const char*>(library + 1) + count * sizeof(Xex2ImportDescriptor));
+    }
+    fprintf(stderr, "[loader] resolved %u function IAT slots + %u kernel variables\n",
+            functions, variables);
+    // A1's import dump is the cross-check, and for Case West it is a THREE-way one:
+    // Xenia's dump of this image lists 247 `F` entries and 13 `V` entries,
+    // `ppc_recomp_shared.h` declares exactly 247 `__imp__` externs, and the XEX's own
+    // header agrees. A count that disagrees means the descriptor walk drifted, not that
+    // the title changed.
+    //
+    // The numbers are 247/13 here where Case Zero was 244/13 — the three extra functions
+    // are `DbgBreakPoint`, `NtCreateMutant` and `NtReleaseMutant` (capture analysis
+    // finding 3). **The 13 variables are the SAME 13**, which is the expected shape:
+    // the kernel variable set is XDK-defined rather than per-title.
+    if (variables != 13 || functions != 247)
+        fprintf(stderr,
+                "[loader] WARNING: expected 247 function slots + 13 variables from this "
+                "image (A1's import dump and ppc_recomp_shared.h agree on those "
+                "numbers) — got %u and %u\n",
+                functions, variables);
+}
+
+// The optional-header walker, shared.
+//
+// It lived inside RtlImageXexHeaderField's import hook until the content layer needed
+// the same answer: XamGetExecutionId hands the guest a pointer to
+// XEX_HEADER_EXECUTION_INFO, and the save enumerator has to know this title's own id
+// to fill an item's title-id field. Two callers reading a header block by two copies
+// of the same 8-byte walk is how they drift, so there is one.
+uint32_t XexHeaderField(uint32_t headerBase, uint32_t key)
+{
+    if (!headerBase)
+        headerBase = g_xexHeaderBase.load();
+    if (!headerBase)
+        return 0;
+
+    uint8_t* base = g_memory.base;
+    // Xex2Header: magic(0) moduleFlags(4) sizeOfHeaders(8) sizeOfDiscardable(0xC)
+    // securityInfo(0x10) headerCount(0x14); optional headers follow at 0x18 as
+    // {key, value} pairs.
+    const uint32_t headerCount = PPC_LOAD_U32(headerBase + 0x14);
+    if (headerCount > 256) // a wild pointer, not a header block
+    {
+        KLOG("XexHeaderField: %08X does not look like a XEX header (count=%u)\n", headerBase,
+             headerCount);
+        return 0;
+    }
+    for (uint32_t i = 0; i < headerCount; i++)
+    {
+        const uint32_t entry = headerBase + 0x18 + i * 8;
+        if (PPC_LOAD_U32(entry) != key)
+            continue;
+        // The key's low byte is the field size in dwords: 0 or 1 means the value is
+        // stored inline in the header entry, so the field's address IS the value
+        // word; anything else means the value is a module-relative offset.
+        const uint32_t lowByte = key & 0xFF;
+        if (lowByte == 0 || lowByte == 1)
+            return entry + 4;
+        return headerBase + PPC_LOAD_U32(entry + 4);
+    }
+    return 0;
+}
+
+uint32_t XexTitleId()
+{
+    // XEX_HEADER_EXECUTION_INFO. The struct is 24 bytes —
+    // mediaId(0) version(4) baseVersion(8) titleId(12) platform(16) executableTable(17)
+    // discNumber(18) discCount(19) savegameId(20) — and +12 is what the title itself
+    // reads: sub_825D8E60 does `lwz r11,12(r11)` on this pointer and compares it with an
+    // enumerated save's title id.
+    const uint32_t info = XexHeaderField(0, XEX_HEADER_EXECUTION_INFO);
+    if (!info)
+        return 0;
+    uint8_t* base = g_memory.base;
+    return PPC_LOAD_U32(info + 12);
+}
+
+bool XexFindResource(const char* name, uint32_t& address, uint32_t& size)
+{
+    address = 0;
+    size = 0;
+    if (!name || !*name)
+        return false;
+
+    // XEX_HEADER_RESOURCE_INFO. The key's low byte is 0xFF, so XexHeaderField hands
+    // back the block itself rather than an inline word. Layout (all big-endian):
+    //
+    //   uint32 blockSize;                    // includes this field
+    //   { char name[8]; uint32 address; uint32 size; } resources[(blockSize - 4) / 16];
+    //
+    // Names are 8 bytes NUL-padded, NOT NUL-terminated — "58410A8D" fills all eight,
+    // so a strcmp against the raw bytes would run into the address that follows it.
+    constexpr uint32_t XEX_HEADER_RESOURCE_INFO = 0x000002FF;
+    const uint32_t block = XexHeaderField(0, XEX_HEADER_RESOURCE_INFO);
+    if (!block)
+        return false;
+
+    uint8_t* base = g_memory.base;
+    const uint32_t blockSize = PPC_LOAD_U32(block);
+    if (blockSize < 4 || blockSize > 0x10000)
+        return false;
+    const uint32_t count = (blockSize - 4) / 16;
+    for (uint32_t i = 0; i < count; i++)
+    {
+        const uint32_t entry = block + 4 + i * 16;
+        char have[9] = {};
+        for (uint32_t k = 0; k < 8; k++)
+            have[k] = char(PPC_LOAD_U8(entry + k));
+        if (strncmp(have, name, 8) != 0)
+            continue;
+        // A resource shorter than the caller's name is a different resource: "Serial"
+        // and "Serial2" share their first six characters, and strncmp over eight
+        // bytes separates them only because the shorter one is NUL-padded.
+        if (strlen(name) < 8 && have[strlen(name)] != '\0')
+            continue;
+        address = PPC_LOAD_U32(entry + 8);
+        size = PPC_LOAD_U32(entry + 12);
+        return true;
+    }
+    return false;
+}

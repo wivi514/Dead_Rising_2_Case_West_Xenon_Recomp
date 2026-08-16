@@ -37,6 +37,7 @@ Done in session 1 — reproducible from a clean clone with the Commands section 
 | Recompilation | ✅ **58,448 functions**, 228 TUs, **zero** `jump outside function`, **zero** dropped branches |
 | Coverage oracle | ✅ **104 entry points** recovered from C1+C2; config at 135 overrides |
 | Shader cache | ✅ **439 shaders, 439 translated, 0 failures** — W4's hardest input already exists |
+| Runtime (W1) | ✅ **links and boots**; 4 per-title modules parked, save layer awaiting A3 |
 | Bink (W3) | ✅ **SOLVED — no host code needed** (finding 17); honour `tiled=0` and the padded chroma pitch |
 | Kernel import surface | ✅ 247 names, measured against Case Zero's 244 |
 | Recompiler gates | ✅ dropped branches and unlowered switches both clean (W0.1, W0.2) |
@@ -132,12 +133,16 @@ What has to change, in rough order of certainty:
 - `cpu/guest_thread.cpp` — the TLS slot count and stack size come from **this** XEX's
   header, not Case Zero's. Read them; do not copy the constants.
 
-**Gate:** `cw_runtime --smoke` links. That is Case Zero's phase 0.2 gate and it is a real
-one — 228 TUs that have never been fed to a compiler, and both template ports hit
-link-scale problems here.
+**Gate:** `cw_runtime --smoke` links. **PASSED 2026-08-15** — 230 TUs compiled with zero
+errors, 58,695 symbols resolved, and a first boot ran 60 s without crashing, opened 87
+`.big` archives through the VFS and delivered 3,720 vblanks to the guest's own callback.
+Full record: **`docs/w1-transplant-notes.md`**.
 
-**Cost:** one to two sessions. The transplant itself is fast; the gate is where the
-surprises live.
+The surprise was not link scale: it was that four modules carry 156 hardcoded Case Zero
+guest addresses, of which **one exists in this image too** and would have linked silently
+to an unrelated function. They are parked in `runtime/port-pending/`.
+
+**Still open in W1:** `kernel/content.cpp`'s save layer, which needs capture A3.
 
 ## W2 — Xenia ground truth (operator-dependent, START IT EARLY)
 
