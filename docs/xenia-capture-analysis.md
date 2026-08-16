@@ -1368,3 +1368,113 @@ passes. Finding 30's 1.40% noise floor does **not** apply here; it is a same-dri
 
 `docs/part2-kickoff.md` §3's GPU list is down to one item: **eight of the nine B4 frames
 remain unanalysed** — the reference set for the hardest surface classes.
+
+---
+
+## 35. **THE PROGRESS-WIDGET DEFECT: a headless repro, and the guard refuted** — part 2, 2026-08-16
+
+**Operator, 2026-08-16:** progress widgets do not work — *"the pp bar and time bar for mission
+doesn't work as well as the little square showing progress when loading a save or something
+like that that shows up in pop-up or when entering the main menu from the title screen."*
+**Present in Case Zero too, and Case Zero has NOT started work on it**, so unlike decals and
+performance (`docs/imported-fixes.md`) this one is ours to lead — and anything found here
+feeds back to the sibling.
+
+### The repro, and it is self-servable and headless — 40 seconds, no operator
+
+This is the first thing to exist for this defect class in either port. Case Zero's own notes
+record it as unreproducible without a human.
+
+```
+SEQ=$(python3 -c "print(','.join(['NONE']*17+['START','F9']))")
+cd runtime/build && CW_VKDRAW=1 CW_NO_WINDOW=1 \
+  CW_FAKE_START_MS=2000 CW_FAKE_PRESS_SEQ="$SEQ" \
+  CW_CAPTURE_KEY=<dir> CW_VK_FRAME_DUMP=<dir> CW_VK_FRAME_DUMP_EVERY=5 \
+  timeout 55 ./cw_runtime
+```
+
+START fires at 36 s, the **"Loading content. Please do not turn off your console."** dialog is
+up for roughly frames **1110-1210**, and F9 at 38 s lands inside it and writes the picture,
+the pose and an 816-draw per-draw census. Frame-dump stats identify the window without
+looking: the title screen samples ~820 distinct colours, the dialog ~355.
+
+**The dialog renders correctly — panel, drop shadow, both text lines, YES/NO — and the little
+progress square is simply absent.**
+
+### What is ruled out
+
+**1. Not a missing shader.** `grep -c "no translated shader"` = **0** on the repro run.
+
+**2. Not the ALU constant window.** The renderer reads `SQ_VS_CONST`/`SQ_PS_CONST` bases from
+the registers rather than assuming 0/256; the counter that fires is informational.
+
+**3. NOT THE STREAM STORE'S GUARD — refuted by A/B with a stated prediction.** This was the
+strongest suspect: it is the mechanism behind the UI *text* defect (`docs/imported-fixes.md`),
+and both widget families rewrite their geometry every frame, so stale streams would freeze a
+meter and stop a flipbook animating.
+
+> **Prediction stated before the run:** if the square is stale-stream, then
+> `CW_VK_STREAM_GUARD_EXACT=1` — the unlimited arm, which hashes every byte of every stream
+> and therefore cannot miss any edit — makes it appear.
+
+It does not. The arm's dialog frame is **pixel-indistinguishable** from the control's, and the
+inter-frame change analysis is identical (134 vs 137 changed samples over the same bounding
+box). **The guard is not the mechanism here**, which also means this is a *different* defect
+from the UI text one despite both being UI.
+
+**4. Nothing square-shaped is animating at all.** Between consecutive dialog frames the
+changed pixels are sparse and spread over the whole 448x418 dialog area — that is the animated
+title-screen sky showing through a translucent panel, not a widget. So the square is not
+"animating wrongly"; it is not being drawn.
+
+### What the guest calls these widgets
+
+The frontend is a named-widget system — `c:\bcg\deadrisingepilogue\source\Common\fe\screen\...`
+— and the image names **39 `cFE*` classes**. Three matter:
+
+| class | almost certainly |
+|---|---|
+| **`cFEMeter`** | the PP bar and the case-timer bar |
+| **`cFEFlipBook`** / **`cFEFlipFrame`** / **`cFEAnim`** | frame-by-frame animated widgets — the loading square |
+
+The widget instance is named **`loading_ind`**, sitting beside `w_loading`, `cFEText` and
+`button_cancel` in the frontend string block at `0x820712E0`. It is **not** an entry in any of
+the 154 `.big` archives (0 of 13,833 entries match), so it is an internal widget name, not a
+packed asset.
+
+**Note the two families are different classes.** The operator's report groups them because
+they fail together, but `cFEMeter` and `cFEFlipBook` are not the same code — so "one defect"
+is a hypothesis, not a finding, and it should be tested rather than assumed. **When an
+attribution has been wrong twice, stop refining the estimate** (finding 23) — this one has not
+been wrong yet, and the way to keep it that way is to make the next step a fact rather than a
+mechanism.
+
+### There is no oracle for this frame, and that was checked
+
+Per gotcha 321 the first question is whether hardware evidence exists. **It does not:**
+
+- **B1's boot stream tops out at 814 draws/frame and its last 30 frames sit at 787-805 with no
+  transition** — its drive ends at the title screen, so the dialog is not in the capture. Our
+  dialog frame is 816 draws, *above* B1's maximum.
+- **The four boot screenshots are the ESRB, Capcom, Blue Castle and Dolby logo cards** — none
+  is the dialog.
+
+So an early, cheap-to-reach screen is nonetheless past the oracle. **This is the case for
+asking the operator for a capture**, and the drive is trivial: boot, press START, F4 at the
+"Loading content" dialog, plus one F4 on a gameplay frame with the PP bar and case timer
+visible. That would give the first hardware picture of what the widgets should look like AND a
+frame `.xtr` to diff draw-for-draw.
+
+### Next steps, in order
+
+1. **Ask for the capture above.** Everything else is cheaper with it and some of it is
+   impossible without it.
+2. **Decide "is it issued at all?" as a true-or-false fact**, not from a picture: the
+   `CW_VK_DRAW_ID` pass paints each draw its own index for one armed frame, so a draw covering
+   the square's rectangle either exists or does not. It needs the square's screen rectangle,
+   which is what the hardware capture supplies.
+3. **`cFEMeter` is the better first target than the square** — the PP bar has a *number* behind
+   it, and Case Zero already recorded that a valid headless metric must watch a **HUD number
+   change**, not a widget's presence (its part 24 built the presence metric and had to retract
+   it: it tracked where Chuck was standing). A meter whose backing value is known is testable
+   in a way an animation is not.
