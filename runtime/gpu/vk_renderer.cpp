@@ -5679,6 +5679,25 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     PipelineKey key{};
     key.vsHash = vsBind.hash;
     key.psHash = psBind.hash;
+    // CW_VK_VS_CENSUS=1 — log each DISTINCT vertex shader the first time it reaches a
+    // draw, with the frame number. One line per shader per session, so a whole run
+    // answers "was hash X ever bound?" — the question the progress-widget hunt reached
+    // after every guest-side stage measured healthy (finding 56 onward): the meter's
+    // vs_a4ae7c2b7c1818c4 is staged 8x in guest memory yet absent from every census'd
+    // frame. Absent from THIS log too = the guest never binds it anywhere in the
+    // session, not just in sampled frames.
+    {
+        static const bool vsCensusOn = Env("CW_VK_VS_CENSUS") != nullptr;
+        if (vsCensusOn)
+        {
+            static std::set<uint64_t> everBound;
+            if (everBound.insert(key.vsHash).second)
+                fprintf(stderr, "[vk] vs census: NEW vs=%016llx first bound at frame %llu "
+                                "(%zu distinct so far)\n",
+                        (unsigned long long)key.vsHash, (unsigned long long)R->frame,
+                        everBound.size());
+        }
+    }
     key.topology = uint32_t(topology);
     key.blendControl = regs[xenos::kRbBlendControl0];
     // CW_VK_DRAW_ID: for ONE armed frame every draw paints its own index. See
