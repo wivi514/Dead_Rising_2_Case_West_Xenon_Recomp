@@ -152,7 +152,7 @@ PPC_FUNC(sub_827815D0)
         return;
     const uint32_t id = ctx.r3.u32;
     std::lock_guard<std::mutex> lock(g_nameMutex);
-    if (g_idName.size() >= 20000 || g_idName.count(id))
+    if (g_idName.size() >= 250000 || g_idName.count(id))
         return;
     const char* p = reinterpret_cast<const char*>(base + nameVa);
     char buf[48];
@@ -371,7 +371,7 @@ PPC_FUNC(sub_828107D8)
                 seen = true;
                 break;
             }
-        if (!seen && g_findRows.size() < 256)
+        if (!seen && g_findRows.size() < 2048)
         {
             g_findRows.push_back({ id, lr });
             g_findCounts.push_back(1);
@@ -493,6 +493,7 @@ std::vector<std::pair<uint32_t, uint64_t>> g_ancFailVt[3];
 // ancestors' ADDRESSES (meters only) so the report can dump each one and
 // correlate it against the hide/show recorder below, within the same run.
 std::vector<std::pair<uint32_t, uint64_t>> g_meterAncFail;   // {ancestor VA, count}
+std::atomic<uint64_t> g_ancOverflow{ 0 };   // fail samples beyond the 64-row cap
 } // namespace
 
 // THE INTERVENTION ARM — CW_FE_FORCESHOW=1. Round 5 found the meters' own
@@ -573,8 +574,10 @@ inline void TreeSample(uint8_t* b, uint32_t self, int c)
         {
             for (auto& e : g_meterAncFail)
                 if (e.first == a) { ++e.second; return; }
-            if (g_meterAncFail.size() < 16)
+            if (g_meterAncFail.size() < 64)
                 g_meterAncFail.emplace_back(a, 1);
+            else
+                g_ancOverflow.fetch_add(1, std::memory_order_relaxed);   // gotcha 109
         }
         return;
     }
@@ -1125,6 +1128,9 @@ void FeProbe_Report()
                 std::fprintf(stderr,
                              "[fe]     %-10s first-failing ancestor vtable 0x%08X   %llu x\n",
                              kVtClassName[c], e.first, (unsigned long long)e.second);
+        std::fprintf(stderr,
+                     "[fe]   meter fail samples NOT attributed below (row cap): %llu\n",
+                     (unsigned long long)g_ancOverflow.load());
         // Dump each distinct failing METER ancestor from live guest memory:
         // its state, its parent chain to the root, and its first children —
         // the identity data the hide/show rows below get matched against.
