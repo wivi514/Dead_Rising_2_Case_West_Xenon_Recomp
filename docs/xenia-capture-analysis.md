@@ -2293,3 +2293,70 @@ cd runtime/build && CW_VKDRAW=1 ./cw_runtime 2> run.log    # play with the HUD u
 ```
 
 One session, and the output is the call-site list.
+
+---
+
+## 46. **The meter IS linked in and traversed — and field 0x1CC is a LIST POINTER, not a value** — 2026-08-16
+
+The link-register probe named the callers of `cFEMeter`'s 0x1CC accessor:
+
+```
+cFEMeter get 0x1CC called 12,292 x
+  from 0x8281CA8C   9,660 x    (inside sub_8281C9D0)
+  from 0x828087AC   2,632 x    (inside sub_82808760)
+```
+
+### Correction: 0x1CC is `next`, and those accessors are `GetNext`/`SetNext`
+
+Both call sites are **linked-list traversals**, and both reach the accessor through the
+vtable rather than directly:
+
+```
+sub_8281C9D0 @ CA78:  lwz r11,0(r30) ; lwz r11,0x7C(r11) ; bctrl   ; r30 = GetNext(r30)
+                      or. r30,r3,r3  ; bne <loop>                   ; walk while non-null
+sub_82808760 @ 87A0:  lwz r11,0x7C(r11) ; bctrl ; cmplwi r3,0 ; bne ; walk to the TAIL
+             @ 87C0:  lwz r11,0x78(r11) ; bctrl                     ; then SetNext(tail, new)
+```
+
+`vtable[0x7C]` is index 31 = **`0x8280D440`**, and `vtable[0x78]` is index 30 =
+**`0x8280D438`** — the two accessors this probe has been calling "get/set the meter's value".
+**They are not.** `0x1CC` is a **next-sibling pointer**, `0x8280D438` is `SetNext` and
+`0x8280D440` is `GetNext`.
+
+So finding 45's reading has to be re-stated:
+
+| finding 45 said | actually |
+|---|---|
+| "69 meters given a value" | **69 meters LINKED into a widget list** (70 built, one never linked) |
+| "value read 10,192 times" | **12,292 list traversals stepping over a meter** |
+
+**The conclusion those numbers supported is unchanged and is in fact strengthened**: the meter
+objects exist, are inserted into the frontend's widget list, and are walked thousands of times
+per session by `sub_8281C9D0`, which calls `vtable[0x18]` (index 6 = `0x8281A5E0`) on each
+element before advancing. The widget is not orphaned — **it is in the list and it is visited.**
+
+### Three of my labels have now been wrong, and the pattern is worth naming
+
+1. the creator→class map (off by one entry, twice — findings 43, 44);
+2. the allocation-size hypothesis (`cFEMeter`'s 0x8920 looked damning; `cFELockBox` at 0x2D0
+   is also unbuilt and `cFEBitmap` at 0x490 builds fine — finding 43);
+3. and now `0x1CC` "the meter's value", which is a list link.
+
+Every one was a **semantic guess about a number the instrument reported correctly**. What has
+actually worked, every time, is refusing to name things from static reading:
+
+- reading the factory table **out of guest memory while the game ran**;
+- hooking `CreateWidget` **by the class name it is passed**;
+- and recording **the link register** so the caller identifies itself.
+
+The counts have never been wrong. The stories attached to them have been wrong three times.
+
+### Next
+
+`sub_8281C9D0` walks the widget list and calls **`0x8281A5E0`** on every element — that is the
+per-widget operation the meter is receiving 9,660 times while drawing nothing. It sits in the
+generic `0x8281xxxx` frontend range, so it is almost certainly shared with the widget classes
+that *do* draw, which makes it the right place to look and the wrong place to hook blindly.
+
+Read it before instrumenting it: if it dispatches again per class, the meter's own branch is
+the target; if it draws directly, the question becomes what it does differently for a meter.
