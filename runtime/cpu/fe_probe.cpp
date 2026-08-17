@@ -91,28 +91,12 @@ namespace
 {
 
 #define CW_FE_FUNCS(X)                                                                   \
-    X(827815D0, "CONTROL A: widget-name intern (every class registers here)")            \
-    X(828194B0, "cFEText creator")                                                      \
-    X(828194C0, "cFEEBMText creator")                                                   \
-    X(828194D0, "cFEBitmap creator")                                                    \
-    X(828194E0, "cFEShape creator")                                                     \
-    X(828194F0, "cFEAnim creator")                                                      \
-    X(82819500, "cFESpinGroup creator")                                                 \
-    X(82819540, "cFETextList creator")                                                  \
-    X(82819550, "cFETextBox creator")                                                   \
-    X(82819560, "cFEBitmapList creator")                                                \
-    X(828195A0, "cFEFlipBook creator")                                                  \
-    X(828195B0, "cFEFlipFrame creator")                                                 \
-    X(828195F0, "cFETable creator")                                                     \
-    X(82819630, "cFEMeter creator")                                                     \
-    X(82819640, "cFEParticleFX creator")                                                \
-    X(82819650, "cFEEdit creator")                                                      \
-    X(8281B698, "cFENineGrid creator")                                                  \
-    X(82813068, "cFEThreeGrid creator")                                                 \
-    X(82813078, "cFEGenericTable creator")                                              \
-    X(82819690, "cFEMovieBox creator")                                                  \
-    X(82813088, "cFELockBox creator")                                                   \
-    X(82813098, "cFEKeyFrame creator")                                                  
+    X(827815D0, "CONTROL A: name intern (everything registers through here)")            \
+    X(82815B80, "cFEMeter creator  [TABLE ENTRY 16] alloc 0x2F0")                        \
+    X(8280D300, "cFEMeter CONSTRUCTOR — writes vtable 0x820BDBE8")                        \
+    X(8280D438, "cFEMeter SET field 0x1CC — is the meter ever given a value?")            \
+    X(8280D440, "cFEMeter get field 0x1CC")                                               \
+    X(8280D448, "cFEMeter get field 0x248")
 
 #define X(addr, what) std::atomic<uint64_t> g_fe_##addr{ 0 };
 CW_FE_FUNCS(X)
@@ -169,6 +153,13 @@ std::vector<std::pair<std::string, uint64_t>> g_asked;
 // sub_82784508 conflates creation with any other name->index question the engine has.
 std::vector<std::array<uint64_t, 2>> g_createCounts;   // {made, failed} per name
 std::vector<std::string> g_createNames;
+// The guest base, stashed from a hook so the report can read the factory table itself.
+// Reading the table AT RUNTIME is the only way to get the {creator, id, name} mapping
+// right: deriving it by eye from the registration code produced a wrong creator for
+// cFEMeter AND for cFELockBox (gotcha 322, twice). The table is the ground truth.
+std::atomic<uint8_t*> g_base{ nullptr };
+constexpr uint32_t kFactoryTable = 0x82AF3118;   // 25 entries x {creator, id, name}
+constexpr uint32_t kFactoryCount = 25;
 } // namespace
 
 extern "C" PPC_FUNC(__imp__sub_82784508);
@@ -234,6 +225,7 @@ PPC_FUNC(sub_82784508)
 extern "C" PPC_FUNC(__imp__sub_82784588);
 PPC_FUNC(sub_82784588)
 {
+    g_base.store(base, std::memory_order_relaxed);
     const uint32_t nameVa = ctx.r4.u32;
     char nb[64];
     size_t m = 0;
@@ -299,6 +291,31 @@ void FeProbe_Report()
                          (unsigned long long)g_createCounts[i][0],
                          (unsigned long long)g_createCounts[i][1],
                          g_createCounts[i][1] ? "   <== never created" : "");
+    // The factory table, read out of guest memory rather than inferred from the code.
+    if (uint8_t* b = g_base.load(std::memory_order_relaxed))
+    {
+        auto rd = [&](uint32_t va) {
+            const uint8_t* p = b + va;
+            return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+        };
+        std::fprintf(stderr, "[fe]   FACTORY TABLE at 0x%08X, read from guest memory:\n",
+                     kFactoryTable);
+        for (uint32_t i = 0; i < kFactoryCount; i++)
+        {
+            const uint32_t e = kFactoryTable + i * 12;
+            const uint32_t creator = rd(e), id = rd(e + 4), nameVa2 = rd(e + 8);
+            char nm[48];
+            size_t k = 0;
+            if (nameVa2)
+            {
+                const char* q = reinterpret_cast<const char*>(b + nameVa2);
+                while (k < sizeof nm - 1 && q[k] > 0x20 && q[k] < 0x7F) { nm[k] = q[k]; ++k; }
+            }
+            nm[k] = 0;
+            std::fprintf(stderr, "[fe]     [%2u] creator 0x%08X  id 0x%08X  %s\n",
+                         i, creator, id, nm);
+        }
+    }
     if (g_missed.empty())
         std::fprintf(stderr, "[fe]   no class name failed to resolve.\n");
     else

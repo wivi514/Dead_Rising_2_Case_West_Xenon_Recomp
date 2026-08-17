@@ -2130,3 +2130,102 @@ cd runtime/build && CW_VKDRAW=1 ./cw_runtime 2> run.log    # play, close the win
   0 and the address to hook next is in the table entry.
 - **`cFEMeter` absent from the list entirely** → the meter is never *created*, only looked up,
   and the caller that looks it up 140 times without creating is the thing to find.
+
+---
+
+## 44. **RETRACTION: `cFEMeter` IS BUILT — 70 times. Finding 41 was wrong, and every count in it was right** — 2026-08-16
+
+### The retraction
+
+**Finding 41 claimed `cFEMeter` is never constructed. That is FALSE.** The name-based
+`CreateWidget` probe on the operator's gameplay run:
+
+```
+cFEMeter                 made     70   FAILED      0
+```
+
+Meters are created, successfully, seventy times. Everything finding 41 built on top of that —
+"the defect is at widget creation", "the chain is measured end to end and every link but one is
+exonerated" — **is retracted.**
+
+### How it went wrong, and it is gotcha 322 for the third time
+
+The factory table, **read out of guest memory at runtime** rather than inferred from the
+registration code:
+
+```
+[15] creator 0x82819630  cFETable
+[16] creator 0x82819640  cFEMeter      <-- the truth
+[17] creator 0x82819650  cFEParticleFX
+```
+
+**My static extraction was shifted by exactly one entry, throughout.** Reconciling finding 41's
+numbers against `CreateWidget`'s self-labelling counts:
+
+| finding 41 said | count | actually | CreateWidget |
+|---|---|---|---|
+| cFEParticleFX | 70 | **cFEMeter** | **70** |
+| cFEFlipBook | 19 | cFEBitmapList | 19 |
+| cFEMeter | **0** | cFETable | 0 |
+| cFEText | 46 | cFEButton | 46 |
+| cFEShape | 1000 | cFEBitmap | 1000 |
+| cFEAnim | 209 | cFEShape | 209 |
+| cFEEBMText | 247 | cFEText | 247 |
+| cFEKeyFrame | 39 | cFELockBox | 39 |
+| cFESpinGroup | 1072 | cFEAnim | 1072 |
+
+**Every single count matches once the label shifts by one.** The instrument was accurate
+throughout; only the names attached to it were wrong. That is the nastiest possible failure
+shape — the numbers look real because they *are* real.
+
+And note the sequence: my **first** reading by eye gave `0x82819640` for cFEMeter, which is
+**correct**. I then "corrected" it to `0x82819630` with a script that read the whole table —
+and the script was shifted the other way. Gotcha 322 said *extract the whole table*; doing that
+was not sufficient, because a static extraction of a table the compiler builds at runtime is
+still an inference. **The fix that actually worked was reading the table out of guest memory
+while the game ran.**
+
+Consequently the earlier chain I discarded as cFEParticleFX is cFEMeter's after all:
+
+```
+creator 0x82819640 -> 0x82815B80 (alloc 0x2F0) -> ctor 0x8280D300 -> VTABLE 0x820BDBE8
+   40 virtual methods; cFEMeter overrides only accessors:
+   0x8280D438  stw r4, 0x1CC(r3)    the setter
+   0x8280D440  lwz r3, 0x1CC(r3)    the getter
+   0x8280D448  lwz r3, 0x248(r3)
+```
+
+**So `cFEMeter` has no draw method of its own** — that observation, made in finding 40 and then
+disowned, stands.
+
+### What is actually true now
+
+```
+the screen data names meters                      ✓  140 lookups in gameplay
+the factory resolves the name                     ✓  nothing unresolved
+CreateWidget makes them                           ✓  70, with 0 failures
+...and no draw in three captured frames uses      ✗  vs_a4ae7c2b7c1818c4
+   the shader that paints them
+```
+
+**The meter objects exist and are not drawn.** The defect is downstream of construction, in
+the meter's own update/draw path — which is where finding 40 pointed before finding 41 sent
+this off in the wrong direction for two rounds.
+
+### Next, with addresses that are now ground truth
+
+The probe has been **re-pointed at cFEMeter's real internals**, and the address-based creator
+census has been **deleted rather than fixed** — it mislabelled every row twice, and
+`CreateWidget` already names its own classes:
+
+```
+0x8280D300  ctor          — expect ~70 in gameplay, which also re-validates the mapping
+0x8280D438  SET 0x1CC     — is the meter ever given a value?
+0x8280D440  get 0x1CC
+0x8280D448  get 0x248
+```
+
+- **ctor ~70 and setter 0** → meters are built and never driven. A meter with no value
+  plausibly draws nothing, and the caller that should be setting it is next.
+- **ctor ~70 and setter > 0** → the meter is built and driven, and the defect is in the
+  inherited draw path, with the 40-method vtable at `0x820BDBE8` as the map.
