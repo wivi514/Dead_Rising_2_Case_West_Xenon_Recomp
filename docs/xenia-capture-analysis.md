@@ -2558,3 +2558,39 @@ pointer — identity by what the guest wrote.
 Also measured: nine `[+0x10] |= 0x00800000` "Show" sites exist in the frontend band
 (`0x82805908/48, 0x828065E8, 0x828096DC, 0x8281809C, 0x8281A944, 0x8281AF7C, 0x8281D3A4,
 0x8281D628`) — the map for whichever widget round 4 names as wrongly hidden.
+
+---
+
+## 50. **THE METER'S CONTAINER IS ACTIVELY HIDDEN — a base-cFEWidget ancestor fails the shown bit in 92% of samples** — part 4, 2026-08-16
+
+Round 4 of the part-4 instrument (the draw-tree membership census). Per class, sampled in
+the update walk:
+
+```
+             parent=0   in-chain   NOT-in-chain   ancFAILbit8   ancFAILalpha   all-pass
+cFEMeter        0        13,016         0           10,492          1,464        1,060
+cFEBitmap       0         1,292         0              212            713          367
+cFEText         0           117         0               19             95            3
+```
+
+**Tree membership is perfect** — every sampled widget of all three classes is in its
+parent's `[+0x8]/[+0xC]` child chain, which also validates the `+0xB0` parent model from
+the control side. The meters' loss is an **ancestor failing bit `0x00800000`** (the
+walker's "shown" gate) in 81% of samples, plus 11% alpha — and the first failing ancestor
+is the **base `cFEWidget`** (vtable `0x820BD310`, confirmed as the vtable the shared base
+ctor `sub_82805C80` writes) in 11,952 of 11,956 failing samples. The drawing classes also
+sample ancestor-fails — widgets in currently-hidden screens, dominated by *alpha* — but at
+far lower rates and with hundreds of all-passes.
+
+**And the direction of causation is now known: every widget is BORN shown.** The base ctor
+sets `0x03C00000` into `[this+0x10]` — both the shown bit and the propagation bit. So the
+meters' grouping containers did not miss a Show; **something actively hides them and
+nothing shows them again** (or hides them wrongly).
+
+The frontend band contains exactly ten clear-bit8 sites and nine set-bit8 sites,
+resolving to twelve functions — pager idioms (hide-all / show-selected over an array at
+`[this+0x640]`) and HUD-wrapper objects owning a widget at `[this+0x3C4]` with a bool at
+`+0x3CC`. The round-5 probe (committed) records every call into those twelve with caller
+LR and target, and dumps each distinct meter-blocking ancestor from live guest memory —
+so the hider and the hidden can be matched by address within one run. A ~300-site
+game-side band (0x824C–0x8250) exists as the fallback if no frontend row matches.
