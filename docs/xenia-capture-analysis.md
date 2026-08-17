@@ -1726,3 +1726,82 @@ cd runtime/build && CW_VKDRAW=1 CW_RING_TRACE=1 CW_PM4_BIN_CENSUS=1 \
 **`run.log` is the artifact this time, not the capture** — the counters live on stderr and the
 last two captures did not carry it. `ring: pm4 ... (predicated out=N)` plus the bin census
 answer the fork in one line.
+
+---
+
+## 39. **THE GPU LAYER IS EXONERATED — the guest never submits these draws** — 2026-08-16
+
+Finding 38 left one fork: are the widget draws **predicated out by us** in `gpu/pm4.cpp`, or
+**never sent by the guest**? The per-draw census cannot tell, because it is written inside
+`DoDraw` and a draw dropped earlier never reaches it. The operator ran the session that
+answers it and sent `run.log`.
+
+### The answer
+
+```
+ring: pm4 packets=25,156,859  frames=1,447  draws=1,699,733  (predicated out=4,918)
+                                                    = 0.29%
+B1 hardware, for comparison                          = 0.3%
+```
+
+**Our bin-mask predication discards 0.29% of draws against hardware's 0.3%.** We are not
+dropping a class of draws — we are dropping what hardware drops, to within a rounding error.
+The bin census lists **no** (mask, select) pair as discarding anything, and `overflow=0`.
+
+That also retires a worry `gpu/vd.cpp` has carried since the transplant, which said *"a third
+of this title's draw packets are discarded here and B1 says hardware discards 0.3%, so the
+pair table is where that gap is localised."* **There is no gap. It measures 0.29%.**
+
+Third frame, third confirmation, this one with the HUD raised:
+
+```
+frame 1352: 3,069 draws · HUD region MAX 249 (hardware 248) · vs_a4ae7c2b7c1818c4: 0
+```
+
+### Everything in the GPU path is now eliminated by measurement
+
+| candidate | verdict |
+|---|---|
+| missing shader | in the bank; 0 "no translated shader" |
+| bad microcode | 60 bytes / 15 dwords, real (finding 38) |
+| unsupported topology | line/point/quad/rect all mapped; none fired |
+| stale stream store | refuted by A/B (finding 35) |
+| ALU constant window | read from the registers, not assumed |
+| **bin-mask predication** | **0.29% vs hardware 0.3%** |
+| ucode validator rejecting the load | **0 rejections** in the whole session |
+| shader binding | `g_boundShaders[stage] = {va, size, hash}` — last-load-wins, which is what `IM_LOAD` means |
+
+And the shader **is loaded during gameplay**: `[imload] VS va=00000000
+hash=a4ae7c2b7c1818c4 size=15`. `va=0` is normal — **12 of the session's 45 VS loads are
+`IM_LOAD_IMMEDIATE`**, and one of the others (`8bb7e189d92e3def`, also `va=0`) draws 96 times
+in a single frame. So immediate loads work.
+
+**So the guest sets the shader up and then never issues a draw while it is bound.** The defect
+is upstream of the GPU entirely — in the recompiled guest code's widget path, not in the
+renderer or the command processor.
+
+### Where to look next, and it is a different kind of work
+
+This stops being a rendering investigation. The handles that exist:
+
+- **`cFEMeter`** (string at `0x820BEEF0`) and **`cFEFlipBook`** (`0x820BEF18`) are the widget
+  classes. The `cFEMeter` string has exactly **one** referencing site, `0x829BC640`, which is
+  a class-registration call into `sub_827815D0` — i.e. a factory table, not the draw path.
+  The vtable reached from that registration is the way to the render method.
+- **`runtime/cpu/gap_probe.cpp` is the instrument already built for this shape of question** —
+  a strong `PPC_FUNC(sub_X)` that counts calls and forwards. Point it at the widget's render
+  method and the answer is "called N times" or "never called", which is a fact rather than an
+  inference.
+- W0.3's untranslatable instructions are **not** a candidate: all seven functions holding them
+  read zero across a full play session (finding 32).
+
+### One unrelated observation, recorded because it was seen and not chased
+
+`gpu/pm4.cpp`'s draw decode reads
+`d.indexed = sourceSelect == 0;   // 0 = DMA; 2 = auto-index; 1 = immediate`
+
+so **`sourceSelect == 1` (indices packed immediately into the packet) is folded into the
+not-indexed path** and would be drawn as auto-index. That is *not* this defect — it cannot
+remove a draw from the census — but if this title ever emits an immediate-index draw it would
+render wrong geometry silently. **Unmeasured: nobody has counted `sourceSelect == 1` in B2.**
+Recorded as a lead, not a claim.
