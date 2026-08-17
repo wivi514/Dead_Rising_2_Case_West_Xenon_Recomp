@@ -2763,3 +2763,36 @@ draw body.
 The catch-it-in-seconds gate is now gotcha 323: after adding any hook, `nm` the binary
 and require `T` at its own address — a clean build proves nothing (gotcha 30 in linkage
 costume). The counters were never wrong; they were never wired.
+
+---
+
+## 56. **The guest submit chain is HEALTHY end to end — and the zero is re-measured TODAY** — part 4, 2026-08-16
+
+Runs 16-18, the first with every hook proven live (`nm`-verified, gotcha 323):
+
+```
+cFEMeter::Draw  mode 0 (emitting), handle valid          178-248 entries/session
+  begin sub_8272EB40                                      runs (95,727 total)
+  resolve sub_8275CD58: the registry is a SPRITE ATLAS —  meterBit -> 0x3B
+     HUD_meter -> 0x1E8, HUD_timer_bit -> 0x1EE,          all meter names RESOLVE
+     HUD_healthcube -> 0x39; fails are unrelated one-offs
+  submit sub_8273C870 -> enqueue sub_8273C3D0             all batches cap 4, 0 DROPPED
+  finalize sub_8274A698: shader-constant-set stack        4 stacks, 168k allocs, 0 FAIL
+     (the retail-silent assert "Shader constant set          (one peaks 6,220/13,824;
+      overflow.", shaderconstantsetstack.cpp:168,             another 1,336/1,340)
+      NEVER fires)
+  end sub_8272EC50(batch, constant-set slot, 0x28)        runs
+```
+
+The finalize only **snapshots** the constant set and hands back a slot; the draw itself is
+issued later by a per-frame consumer of the batches. And that consumer's output is freshly
+re-measured: **run 19's F9 draw census — 3,206 draws of frame 1239, captured on TODAY'S
+binary during gameplay with the HUD up — contains ZERO draws with `vs_a4ae7c2b7c1818c4`**,
+while listing dozens of other vertex shaders (so the detector provably can match). The
+part-2 measurement was not stale: the meter bits are enqueued, constant-set-stamped, and
+then never turned into a draw.
+
+What remains is one stage: the per-frame batch consumer. Also in hand from run 16: the
+type-2 retained-item update's function-pointer target is `sub_8275DFB8` (1,593 calls, id
+"blank"), and the batch manager `[global+0xDB4]` has its readers mapped — the flush lives
+among `sub_8275Cxxx-8275Fxxx` / `sub_8274Cxxx-8274Dxxx`.
