@@ -787,6 +787,61 @@ struct BitsBatch { uint16_t cap, hiCount; uint64_t pass, drop; };
 std::unordered_map<uint32_t, BitsBatch> g_bitsBatch;   // batch VA -> stats
 } // namespace
 
+// THE FLUSH CHAIN (round 19, prepared while the operator is away): the draw
+// that should carry vs_a4ae7c2b7c1818c4 is issued when a named render pass
+// executes the retained lists —
+//   sub_82763900 -> sub_82763240(this, passName)   ; dispatch by NAME
+//     -> sub_82753FF8                              ; the draw-list executor
+//        -> sub_8274C488 per item                  ; state + decompose to bits
+//           -> sub_8273C298                        ; inline vertex write
+// Counts for each stage, and the dispatcher's NAME argument recorded, so one
+// run says whether the meter's pass ever executes — and if not, which passes
+// do. Hardware's B2 PM4 capture is the oracle for what the pass list should
+// look like.
+namespace
+{
+std::atomic<uint64_t> g_fl63900{ 0 }, g_fl53FF8{ 0 }, g_fl4C488{ 0 }, g_flC298{ 0 };
+std::mutex g_passMutex;
+std::vector<std::pair<std::string, uint64_t>> g_passNames;
+} // namespace
+
+#define CW_FLUSH_HOOK(addr, ctr)                                                         \
+    extern "C" PPC_FUNC(__imp__sub_##addr);                                              \
+    PPC_FUNC(sub_##addr)                                                                 \
+    {                                                                                    \
+        ctr.fetch_add(1, std::memory_order_relaxed);                                     \
+        __imp__sub_##addr(ctx, base);                                                    \
+    }
+CW_FLUSH_HOOK(82763900, g_fl63900)
+CW_FLUSH_HOOK(82753FF8, g_fl53FF8)
+CW_FLUSH_HOOK(8274C488, g_fl4C488)
+CW_FLUSH_HOOK(8273C298, g_flC298)
+#undef CW_FLUSH_HOOK
+
+extern "C" PPC_FUNC(__imp__sub_82763240);
+PPC_FUNC(sub_82763240)
+{
+    const uint32_t nameVa = ctx.r4.u32;
+    char buf[64];
+    size_t n = 0;
+    if (nameVa >= 0x1000)
+    {
+        const char* p = reinterpret_cast<const char*>(base + nameVa);
+        while (n < sizeof buf - 1 && p[n] >= 0x20 && p[n] < 0x7F) { buf[n] = p[n]; ++n; }
+    }
+    buf[n] = 0;
+    if (n)
+    {
+        std::lock_guard<std::mutex> lock(g_passMutex);
+        bool seen = false;
+        for (auto& e : g_passNames)
+            if (e.first == buf) { ++e.second; seen = true; break; }
+        if (!seen && g_passNames.size() < 256)
+            g_passNames.emplace_back(buf, 1);
+    }
+    __imp__sub_82763240(ctx, base);
+}
+
 // THE SHADER-CONSTANT-SET STACK (round 17): the finalize sub_8274A698 needs a
 // slot from the stack at [this+0x38] via sub_821D4E90 -> sub_821954A8, and on
 // -1 it fires the retail-silent assert "Shader constant set overflow."
@@ -1529,6 +1584,21 @@ void FeProbe_Report()
                          e.second.mode, e.second.modeExit,
                          e.second.mode != e.second.modeExit ? " <== FLIPS IN-BODY" : "",
                          (unsigned long long)e.second.count);
+        {
+            std::lock_guard<std::mutex> fllock(g_passMutex);
+            std::fprintf(stderr,
+                         "[fe]   FLUSH CHAIN: dispatch %llu  list-exec %llu  per-item %llu  bits-write %llu\n",
+                         (unsigned long long)g_fl63900.load(),
+                         (unsigned long long)g_fl53FF8.load(),
+                         (unsigned long long)g_fl4C488.load(),
+                         (unsigned long long)g_flC298.load());
+            std::fprintf(stderr, "[fe]   render passes dispatched by name (sub_82763240):\n");
+            if (g_passNames.empty())
+                std::fprintf(stderr, "[fe]     (never called)\n");
+            for (const auto& e : g_passNames)
+                std::fprintf(stderr, "[fe]     %-40s %8llu x\n", e.first.c_str(),
+                             (unsigned long long)e.second);
+        }
         {
             std::lock_guard<std::mutex> scslock(g_scsMutex);
             std::fprintf(stderr,
