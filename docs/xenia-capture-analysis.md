@@ -2229,3 +2229,67 @@ census has been **deleted rather than fixed** — it mislabelled every row twice
   plausibly draws nothing, and the caller that should be setting it is next.
 - **ctor ~70 and setter > 0** → the meter is built and driven, and the defect is in the
   inherited draw path, with the 40-method vtable at `0x820BDBE8` as the map.
+
+---
+
+## 45. **THE METER IS ALIVE: built 70, driven 69, read 10,192 times — and still draws nothing** — 2026-08-16
+
+Finding 44 re-pointed the probe at `cFEMeter`'s true internals and named two outcomes. The
+operator played; this is the answer, and it is the second of them.
+
+```
+[fe] sub_82815B80      70   cFEMeter creator  [table entry 16]
+[fe] sub_8280D300      70   cFEMeter CONSTRUCTOR
+[fe] sub_8280D438      69   cFEMeter SET field 0x1CC
+[fe] sub_8280D440  10,192   cFEMeter GET field 0x1CC
+[fe] sub_8280D448       0   cFEMeter get field 0x248
+                     ---
+CreateWidget         70 made, 0 FAILED     <- independent, name-based
+```
+
+### The address mapping is now confirmed from two directions
+
+**The constructor count is 70 and `CreateWidget`'s name-based count is 70.** Those are two
+independent instruments — one hooked by address off the *runtime* factory table, one reading
+the class name at the creation entry point — and they agree exactly. **The off-by-one that ran
+through findings 40-43 is settled**, and table entry 16 (`creator 0x82819640 -> 0x82815B80 ->
+ctor 0x8280D300 -> vtable 0x820BDBE8`) is cFEMeter's real chain.
+
+### The widget is fully alive
+
+- **70 built**, and 70 requested — nothing is lost at creation.
+- **69 given a value.** 69 of 70, so essentially every meter is driven; the odd one out is
+  plausibly a meter constructed and destroyed without ever being shown.
+- **Its value is read 10,192 times** — roughly 146 reads per meter, i.e. per-frame polling.
+  **Something is actively asking these meters what to display, every frame, all session.**
+- And **not one draw in three captured frames uses the shader that paints them**
+  (findings 36-38).
+
+So the meter is constructed, driven, and interrogated — and produces no geometry. **The defect
+is in the draw path**, which is exactly where finding 40 pointed before finding 41's
+mislabelled census sent this in the wrong direction for two rounds.
+
+`0x248`'s getter is never called at all, which is worth noting only as a fact: whatever that
+field is for, this session never asked for it.
+
+### Why the next hook cannot be a per-class one
+
+`cFEMeter` overrides only accessors — **it has no draw method of its own**, so its drawing is
+inherited code shared with every other widget class. Hooking that inherited method would count
+cFEBitmap and cFEText too and isolate nothing.
+
+**The link register solves it.** The recompiler sets `ctx.lr` on every `bl`, so on entry to the
+0x1CC getter it holds the return address of the call site — and the callers of a value that is
+read 10,192 times while nothing draws *are* the live meter path. The probe now records the
+distinct return addresses with counts.
+
+That turns "somewhere in the inherited draw path" into a list of guest addresses, each of
+which resolves to a named function via `ppc/` and can then be disassembled or hooked in turn.
+
+### The run
+
+```
+cd runtime/build && CW_VKDRAW=1 ./cw_runtime 2> run.log    # play with the HUD up, close the window
+```
+
+One session, and the output is the call-site list.

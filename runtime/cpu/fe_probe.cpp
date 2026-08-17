@@ -95,7 +95,6 @@ namespace
     X(82815B80, "cFEMeter creator  [TABLE ENTRY 16] alloc 0x2F0")                        \
     X(8280D300, "cFEMeter CONSTRUCTOR — writes vtable 0x820BDBE8")                        \
     X(8280D438, "cFEMeter SET field 0x1CC — is the meter ever given a value?")            \
-    X(8280D440, "cFEMeter get field 0x1CC")                                               \
     X(8280D448, "cFEMeter get field 0x248")
 
 #define X(addr, what) std::atomic<uint64_t> g_fe_##addr{ 0 };
@@ -222,6 +221,33 @@ PPC_FUNC(sub_82784508)
     g_missed.emplace_back(buf);
 }
 
+// WHO READS THE METER'S VALUE? The 0x1CC getter is called 10,192 times in one play
+// session while the meter draws nothing, so its callers ARE the meter's live update/draw
+// path — and cFEMeter has no draw method of its own, so that path is inherited code that
+// no per-class hook can isolate. The link register names it directly: the recompiler sets
+// ctx.lr on every `bl`, so on entry it holds the return address of the call site.
+namespace
+{
+std::vector<std::pair<uint32_t, uint64_t>> g_getCallers;   // {return address, count}
+std::atomic<uint64_t> g_getCalls{ 0 };
+} // namespace
+
+extern "C" PPC_FUNC(__imp__sub_8280D440);
+PPC_FUNC(sub_8280D440)
+{
+    const uint32_t lr = uint32_t(ctx.lr);
+    g_getCalls.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(g_missMutex);
+        bool seen = false;
+        for (auto& e : g_getCallers)
+            if (e.first == lr) { ++e.second; seen = true; break; }
+        if (!seen && g_getCallers.size() < 32)
+            g_getCallers.emplace_back(lr, 1);
+    }
+    __imp__sub_8280D440(ctx, base);
+}
+
 extern "C" PPC_FUNC(__imp__sub_82784588);
 PPC_FUNC(sub_82784588)
 {
@@ -291,6 +317,19 @@ void FeProbe_Report()
                          (unsigned long long)g_createCounts[i][0],
                          (unsigned long long)g_createCounts[i][1],
                          g_createCounts[i][1] ? "   <== never created" : "");
+    {
+        std::lock_guard<std::mutex> lock(g_missMutex);
+        std::fprintf(stderr,
+                     "[fe]   cFEMeter get 0x1CC called %llu x. CALL SITES (return addresses):\n",
+                     (unsigned long long)g_getCalls.load());
+        if (g_getCallers.empty())
+            std::fprintf(stderr, "[fe]     (never called)\n");
+        else
+            for (const auto& e : g_getCallers)
+                std::fprintf(stderr, "[fe]     from 0x%08X   %llu x\n", e.first,
+                             (unsigned long long)e.second);
+    }
+
     // The factory table, read out of guest memory rather than inferred from the code.
     if (uint8_t* b = g_base.load(std::memory_order_relaxed))
     {
