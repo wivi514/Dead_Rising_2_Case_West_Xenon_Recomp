@@ -2709,3 +2709,33 @@ failure**, upon which the meter never draws anything, ever, with no complaint.
 
 So the last question in the chain is measurable and named: per meter, what is the handle,
 and what did the registry answer for its name? The round-11 instrument records both.
+
+---
+
+## 54. **The handles are all VALID, slot 9 never runs — and the meter's real submit chain is decoded** — part 4, 2026-08-16
+
+Run 11 refuted finding 53's suspect cleanly: **every named meter carries a valid retained
+handle** (`w_meter` 0x3B, `pp1` 0x1E8, `up/down` 0x4F, `left/right` 0x50 — none -1), the
+value fields at `[+0x1D0]` are sequential item indexes, and the registry lookup
+`sub_82813940` never ran — the handle has another writer outside the scanned band. The -1
+gate is real but never the blocker.
+
+Run 12 then showed `sub_8273A510` — slot 9's unconditional tail call — **never runs**, so
+slot 9 itself never runs, so the meter's emission is not that path at all. Reading
+`cFEMeter::Draw` (`0x82815C18`) end to end: it computes the transform, stores the matrix
+into `[this+0x20..0x4C]`, propagates the visibility token to children — and its EMITTING
+branch, taken only when **`[this+0x254] == 0`**, goes:
+
+```
+sub_8272EB40(batch, 0, -1)                      ; begin
+id = sub_8275CD58(global, name)                 ; resolve — names held at
+                                                ;   [0x82AF363C/40], RUNTIME-populated
+sub_8273C870(batch, name, id, 1, &this+0x26C)   ; submit, twice
+sub_8274A698 ; sub_8272EC50(batch, r, 0x28)     ; end
+```
+
+`[this+0x254]` has been in the probe since finding 47 — the update-walk histogram says it
+is 0 in ~74% of samples — but its DRAW-TIME value on the 126 token-passing draw entries
+per session is unmeasured. Round 13 hooks all four functions: begin==0 means the branch is
+never taken at draw time (and `[0x254]`'s draw-time value is the block); failing resolve
+rows name missing resources; healthy submits push the loss into the flusher below.
