@@ -3189,3 +3189,20 @@ From phase C part 18 (the frame rate — and none of it was work):
      the alternative is a measurement that is wrong in a way no control catches,
      because the control (`is the probe counting?`) passes perfectly — it was
      counting, accurately, the wrong function. See finding 40.
+
+## 323. A PPC_FUNC hook inside an anonymous namespace compiles, prints its report, and reports its own absence as guest behaviour
+
+An unclosed `namespace {` swallowed every hook added to `fe_probe.cpp` over three
+rounds (the retained-submit chain, the registry lookups, the twelve hide/show
+recorders). Internal linkage meant the strong override never replaced the
+recompiler's weak symbol; the hook bodies were dead code, their counters stayed
+zero, and the report faithfully printed "(never called)" — five investigation
+rounds read those zeros as facts about the guest. The build was clean throughout,
+and the file's OLDER hooks kept counting, which made the instrument look alive.
+
+The gate that catches it in seconds: `nm` the BINARY and check the hook's symbol
+is `T` (strong) at a different address from `__imp__sub_X` — a `W` at the same
+address is the recompiled weak alias, i.e. the hook did not land. Run it for
+every new hook before believing any zero from it. This is gotcha 30 ("an
+instrument that has never failed has not been shown capable of failing") wearing
+C++ linkage as a costume; the counters were never wrong, they were never wired.

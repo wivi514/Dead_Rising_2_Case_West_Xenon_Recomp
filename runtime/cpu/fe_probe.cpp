@@ -637,6 +637,10 @@ inline void NoteHideShow(uint8_t* b, uint32_t func, uint32_t lr, uint32_t obj)
 }
 } // namespace
 
+} // namespace  <-- closes the anonymous namespace opened before g_s8Flag;
+// every PPC_FUNC override below MUST be at global scope or it silently fails
+// to replace the recompiled weak symbol (the round-15 lesson: six dead hooks
+// reported their own absence as guest behaviour).
 #define X(addr, what)                                                                    \
     extern "C" PPC_FUNC(__imp__sub_##addr);                                              \
     PPC_FUNC(sub_##addr)                                                                 \
@@ -862,7 +866,6 @@ inline void NoteSlot8(uint8_t* b, uint32_t self, uint32_t lr)
         }
     }
 }
-} // namespace
 
 extern "C" PPC_FUNC(__imp__sub_8280FF30);
 PPC_FUNC(sub_8280FF30)
