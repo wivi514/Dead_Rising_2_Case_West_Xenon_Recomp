@@ -384,6 +384,63 @@ inline float GuestF32(uint8_t* b, uint32_t va)
     return f;
 }
 
+// ROUND 3 ANSWERED: meters PASS both walker gates where they are sampled —
+// bit 0x00800000 SET 92%, [+0x6C] positive 100% — and still receive ~250
+// slot-8 calls against 9,236 update-walk visits. So the pruning is not the
+// meter's own state. Slot 8 is a TREE recursion (children at [this+0x8],
+// siblings at [+0xC], self-render via own slot 9), which leaves exactly two
+// places to lose a meter: an ANCESTOR failing the same gates (the recursion
+// prunes whole subtrees), or the meter not being linked under a drawn parent
+// at all. Both are measured here, per class, in the update walk:
+//   * parent = [self+0xB0] (the field cFEMeter::Draw reads its inherited
+//     scale through); null / self-found-in-parent's-child-chain / not-found;
+//   * climb the parent chain and test each ancestor's bit 0x00800000 and
+//     [+0x6C]; count which gate the FIRST failing ancestor fails, and record
+//     that ancestor's VTABLE POINTER — identity by what the guest wrote.
+namespace
+{
+std::atomic<uint64_t> g_parNull[3], g_inChain[3], g_notInChain[3];
+std::atomic<uint64_t> g_ancFailBit8[3], g_ancFailAlpha[3], g_ancAllPass[3];
+std::mutex g_ancMutex;
+// [class] -> distinct {failing ancestor's vtable, count}
+std::vector<std::pair<uint32_t, uint64_t>> g_ancFailVt[3];
+} // namespace
+
+inline void TreeSample(uint8_t* b, uint32_t self, int c)
+{
+    const uint32_t parent = GuestU32(b, self + 0xB0);
+    if (parent < 0x1000)
+    {
+        g_parNull[c].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    // Is self in parent's child chain? head [parent+0x8], siblings [+0xC].
+    bool found = false;
+    uint32_t w = GuestU32(b, parent + 0x8);
+    for (int i = 0; i < 512 && w >= 0x1000; i++, w = GuestU32(b, w + 0xC))
+        if (w == self) { found = true; break; }
+    (found ? g_inChain : g_notInChain)[c].fetch_add(1, std::memory_order_relaxed);
+
+    // Climb ancestors; the walker prunes a subtree on the first gate failure.
+    uint32_t a = parent;
+    for (int d = 0; d < 32 && a >= 0x1000; d++, a = GuestU32(b, a + 0xB0))
+    {
+        const bool bit8ok = (GuestU32(b, a + 0x10) & 0x00800000u) != 0;
+        const bool alphaok = GuestF32(b, a + 0x6C) > 0.0f;
+        if (bit8ok && alphaok)
+            continue;
+        (bit8ok ? g_ancFailAlpha : g_ancFailBit8)[c].fetch_add(1, std::memory_order_relaxed);
+        const uint32_t avt = GuestU32(b, a);
+        std::lock_guard<std::mutex> lock(g_ancMutex);
+        for (auto& e : g_ancFailVt[c])
+            if (e.first == avt) { ++e.second; return; }
+        if (g_ancFailVt[c].size() < 24)
+            g_ancFailVt[c].emplace_back(avt, 1);
+        return;
+    }
+    g_ancAllPass[c].fetch_add(1, std::memory_order_relaxed);
+}
+
 inline void FlagSample(uint8_t* b, uint32_t self, std::atomic<uint64_t> (*ctr)[2])
 {
     const int c = VtClass(b, self);
@@ -396,6 +453,7 @@ inline void FlagSample(uint8_t* b, uint32_t self, std::atomic<uint64_t> (*ctr)[2
         g_updBit8[c][(flags & 0x00800000u) ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
         g_updAlpha[c][GuestF32(b, self + 0x6C) > 0.0f ? 1 : 0]
             .fetch_add(1, std::memory_order_relaxed);
+        TreeSample(b, self, c);
     }
 }
 
@@ -844,6 +902,25 @@ void FeProbe_Report()
                      (unsigned long long)g_updBit8[c][1].load(),
                      (unsigned long long)g_updAlpha[c][0].load(),
                      (unsigned long long)g_updAlpha[c][1].load());
+    std::fprintf(stderr,
+                 "[fe]   DRAW-TREE MEMBERSHIP AND ANCESTOR GATES (update-walk samples):\n"
+                 "[fe]                parent=0  in-chain  NOT-in-chain  ancFAILbit8  ancFAILalpha  all-pass\n");
+    for (int c = 0; c < 3; c++)
+        std::fprintf(stderr, "[fe]     %-10s %8llu %9llu %13llu %12llu %13llu %9llu\n",
+                     kVtClassName[c], (unsigned long long)g_parNull[c].load(),
+                     (unsigned long long)g_inChain[c].load(),
+                     (unsigned long long)g_notInChain[c].load(),
+                     (unsigned long long)g_ancFailBit8[c].load(),
+                     (unsigned long long)g_ancFailAlpha[c].load(),
+                     (unsigned long long)g_ancAllPass[c].load());
+    {
+        std::lock_guard<std::mutex> anclock(g_ancMutex);
+        for (int c = 0; c < 3; c++)
+            for (const auto& e : g_ancFailVt[c])
+                std::fprintf(stderr,
+                             "[fe]     %-10s first-failing ancestor vtable 0x%08X   %llu x\n",
+                             kVtClassName[c], e.first, (unsigned long long)e.second);
+    }
     std::fprintf(stderr, "[fe]   slot-8 CALL SITES (return addresses, both bodies):\n");
     {
         std::lock_guard<std::mutex> s8lock(g_s8Mutex);
