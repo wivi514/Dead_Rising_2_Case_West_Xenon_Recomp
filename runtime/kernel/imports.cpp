@@ -3973,6 +3973,9 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
         int hostKey = 0;        // 2/3/4 = the F2/F3/F4 debug edges, 9 = F9's frame
                                 // dump/census, all of them pulses with no pad state
         bool barrier = false;   // WAITJUMP: park here until the screen request lands
+        uint8_t lt = 0, rt = 0; // trigger entries HOLD like sticks; LT re-shows the
+                                // auto-hidden HUD (operator, 2026-08-17), which is what
+                                // makes a census frame with the PP bar reachable
     };
     // Full deflection is 32767 and the Y axis is positive UP (gotcha 102 — the
     // conversion the real pad path also makes). No deadzone is applied anywhere,
@@ -3996,6 +3999,9 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
         { "RSDOWN",  0, 0, 0, 0, -kFull, true },
         { "RSLEFT",  0, 0, 0, -kFull, 0, true },
         { "RSRIGHT", 0, 0, 0,  kFull, 0, true },
+        // Triggers — LT aims, and aiming re-shows the auto-hidden HUD bars.
+        { "LT", 0, 0,0,0,0, true, 0, false, 255, 0 },
+        { "RT", 0, 0,0,0,0, true, 0, false, 0, 255 },
         // Host debug edges — see the note above. No pad state, one pulse per interval.
         { "F2", 0, 0,0,0,0, false, 2 },   // the title's shipped DebugJump screen
         { "F3", 0, 0,0,0,0, false, 3 },   // DebugEnter
@@ -4219,9 +4225,13 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
     const int16_t outLY = active ? entry.ly : int16_t(0);
     const int16_t outRX = active ? entry.rx : int16_t(0);
     const int16_t outRY = active ? entry.ry : int16_t(0);
+    const uint8_t outLT = active ? entry.lt : uint8_t(0);
+    const uint8_t outRT = active ? entry.rt : uint8_t(0);
 
     const uint64_t stateKey =
-        stateHash(outButtons, outLX, outLY, outRX, outRY);
+        stateHash(outButtons, outLX, outLY, outRX,
+                  int16_t(uint16_t(outRY) ^ (uint16_t(outLT) << 1) ^
+                          (uint16_t(outRT) << 9)));
     if (stateKey != lastState.exchange(stateKey))
     {
         const uint32_t n = packet.fetch_add(1) + 1;
@@ -4258,6 +4268,8 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
     state->gamepad.thumbLY = outLY;
     state->gamepad.thumbRX = outRX;
     state->gamepad.thumbRY = outRY;
+    state->gamepad.leftTrigger = outLT;
+    state->gamepad.rightTrigger = outRT;
     return 0;
 }
 

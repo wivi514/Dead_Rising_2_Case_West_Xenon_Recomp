@@ -1772,6 +1772,98 @@ void FeProbe_Report()
         else
             std::fprintf(stderr, "[fe]   RETAINED ITEMS: manager not resolvable\n");
     }
+    // IS THE METER SHADER EVEN LOADED? Every guest stage of the meter path measures
+    // healthy and no draw with vs_a4ae7c2b7c1818c4 is ever issued — so ask the most
+    // basic question left: does that shader's MICROCODE exist anywhere in guest
+    // memory in our runtime? CW_FE_UCODE_SCAN=<path> (default: the a4ae dump) is
+    // read and its first 64 bytes searched across every readable mapping inside the
+    // guest window (found via /proc/self/maps, so lazily-mapped holes cannot fault
+    // the report). For each hit, pointers to it (big-endian u32 of the guest
+    // address) are searched the same way — those are the shader OBJECTS, and their
+    // absence or presence names the divergence: bank never loaded, loaded but never
+    // wrapped, or wrapped but never selected.
+    if (uint8_t* b3 = g_base.load(std::memory_order_relaxed))
+    {
+        const char* ucodePath = std::getenv("CW_FE_UCODE_SCAN");
+        if (!ucodePath)
+            ucodePath = "/home/wivi514/DR2CW-troubleshooting/ucode-dumps/"
+                        "vs_a4ae7c2b7c1818c4.ucode";
+        FILE* uf = std::fopen(ucodePath, "rb");
+        if (!uf)
+            std::fprintf(stderr, "[fe]   UCODE SCAN: cannot open %s\n", ucodePath);
+        else
+        {
+            uint8_t needle[64];
+            const size_t nlen = std::fread(needle, 1, sizeof needle, uf);
+            std::fclose(uf);
+            std::vector<std::pair<uintptr_t, uintptr_t>> regions;
+            if (FILE* maps = std::fopen("/proc/self/maps", "r"))
+            {
+                char line[512];
+                while (std::fgets(line, sizeof line, maps))
+                {
+                    uintptr_t lo, hi;
+                    char perms[8];
+                    if (std::sscanf(line, "%lx-%lx %7s", &lo, &hi, perms) == 3 &&
+                        perms[0] == 'r')
+                    {
+                        const uintptr_t gb = uintptr_t(b3);
+                        if (hi > gb + 0x10000 && lo < gb + 0xC0000000ull)
+                            regions.emplace_back(std::max(lo, gb),
+                                                 std::min(hi, gb + 0xC0000000ull));
+                    }
+                }
+                std::fclose(maps);
+            }
+            std::vector<uint32_t> hits;
+            for (const auto& r : regions)
+            {
+                const uint8_t* p = reinterpret_cast<const uint8_t*>(r.first);
+                size_t len = r.second - r.first;
+                while (len >= nlen && hits.size() < 8)
+                {
+                    const void* m = memmem(p, len, needle, nlen);
+                    if (!m)
+                        break;
+                    hits.push_back(uint32_t(uintptr_t(m) - uintptr_t(b3)));
+                    const size_t adv = uintptr_t(m) - uintptr_t(p) + 1;
+                    p += adv;
+                    len -= adv;
+                }
+            }
+            std::fprintf(stderr, "[fe]   UCODE SCAN (%zu-byte needle, %zu regions): %zu hit%s\n",
+                         nlen, regions.size(), hits.size(), hits.size() == 1 ? "" : "s");
+            for (uint32_t h : hits)
+            {
+                std::fprintf(stderr, "[fe]     microcode at guest 0x%08X; pointers to it:", h);
+                uint8_t ptr[4] = { uint8_t(h >> 24), uint8_t(h >> 16), uint8_t(h >> 8),
+                                   uint8_t(h) };
+                int nptr = 0;
+                for (const auto& r : regions)
+                {
+                    const uint8_t* p = reinterpret_cast<const uint8_t*>(r.first);
+                    size_t len = r.second - r.first;
+                    while (len >= 4 && nptr < 6)
+                    {
+                        const void* m = memmem(p, len, ptr, 4);
+                        if (!m)
+                            break;
+                        std::fprintf(stderr, " 0x%08X",
+                                     uint32_t(uintptr_t(m) - uintptr_t(b3)));
+                        ++nptr;
+                        const size_t adv = uintptr_t(m) - uintptr_t(p) + 1;
+                        p += adv;
+                        len -= adv;
+                    }
+                }
+                std::fprintf(stderr, nptr ? "\n" : " (none)\n");
+            }
+            if (hits.empty())
+                std::fprintf(stderr,
+                             "[fe]     THE METER SHADER'S MICROCODE IS NOT IN GUEST MEMORY —\n"
+                             "[fe]     the bank entry never loads in our runtime.\n");
+        }
+    }
     // The factory table, read out of guest memory rather than inferred from the code.
     if (uint8_t* b = g_base.load(std::memory_order_relaxed))
     {
