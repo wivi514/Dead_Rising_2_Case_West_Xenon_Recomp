@@ -1808,9 +1808,10 @@ void FeProbe_Report()
                         perms[0] == 'r')
                     {
                         const uintptr_t gb = uintptr_t(b3);
-                        if (hi > gb + 0x10000 && lo < gb + 0xC0000000ull)
-                            regions.emplace_back(std::max(lo, gb),
-                                                 std::min(hi, gb + 0xC0000000ull));
+                        const uintptr_t guestEnd = gb + uintptr_t(0xC0000000ull);
+                        if (hi > gb + 0x10000 && lo < guestEnd)
+                            regions.emplace_back(lo > gb ? lo : gb,
+                                                 hi < guestEnd ? hi : guestEnd);
                     }
                 }
                 std::fclose(maps);
