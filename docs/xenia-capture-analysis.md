@@ -2672,3 +2672,40 @@ class `0x820BE440` wraps it), and yet meters collect ~250 draw-walk entries a se
 the update walk samples them, hidden when the draw recursion arrives. The round-9
 instrument (committed) measures at draw time, by name: slot-8 reach per widget id, and
 every child's bit8/alpha sampled at the walker's own decision point.
+
+---
+
+## 53. **THE RENDER GATE: a meter draws only if `[this+0x244] != -1` — and the draw model was wrong all along** — part 4, 2026-08-16
+
+Runs 9-10 (the draw-time frontier, per named widget) rewrote the model twice:
+
+**1. Nothing draws per frame through slot 8.** The busiest widget in a session sees ~1,800
+slot-8 entries; a minutes-long session has hundreds of thousands of frames' worth of HUD on
+screen. The widget tree walk is a **retained rebuild** — it runs when something is dirty,
+and whatever it builds is re-submitted each frame by a separate path. (Screen-node widgets
+double-count in the frontier — wrapper plus base hook — so printed "entered" is 2x reach
+for that class.)
+
+**2. The pp and mission chains are walked all the way down.** In a gameplay session the
+recursion entered, 171 times each: `small_healthbar → health_pp_meter →
+pp_meter_container → meter_group → w_meter → pp_meter` — the meters themselves included.
+The only draw-time bit8 failures on those chains are `w_KO_bar` (co-op — correctly hidden),
+`health_meter` (npc1), and `meter_sub_mission` (the timer rows). **So for the PP bar, every
+container theory is dead: its meter's render runs and emits nothing.**
+
+**3. The gate is one field.** `cFEMeter`'s render (slot 9, `sub_82804808`) is four
+instructions of gate and a tail call:
+
+```
+if ([this+0x244] == -1) return;                       // silently draw nothing
+submit([global+0x1498], [this+0x1D0], [this+0x244], 2);   // -> sub_8273A510
+```
+
+`[this+0x244]` is written in exactly two frontend-band places: the ctor (initial value)
+and property-setter slot 1 (`sub_82816368`), which for one specific property copies the
+value string into `[this+0x2C0]` and resolves it through global registry `[0x82AF3028]`
+via **`sub_82813940(registry, name) -> id`**, storing the result — **-1 on lookup
+failure**, upon which the meter never draws anything, ever, with no complaint.
+
+So the last question in the chain is measurable and named: per meter, what is the handle,
+and what did the registry answer for its name? The round-11 instrument records both.
