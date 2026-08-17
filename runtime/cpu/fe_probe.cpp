@@ -880,7 +880,11 @@ PPC_FUNC(sub_8280FF30)
 // ambiguity: the drawn instances' own fields, at the moment that matters.
 namespace
 {
-struct MeterDrawState { uint32_t handle, mode; uint64_t count; };
+// modeExit catches a flip INSIDE the body: run 14 read mode 0 at entry on
+// every drawn meter while the mode-0 submit block never began — either the
+// helpers between entry and the test rewrite [0x254], or the begin-hook has
+// never been shown able to count (gotcha 30). Exit-mode splits those.
+struct MeterDrawState { uint32_t handle, mode, modeExit; uint64_t count; };
 std::unordered_map<uint32_t, MeterDrawState> g_meterDraw;
 } // namespace
 
@@ -889,15 +893,21 @@ PPC_FUNC(sub_82815C18)
 {
     VtNote(base, ctx.r3.u32, g_vtc_82815C18);
     NoteSlot8(base, ctx.r3.u32, uint32_t(ctx.lr));
-    if (ctx.r3.u32 >= 0x1000)
+    const uint32_t self = ctx.r3.u32;
+    if (self >= 0x1000)
     {
         std::lock_guard<std::mutex> lock(g_mhMutex);
-        MeterDrawState& m = g_meterDraw[GuestU32(base, ctx.r3.u32 + 0x4)];
-        m.handle = GuestU32(base, ctx.r3.u32 + 0x244);
-        m.mode = GuestU32(base, ctx.r3.u32 + 0x254);
+        MeterDrawState& m = g_meterDraw[GuestU32(base, self + 0x4)];
+        m.handle = GuestU32(base, self + 0x244);
+        m.mode = GuestU32(base, self + 0x254);
         m.count++;
     }
     __imp__sub_82815C18(ctx, base);
+    if (self >= 0x1000)
+    {
+        std::lock_guard<std::mutex> lock(g_mhMutex);
+        g_meterDraw[GuestU32(base, self + 0x4)].modeExit = GuestU32(base, self + 0x254);
+    }
 }
 
 // The screen-node class (vtable 0x820BE440 — IGOverlay/HUD/hud_* nodes) has
@@ -1430,10 +1440,12 @@ void FeProbe_Report()
                      "[fe]   METER DRAW-TIME STATE — per meter at sub_82815C18 entry:\n");
         for (const auto& e : g_meterDraw)
             std::fprintf(stderr,
-                         "[fe]     %-28s handle 0x%08X%s  mode %u  (%llu draws)\n",
+                         "[fe]     %-28s handle 0x%08X%s  mode %u -> exit %u%s  (%llu draws)\n",
                          NameOfId(e.first), e.second.handle,
                          e.second.handle == 0xFFFFFFFFu ? " <== -1, slot 9 bails" : "",
-                         e.second.mode, (unsigned long long)e.second.count);
+                         e.second.mode, e.second.modeExit,
+                         e.second.mode != e.second.modeExit ? " <== FLIPS IN-BODY" : "",
+                         (unsigned long long)e.second.count);
         std::fprintf(stderr,
                      "[fe]   meter submit chain: begin %llu  submit %llu  end %llu\n",
                      (unsigned long long)g_batchBegin.load(),
