@@ -237,17 +237,22 @@ inline bool IsMeter(uint8_t* b, uint32_t self)
 // richer custom hooks below; those feed the same counters so the census stays
 // complete.
 #define CW_VT_HOOKS(X)                                                                   \
-    X(821C3380) X(82332528) X(82463648) X(82466CB8) X(828023B8) X(82802408)              \
+    X(82332528) X(82463648) X(82466CB8) X(828023B8) X(82802408)                          \
     X(82803678) X(828036F0) X(82803928) X(82803ED0) X(82804808) X(82804840)              \
     X(828048C0) X(82804D98) X(82804DB0) X(82805C38) X(82805D70) X(82806000)              \
     X(828064F8) X(82807E48) X(82807EA8) X(82809A70) X(82809AB0) X(8280BA10)              \
     X(8280BB08) X(8280BBA0) X(8280BD38) X(8280BEB8) X(8280D438)                          \
     X(8280D448) X(8280D458) X(8280DDF8) X(8280DE00) X(8280E308) X(8280E978)              \
-    X(8280FD98) X(8280FEB0) X(8280FF30) X(82810160) X(82810210) X(82810628)              \
+    X(8280FD98) X(8280FEB0) X(82810160) X(82810210) X(82810628)                          \
     X(82810698) X(82810708) X(828107D8) X(82810960) X(828109D8) X(82810A60)              \
-    X(82810AF0) X(82814A98) X(82814AE8) X(82815A78) X(82815BC8) X(82815C18)              \
+    X(82810AF0) X(82814A98) X(82814AE8) X(82815A78) X(82815BC8)                          \
     X(828162C8) X(82816368) X(82816920) X(82816970) X(82816AA8) X(82816BB0)              \
     X(8281B8E0) X(8281BB70) X(8281C0A8) X(8281C370)
+
+// Comment above says CW_VT_HOOKS is the union minus the custom-hooked
+// functions; after the first census run that exclusion list grew to FOUR —
+// sub_8281A5E0, sub_8280D440, and now sub_8280FF30 / sub_82815C18 / the shared
+// stub sub_821C3380, which get the slot-8 traversal probes below.
 
 namespace
 {
@@ -325,6 +330,81 @@ std::atomic<uint32_t> g_ctorVtSeen[3];
     }
 CW_FE_CTORS(X)
 #undef X
+
+// ============================================================================
+// THE SLOT-8 TRAVERSAL PROBE — added after the census's first run, 2026-08-16.
+//
+// The census answered with a disproportion, not a hole: slots 8 and 9 are
+// called TOGETHER (identical counts per class) at per-frame magnitude on the
+// drawing classes — 32,024 on cFEBitmap, 9,247 on cFEText, ~32-37 per widget —
+// and only 118 times on cFEMeter, ~1.7 per meter, the same one-shot magnitude
+// as the layout. So a traversal that hits drawers every frame skips meters
+// almost always. Both slot-8 bodies (drawers' sub_8280FF30 and the meter's own
+// override sub_82815C18) open by testing bit 0x02000000 of the flag word at
+// [this+0x10] and do nothing when it is clear.
+//
+// Two measurements, both comparisons rather than stories:
+//   * the LR at slot-8 entry names the traversal that decides who gets drawn —
+//     the walker we have been unable to name for four findings;
+//   * the flag bit, sampled per class BOTH at slot-8 entry and in the update
+//     walk (which reaches every widget, meters included, 4,480x last run),
+//     splits the outcomes: meters flag-clear in the update walk -> the defect
+//     is whoever should SET the flag; meters flag-set but still skipped ->
+//     the pruning is upstream of the flag (parent chain or list membership).
+namespace
+{
+std::atomic<uint64_t> g_s8Flag[3][2];    // [class][bit 0x02000000 clear/set] at slot-8 entry
+std::atomic<uint64_t> g_updFlag[3][2];   // same, sampled in the update walk
+std::mutex g_s8Mutex;
+std::vector<std::pair<uint32_t, uint64_t>> g_s8Callers;   // {LR, count} across both bodies
+
+inline void FlagSample(uint8_t* b, uint32_t self, std::atomic<uint64_t> (*ctr)[2])
+{
+    const int c = VtClass(b, self);
+    if (c < 0)
+        return;
+    const bool set = (GuestU32(b, self + 0x10) & 0x02000000u) != 0;
+    ctr[c][set ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+}
+
+inline void NoteSlot8(uint8_t* b, uint32_t self, uint32_t lr)
+{
+    FlagSample(b, self, g_s8Flag);
+    std::lock_guard<std::mutex> lock(g_s8Mutex);
+    for (auto& e : g_s8Callers)
+        if (e.first == lr) { ++e.second; return; }
+    if (g_s8Callers.size() < 32)
+        g_s8Callers.emplace_back(lr, 1);
+}
+} // namespace
+
+extern "C" PPC_FUNC(__imp__sub_8280FF30);
+PPC_FUNC(sub_8280FF30)
+{
+    VtNote(base, ctx.r3.u32, g_vtc_8280FF30);
+    NoteSlot8(base, ctx.r3.u32, uint32_t(ctx.lr));
+    __imp__sub_8280FF30(ctx, base);
+}
+
+extern "C" PPC_FUNC(__imp__sub_82815C18);
+PPC_FUNC(sub_82815C18)
+{
+    VtNote(base, ctx.r3.u32, g_vtc_82815C18);
+    NoteSlot8(base, ctx.r3.u32, uint32_t(ctx.lr));
+    __imp__sub_82815C18(ctx, base);
+}
+
+// The shared no-op stub is the drawers' UPDATE slot 6 (also their 30/32), so a
+// flag sample here is the drawers' side of the update-walk comparison. The
+// slot conflation does not matter: the flag belongs to the object, not the
+// slot.
+extern "C" PPC_FUNC(__imp__sub_821C3380);
+PPC_FUNC(sub_821C3380)
+{
+    VtNote(base, ctx.r3.u32, g_vtc_821C3380);
+    FlagSample(base, ctx.r3.u32, g_updFlag);
+    __imp__sub_821C3380(ctx, base);
+}
 
 // THE WIDGET FACTORY'S LOOKUP, which is where a missing class becomes silence.
 //
@@ -490,6 +570,7 @@ PPC_FUNC(sub_8281A5E0)
 {
     const uint32_t self = ctx.r3.u32;
     VtNote(base, self, g_vtc_8281A5E0);   // meter vtable slot 6
+    FlagSample(base, self, g_updFlag);    // the meters' side of the update-walk flag census
     g_updAll.fetch_add(1, std::memory_order_relaxed);
     if (IsMeter(base, self))
     {
@@ -706,6 +787,30 @@ void FeProbe_Report()
         std::fprintf(stderr, "[fe]    %2d  | %s | %s | %s %s\n", s, cols[0], cols[1],
                      cols[2],
                      drawersOnly ? "<== DRAWERS ONLY" : meterOnly ? "<== meter only" : "");
+    }
+
+    // ------------------------------------------------------------------
+    // THE SLOT-8 TRAVERSAL PROBE: the flag bit both slot-8 bodies gate on,
+    // per class, at two sampling points — and the traversal's own call sites.
+    std::fprintf(stderr,
+                 "[fe]   SLOT-8 PROBE — flag [this+0x10] & 0x02000000, per class:\n"
+                 "[fe]                     at slot-8 entry        in the update walk\n"
+                 "[fe]                     clear      SET         clear      SET\n");
+    for (int c = 0; c < 3; c++)
+        std::fprintf(stderr, "[fe]     %-10s %9llu %9llu   %9llu %9llu\n", kVtClassName[c],
+                     (unsigned long long)g_s8Flag[c][0].load(),
+                     (unsigned long long)g_s8Flag[c][1].load(),
+                     (unsigned long long)g_updFlag[c][0].load(),
+                     (unsigned long long)g_updFlag[c][1].load());
+    std::fprintf(stderr, "[fe]   slot-8 CALL SITES (return addresses, both bodies):\n");
+    {
+        std::lock_guard<std::mutex> s8lock(g_s8Mutex);
+        if (g_s8Callers.empty())
+            std::fprintf(stderr, "[fe]     (slot 8 never ran)\n");
+        else
+            for (const auto& e : g_s8Callers)
+                std::fprintf(stderr, "[fe]     from 0x%08X   %llu x\n", e.first,
+                             (unsigned long long)e.second);
     }
 
     // The factory table, read out of guest memory rather than inferred from the code.
