@@ -2739,3 +2739,27 @@ is 0 in ~74% of samples — but its DRAW-TIME value on the 126 token-passing dra
 per session is unmeasured. Round 13 hooks all four functions: begin==0 means the branch is
 never taken at draw time (and `[0x254]`'s draw-time value is the block); failing resolve
 rows name missing resources; healthy submits push the loss into the flusher below.
+
+---
+
+## 55. **RETRACTION: six rounds of hooks were dead code — an unclosed anonymous namespace, gotcha 323** — part 4, 2026-08-16
+
+`nm` on the binary showed every hook added in rounds 11-13 as `W` at `__imp__`'s own
+address — the recompiled weak alias, not the override. An unclosed `namespace {` in
+`fe_probe.cpp` (opened before the slot-8 probe's counters, balanced by a stray close 600
+lines later) gave internal linkage to every `PPC_FUNC` override defined in between. They
+compiled, were dead, and their "(never called)" rows were **the instrument reporting its
+own absence**.
+
+**VOID:** finding 51's "none of the twelve hide/show functions ever ran"; run 11's
+"registry lookup never called"; run 12's "`sub_8273A510` never runs"; finding 54's
+"slot 9 never runs / bails at -1". **STILL VALID** (from hooks proven live by their
+nonzero data): all vtable censuses, the draw-time frontier, the flag/gate/tree sampling,
+and the draw-time meter state — **the drawn meters (`w_meter`, `pp1`) enter and exit
+`cFEMeter::Draw` with mode 0 (the emitting mode) and a valid handle 0x1E8**, so on the
+surviving evidence the submit chain is plausibly healthy and simply unmeasured below the
+draw body.
+
+The catch-it-in-seconds gate is now gotcha 323: after adding any hook, `nm` the binary
+and require `T` at its own address — a clean build proves nothing (gotcha 30 in linkage
+costume). The counters were never wrong; they were never wired.
