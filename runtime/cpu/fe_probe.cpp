@@ -80,6 +80,7 @@
 #include <ppc_config.h>   // ppc_context.h #errors without it
 #include <ppc_context.h>
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <mutex>
@@ -662,14 +663,52 @@ inline void FlagSample(uint8_t* b, uint32_t self, std::atomic<uint64_t> (*ctr)[2
     }
 }
 
+// ROUND 8 LEFT ONE CONTRADICTION: the pp/health chains pass bit8+alpha in
+// every update-walk sample, all container classes on the chain use the
+// STANDARD recursive slot 8 — and the meters still collect ~250 draw-walk
+// entries a session. The only reading that fits is that the gates FLIP WITHIN
+// THE FRAME: healthy when the update walk samples them, hidden when the draw
+// recursion arrives. So measure at draw time, by name: every slot-8 entry
+// records the widget's interned id, and samples each CHILD's gates as the
+// walker is about to test them. The recursion's stopping frontier — and the
+// gate that stops it — become readable per named widget.
+struct S8Gate
+{
+    uint64_t entered, childPass, childFailBit8, childFailAlpha;
+};
+namespace
+{
+std::unordered_map<uint32_t, S8Gate> g_s8ById;   // widget id -> draw-time stats
+} // namespace
+
 inline void NoteSlot8(uint8_t* b, uint32_t self, uint32_t lr)
 {
     FlagSample(b, self, g_s8Flag);
     std::lock_guard<std::mutex> lock(g_s8Mutex);
     for (auto& e : g_s8Callers)
-        if (e.first == lr) { ++e.second; return; }
-    if (g_s8Callers.size() < 32)
+        if (e.first == lr) { ++e.second; break; }
+    if (g_s8Callers.size() < 32 &&
+        (g_s8Callers.empty() ||
+         std::none_of(g_s8Callers.begin(), g_s8Callers.end(),
+                      [lr](const auto& e) { return e.first == lr; })))
         g_s8Callers.emplace_back(lr, 1);
+    if (g_s8ById.size() < 20000)
+    {
+        g_s8ById[GuestU32(b, self + 0x4)].entered++;
+        uint32_t ch = GuestU32(b, self + 0x8);
+        for (int i = 0; i < 512 && ch >= 0x1000; i++, ch = GuestU32(b, ch + 0xC))
+        {
+            S8Gate& g = g_s8ById[GuestU32(b, ch + 0x4)];
+            const bool bit8ok = (GuestU32(b, ch + 0x10) & 0x00800000u) != 0;
+            const bool alphaok = GuestF32(b, ch + 0x6C) > 0.0f;
+            if (bit8ok && alphaok)
+                g.childPass++;
+            else if (!bit8ok)
+                g.childFailBit8++;
+            else
+                g.childFailAlpha++;
+        }
+    }
 }
 } // namespace
 
@@ -687,6 +726,16 @@ PPC_FUNC(sub_82815C18)
     VtNote(base, ctx.r3.u32, g_vtc_82815C18);
     NoteSlot8(base, ctx.r3.u32, uint32_t(ctx.lr));
     __imp__sub_82815C18(ctx, base);
+}
+
+// The screen-node class (vtable 0x820BE440 — IGOverlay/HUD/hud_* nodes) has
+// its own slot 8: a wrapper that calls base draw on itself when its bit8 is
+// set. Hooked so the roots appear in the draw-time frontier too.
+extern "C" PPC_FUNC(__imp__sub_82812098);
+PPC_FUNC(sub_82812098)
+{
+    NoteSlot8(base, ctx.r3.u32, uint32_t(ctx.lr));
+    __imp__sub_82812098(ctx, base);
 }
 
 // The shared no-op stub is the drawers' UPDATE slot 6 (also their 30/32), so a
@@ -1180,6 +1229,38 @@ void FeProbe_Report()
         }
         if (g_hsRows.empty())
             std::fprintf(stderr, "[fe]     (none of the twelve ever ran)\n");
+    }
+    // THE DRAW-TIME FRONTIER: which named widgets the draw recursion visits,
+    // and per widget, how its own children's gates read AT DRAW TIME. A widget
+    // that is 'entered' while its child fails is the exact block point.
+    std::fprintf(stderr,
+                 "[fe]   DRAW-TIME frontier — per widget: entered / as-a-child pass|failBit8|failAlpha:\n");
+    {
+        std::lock_guard<std::mutex> s8lock2(g_s8Mutex);
+        std::lock_guard<std::mutex> nmlock3(g_nameMutex);
+        std::vector<std::pair<uint32_t, const S8Gate*>> rows;
+        for (const auto& e : g_s8ById)
+            rows.emplace_back(e.first, &e.second);
+        std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+            return a.second->entered + a.second->childPass + a.second->childFailBit8 +
+                       a.second->childFailAlpha >
+                   b.second->entered + b.second->childPass + b.second->childFailBit8 +
+                       b.second->childFailAlpha;
+        });
+        size_t shown = 0;
+        for (const auto& r : rows)
+        {
+            if (shown++ >= 120)
+                break;
+            std::fprintf(stderr,
+                         "[fe]     %-28s entered %8llu   pass %8llu  failBit8 %8llu  failAlpha %8llu\n",
+                         NameOfId(r.first), (unsigned long long)r.second->entered,
+                         (unsigned long long)r.second->childPass,
+                         (unsigned long long)r.second->childFailBit8,
+                         (unsigned long long)r.second->childFailAlpha);
+        }
+        std::fprintf(stderr, "[fe]     (%zu named widgets total in the draw walk)\n",
+                     rows.size());
     }
     std::fprintf(stderr, "[fe]   FindChildById (slot 18) — {id -> name, caller LR}:\n");
     {
