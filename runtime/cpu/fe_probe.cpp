@@ -872,11 +872,31 @@ PPC_FUNC(sub_8280FF30)
     __imp__sub_8280FF30(ctx, base);
 }
 
+// Draw-time state per named meter: run 13 proved slot 9 runs on every meter
+// draw entry and bails at its [0x244]==-1 gate every time, while the
+// update-walk samples of the SAME fields read valid — and the two walks reach
+// different instance sets (pp_meter draws but is never update-walked). This
+// records {id -> handle 0x244, mode 0x254} at draw entry, ending the
+// ambiguity: the drawn instances' own fields, at the moment that matters.
+namespace
+{
+struct MeterDrawState { uint32_t handle, mode; uint64_t count; };
+std::unordered_map<uint32_t, MeterDrawState> g_meterDraw;
+} // namespace
+
 extern "C" PPC_FUNC(__imp__sub_82815C18);
 PPC_FUNC(sub_82815C18)
 {
     VtNote(base, ctx.r3.u32, g_vtc_82815C18);
     NoteSlot8(base, ctx.r3.u32, uint32_t(ctx.lr));
+    if (ctx.r3.u32 >= 0x1000)
+    {
+        std::lock_guard<std::mutex> lock(g_mhMutex);
+        MeterDrawState& m = g_meterDraw[GuestU32(base, ctx.r3.u32 + 0x4)];
+        m.handle = GuestU32(base, ctx.r3.u32 + 0x244);
+        m.mode = GuestU32(base, ctx.r3.u32 + 0x254);
+        m.count++;
+    }
     __imp__sub_82815C18(ctx, base);
 }
 
@@ -1406,6 +1426,14 @@ void FeProbe_Report()
             if (g_riRows.empty())
                 std::fprintf(stderr, "[fe]     (never called)\n");
         }
+        std::fprintf(stderr,
+                     "[fe]   METER DRAW-TIME STATE — per meter at sub_82815C18 entry:\n");
+        for (const auto& e : g_meterDraw)
+            std::fprintf(stderr,
+                         "[fe]     %-28s handle 0x%08X%s  mode %u  (%llu draws)\n",
+                         NameOfId(e.first), e.second.handle,
+                         e.second.handle == 0xFFFFFFFFu ? " <== -1, slot 9 bails" : "",
+                         e.second.mode, (unsigned long long)e.second.count);
         std::fprintf(stderr,
                      "[fe]   meter submit chain: begin %llu  submit %llu  end %llu\n",
                      (unsigned long long)g_batchBegin.load(),
