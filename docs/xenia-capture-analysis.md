@@ -1650,3 +1650,79 @@ cd runtime/build && CW_VKDRAW=1 CW_RING_TRACE=1 CW_PM4_BIN_CENSUS=1 \
 Both readings come from one session. If `predicated out` is large and the bin census names a
 pair, the defect is ours in `pm4.cpp`; if it is ~0, the guest is not submitting these draws and
 the cause is upstream of the GPU entirely.
+
+---
+
+## 38. **CONFIRMED ON A FRAME THAT HAS THE WIDGETS: zero draws, and the bar renders BLACK** — 2026-08-16
+
+Finding 37 could not answer the LIFE/PP half, because the frame it was given did not contain
+that cluster. The operator took a second capture — **frame 8724** — and this one does.
+
+```
+HUD region x70-390 y45-95     hardware MAX 248 · frame 2387 MAX 115 · FRAME 8724 MAX 249
+frame 8724: 2,625 draws   ·   draws using vs_a4ae7c2b7c1818c4:  0
+hardware  : 2,175 draws   ·   draws using vs_a4ae7c2b7c1818c4: 55
+```
+
+**The HUD is raised (MAX 249 against hardware's 248) and not one of 2,625 draws uses the
+shader.** The finding-37 caveat is now discharged: this is no longer an absence about what was
+looked at.
+
+### The picture, measured with its own positive control
+
+Mean RGB over three strips, ours against hardware:
+
+| strip | hardware | ours | reading |
+|---|---|---|---|
+| **LIFE filled pips** (x175-245) | R142 G114 B0 | R147 G119 B0 | **CONTROL — agrees.** Our HUD is otherwise correct and the method works |
+| **PP bar** (x200-380, y55-66) | R6 **G66 B85** | R2 **G3 B2** | hardware **cyan**, ours **BLACK** |
+
+**The positive control is what makes this admissible** (gotcha 30 applied to a measurement
+rather than a test): the filled pips agree to within five units, so a black PP bar is a real
+difference and not a mis-registered rectangle or a brightness offset.
+
+So the widget is not displaced or mis-coloured — **the region is simply not painted, and the
+HUD's own dark backdrop shows through.** That is exactly what a missing draw looks like over a
+dark backing, and it matches the mission line in finding 37 (hardware 191-193, ours 61-63).
+
+**The LIFE empty-square strip is NOT usable as evidence and is excluded**: our capture is LV.41
+with six filled pips, hardware's is LV.40 with five filled plus two empty, so the strips hold
+different things. Reporting it as a difference would be comparing two different health values.
+
+### The shader is real — that is now checked, not assumed
+
+`vs_a4ae7c2b7c1818c4.ucode` is **60 bytes / 15 dwords of genuine microcode**, not zeros:
+
+```
+10011002 00001200 C4000000 00000000 1003C200 22000000 00080000 00253B48
+00000002 C80F803E 00000000 E2000000 00000000 00000000 00000000
+```
+
+It was worth checking because our loader reports `va=00000000` for it — which had a plausible
+failure story behind it (microcode read from an unmapped address would be zeros, hash
+consistently, and translate to something that draws nothing). **That story is dead:** the
+bytes are real, `va=0` is simply what `IM_LOAD_IMMEDIATE` looks like — the microcode travels
+inline in the packet — and B2 counts 2.7 M of those.
+
+### Where the defect is now cornered
+
+Everything downstream is eliminated. The shader exists, is real, is translated, is in the
+bank, and is loaded by our runtime. Topology is supported. The stream guard is refuted. The
+HUD around it renders correctly, pixel-for-pixel on the control strip. **The draws simply do
+not arrive at the renderer.**
+
+**The one remaining fork is unchanged and still needs one reading**, because the per-draw
+census is written inside `DoDraw` and cannot see a draw dropped before it:
+
+- **we drop them** — predicated out by the bin mask in `gpu/pm4.cpp`. B2 makes this a live
+  possibility: `SET_BIN_MASK_LO` is the most common type-3 opcode in the game (finding 34).
+- **the guest never sends them** — the cause is then upstream of the GPU entirely.
+
+```
+cd runtime/build && CW_VKDRAW=1 CW_RING_TRACE=1 CW_PM4_BIN_CENSUS=1 \
+  CW_CAPTURE_KEY=<dir> ./cw_runtime 2> run.log      # F9 with the HUD up, then send run.log
+```
+
+**`run.log` is the artifact this time, not the capture** — the counters live on stderr and the
+last two captures did not carry it. `ring: pm4 ... (predicated out=N)` plus the bin census
+answer the fork in one line.
