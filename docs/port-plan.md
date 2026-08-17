@@ -3,7 +3,7 @@
 > ## STATUS as of the end of part 2 (2026-08-16) — READ THIS BEFORE THE PLAN
 >
 > **The plan below is largely DONE and is kept for its reasoning, not its task list.**
-> The live hand-off is `docs/part3-kickoff.md`; the authority on any number is
+> The live hand-off is `docs/part4-kickoff.md`; the authority on any number is
 > `docs/xenia-capture-analysis.md`.
 >
 > | item | state |
