@@ -647,6 +647,50 @@ inline void NoteHideShow(uint8_t* b, uint32_t func, uint32_t lr, uint32_t obj)
 CW_HS_FUNCS(X)
 #undef X
 
+// ROUNDS 9-10 REWROTE THE MODEL: nothing draws per frame through slot 8 — the
+// widget tree is a RETAINED rebuild, and the pp/mission chains are walked all
+// the way down to their meters. The failure is inside cFEMeter's render
+// (slot 9, sub_82804808), which is one gate:
+//     if ([this+0x244] == -1) return;   // silently draw nothing
+//     submit(global, [this+0x1D0], [this+0x244], 2);
+// and [this+0x244] is written exactly twice in the frontend band: the ctor
+// (initial value) and the property setter sub_82816368, which resolves a
+// name string (copied to [this+0x2C0]) through registry [0x82AF3028] via
+// sub_82813940 — returning -1 on failure, and the meter then never draws.
+// These two instruments close the loop: the handle per NAMED meter, and every
+// registry lookup's {name -> result}.
+namespace
+{
+std::mutex g_mhMutex;
+// widget id -> {last [this+0x244], samples, last [this+0x1D0]}
+struct MeterHandle { uint32_t handle, value; uint64_t samples; };
+std::unordered_map<uint32_t, MeterHandle> g_meterHandle;
+
+struct RegRow { std::string name; uint32_t result; uint64_t count; };
+std::vector<RegRow> g_regRows;
+} // namespace
+
+extern "C" PPC_FUNC(__imp__sub_82813940);
+PPC_FUNC(sub_82813940)
+{
+    const uint32_t nameVa = ctx.r4.u32;
+    char buf[48];
+    size_t n = 0;
+    if (nameVa >= 0x1000)
+    {
+        const char* p = reinterpret_cast<const char*>(base + nameVa);
+        while (n < sizeof buf - 1 && p[n] >= 0x20 && p[n] < 0x7F) { buf[n] = p[n]; ++n; }
+    }
+    buf[n] = 0;
+    __imp__sub_82813940(ctx, base);
+    const uint32_t res = ctx.r3.u32;
+    std::lock_guard<std::mutex> lock(g_mhMutex);
+    for (auto& r : g_regRows)
+        if (r.name == buf && r.result == res) { ++r.count; return; }
+    if (g_regRows.size() < 128)
+        g_regRows.push_back({ buf, res, 1 });
+}
+
 inline void FlagSample(uint8_t* b, uint32_t self, std::atomic<uint64_t> (*ctr)[2])
 {
     const int c = VtClass(b, self);
@@ -660,6 +704,14 @@ inline void FlagSample(uint8_t* b, uint32_t self, std::atomic<uint64_t> (*ctr)[2
         g_updAlpha[c][GuestF32(b, self + 0x6C) > 0.0f ? 1 : 0]
             .fetch_add(1, std::memory_order_relaxed);
         TreeSample(b, self, c);
+        if (c == 0)
+        {
+            std::lock_guard<std::mutex> lock(g_mhMutex);
+            MeterHandle& m = g_meterHandle[GuestU32(b, self + 0x4)];
+            m.handle = GuestU32(b, self + 0x244);
+            m.value = GuestU32(b, self + 0x1D0);
+            m.samples++;
+        }
     }
 }
 
@@ -1229,6 +1281,27 @@ void FeProbe_Report()
         }
         if (g_hsRows.empty())
             std::fprintf(stderr, "[fe]     (none of the twelve ever ran)\n");
+    }
+    // THE RENDER GATE: per named meter, the retained-draw handle [this+0x244]
+    // (-1 = the render silently returns) and the value field [this+0x1D0];
+    // then every registry lookup {name -> result} through sub_82813940.
+    {
+        std::lock_guard<std::mutex> mhlock(g_mhMutex);
+        std::lock_guard<std::mutex> nmlock4(g_nameMutex);
+        std::fprintf(stderr, "[fe]   METER RENDER GATE — per meter: handle 0x244, value 0x1D0:\n");
+        for (const auto& e : g_meterHandle)
+            std::fprintf(stderr,
+                         "[fe]     %-28s handle 0x%08X%s  value 0x%08X  (%llu samples)\n",
+                         NameOfId(e.first), e.second.handle,
+                         e.second.handle == 0xFFFFFFFFu ? " <== NEVER DRAWS" : "",
+                         e.second.value, (unsigned long long)e.second.samples);
+        std::fprintf(stderr, "[fe]   registry lookups via sub_82813940 {name -> result}:\n");
+        if (g_regRows.empty())
+            std::fprintf(stderr, "[fe]     (never called)\n");
+        for (const auto& r : g_regRows)
+            std::fprintf(stderr, "[fe]     %-36s -> 0x%08X%s  %llu x\n", r.name.c_str(),
+                         r.result, r.result == 0xFFFFFFFFu ? " <== FAILED" : "",
+                         (unsigned long long)r.count);
     }
     // THE DRAW-TIME FRONTIER: which named widgets the draw recursion visits,
     // and per widget, how its own children's gates read AT DRAW TIME. A widget
