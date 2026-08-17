@@ -9669,7 +9669,17 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
         captureDir ? std::string(captureDir) + "/capture.census" : std::string();
     static const char* censusPath =
         captureDir ? captureCensus.c_str() : Env("CW_VK_DRAW_CENSUS");
-    if (snapKey && censusPath && !R->drawCensusFrame)
+    // CW_VK_CENSUS_FRAME=N — arm the same census+picture once, on a frame number,
+    // for runs with no human to press F9 (the synthetic-input recipe runs). Fires
+    // at the first present at or past N so a stalled frame counter cannot skip it.
+    static const uint64_t censusAtFrame =
+        Env("CW_VK_CENSUS_FRAME") ? strtoull(Env("CW_VK_CENSUS_FRAME"), nullptr, 10) : 0;
+    static bool censusAtFrameFired = false;
+    const bool censusFrameHit = censusAtFrame && !censusAtFrameFired &&
+                                R->frame + 1 >= censusAtFrame;
+    if (censusFrameHit)
+        censusAtFrameFired = true;
+    if ((snapKey || censusFrameHit) && censusPath && !R->drawCensusFrame)
     {
         R->drawCensusFrame = R->frame + 1;
         // The PICTURE of the same frame, which is the artifact the other two exist to
