@@ -713,6 +713,63 @@ PPC_FUNC(sub_8273A510)
     __imp__sub_8273A510(ctx, base);
 }
 
+// THE DRAW'S REAL SUBMIT CHAIN (round 12): cFEMeter::Draw's emitting branch
+// runs only when [this+0x254] == 0 and goes
+//     sub_8272EB40(batch, 0, -1)                       ; begin
+//     id = sub_8275CD58(global, name)                  ; resolve, cached in
+//                                                      ;   [0x82AF3648/44]
+//     sub_8273C870(batch, name, id, 1, &this+0x26C)    ; submit (x2)
+//     sub_8274A698 ; sub_8272EC50(batch, r, 0x28)      ; end
+// — NOT slot 9's sub_8273A510, which never runs. The two resource-name
+// pointers ([0x82AF363C/40]) are runtime-populated, so everything here is
+// recorded dynamically: begin/end counts say whether the branch is entered,
+// and the resolve rows name the resources and their results.
+namespace
+{
+std::atomic<uint64_t> g_batchBegin{ 0 }, g_batchEnd{ 0 }, g_batchSubmit{ 0 };
+std::mutex g_rsMutex;
+struct ResolveRow { std::string name; uint32_t result; uint64_t count; };
+std::vector<ResolveRow> g_resolveRows;
+} // namespace
+
+extern "C" PPC_FUNC(__imp__sub_8272EB40);
+PPC_FUNC(sub_8272EB40)
+{
+    g_batchBegin.fetch_add(1, std::memory_order_relaxed);
+    __imp__sub_8272EB40(ctx, base);
+}
+extern "C" PPC_FUNC(__imp__sub_8272EC50);
+PPC_FUNC(sub_8272EC50)
+{
+    g_batchEnd.fetch_add(1, std::memory_order_relaxed);
+    __imp__sub_8272EC50(ctx, base);
+}
+extern "C" PPC_FUNC(__imp__sub_8273C870);
+PPC_FUNC(sub_8273C870)
+{
+    g_batchSubmit.fetch_add(1, std::memory_order_relaxed);
+    __imp__sub_8273C870(ctx, base);
+}
+extern "C" PPC_FUNC(__imp__sub_8275CD58);
+PPC_FUNC(sub_8275CD58)
+{
+    const uint32_t nameVa = ctx.r4.u32;
+    char buf[64];
+    size_t n = 0;
+    if (nameVa >= 0x1000)
+    {
+        const char* p = reinterpret_cast<const char*>(base + nameVa);
+        while (n < sizeof buf - 1 && p[n] >= 0x20 && p[n] < 0x7F) { buf[n] = p[n]; ++n; }
+    }
+    buf[n] = 0;
+    __imp__sub_8275CD58(ctx, base);
+    std::lock_guard<std::mutex> lock(g_rsMutex);
+    for (auto& r : g_resolveRows)
+        if (r.name == buf && r.result == ctx.r3.u32) { ++r.count; return; }
+    if (g_resolveRows.size() < 96)
+        g_resolveRows.push_back({ buf, ctx.r3.u32, 1 });
+}
+
 extern "C" PPC_FUNC(__imp__sub_82813940);
 PPC_FUNC(sub_82813940)
 {
@@ -1348,6 +1405,22 @@ void FeProbe_Report()
                              (unsigned long long)g_riCounts[i]);
             if (g_riRows.empty())
                 std::fprintf(stderr, "[fe]     (never called)\n");
+        }
+        std::fprintf(stderr,
+                     "[fe]   meter submit chain: begin %llu  submit %llu  end %llu\n",
+                     (unsigned long long)g_batchBegin.load(),
+                     (unsigned long long)g_batchSubmit.load(),
+                     (unsigned long long)g_batchEnd.load());
+        {
+            std::lock_guard<std::mutex> rslock(g_rsMutex);
+            std::fprintf(stderr, "[fe]   resource resolves via sub_8275CD58 {name -> id}:\n");
+            if (g_resolveRows.empty())
+                std::fprintf(stderr, "[fe]     (never called)\n");
+            for (const auto& r : g_resolveRows)
+                std::fprintf(stderr, "[fe]     %-36s -> 0x%08X%s  %llu x\n", r.name.c_str(),
+                             r.result,
+                             (r.result == 0xFFFFFFFFu || r.result == 0) ? " <== SUSPECT" : "",
+                             (unsigned long long)r.count);
         }
         std::fprintf(stderr, "[fe]   registry lookups via sub_82813940 {name -> result}:\n");
         if (g_regRows.empty())
