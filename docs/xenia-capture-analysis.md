@@ -1478,3 +1478,97 @@ frame `.xtr` to diff draw-for-draw.
    change**, not a widget's presence (its part 24 built the presence metric and had to retract
    it: it tracked where Chuck was standing). A meter whose backing value is known is testable
    in a way an animation is not.
+
+---
+
+## 36. **ONE VERTEX SHADER DRAWS ALL THE BROKEN WIDGETS — `vs_a4ae7c2b7c1818c4`** — part 2, 2026-08-16
+
+Finding 35 ended by asking the operator for hardware pictures of the widgets, because B1 tops
+out below the dialog and no screenshot existed. **They delivered `R2_ui_bars` the same day:**
+two single-frame F4 `.xtr` traces with frame-locked PNGs, md5-verified on copy-in.
+
+### First: the symptom is sharper than "a square is missing"
+
+The hardware PNGs show what these widgets actually are:
+
+- **Loading pop-up:** a **SEGMENTED bar** — roughly 28 small grey squares in a row with **one
+  blue segment lit**, caught mid-fill. Not a spinner, and not a solid bar.
+- **HUD:** `LIFE` is **5 filled yellow squares plus 2 EMPTY outlined squares**; the PP bar is a
+  partially-filled cyan bar; the mission bar has a **thin progress line** under
+  "Case 1-2: Access Codes".
+
+The operator's own words for the part I had missed: *"for the empty health point you can also
+see a empty square that we do not have on our end."* **We draw the filled pips and omit the
+empty ones.** So the class is not "progress bars are broken" — it is closer to **the unlit /
+track / empty segments of segmented widgets are absent**, plus the lit segment in the pop-up.
+
+### The measurement that unifies them
+
+Both hardware frames were decoded (`xtr_draw_bindings.py --csv` — `--csv`, not the top-12
+default, which is the finding-18 trap) and diffed against our own per-draw census of the
+matching screen.
+
+**Loading pop-up, hardware vs ours:**
+
+```
+shader pairs: hardware 39, ours 31, SHARED 31, ours-only 0
+pairs hardware draws that we never draw:  8, totalling 27 draws
+  and ALL EIGHT SHARE ONE VERTEX SHADER: vs_a4ae7c2b7c1818c4
+```
+
+Every pair we draw, hardware draws. The entire difference is 27 draws on **one vertex
+shader** — against a bar with ~28 grey segments plus one lit.
+
+**And the same shader draws the HUD widgets.** In the PP/mission frame,
+`vs_a4ae7c2b7c1818c4` accounts for **55 of 2,175 draws**, and the indices cluster exactly as
+the picture does — **draws 887-893 are seven consecutive draws**, and `LIFE` on screen is
+**5 filled + 2 empty = 7 squares**.
+
+**So one vertex shader draws the loading bar, the LIFE squares, the PP bar and the mission
+line.** That is a true-or-false fact about a named object rather than an estimate about a
+count — which is the standard finding 23 set after the mutants were mis-attributed twice.
+
+### What is NOT the cause
+
+- **Not a missing shader.** `vs_a4ae7c2b7c1818c4.spv` and its `.meta.json` **are in our bank**,
+  and `grep -c "no translated shader"` is 0.
+- **Not an untranslated primitive.** Line list and line strip are both mapped; no unsupported
+  primitive fired; our stream contains **zero** line primitives.
+- **Not the stream store's guard** — refuted by A/B in finding 35.
+- **Our runtime does load this shader**: `[imload] VS va=00000000 hash=a4ae7c2b7c1818c4
+  size=15`. The `va=00000000` is expected for `IM_LOAD_IMMEDIATE`, which carries its microcode
+  inline (2.7 M of them in B2), and the 60-byte `.ucode` in our dumps is dated **16 Aug**, i.e.
+  written by **our own runtime**, not by a Xenia capture.
+
+**So the shader exists, is translated, and is loaded — and in our frame not one draw uses it.**
+
+### The confound, stated rather than buried
+
+**The two loading-pop-up frames are NOT a matched pair.** The operator's drive **loaded a
+progressed save**; my headless repro presses START with **no profile**, which raises an extra
+"You are not currently signed into a gamer" panel. Different guest state can legitimately
+produce a different draw set, so the loading-frame comparison is **suggestive, not
+admissible** under this project's own A/B rule.
+
+**The HUD frame does not have that problem as evidence of the defect** — the operator sees the
+PP bar, the empty LIFE squares and the mission line broken in ordinary play, and hardware
+renders them with this shader. What is still missing is **our side of that same frame**.
+
+### The next measurement, and it is one keypress
+
+**Our own per-draw census of a gameplay frame with the HUD on screen.** If
+`vs_a4ae7c2b7c1818c4` appears there with ~55 draws, the draws are issued and the defect is
+downstream (geometry, constants, blend, or the pixel shaders paired with it — note the eight
+missing pairs use *eight different* pixel shaders, which argues the vertex side is the common
+factor). If it appears with **zero**, the draws are never issued and the cause is upstream of
+the renderer entirely.
+
+That is one F9 press in a normal session:
+
+```
+cd runtime/build && CW_VKDRAW=1 CW_CAPTURE_KEY=<dir> ./cw_runtime
+#   play to anywhere the HUD shows LIFE + PP, then press F9
+```
+
+It writes the picture, the pose and a full per-draw census. **The same press at the safehouse
+bathroom save point makes it a matched pair with `pp_mission_bar.xtr`.**
