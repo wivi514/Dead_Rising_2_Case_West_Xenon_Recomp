@@ -79,6 +79,7 @@
 #include <ppc_config.h>   // ppc_context.h #errors without it
 #include <ppc_context.h>
 
+#include <array>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -163,6 +164,11 @@ std::vector<std::string> g_missed;   // distinct class names that resolved to -1
 // question. A class that is never requested is a screen-data problem; one that is
 // requested and unresolved is a factory problem. Without both, a zero is ambiguous.
 std::vector<std::pair<std::string, uint64_t>> g_asked;
+// CreateWidget(name) itself — unambiguous, unlike the generic lookup above. Records the
+// class name and whether the call returned a widget or 0, because "asked" via
+// sub_82784508 conflates creation with any other name->index question the engine has.
+std::vector<std::array<uint64_t, 2>> g_createCounts;   // {made, failed} per name
+std::vector<std::string> g_createNames;
 } // namespace
 
 extern "C" PPC_FUNC(__imp__sub_82784508);
@@ -225,6 +231,31 @@ PPC_FUNC(sub_82784508)
     g_missed.emplace_back(buf);
 }
 
+extern "C" PPC_FUNC(__imp__sub_82784588);
+PPC_FUNC(sub_82784588)
+{
+    const uint32_t nameVa = ctx.r4.u32;
+    char nb[64];
+    size_t m = 0;
+    if (nameVa)
+    {
+        const char* q = reinterpret_cast<const char*>(base + nameVa);
+        while (m < sizeof nb - 1 && q[m] > 0x20 && q[m] < 0x7F) { nb[m] = q[m]; ++m; }
+    }
+    nb[m] = 0;
+    __imp__sub_82784588(ctx, base);
+    const bool made = ctx.r3.u32 != 0;
+    if (!m)
+        return;
+    std::lock_guard<std::mutex> lock(g_missMutex);
+    for (size_t i = 0; i < g_createNames.size(); i++)
+        if (g_createNames[i] == nb) { g_createCounts[i][made ? 0 : 1]++; return; }
+    if (g_createNames.size() >= 64)
+        return;
+    g_createNames.emplace_back(nb);
+    g_createCounts.push_back({ made ? 1u : 0u, made ? 0u : 1u });
+}
+
 void FeProbe_Report()
 {
     std::fprintf(stderr, "\n[fe] frontend METER widget probe — findings 35-39\n");
@@ -258,6 +289,16 @@ void FeProbe_Report()
         for (const auto& e : g_asked)
             std::fprintf(stderr, "[fe]     asked %6llu x  %s\n",
                          (unsigned long long)e.second, e.first.c_str());
+    std::fprintf(stderr, "[fe]   CreateWidget(name) — made / FAILED:\n");
+    if (g_createNames.empty())
+        std::fprintf(stderr, "[fe]     (CreateWidget was never called)\n");
+    else
+        for (size_t i = 0; i < g_createNames.size(); i++)
+            std::fprintf(stderr, "[fe]     %-24s made %6llu   FAILED %6llu%s\n",
+                         g_createNames[i].c_str(),
+                         (unsigned long long)g_createCounts[i][0],
+                         (unsigned long long)g_createCounts[i][1],
+                         g_createCounts[i][1] ? "   <== never created" : "");
     if (g_missed.empty())
         std::fprintf(stderr, "[fe]   no class name failed to resolve.\n");
     else

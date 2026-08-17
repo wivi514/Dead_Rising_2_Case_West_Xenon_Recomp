@@ -2051,3 +2051,82 @@ cd runtime/build && CW_VKDRAW=1 ./cw_runtime 2> run.log    # play, close the win
 allocation that large failing where a 0x400 one succeeds is a specific, checkable story rather
 than a vague one. `sub_82817488` returns 0 on allocation failure, exactly like the missing-class
 branch, and just as quietly.
+
+---
+
+## 43. **`cFEMeter` IS REQUESTED AND NEVER BUILT — and my own creator census is partly unreliable** — 2026-08-16
+
+### The gameplay reading that matters
+
+The operator's gameplay run, with finding 42's instrument:
+
+```
+factory lookups 53,559   ·   asked for cFEMeter: 140   ·   unresolved bare tokens: only `}`
+cFEMeter creator: 0 constructions
+```
+
+**`cFEMeter` is asked for 140 times, resolves correctly, and is still never built.** So the
+defect is not the screen data failing to name it, and not the factory failing to classify it.
+That eliminates two of finding 42's three branches.
+
+### The allocation-size hypothesis is DEAD, and it was mine
+
+Finding 42 flagged `cFEMeter`'s **0x8920-byte** allocation — 35 KB against `cFEText`'s 0x400 —
+as "a specific, checkable story". It is checkable, and it is wrong:
+
+```
+BUILT      cFEShape 0xF0 · cFEAnim 0xD0 · cFEKeyFrame 0xE0 · cFEEBMText 0x2C0
+           cFEFlipBook 0x300 · cFEParticleFX 0x2F0 · cFEText 0x400 · cFEBitmap 0x490
+NEVER      cFELockBox 0x2D0 · cFEBitmapList 0x3D0 · cFEMeter 0x8920
+```
+
+`cFELockBox` (0x2D0) and `cFEBitmapList` (0x3D0) are **smaller** than `cFEFlipBook` (0x300)
+and `cFEBitmap` (0x490), which are built. Size does not separate the two groups. **A large
+allocation failing quietly was a good story and it is not what is happening.**
+
+### AND MY CREATOR CENSUS IS PARTLY WRONG — gotcha 322 bit a second time
+
+Hooking `sub_82784588` — `CreateWidget(name)` — by NAME rather than by creator address gives a
+different and better-founded picture, and it immediately contradicts the address-based census:
+
+```
+CreateWidget, title screen:  cFEKeyFrame made 1244 · cFEBitmap 309 · cFEAnim 321
+                             cFEWidget 279 · cFEText 108 · cFEButton 56 · cFEShape 56
+                             cFEScreen 17 · cFELockBox 4 · cFEEBMText 3
+                             ...and EVERY row reads FAILED 0
+```
+
+**`cFELockBox` is made 4 times here, while finding 41's creator hook counted it as ZERO.** The
+two cannot both be right, and the name-based one is the trustworthy half: it reads the class
+name at the actual creation entry point instead of trusting an address I attributed from a
+table. **So the creator→class mapping used in findings 40 and 41 is unreliable for at least one
+class, and possibly more** — exactly the failure gotcha 322 was written about, one round after
+it was written. The per-class counts in finding 41 should not be quoted; its headline claim
+(`cFEMeter` is never constructed) survives because that chain was derived and cross-checked
+independently (thunk → allocator of 0x8920 → constructor), and because the meter never appears
+in the CreateWidget list at all.
+
+**`CreateWidget` is also not widget-specific** — it makes `cScalabilityProfile`,
+`cAnimatedPostFXEvent`, `cFloatJuncture` and more. It is the engine's general named-class
+factory, which is why "asked" and "made" counts differ per class and why the address-based
+census could drift from it unnoticed.
+
+### What is now known, and the single run that ends it
+
+- The screen data **does** name meters (140 requests in gameplay).
+- The factory **does** resolve the name (nothing unresolved).
+- **No `CreateWidget` call fails** anywhere — every row reads `FAILED 0`.
+- And yet **no meter object exists**, so nothing draws, so the bar is black (findings 38-41).
+
+Those four are only consistent if `CreateWidget` is never actually *called* for `cFEMeter` —
+i.e. the 140 lookups come from somewhere that is not creation. **The next run resolves that
+directly**, because the probe now records `CreateWidget`'s own argument:
+
+```
+cd runtime/build && CW_VKDRAW=1 ./cw_runtime 2> run.log    # play, close the window
+```
+
+- **`cFEMeter` appears in the CreateWidget list with `FAILED > 0`** → the creator is returning
+  0 and the address to hook next is in the table entry.
+- **`cFEMeter` absent from the list entirely** → the meter is never *created*, only looked up,
+  and the caller that looks it up 140 times without creating is the thing to find.
