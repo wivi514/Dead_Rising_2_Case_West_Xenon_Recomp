@@ -372,6 +372,44 @@ CW_METER_VT(X)
 CW_METER_VT(X)
 #undef X
 
+// THE BYTE AT +0x6A, which gates the frontend's slot-21 call on a widget.
+//
+// Both frontend call sites through vtable slot 21 are guarded the same way:
+//
+//     lbz  r11, 0x6A(widget) ; cmplwi r11,0 ; beq -> SKIP
+//     lwz  r3, 0xB0(self)    ; lwz r11,0(r3) ; lwz r11,0x54(r11) ; bctrl
+//
+// so the call is made on [self+0xB0] WITH the widget as an argument — slot 21 belongs to
+// that object, not to the widget — and a zero at widget+0x6A skips it entirely.
+//
+// Slot 21 of cFEMeter's own vtable never runs (the vtable census), and this flag is the only
+// gate found on the frontend's slot-21 path. THAT IS A LEAD, NOT A CONCLUSION: whether the
+// two are the same call has not been shown. So this measures the flag directly, on meters and
+// on non-meters, in the same traversal — a comparison rather than a story, after three wrong
+// labels in findings 43, 44 and 46.
+namespace
+{
+std::atomic<uint64_t> g_walkMeter{ 0 }, g_walkOther{ 0 };
+std::atomic<uint64_t> g_flagMeterSet{ 0 }, g_flagOtherSet{ 0 };
+inline void NoteWidgetFlag(uint8_t* b, uint32_t w)
+{
+    if (w < 0x1000)
+        return;
+    const bool meter = GuestU32(b, w) == kMeterVtable;
+    const bool set = *(b + w + 0x6A) != 0;
+    (meter ? g_walkMeter : g_walkOther).fetch_add(1, std::memory_order_relaxed);
+    if (set)
+        (meter ? g_flagMeterSet : g_flagOtherSet).fetch_add(1, std::memory_order_relaxed);
+}
+} // namespace
+
+extern "C" PPC_FUNC(__imp__sub_82803570);
+PPC_FUNC(sub_82803570)
+{
+    NoteWidgetFlag(base, ctx.r4.u32);   // this site takes the widget in r4
+    __imp__sub_82803570(ctx, base);
+}
+
 extern "C" PPC_FUNC(__imp__sub_82784588);
 PPC_FUNC(sub_82784588)
 {
@@ -467,6 +505,14 @@ void FeProbe_Report()
                  (unsigned long long)g_f254nz.load(), (unsigned long long)g_fGT.load(),
                  (unsigned long long)g_actAll.load(), (unsigned long long)g_actMeter.load());
 
+    std::fprintf(stderr,
+                 "[fe]   widget+0x6A (gates the frontend's slot-21 call), sampled in sub_82803570:\n"
+                 "[fe]     METERS     seen %llu, flag SET %llu\n"
+                 "[fe]     non-meters seen %llu, flag SET %llu\n",
+                 (unsigned long long)g_walkMeter.load(),
+                 (unsigned long long)g_flagMeterSet.load(),
+                 (unsigned long long)g_walkOther.load(),
+                 (unsigned long long)g_flagOtherSet.load());
     std::fprintf(stderr, "[fe]   cFEMeter VTABLE slots that actually run on a meter:\n");
 #define X(addr, slot)                                                                    \
     if (g_vt_##addr.load())                                                              \
