@@ -311,6 +311,67 @@ PPC_FUNC(sub_82816128)
     __imp__sub_82816128(ctx, base);
 }
 
+// THE METER'S WHOLE VTABLE, counted per slot and filtered to cFEMeter instances.
+//
+// The update path turned out healthy (finding 47): sub_8281A5E0 runs 183,190 times, 100% of
+// them on meters, and its guarded action fires 106 times — about 1.5 per meter, which is what
+// a one-shot layout looks like. So the meter is updated; it just never submits geometry. The
+// draw must therefore be a DIFFERENT vtable slot reached by a different traversal, and rather
+// than guess which of 40 it is, every slot is counted.
+//
+// Same filter as before — the object's own vtable pointer — so a slot shared with widget
+// classes that draw correctly still reports only its meter calls. Slots whose `this` is an
+// adjusted sub-object pointer will not match the filter and will read 0; that is a known
+// blind spot of this instrument rather than a result, and it is written here so a zero from
+// one of those is not read as "the meter never receives this call".
+#define CW_METER_VT(X)                                                                   \
+    X(82815BC8, 0)                                                                      \
+    X(82816368, 1)                                                                      \
+    X(82806000, 2)                                                                      \
+    X(82463648, 3)                                                                      \
+    X(8281C0A8, 4)                                                                      \
+    X(8280FD98, 5)                                                                      \
+    X(82815C18, 8)                                                                      \
+    X(82804808, 9)                                                                      \
+    X(82810160, 10)                                                                     \
+    X(82466CB8, 11)                                                                     \
+    X(8280FEB0, 12)                                                                     \
+    X(82805D70, 13)                                                                     \
+    X(82804840, 14)                                                                     \
+    X(828023B8, 16)                                                                     \
+    X(82802408, 17)                                                                     \
+    X(828107D8, 18)                                                                     \
+    X(82810628, 19)                                                                     \
+    X(82810698, 20)                                                                     \
+    X(82810708, 21)                                                                     \
+    X(828064F8, 22)                                                                     \
+    X(82810210, 23)                                                                     \
+    X(828048C0, 24)                                                                     \
+    X(828109D8, 26)                                                                     \
+    X(82810A60, 27)                                                                     \
+    X(82810AF0, 29)                                                                     \
+    X(821C3380, 32)                                                                     \
+    X(82809A70, 33)                                                                     \
+    X(82809AB0, 34)                                                                     \
+    X(8280D458, 35)                                                                     \
+    X(82332528, 36)                                                                     \
+    X(828162C8, 38)                                                                     \
+    X(82815A78, 39)                                                                     
+
+#define X(addr, slot) extern "C" PPC_FUNC(__imp__sub_##addr); std::atomic<uint64_t> g_vt_##addr{ 0 };
+CW_METER_VT(X)
+#undef X
+
+#define X(addr, slot)                                                                    \
+    PPC_FUNC(sub_##addr)                                                                 \
+    {                                                                                    \
+        if (IsMeter(base, ctx.r3.u32))                                                   \
+            g_vt_##addr.fetch_add(1, std::memory_order_relaxed);                         \
+        __imp__sub_##addr(ctx, base);                                                    \
+    }
+CW_METER_VT(X)
+#undef X
+
 extern "C" PPC_FUNC(__imp__sub_82784588);
 PPC_FUNC(sub_82784588)
 {
@@ -405,6 +466,14 @@ void FeProbe_Report()
                  (unsigned long long)g_updAll.load(), (unsigned long long)g_updMeter.load(),
                  (unsigned long long)g_f254nz.load(), (unsigned long long)g_fGT.load(),
                  (unsigned long long)g_actAll.load(), (unsigned long long)g_actMeter.load());
+
+    std::fprintf(stderr, "[fe]   cFEMeter VTABLE slots that actually run on a meter:\n");
+#define X(addr, slot)                                                                    \
+    if (g_vt_##addr.load())                                                              \
+        std::fprintf(stderr, "[fe]     slot %2d  sub_%s  %10llu x\n", slot, #addr,      \
+                     (unsigned long long)g_vt_##addr.load());
+    CW_METER_VT(X)
+#undef X
 
     // The factory table, read out of guest memory rather than inferred from the code.
     if (uint8_t* b = g_base.load(std::memory_order_relaxed))
