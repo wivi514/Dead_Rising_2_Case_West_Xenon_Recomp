@@ -1880,3 +1880,89 @@ cd runtime/build && CW_VKDRAW=1 ./cw_runtime 2> run.log     # play, then close t
 
 Either way it is one number from one ordinary play session, with a sibling control in the same
 run.
+
+---
+
+## 41. **`cFEMeter` IS NEVER CONSTRUCTED — the defect is at widget creation, not drawing** — 2026-08-16
+
+Finding 40 built the census and said it needed one gameplay run to mean anything. The
+operator played and closed the window; the probe reported on the way out.
+
+### The result, with nine sibling controls in the same run
+
+```
+CONTROL A  widget-name intern   1,168,153
+
+  cFESpinGroup   1,072      cFEAnim         209      cFEKeyFrame   39
+  cFEShape       1,000      cFEParticleFX    70      cFEFlipBook   19
+  cFEEBMText       247      cFEText          46      cFEBitmap      7      = 2,709 built
+
+  cFEMeter            0
+```
+
+**In a gameplay session where hardware demonstrably shows a PP bar, a LIFE meter and a
+mission bar, `cFEMeter` is not constructed once — while nine sibling widget classes are
+constructed 2,709 times.** Finding 40's caveat ("a title screen plausibly has no meter") is
+discharged: this is gameplay, the widgets are on screen on hardware, and the controls are in
+the same run.
+
+### And it splits the symptom, which finding 35 warned might happen
+
+Against the title-screen census, two classes changed:
+
+```
+                 title screen   gameplay
+cFEFlipBook            0    ->      19
+cFEParticleFX          0    ->      70
+cFEMeter               0    ->       0
+```
+
+**`cFEFlipBook` builds fine in gameplay.** So the animated-widget family is *not* broken at
+construction, and finding 35's grouping of "meters and flipbooks fail together" was a
+hypothesis that has now been **partly refuted**: whatever is wrong with `cFEMeter` is specific
+to `cFEMeter`. If the loading pop-up's segmented bar is also missing, either it is a meter too,
+or it has a different cause — and that is now a separate question rather than an assumed
+shared one.
+
+### The guest's own names for these widgets
+
+The image carries the instance names, and they read exactly like the broken list:
+
+```
+meter_life   meter_sub_mission   timermeter   health_meter   w_meter   w_red_meter
+w_KO_meter   w_meter_star   meter_attack   meter_group   meter_itemstock
+meter_range  meter_speed  meter_throwdistance
+```
+
+plus the methods `Meter`, `SetMeter`, `UpdateMeter`. **`meter_life` and `meter_sub_mission`
+are the LIFE bar and the mission bar by name.** So the widgets exist in the data, the class is
+registered in the factory (its registration is what gave us the address), and it is simply
+never instantiated.
+
+### Where this lands
+
+The whole chain is now measured end to end, and every link but one is exonerated:
+
+```
+screen data names meter_life / meter_sub_mission        ✓ present in the image
+cFEMeter registered in the widget factory               ✓ that is how we found it
+cFEMeter CONSTRUCTED                                    ✗  ZERO, in gameplay, with 9 controls
+  -> no widget object exists
+  -> nothing submits its draws                          ✗  0 draws in 3 captured frames
+  -> vs_a4ae7c2b7c1818c4 never bound at draw time       (finding 36-38)
+  -> the bar/track/empty segments are simply not painted (finding 38: PP bar reads
+     R2 G3 B2 where hardware reads R6 G66 B85)
+```
+
+**The defect is at widget creation.** Everything downstream of it — the renderer, the command
+processor, the shader bank, the stream store — was measured and cleared in findings 35-39, and
+none of it was ever going to matter.
+
+### Next
+
+Find why the factory never produces one. The registration writes `{creator, id, name}` triples
+into a table; the creation path looks a class up in that table and calls its creator. So the
+question is whether the lookup is asked for a meter and fails, or is never asked. Hooking the
+*dispatch* — the function that reads the table and calls a creator — answers it the same way
+this finding was reached, and `cFEFlipBook` is now the ideal control, because it goes through
+the same dispatch and works.
