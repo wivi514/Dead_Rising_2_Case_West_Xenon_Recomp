@@ -1735,6 +1735,43 @@ void FeProbe_Report()
                              (unsigned long long)e.second);
     }
 
+    // THE RETAINED ITEMS THEMSELVES, read from guest memory: the item manager
+    // is [[0x82A7B568]+0x1498], items are 128-byte records at [mgr+0x28]. The
+    // meters' item indexes are their [this+0x1D0] values (0x2D1-0x2D8 etc.);
+    // the neighbors on either side belong to widgets that DO draw, so a field
+    // diff between a meter item and its neighbors names the flag or link the
+    // executable lists key on.
+    if (uint8_t* b2 = g_base.load(std::memory_order_relaxed))
+    {
+        auto rd2 = [&](uint32_t va) {
+            const uint8_t* p = b2 + va;
+            return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+        };
+        const uint32_t obj = rd2(0x82A7B568);
+        const uint32_t mgr = obj >= 0x1000 ? rd2(obj + 0x1498) : 0;
+        if (mgr >= 0x1000)
+        {
+            const uint32_t cnt = rd2(mgr + 0x24), arr = rd2(mgr + 0x28);
+            std::fprintf(stderr,
+                         "[fe]   RETAINED ITEMS: mgr 0x%08X count %u array 0x%08X\n", mgr,
+                         cnt, arr);
+            static const uint32_t kIdx[] = { 0x2CF, 0x2D0, 0x2D1, 0x2D2, 0x2D3, 0x2D4,
+                                             0x2D5, 0x2D6, 0x2D7, 0x2D8, 0x2D9, 0x2DA,
+                                             0xBF,  0xC0,  0xC1,  0xE3,  0x1F9 };
+            for (uint32_t idx : kIdx)
+            {
+                if (arr < 0x1000 || idx >= cnt)
+                    continue;
+                const uint32_t it = arr + idx * 128;
+                std::fprintf(stderr, "[fe]     item %4X @0x%08X:", idx, it);
+                for (int w = 0; w < 16; w++)
+                    std::fprintf(stderr, " %08X", rd2(it + w * 4));
+                std::fprintf(stderr, "\n");
+            }
+        }
+        else
+            std::fprintf(stderr, "[fe]   RETAINED ITEMS: manager not resolvable\n");
+    }
     // The factory table, read out of guest memory rather than inferred from the code.
     if (uint8_t* b = g_base.load(std::memory_order_relaxed))
     {
