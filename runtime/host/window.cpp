@@ -89,6 +89,7 @@ bool Host_DebugMenuConsumeAction(uint32_t&, int32_t&) { return false; }
 
 #include "../gpu/vk_renderer.h"
 #include "../cpu/gap_probe.h"
+#include "../cpu/fe_probe.h"
 
 namespace {
 
@@ -522,6 +523,7 @@ void Shutdown(const char* why)
     // reach a function the title only calls somewhere unusual, and it is the run that
     // ends here rather than through main.
     ::GapProbe_Report();
+    ::FeProbe_Report();
     fflush(nullptr);
     // _Exit, not exit: guest threads are still running recompiled code against guest
     // memory, and running static destructors underneath them would turn an ordinary

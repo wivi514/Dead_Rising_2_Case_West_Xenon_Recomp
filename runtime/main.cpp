@@ -33,6 +33,7 @@
 
 #include "cpu/crash_report.h"
 #include "cpu/gap_probe.h"
+#include "cpu/fe_probe.h"
 #include "cpu/guest_thread.h"
 #include "cpu/timebase.h"
 #include "gpu/vk_renderer.h"
@@ -188,6 +189,7 @@ int main(int argc, char** argv)
                     s);
             ::VkRenderer_DumpStats();
             ::GapProbe_Report();
+            ::FeProbe_Report();
             fflush(nullptr);
             std::_Exit(128 + s);
         });

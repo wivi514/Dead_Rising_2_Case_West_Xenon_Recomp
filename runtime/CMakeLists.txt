@@ -138,6 +138,7 @@ add_executable(cw_runtime
     cpu/timebase.cpp
     cpu/guest_thread.cpp
     cpu/crash_report.cpp
+    cpu/fe_probe.cpp                 # frontend cFEMeter widget probe (findings 35-39)
     cpu/gap_probe.cpp                # counts calls into the 7 functions with untranslated instructions
     # cpu/guest_probe.cpp and cpu/debug_tunables.cpp are Case Zero's per-title reverse
     # engineering (89 hardcoded guest addresses between them and the D3D pair below).

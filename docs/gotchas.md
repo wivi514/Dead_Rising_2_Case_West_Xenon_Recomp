@@ -3166,3 +3166,26 @@ From phase C part 18 (the frame rate — and none of it was work):
      behaviour, the engine's internal consistency, and the operator's eyes.** All
      three are real; none is a byte comparison. Say which one a late-content claim
      rests on.
+
+322. **WHEN YOU NEED ONE ENTRY OUT OF A TABLE THE COMPILER EMITTED,
+     EXTRACT THE WHOLE TABLE — READING ONE ENTRY BY EYE IS AN OFF-BY-ONE
+     WAITING TO HAPPEN, AND IT FAILS *CONFIDENTLY*.** Third gotcha authored in
+     Case West. The frontend registers 22 widget classes through a run of
+     `{creator, id, name}` triples, and the creator is stored into the table
+     BEFORE its own class name is loaded into a register. Reading the site by eye
+     — name, then `bl`, then the stores that follow — therefore attributes the
+     NEXT class's creator to this one. That produced a fully-built probe, a
+     plausible chain (creator -> allocator -> constructor -> a real vtable of 40
+     methods), and a confident answer: "no cFEMeter is ever built". Every step
+     was real; it was all cFEParticleFX. Nothing about the wrong answer looked
+     wrong, because a neighbouring table entry is the perfect decoy — same shape,
+     same address range, same everything.
+     What caught it was extracting all 22 triples programmatically and printing
+     them in order: the classes came out in a sequence whose names could be read
+     against the table, and cFEMeter's creator was one slot back from the one
+     already hooked.
+     So: **when the answer depends on which entry you picked, decode the whole
+     structure and print it, then index into it.** The extra cost is one script;
+     the alternative is a measurement that is wrong in a way no control catches,
+     because the control (`is the probe counting?`) passes perfectly — it was
+     counting, accurately, the wrong function. See finding 40.
