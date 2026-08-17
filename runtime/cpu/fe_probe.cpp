@@ -404,6 +404,14 @@ std::atomic<uint64_t> g_ancFailBit8[3], g_ancFailAlpha[3], g_ancAllPass[3];
 std::mutex g_ancMutex;
 // [class] -> distinct {failing ancestor's vtable, count}
 std::vector<std::pair<uint32_t, uint64_t>> g_ancFailVt[3];
+// ROUND 4 ANSWERED: tree membership is perfect for all three classes, and the
+// meters' loss is an ANCESTOR failing bit 0x00800000 — 92% of samples, and the
+// failing class is the BASE cFEWidget (vtable 0x820BD310, the grouping node).
+// The base ctor sets 0x03C00000, i.e. every widget is BORN shown — so the
+// meters' containers are being actively HIDDEN. These record the failing
+// ancestors' ADDRESSES (meters only) so the report can dump each one and
+// correlate it against the hide/show recorder below, within the same run.
+std::vector<std::pair<uint32_t, uint64_t>> g_meterAncFail;   // {ancestor VA, count}
 } // namespace
 
 inline void TreeSample(uint8_t* b, uint32_t self, int c)
@@ -432,14 +440,84 @@ inline void TreeSample(uint8_t* b, uint32_t self, int c)
         (bit8ok ? g_ancFailAlpha : g_ancFailBit8)[c].fetch_add(1, std::memory_order_relaxed);
         const uint32_t avt = GuestU32(b, a);
         std::lock_guard<std::mutex> lock(g_ancMutex);
+        bool seen = false;
         for (auto& e : g_ancFailVt[c])
-            if (e.first == avt) { ++e.second; return; }
-        if (g_ancFailVt[c].size() < 24)
+            if (e.first == avt) { ++e.second; seen = true; break; }
+        if (!seen && g_ancFailVt[c].size() < 24)
             g_ancFailVt[c].emplace_back(avt, 1);
+        if (c == 0)
+        {
+            for (auto& e : g_meterAncFail)
+                if (e.first == a) { ++e.second; return; }
+            if (g_meterAncFail.size() < 16)
+                g_meterAncFail.emplace_back(a, 1);
+        }
         return;
     }
     g_ancAllPass[c].fetch_add(1, std::memory_order_relaxed);
 }
+
+// THE HIDE/SHOW RECORDER. Every widget is born shown (base ctor sets
+// 0x03C00000), so whoever last clears bit 0x00800000 on the meters' container
+// is the defect's actor — or the actor whose matching Show never fires. The
+// image has exactly ten frontend-band clear-bit8 sites and nine set-bit8
+// sites; they resolve to the twelve functions below (several pair a hide and
+// a show — pager idioms over [this+0x640], and HUD-wrapper objects that own a
+// widget at [this+0x3C4] with a bool at +0x3CC). Each call records
+// {function, LR, r3, [r3+0x3C4]}; the report prints them beside the failing
+// ancestors' addresses so the actor can be matched within one run.
+// The 0x824C-0x8250 band has ~300 more clear sites — game-side, hooked only
+// if this frontend-band set fails to name the actor.
+#define CW_HS_FUNCS(X)                                                                   \
+    X(82805738, "hide-all over [r3+0x63C..], pager")                                     \
+    X(828058E0, "show-selected, same pager")                                             \
+    X(828065D0, "wrapper SHOW  [r3+0x3C4], bool +0x3CC")                                 \
+    X(82808900, "wrapper HIDE  [r3+0x3C4], bool +0x3CC")                                 \
+    X(82809608, "hide via [+0x74] chain")                                                \
+    X(82809698, "show via [+0x74] chain")                                                \
+    X(82817E20, "hide [r3+0x3C4] variant A")                                             \
+    X(82818030, "hide+show [r3+0x3C4] variant B")                                        \
+    X(8281A890, "list show-first-N / hide-rest")                                         \
+    X(8281ACB8, "hide loop of 3")                                                        \
+    X(8281D268, "hide loop over children")                                               \
+    X(8281D5C0, "show, reads [r3+0xB0]/[+0xB8]")
+
+namespace
+{
+struct HsRow
+{
+    uint32_t func, lr, obj, widget;
+    uint64_t count;
+};
+std::mutex g_hsMutex;
+std::vector<HsRow> g_hsRows;
+
+inline void NoteHideShow(uint8_t* b, uint32_t func, uint32_t lr, uint32_t obj)
+{
+    uint32_t widget = 0;
+    if (obj >= 0x1000)
+        widget = GuestU32(b, obj + 0x3C4);
+    std::lock_guard<std::mutex> lock(g_hsMutex);
+    for (auto& r : g_hsRows)
+        if (r.func == func && r.lr == lr && r.obj == obj && r.widget == widget)
+        {
+            ++r.count;
+            return;
+        }
+    if (g_hsRows.size() < 192)
+        g_hsRows.push_back({ func, lr, obj, widget, 1 });
+}
+} // namespace
+
+#define X(addr, what)                                                                    \
+    extern "C" PPC_FUNC(__imp__sub_##addr);                                              \
+    PPC_FUNC(sub_##addr)                                                                 \
+    {                                                                                    \
+        NoteHideShow(base, 0x##addr, uint32_t(ctx.lr), ctx.r3.u32);                      \
+        __imp__sub_##addr(ctx, base);                                                    \
+    }
+CW_HS_FUNCS(X)
+#undef X
 
 inline void FlagSample(uint8_t* b, uint32_t self, std::atomic<uint64_t> (*ctr)[2])
 {
@@ -920,6 +998,47 @@ void FeProbe_Report()
                 std::fprintf(stderr,
                              "[fe]     %-10s first-failing ancestor vtable 0x%08X   %llu x\n",
                              kVtClassName[c], e.first, (unsigned long long)e.second);
+        // Dump each distinct failing METER ancestor from live guest memory:
+        // its state, its parent chain to the root, and its first children —
+        // the identity data the hide/show rows below get matched against.
+        if (uint8_t* b = g_base.load(std::memory_order_relaxed))
+            for (const auto& e : g_meterAncFail)
+            {
+                const uint32_t a = e.first;
+                std::fprintf(stderr,
+                             "[fe]   METER-BLOCKING ancestor 0x%08X (seen %llu x):\n",
+                             a, (unsigned long long)e.second);
+                uint32_t w = a;
+                for (int d = 0; d < 12 && w >= 0x1000; d++, w = GuestU32(b, w + 0xB0))
+                {
+                    const uint32_t fl = GuestU32(b, w + 0x10);
+                    std::fprintf(stderr,
+                                 "[fe]     %*s0x%08X vt 0x%08X flags 0x%08X bit8=%d alpha=%g\n",
+                                 d * 2, "", w, GuestU32(b, w), fl,
+                                 (fl & 0x00800000u) ? 1 : 0, GuestF32(b, w + 0x6C));
+                }
+                uint32_t ch = GuestU32(b, a + 0x8);
+                for (int i = 0; i < 8 && ch >= 0x1000; i++, ch = GuestU32(b, ch + 0xC))
+                    std::fprintf(stderr, "[fe]       child 0x%08X vt 0x%08X flags 0x%08X\n",
+                                 ch, GuestU32(b, ch), GuestU32(b, ch + 0x10));
+            }
+    }
+    std::fprintf(stderr, "[fe]   HIDE/SHOW calls — {function, caller LR, r3, [r3+0x3C4]}:\n");
+    {
+        std::lock_guard<std::mutex> hslock(g_hsMutex);
+        const char* what = "";
+        for (const auto& r : g_hsRows)
+        {
+#define X(addr, w2)                                                                      \
+            if (r.func == 0x##addr) what = w2;
+            CW_HS_FUNCS(X)
+#undef X
+            std::fprintf(stderr,
+                         "[fe]     sub_%08X lr 0x%08X r3 0x%08X w 0x%08X %6llu x  %s\n",
+                         r.func, r.lr, r.obj, r.widget, (unsigned long long)r.count, what);
+        }
+        if (g_hsRows.empty())
+            std::fprintf(stderr, "[fe]     (none of the twelve ever ran)\n");
     }
     std::fprintf(stderr, "[fe]   slot-8 CALL SITES (return addresses, both bodies):\n");
     {
