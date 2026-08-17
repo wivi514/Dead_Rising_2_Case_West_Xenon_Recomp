@@ -248,6 +248,69 @@ PPC_FUNC(sub_8280D440)
     __imp__sub_8280D440(ctx, base);
 }
 
+// THE PER-WIDGET UPDATE, AND THE ACTION IT GUARDS.
+//
+// sub_8281C9D0 walks the widget list and calls vtable[6] on each element; for cFEMeter that
+// is sub_8281A5E0, which is a CONDITIONAL:
+//
+//     bl   0x82804770                 ; r3 = <some current value>
+//     lwz  r11, 0x25C(this)
+//     cmpw r11, r3
+//     bne  -> call [this+0xC0]->vt[0xC]   ; the "changed" path
+//     lwz  r11, 0x254(this) ; cmpwi 0 ; bne -> DO NOTHING
+//     lwz  r11, 0x268(this) ; lwz r10, 0x264(this) ; cmpw ; bgt -> DO NOTHING
+//     bl   0x82816128                 ; <-- the guarded action
+//
+// Both functions are SHARED with widget classes that draw correctly, so a plain hook counts
+// everything and isolates nothing. The filter is the object's own vtable pointer: a cFEMeter
+// has 0x820BDBE8 at offset 0, written by its constructor. That makes a shared function
+// measurable per class without guessing which slot is class-specific — and after three wrong
+// labels in this investigation (findings 43, 44, 46) the rule is to identify things by
+// something the guest itself wrote, not by where they sit.
+namespace
+{
+constexpr uint32_t kMeterVtable = 0x820BDBE8;
+std::atomic<uint64_t> g_updAll{ 0 }, g_updMeter{ 0 };
+std::atomic<uint64_t> g_actAll{ 0 }, g_actMeter{ 0 };
+std::atomic<uint64_t> g_f254nz{ 0 }, g_fGT{ 0 };
+inline uint32_t GuestU32(uint8_t* b, uint32_t va)
+{
+    const uint8_t* p = b + va;
+    return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+}
+inline bool IsMeter(uint8_t* b, uint32_t self)
+{
+    return self >= 0x1000 && GuestU32(b, self) == kMeterVtable;
+}
+} // namespace
+
+extern "C" PPC_FUNC(__imp__sub_8281A5E0);
+PPC_FUNC(sub_8281A5E0)
+{
+    const uint32_t self = ctx.r3.u32;
+    g_updAll.fetch_add(1, std::memory_order_relaxed);
+    if (IsMeter(base, self))
+    {
+        g_updMeter.fetch_add(1, std::memory_order_relaxed);
+        // The two guards that are plain field reads, sampled here so a blocked action can
+        // say WHICH test blocked it rather than only that it did.
+        if (GuestU32(base, self + 0x254) != 0)
+            g_f254nz.fetch_add(1, std::memory_order_relaxed);
+        if (int32_t(GuestU32(base, self + 0x268)) > int32_t(GuestU32(base, self + 0x264)))
+            g_fGT.fetch_add(1, std::memory_order_relaxed);
+    }
+    __imp__sub_8281A5E0(ctx, base);
+}
+
+extern "C" PPC_FUNC(__imp__sub_82816128);
+PPC_FUNC(sub_82816128)
+{
+    g_actAll.fetch_add(1, std::memory_order_relaxed);
+    if (IsMeter(base, ctx.r3.u32))
+        g_actMeter.fetch_add(1, std::memory_order_relaxed);
+    __imp__sub_82816128(ctx, base);
+}
+
 extern "C" PPC_FUNC(__imp__sub_82784588);
 PPC_FUNC(sub_82784588)
 {
@@ -334,6 +397,14 @@ void FeProbe_Report()
                 std::fprintf(stderr, "[fe]     from 0x%08X   %llu x\n", e.first,
                              (unsigned long long)e.second);
     }
+
+    std::fprintf(stderr,
+                 "[fe]   per-widget update sub_8281A5E0: %llu calls, %llu ON A METER\n"
+                 "[fe]     of those meter calls: [0x254]!=0 %llu x, [0x268]>[0x264] %llu x\n"
+                 "[fe]   guarded action sub_82816128: %llu calls, %llu ON A METER\n",
+                 (unsigned long long)g_updAll.load(), (unsigned long long)g_updMeter.load(),
+                 (unsigned long long)g_f254nz.load(), (unsigned long long)g_fGT.load(),
+                 (unsigned long long)g_actAll.load(), (unsigned long long)g_actMeter.load());
 
     // The factory table, read out of guest memory rather than inferred from the code.
     if (uint8_t* b = g_base.load(std::memory_order_relaxed))
