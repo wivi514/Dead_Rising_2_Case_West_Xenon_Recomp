@@ -2499,3 +2499,62 @@ not. The next probe (committed with this finding) converts the remaining questio
 two comparisons: the `0x02000000` flag per class at slot-8 entry **and** in the update
 walk, plus the LR at slot-8 entry — which names the walker, and with it the caller-side
 gate that decides who gets drawn.
+
+---
+
+## 49. **SLOT 8 IS THE DRAW TREE — and the meter passes every gate of its own** — part 4, 2026-08-16
+
+Two more instrumented drives on the census's heels. Everything below is measured on this
+title's own runtime; the addresses came from LR values the recompiler wrote, not from
+reading code first.
+
+### The walker has a name and a shape
+
+The slot-8 return addresses land inside `sub_8280FF30` itself — **slot 8 is the recursive
+widget Draw**. Decoded (and this reading is *anchored* by the LRs, not free-floating):
+
+```
+sub_8280FF30 (drawers' slot 8, cFEWidget::Draw):
+  entry:  [this+0x10] & 0x02000000 or bail          ; parent-propagated, per frame
+  if own bit 0x00800000 set and [this+0x6C] > eps:
+      call OWN vtable slot 9                        ; per-class "render myself"
+  for child = [this+0x8]; child; child = [child+0xC]:
+      (loop A only) child->flags |= 0x02000000      ; the propagation token
+      if child bit 0x00800000 and [child+0x6C] > eps:
+          call child->slot8()                        ; recurse
+  clear own 0x02000000                               ; token consumed
+```
+
+That explains finding 48's identical slot-8/slot-9 counts (8 calls 9 on itself), and it
+re-labels the census: **slot 9 is the per-class render** (bitmap `0x82803678`, text
+`0x82816970`, meter `0x82804808`), slot 8 the traversal, and `0x82815C18` is
+**cFEMeter::Draw**, a real 700-byte float-heavy override.
+
+### The meter's own state is EXONERATED, gate by gate
+
+Update-walk samples (the walk that reaches every widget):
+
+```
+                 0x02000000 set   bit 0x00800000 set   [+0x6C] > 0
+cFEMeter             97%             8,456 / 9,236       9,236 / 9,236
+cFEBitmap           100%             1,247 / 1,286       1,028 / 1,286
+cFEText             100%               114 /   117          96 /   117
+```
+
+Meters pass the walker's per-child gates **at least as well as the classes that draw** —
+and still collect only ~250 slot-8 entries against 9,236 update visits, half of them
+arriving without the propagation token (loop B) and dying at the callee's first test.
+
+### What that leaves, and it is two things exactly
+
+The draw is a **tree** recursion (children at `[this+0x8]`, siblings `[+0xC]`) pruned at
+every level, while the update walk is a **different structure** (the virtual
+Set/GetNext — `[+0x1CC]` on meters, finding 46's "list link"). A widget healthy in its own
+right is lost by the tree in only two ways: **an ancestor fails the gates** (the recursion
+prunes whole subtrees), or **it is not linked under a drawn parent at all**. The committed
+round-4 probe measures both, per class, and records the first failing ancestor's vtable
+pointer — identity by what the guest wrote.
+
+Also measured: nine `[+0x10] |= 0x00800000` "Show" sites exist in the frontend band
+(`0x82805908/48, 0x828065E8, 0x828096DC, 0x8281809C, 0x8281A944, 0x8281AF7C, 0x8281D3A4,
+0x8281D628`) — the map for whichever widget round 4 names as wrongly hidden.
