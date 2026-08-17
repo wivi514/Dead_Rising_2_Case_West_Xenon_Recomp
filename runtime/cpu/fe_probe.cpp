@@ -787,6 +787,49 @@ struct BitsBatch { uint16_t cap, hiCount; uint64_t pass, drop; };
 std::unordered_map<uint32_t, BitsBatch> g_bitsBatch;   // batch VA -> stats
 } // namespace
 
+// THE SHADER-CONSTANT-SET STACK (round 17): the finalize sub_8274A698 needs a
+// slot from the stack at [this+0x38] via sub_821D4E90 -> sub_821954A8, and on
+// -1 it fires the retail-silent assert "Shader constant set overflow."
+// (renderlib/common/shaderconstantsetstack.cpp:168) and drops the draw. The
+// allocator is a bounded stack: [+0] capacity, [+2] current, [+0xC]
+// high-water; -1 = full. If nothing ever POPS it in our runtime it fills once
+// and every meter finalize fails forever. Recorded per stack object:
+// capacity, the current value's min/max seen, and alloc pass/fail.
+namespace
+{
+std::mutex g_scsMutex;
+struct ScsStack { int16_t cap, curMin, curMax, hiWater; uint64_t ok, fail; };
+std::unordered_map<uint32_t, ScsStack> g_scsStacks;
+} // namespace
+
+extern "C" PPC_FUNC(__imp__sub_821D4E90);
+PPC_FUNC(sub_821D4E90)
+{
+    const uint32_t self = ctx.r3.u32;
+    int16_t cap = 0, cur = 0, hi = 0;
+    if (self >= 0x1000)
+    {
+        // sub_821D4E90 hands this+4 to the inner allocator, whose fields are
+        // [+0] capacity, [+2] current, [+0xC] high-water — so from the outer
+        // object: +4, +6, +0x10.
+        cap = int16_t(GuestU32(base, self + 0x4) >> 16);
+        cur = int16_t(GuestU32(base, self + 0x4) & 0xFFFF);
+        hi = int16_t(GuestU32(base, self + 0x10) >> 16);
+    }
+    __imp__sub_821D4E90(ctx, base);
+    if (self >= 0x1000)
+    {
+        std::lock_guard<std::mutex> lock(g_scsMutex);
+        ScsStack& s = g_scsStacks[self];
+        if (s.ok + s.fail == 0) { s.curMin = s.curMax = cur; }
+        s.cap = cap;
+        s.hiWater = hi;
+        if (cur < s.curMin) s.curMin = cur;
+        if (cur > s.curMax) s.curMax = cur;
+        (ctx.r3.s32 == -1 ? s.fail : s.ok)++;
+    }
+}
+
 extern "C" PPC_FUNC(__imp__sub_8273C3D0);
 PPC_FUNC(sub_8273C3D0)
 {
@@ -1486,6 +1529,20 @@ void FeProbe_Report()
                          e.second.mode, e.second.modeExit,
                          e.second.mode != e.second.modeExit ? " <== FLIPS IN-BODY" : "",
                          (unsigned long long)e.second.count);
+        {
+            std::lock_guard<std::mutex> scslock(g_scsMutex);
+            std::fprintf(stderr,
+                         "[fe]   SHADER-CONSTANT-SET STACKS via sub_821D4E90 — cap/cur-range/hiwater, ok, FAIL(-1):\n");
+            for (const auto& e : g_scsStacks)
+                std::fprintf(stderr,
+                             "[fe]     stack 0x%08X  cap %5d  cur %5d..%-5d  hiw %5d  ok %8llu  FAIL %8llu%s\n",
+                             e.first, e.second.cap, e.second.curMin, e.second.curMax,
+                             e.second.hiWater, (unsigned long long)e.second.ok,
+                             (unsigned long long)e.second.fail,
+                             e.second.fail ? "  <== OVERFLOWING (silent retail assert)" : "");
+            if (g_scsStacks.empty())
+                std::fprintf(stderr, "[fe]     (never called)\n");
+        }
         {
             std::lock_guard<std::mutex> bqlock(g_bqMutex);
             std::fprintf(stderr,
