@@ -2594,3 +2594,41 @@ resolving to twelve functions — pager idioms (hide-all / show-selected over an
 LR and target, and dumps each distinct meter-blocking ancestor from live guest memory —
 so the hider and the hidden can be matched by address within one run. A ~300-site
 game-side band (0x824C–0x8250) exists as the fallback if no frontend row matches.
+
+---
+
+## 51. **THE INTERVENTION RENDERS THE WIDGETS — findings 48-50 are the mechanism, and much of what was hidden is co-op UI** — part 4, 2026-08-16
+
+Round 5 first: the meter-blocking containers were dumped from live guest memory with
+their full parent chains and children, and **none of the twelve frontend hide/show
+functions ever ran** — the actor writes the flag word through some idiom the static
+scans did not cover. The dumps showed the shape plainly: two containers whose only
+children are **two cFEMeters each** (blocked 228 samples apiece, `bit8=0`, with a second
+hidden ancestor higher in the same chain), five identical sibling rows blocked at
+`alpha=0`, one mid-fade at `alpha=0.5`.
+
+Then the intervention. `CW_FE_FORCESHOW=1` forces `bit8` set and alpha positive on every
+node of every meter's ancestor chain, per update-walk visit; the same binary without the
+variable is the control, and the arm proved engagement: **13,881 forced bit8 writes, 17
+forced alphas** — and meter draw-tree entries went from ~250 to **15,302**, with
+`cFEMeter`'s own render slot running **8,892 times**.
+
+**The operator's screenshot confirms it on screen.** With the containers forced visible,
+previously-invisible HUD renders: the **PP and LIFE labels**, the item-belt's row of
+empty squares — and with them a crowd of things that "shouldn't be here": **five PLAY
+ONLINE menu rows** (the five alpha-0 siblings), **Frank's kill counter and the
+second-player item belt** — the co-op UI, correctly hidden in single-player, forced
+visible by a deliberately blunt arm. Operator: *"A lot of thing that shouldn't be here."*
+
+### What this settles and what it opens
+
+- The draw pipeline for these widgets is **fully functional end to end** — shader,
+  geometry, traversal, meter code. Findings 35-39's GPU exoneration plus 48-50's
+  guest-side chain are the complete mechanism.
+- The defect is now exactly this: **the game-side show/hide state for the single-player
+  meter groups is wrong** — their containers stay hidden (or transparent) while on
+  hardware they are shown. Everything else about them is healthy.
+- The round-7 instrument names the containers: `[widget+0x4]` is the interned name id
+  (slot 18, FindChildById, compares its argument against it), CONTROL A now doubles as
+  the name↔id dictionary, and FindChildById records {id, caller LR} — whoever looks up a
+  blocked container by name is the game code that manipulates it.
