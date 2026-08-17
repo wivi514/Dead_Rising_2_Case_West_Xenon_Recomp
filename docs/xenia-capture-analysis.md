@@ -1966,3 +1966,88 @@ question is whether the lookup is asked for a meter and fails, or is never asked
 *dispatch* — the function that reads the table and calls a creator — answers it the same way
 this finding was reached, and `cFEFlipBook` is now the ideal control, because it goes through
 the same dispatch and works.
+
+---
+
+## 42. **THE FACTORY IS NEVER ASKED FOR A METER — and the instrument that decides why** — 2026-08-16
+
+Finding 41 established `cFEMeter` is never constructed in gameplay. This traces the creation
+path to the exact branch where a missing widget becomes silence, and instruments it.
+
+### The mechanism, read out of the guest
+
+The widget factory is a global table at **`0x82AF3118`** — **25 entries of
+`{creator, id, name}`, 12 bytes each** — filled by `sub_829BC368` and handed to the factory
+object by `sub_82784578` (`count -> [obj+0x1C]`, `table -> [obj+0x20]`).
+
+Creation is `sub_82784588`:
+
+```
+bl    0x82784508          ; index = FindClass(name)
+cmpwi r3, -1
+beq   -> li r3,0 ; return ; <-- NO CLASS, NO WIDGET, NO COMPLAINT
+lwz   r11, 0x20(r31)      ; the table
+mulli r10, r3, 0xc        ; index * 12
+lwzx  r11, r10, r11       ; creator = table[index].creator
+mtctr r11 ; bctrl         ; call it
+```
+
+and `sub_82784508` matches by **interned id**: it interns the requested name through
+`sub_827815D0` — the same intern the registration used — and walks the 25 entries comparing
+`[entry+4]`. No match returns `-1`. **That `beq` is the whole failure mode: a widget that
+cannot be classified is simply not made, and nothing anywhere says so.**
+
+### The instrument
+
+`fe_probe.cpp` now hooks that lookup and reports three things: every `cFE*` class the parser
+**asks** for with a count, every bare name that **fails to resolve**, and the construction
+census from finding 40. Together they separate three different defects that all present as
+"no widget":
+
+| reading | meaning |
+|---|---|
+| class never **asked** for | the screen data never names it — a data/parse problem |
+| asked and **unresolved** | the factory table or the intern is wrong |
+| asked, resolved, not **constructed** | the creator itself fails |
+
+### What the title/loading screen says, and why it indicts nothing yet
+
+```
+factory lookups 16,771, of which 11,767 returned -1
+asked: cFEKeyFrame 2488 · cFEBitmap 618 · cFEAnim 642 · cFEWidget 558 · cFEText 216
+       cFEShape 112 · cFEButton 112 · cFEScreen 34 · cFELockBox 8 · cFEEBMText 6
+unresolved bare tokens: `}`  (nothing else)
+```
+
+**`cFEMeter` is never asked for on this screen** — and no widget type fails to resolve at all.
+
+Two things had to be understood before those numbers meant anything:
+
+1. **`sub_82784508` is a GENERIC name→index lookup**, not a widget-only one. The
+   screen-definition parser calls it for every token it meets, including property lines —
+   the first run of this probe returned `X=0.18906`, `Font="arialblk18"` and
+   `Text="413 IDS_SGF_ONLINE"` as "unresolved classes". **So 11,767 failures are normal**,
+   and the probe now drops anything containing `=`, `"` or a space.
+2. **This screen plausibly has no meter**, so a zero here is not evidence. Same caveat as
+   finding 40, unresolved by the same argument.
+
+### The run that finishes this, and it is the last one needed
+
+**Gameplay, where hardware shows the PP bar, the LIFE meter and the mission bar.** The probe
+is always on and prints on window close:
+
+```
+cd runtime/build && CW_VKDRAW=1 ./cw_runtime 2> run.log    # play, close the window
+```
+
+- **`cFEMeter` never asked for** → the HUD's screen definition never names it. The defect is
+  in loading or parsing that screen's data, and the next question is which file it lives in.
+- **asked but unresolved** → the intern or the factory table is wrong, and the probe prints
+  the name outright.
+- **asked, resolved, still 0 constructions** → `sub_82817488` itself is failing, and it
+  allocates 0x8920 bytes — by far the largest of any widget class, against `cFEText`'s 0x400.
+
+**That third possibility deserves flagging now**: 0x8920 is 35 KB for one widget, and an
+allocation that large failing where a 0x400 one succeeds is a specific, checkable story rather
+than a vague one. `sub_82817488` returns 0 on allocation failure, exactly like the missing-class
+branch, and just as quietly.

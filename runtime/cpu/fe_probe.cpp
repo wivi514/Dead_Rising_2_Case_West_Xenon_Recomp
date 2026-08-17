@@ -79,6 +79,11 @@
 #include <ppc_config.h>   // ppc_context.h #errors without it
 #include <ppc_context.h>
 
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <vector>
+
 #include "fe_probe.h"
 
 namespace
@@ -127,6 +132,99 @@ CW_FE_FUNCS(X)
 CW_FE_FUNCS(X)
 #undef X
 
+// THE WIDGET FACTORY'S LOOKUP, which is where a missing class becomes silence.
+//
+// sub_82784588 is "create a widget of class <name>". It calls sub_82784508 to turn the
+// name into a table index and, if that comes back -1, RETURNS 0 WITHOUT A WORD:
+//
+//     bl   0x82784508            ; index = FindClass(name)
+//     cmpwi r3, -1
+//     beq  -> li r3,0 ; return   ; <- no class, no widget, no complaint
+//     lwz  r11, 0x20(r31)        ; the table
+//     mulli r10, r3, 0xc         ; index * 12
+//     lwzx r11, r10, r11         ; creator = table[index].creator
+//     mtctr r11 ; bctrl          ; call it
+//
+// and sub_82784508 matches by INTERNED ID: it interns the requested name through
+// sub_827815D0 and compares that against each entry's stored id, which was interned the
+// same way at registration. So a failure here is an id that does not match, and the
+// name it was asked for is the single most useful thing to know.
+//
+// This counts every lookup, counts the failures, and records the NAMES that failed —
+// bounded, deduplicated, and read straight out of guest memory, because a count alone
+// would say "something was not found" and leave the interesting half out.
+namespace
+{
+std::atomic<uint64_t> g_lookups{ 0 };
+std::atomic<uint64_t> g_lookupFails{ 0 };
+std::mutex g_missMutex;
+std::vector<std::string> g_missed;   // distinct class names that resolved to -1
+// Every `cFE*` name the parser ASKS the factory for, with a count — the other half of the
+// question. A class that is never requested is a screen-data problem; one that is
+// requested and unresolved is a factory problem. Without both, a zero is ambiguous.
+std::vector<std::pair<std::string, uint64_t>> g_asked;
+} // namespace
+
+extern "C" PPC_FUNC(__imp__sub_82784508);
+PPC_FUNC(sub_82784508)
+{
+    // r4 is the name pointer on entry; the callee is free to clobber it, so take it now.
+    const uint32_t nameVa = ctx.r4.u32;
+    if (nameVa)
+    {
+        const char* q = reinterpret_cast<const char*>(base + nameVa);
+        if (q[0] == 'c' && q[1] == 'F' && q[2] == 'E')
+        {
+            char nb[64];
+            size_t m = 0;
+            while (m < sizeof nb - 1 && q[m] > 0x20 && q[m] < 0x7F) { nb[m] = q[m]; ++m; }
+            nb[m] = 0;
+            std::lock_guard<std::mutex> lock(g_missMutex);
+            bool seen = false;
+            for (auto& e : g_asked)
+                if (e.first == nb) { ++e.second; seen = true; break; }
+            if (!seen && g_asked.size() < 64)
+                g_asked.emplace_back(nb, 1);
+        }
+    }
+    __imp__sub_82784508(ctx, base);
+    g_lookups.fetch_add(1, std::memory_order_relaxed);
+    if (ctx.r3.s32 != -1)
+        return;
+    g_lookupFails.fetch_add(1, std::memory_order_relaxed);
+
+    // Guest strings are plain bytes, so no swap; bound the read so a wild pointer cannot
+    // walk off the map, and keep the distinct list small — this is a diagnosis, not a log.
+    if (!nameVa)
+        return;
+    const char* p = reinterpret_cast<const char*>(base + nameVa);
+    char buf[64];
+    size_t n = 0;
+    while (n < sizeof buf - 1 && p[n] >= 0x20 && p[n] < 0x7F)
+    {
+        buf[n] = p[n];
+        ++n;
+    }
+    buf[n] = 0;
+    if (!n)
+        return;
+    // sub_82784508 is a GENERIC name->index lookup: the screen-definition parser calls it
+    // for every token it meets, including property lines like `X=0.18906` and
+    // `Font="arialblk18"`, so most failures are the parser falling through to its property
+    // handling and are entirely normal. A widget TYPE name is a bare token, so anything
+    // carrying '=' or a quote is dropped here — otherwise the bounded list fills with
+    // property text and the one interesting name never reaches it.
+    if (std::strchr(buf, '=') || std::strchr(buf, '"') || std::strchr(buf, ' '))
+        return;
+    std::lock_guard<std::mutex> lock(g_missMutex);
+    if (g_missed.size() >= 64)
+        return;
+    for (const auto& s : g_missed)
+        if (s == buf)
+            return;
+    g_missed.emplace_back(buf);
+}
+
 void FeProbe_Report()
 {
     std::fprintf(stderr, "\n[fe] frontend METER widget probe — findings 35-39\n");
@@ -146,4 +244,23 @@ void FeProbe_Report()
                      "[fe]   A class with a NONZERO count is constructed by this drive; a\n"
                      "[fe]   zero is only meaningful beside a nonzero sibling on the SAME\n"
                      "[fe]   screen. See findings 35-40.\n");
+
+    const uint64_t look = g_lookups.load(), fail = g_lookupFails.load();
+    std::fprintf(stderr,
+                 "[fe]   factory lookups: %llu, of which %llu FAILED (returned -1 and the\n"
+                 "[fe]   widget was silently not created)\n",
+                 (unsigned long long)look, (unsigned long long)fail);
+    std::lock_guard<std::mutex> lock(g_missMutex);
+    std::fprintf(stderr, "[fe]   cFE* class names the parser ASKED the factory for:\n");
+    if (g_asked.empty())
+        std::fprintf(stderr, "[fe]     (none — the screen data never names a widget class)\n");
+    else
+        for (const auto& e : g_asked)
+            std::fprintf(stderr, "[fe]     asked %6llu x  %s\n",
+                         (unsigned long long)e.second, e.first.c_str());
+    if (g_missed.empty())
+        std::fprintf(stderr, "[fe]   no class name failed to resolve.\n");
+    else
+        for (const auto& s : g_missed)
+            std::fprintf(stderr, "[fe]     UNRESOLVED CLASS: %s\n", s.c_str());
 }
