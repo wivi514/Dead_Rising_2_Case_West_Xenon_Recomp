@@ -2796,3 +2796,43 @@ What remains is one stage: the per-frame batch consumer. Also in hand from run 1
 type-2 retained-item update's function-pointer target is `sub_8275DFB8` (1,593 calls, id
 "blank"), and the batch manager `[global+0xDB4]` has its readers mapped — the flush lives
 among `sub_8275Cxxx-8275Fxxx` / `sub_8274Cxxx-8274Dxxx`.
+
+---
+
+## 57. **THE DEBUG JUMP IS PORTED AND CONFIRMED WORKING — Case West's own dev scaffolding, re-derived** — part 4, 2026-08-16
+
+The operator asked for Case Zero's debug-jump toolchain here ("it'll be easier that way").
+Ported by re-derivation, never by copied constants (the port-pending rule):
+
+- **The tunables loader is `sub_824A4C90`**, get-bool-by-name `sub_82786708`, and
+  `tools/find_debug_tunables.py` machine-extracts the (name → byte) table, modelling the
+  pipelined store that produced Case Zero's off-by-one and confirming every byte by its
+  `lbz` readers: **401 confirmed tunables** (`enable_debug_jump_menu → 0x82A744FF`,
+  `chuck_in_god_mode → 0x82A74557`, and Case West additions like `test_frank`). Checked in
+  as `runtime/cpu/debug_tunables_table.inc`.
+- **The screen-name hash is `sub_827815D0(name, len)`** — Case Zero's `0x8276E398`
+  fingerprint-matched uniquely, and independently already known as fe_probe's CONTROL A.
+- **The transition request is `sub_82812410(manager, hash, 0)`** — Case Zero's
+  `0x827F6D40` fingerprint-matched uniquely; the manager is captured live from the
+  title's own transitions.
+- `DebugJump` (0x8206D8C0) / `DebugEnter` (0x8206E284) are the image's own strings, and
+  `debugjump.txt` ships in `mainmenu.big` at 4,144 bytes — the same size as Case Zero's.
+
+**Confirmed by the operator**: enter the main menu, press F2, and the title's own
+DebugJump screen opens and navigates. (One crash on the way: F3/DebugEnter serviced
+during the BOOT LOGOS dies on a null virtual call — screens opened onto a half-booted
+game are unsafe; noted, parked at the operator's request.)
+
+The working recipe is now automated: `CW_FAKE_START_MS=3000` with
+`...,START,NONE,F2,DOWN,A,...` walks boot → main menu → DebugJump → first entry → jump,
+landing in-game with no human and no save-file dependency — the fixed point Case Zero's
+whole navigation toolchain existed to provide. `CW_SCREEN_TRACE=1` logs every screen
+hash; `CW_DEBUG_TUNABLES=name[=v],...` sets any of the 401 by name, failing loudly on
+typos. The F4 overlay / AutoChuck surface is deliberately not ported yet.
+
+Also learned on the way (from run 23's shutdown report): the "flush chain" counters of
+finding 56's framing — dispatch 506 / list-exec 506 / per-item 2,516 — are IDENTICAL
+across sessions of different lengths, so `sub_82763900/82753FF8/8274C488` are a
+BOOT-TIME build pass, not the per-frame flush; only the bits-write counter scales with
+session length. The per-frame consumer of the bits batches remains the open question in
+the progress-widget investigation.
