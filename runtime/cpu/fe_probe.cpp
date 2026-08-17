@@ -670,6 +670,49 @@ struct RegRow { std::string name; uint32_t result; uint64_t count; };
 std::vector<RegRow> g_regRows;
 } // namespace
 
+// THE RETAINED-ITEM UPDATE, sub_8273A510(mgr, index, id, type, ...): items are
+// a 128-byte-stride array at [mgr+0x28], and the work happens through a raw
+// function pointer at [[mgr+0]+8] — unhookable until named. This records the
+// pointer's distinct targets plus the index/id/type ranges, so the NEXT hook
+// has an address instead of a guess.
+namespace
+{
+std::mutex g_riMutex;
+std::vector<std::array<uint32_t, 4>> g_riRows;   // {fptr, id(r5), type(r6), count-ish}
+std::vector<uint64_t> g_riCounts;
+} // namespace
+
+extern "C" PPC_FUNC(__imp__sub_8273A510);
+PPC_FUNC(sub_8273A510)
+{
+    uint32_t fptr = 0;
+    const uint32_t mgr = ctx.r3.u32;
+    if (mgr >= 0x1000)
+    {
+        const uint32_t inner = GuestU32(base, mgr);
+        if (inner >= 0x1000)
+            fptr = GuestU32(base, inner + 8);
+    }
+    const uint32_t id = ctx.r5.u32, ty = ctx.r6.u32;
+    {
+        std::lock_guard<std::mutex> lock(g_riMutex);
+        bool seen = false;
+        for (size_t i = 0; i < g_riRows.size(); i++)
+            if (g_riRows[i][0] == fptr && g_riRows[i][1] == id && g_riRows[i][2] == ty)
+            {
+                ++g_riCounts[i];
+                seen = true;
+                break;
+            }
+        if (!seen && g_riRows.size() < 96)
+        {
+            g_riRows.push_back({ fptr, id, ty, 0 });
+            g_riCounts.push_back(1);
+        }
+    }
+    __imp__sub_8273A510(ctx, base);
+}
+
 extern "C" PPC_FUNC(__imp__sub_82813940);
 PPC_FUNC(sub_82813940)
 {
@@ -1295,6 +1338,17 @@ void FeProbe_Report()
                          NameOfId(e.first), e.second.handle,
                          e.second.handle == 0xFFFFFFFFu ? " <== NEVER DRAWS" : "",
                          e.second.value, (unsigned long long)e.second.samples);
+        {
+            std::lock_guard<std::mutex> rilock(g_riMutex);
+            std::fprintf(stderr,
+                         "[fe]   retained-item updates via sub_8273A510 {fptr, id, type}:\n");
+            for (size_t i = 0; i < g_riRows.size(); i++)
+                std::fprintf(stderr, "[fe]     fptr 0x%08X  id 0x%08X  type %u  %llu x\n",
+                             g_riRows[i][0], g_riRows[i][1], g_riRows[i][2],
+                             (unsigned long long)g_riCounts[i]);
+            if (g_riRows.empty())
+                std::fprintf(stderr, "[fe]     (never called)\n");
+        }
         std::fprintf(stderr, "[fe]   registry lookups via sub_82813940 {name -> result}:\n");
         if (g_regRows.empty())
             std::fprintf(stderr, "[fe]     (never called)\n");
