@@ -84,6 +84,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "fe_probe.h"
@@ -93,8 +94,11 @@ namespace
 
 // The ctors and the 0x1CC accessors that used to sit in this list moved into the
 // three-class vtable census below, where their counts come back CLASS-FILTERED.
+// The intern function 0x827815D0 moved to its own hook below (round 6): it still
+// counts as CONTROL A, and now also records the name -> id mapping, because
+// [widget+0x4] IS the interned name id (slot 18 compares its r4 against it) and
+// the blocked containers can therefore be printed BY NAME.
 #define CW_FE_FUNCS(X)                                                                   \
-    X(827815D0, "CONTROL A: name intern (everything registers through here)")            \
     X(82815B80, "cFEMeter  creator [TABLE ENTRY 16] alloc 0x2F0")                        \
     X(82814A50, "cFEBitmap creator [TABLE ENTRY  6] alloc 0xF0")                         \
     X(828168D0, "cFEText   creator [TABLE ENTRY  4] alloc 0x2C0")
@@ -117,6 +121,47 @@ CW_FE_FUNCS(X)
     }
 CW_FE_FUNCS(X)
 #undef X
+
+// CONTROL A, now also the id -> name dictionary. Every widget name reaches
+// sub_827815D0(name) -> id at least once (registration, parsing, lookups), so
+// recording first-seen pairs makes every interned id in guest memory readable.
+// ~1.2M calls/session, one hash probe each under a mutex — the frontend
+// interns from one thread, so contention is nil; the fps counter is the
+// canary if that assumption is ever wrong (gotcha 223).
+namespace
+{
+std::atomic<uint64_t> g_fe_827815D0{ 0 };
+std::mutex g_nameMutex;
+std::unordered_map<uint32_t, std::string> g_idName;   // interned id -> name
+
+inline const char* NameOfId(uint32_t id)
+{
+    // caller holds no lock; report-time only
+    auto it = g_idName.find(id);
+    return it == g_idName.end() ? "?" : it->second.c_str();
+}
+} // namespace
+
+extern "C" PPC_FUNC(__imp__sub_827815D0);
+PPC_FUNC(sub_827815D0)
+{
+    g_fe_827815D0.fetch_add(1, std::memory_order_relaxed);
+    const uint32_t nameVa = ctx.r3.u32;
+    __imp__sub_827815D0(ctx, base);
+    if (!nameVa)
+        return;
+    const uint32_t id = ctx.r3.u32;
+    std::lock_guard<std::mutex> lock(g_nameMutex);
+    if (g_idName.size() >= 20000 || g_idName.count(id))
+        return;
+    const char* p = reinterpret_cast<const char*>(base + nameVa);
+    char buf[48];
+    size_t n = 0;
+    while (n < sizeof buf - 1 && p[n] >= 0x20 && p[n] < 0x7F) { buf[n] = p[n]; ++n; }
+    buf[n] = 0;
+    if (n)
+        g_idName.emplace(id, buf);
+}
 
 // ============================================================================
 // THE THREE-CLASS VTABLE CENSUS — the measurement part 4 exists to make.
@@ -245,7 +290,7 @@ inline bool IsMeter(uint8_t* b, uint32_t self)
     X(8280BB08) X(8280BBA0) X(8280BD38) X(8280BEB8) X(8280D438)                          \
     X(8280D448) X(8280D458) X(8280DDF8) X(8280DE00) X(8280E308) X(8280E978)              \
     X(8280FD98) X(8280FEB0) X(82810160) X(82810210) X(82810628)                          \
-    X(82810698) X(82810708) X(828107D8) X(82810960) X(828109D8) X(82810A60)              \
+    X(82810698) X(82810708) X(82810960) X(828109D8) X(82810A60)                          \
     X(82810AF0) X(82814A98) X(82814AE8) X(82815A78) X(82815BC8)                          \
     X(828162C8) X(82816368) X(82816920) X(82816970) X(82816AA8) X(82816BB0)              \
     X(8281B8E0) X(8281BB70) X(8281C0A8) X(8281C370)
@@ -299,6 +344,41 @@ inline void VtNote(uint8_t* b, uint32_t self, std::atomic<uint64_t>* ctr3)
     }
 CW_VT_HOOKS(X)
 #undef X
+
+// Slot 18 is FindChildById(this, id) — it compares r4 against [this+0x4] and
+// recurses the child tree. Whoever calls it with a blocked container's id is
+// the game code that MANIPULATES that container, so record {id, LR} pairs.
+// (Excluded from CW_VT_HOOKS above; this hook feeds the same census counter.)
+namespace
+{
+std::mutex g_findMutex;
+std::vector<std::array<uint32_t, 2>> g_findRows;   // {id, lr}
+std::vector<uint64_t> g_findCounts;
+} // namespace
+
+extern "C" PPC_FUNC(__imp__sub_828107D8);
+PPC_FUNC(sub_828107D8)
+{
+    VtNote(base, ctx.r3.u32, g_vtc_828107D8);
+    const uint32_t id = ctx.r4.u32, lr = uint32_t(ctx.lr);
+    {
+        std::lock_guard<std::mutex> lock(g_findMutex);
+        bool seen = false;
+        for (size_t i = 0; i < g_findRows.size(); i++)
+            if (g_findRows[i][0] == id && g_findRows[i][1] == lr)
+            {
+                ++g_findCounts[i];
+                seen = true;
+                break;
+            }
+        if (!seen && g_findRows.size() < 256)
+        {
+            g_findRows.push_back({ id, lr });
+            g_findCounts.push_back(1);
+        }
+    }
+    __imp__sub_828107D8(ctx, base);
+}
 
 // THE CTOR HOOKS, which are the census's validity gate. Each counts (the
 // count must reproduce CreateWidget's independent name-based count, the same
@@ -876,6 +956,9 @@ PPC_FUNC(sub_82784588)
 void FeProbe_Report()
 {
     std::fprintf(stderr, "\n[fe] frontend METER widget probe — findings 35-39\n");
+    std::fprintf(stderr, "[fe]   sub_%-10s %10llu   %s\n", "827815D0",
+                 (unsigned long long)g_fe_827815D0.load(),
+                 "CONTROL A: name intern (everything registers through here)");
 #define X(addr, what)                                                                    \
     std::fprintf(stderr, "[fe]   sub_%-10s %10llu   %s\n", #addr,                        \
                  (unsigned long long)g_fe_##addr.load(), what);
@@ -1052,19 +1135,23 @@ void FeProbe_Report()
                 std::fprintf(stderr,
                              "[fe]   METER-BLOCKING ancestor 0x%08X (seen %llu x):\n",
                              a, (unsigned long long)e.second);
+                std::lock_guard<std::mutex> nmlock(g_nameMutex);
                 uint32_t w = a;
                 for (int d = 0; d < 12 && w >= 0x1000; d++, w = GuestU32(b, w + 0xB0))
                 {
                     const uint32_t fl = GuestU32(b, w + 0x10);
                     std::fprintf(stderr,
-                                 "[fe]     %*s0x%08X vt 0x%08X flags 0x%08X bit8=%d alpha=%g\n",
+                                 "[fe]     %*s0x%08X vt 0x%08X flags 0x%08X bit8=%d alpha=%g  \"%s\"\n",
                                  d * 2, "", w, GuestU32(b, w), fl,
-                                 (fl & 0x00800000u) ? 1 : 0, GuestF32(b, w + 0x6C));
+                                 (fl & 0x00800000u) ? 1 : 0, GuestF32(b, w + 0x6C),
+                                 NameOfId(GuestU32(b, w + 0x4)));
                 }
                 uint32_t ch = GuestU32(b, a + 0x8);
                 for (int i = 0; i < 8 && ch >= 0x1000; i++, ch = GuestU32(b, ch + 0xC))
-                    std::fprintf(stderr, "[fe]       child 0x%08X vt 0x%08X flags 0x%08X\n",
-                                 ch, GuestU32(b, ch), GuestU32(b, ch + 0x10));
+                    std::fprintf(stderr,
+                                 "[fe]       child 0x%08X vt 0x%08X flags 0x%08X  \"%s\"\n",
+                                 ch, GuestU32(b, ch), GuestU32(b, ch + 0x10),
+                                 NameOfId(GuestU32(b, ch + 0x4)));
             }
     }
     std::fprintf(stderr,
@@ -1087,6 +1174,19 @@ void FeProbe_Report()
         }
         if (g_hsRows.empty())
             std::fprintf(stderr, "[fe]     (none of the twelve ever ran)\n");
+    }
+    std::fprintf(stderr, "[fe]   FindChildById (slot 18) — {id -> name, caller LR}:\n");
+    {
+        std::lock_guard<std::mutex> flock(g_findMutex);
+        std::lock_guard<std::mutex> nmlock2(g_nameMutex);
+        for (size_t i = 0; i < g_findRows.size(); i++)
+            std::fprintf(stderr, "[fe]     id 0x%08X \"%s\"  lr 0x%08X  %6llu x\n",
+                         g_findRows[i][0], NameOfId(g_findRows[i][0]), g_findRows[i][1],
+                         (unsigned long long)g_findCounts[i]);
+        if (g_findRows.empty())
+            std::fprintf(stderr, "[fe]     (never called)\n");
+        std::fprintf(stderr, "[fe]   name dictionary: %zu distinct ids recorded\n",
+                     g_idName.size());
     }
     std::fprintf(stderr, "[fe]   slot-8 CALL SITES (return addresses, both bodies):\n");
     {
