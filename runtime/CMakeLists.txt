@@ -145,7 +145,7 @@ add_executable(cw_runtime
     # They live in runtime/port-pending/ until Case West's own addresses are derived —
     # read that directory's README, especially the part about sub_82475718, which exists
     # in BOTH images and would have linked silently to an unrelated function.
-    cpu/debug_tunables_stub.cpp
+    cpu/debug_tunables_cw.cpp
     kernel/klog.cpp
     kernel/memory.cpp
     kernel/heap.cpp
