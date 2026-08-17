@@ -317,8 +317,13 @@ void FeProbe_Report()
                          (unsigned long long)g_createCounts[i][0],
                          (unsigned long long)g_createCounts[i][1],
                          g_createCounts[i][1] ? "   <== never created" : "");
+    // NO SECOND lock_guard HERE. g_missMutex is already held by the outer scope and it is
+    // NOT recursive, so re-locking it self-deadlocked the report: the run of 2026-08-16
+    // printed cleanly as far as the CreateWidget list and then stopped dead, the shutdown
+    // never reached _Exit, and guest threads kept logging over the top of it. An
+    // instrument that hangs the shutdown it is reporting from destroys the run it was
+    // measuring — worse than one that prints nothing, because the log still looks alive.
     {
-        std::lock_guard<std::mutex> lock(g_missMutex);
         std::fprintf(stderr,
                      "[fe]   cFEMeter get 0x1CC called %llu x. CALL SITES (return addresses):\n",
                      (unsigned long long)g_getCalls.load());
