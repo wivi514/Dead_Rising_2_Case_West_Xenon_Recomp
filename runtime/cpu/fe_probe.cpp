@@ -774,6 +774,43 @@ PPC_FUNC(sub_8275CD58)
         g_resolveRows.push_back({ buf, ctx.r3.u32, 1 });
 }
 
+// THE BITS ENQUEUE, sub_8273C3D0 (round 16): the real writer behind the
+// submit wrapper, and its first gate is
+//     if ([this+6] >= [this+4]) return 0;      // int16 count vs CAPACITY
+// A batch whose capacity was never set up drops every element silently —
+// which is exactly this defect's shape. Record per batch object: capacity,
+// high-water count, and how often the gate dropped vs passed.
+namespace
+{
+std::mutex g_bqMutex;
+struct BitsBatch { uint16_t cap, hiCount; uint64_t pass, drop; };
+std::unordered_map<uint32_t, BitsBatch> g_bitsBatch;   // batch VA -> stats
+} // namespace
+
+extern "C" PPC_FUNC(__imp__sub_8273C3D0);
+PPC_FUNC(sub_8273C3D0)
+{
+    const uint32_t self = ctx.r3.u32;
+    if (self >= 0x1000)
+    {
+        // [this+4] (capacity) and [this+6] (count) are adjacent int16s; one
+        // big-endian 32-bit read splits them: high half = +4, low half = +6.
+        const uint32_t w = GuestU32(base, self + 0x4);
+        const int16_t cap = int16_t(w >> 16);
+        const int16_t cnt = int16_t(w & 0xFFFF);
+        std::lock_guard<std::mutex> lock(g_bqMutex);
+        BitsBatch& b = g_bitsBatch[self];
+        b.cap = uint16_t(cap);
+        if (uint16_t(cnt) > b.hiCount)
+            b.hiCount = uint16_t(cnt);
+        if (cnt >= cap)
+            b.drop++;   // the guest's own gate: full (or never allocated) -> silently return 0
+        else
+            b.pass++;
+    }
+    __imp__sub_8273C3D0(ctx, base);
+}
+
 extern "C" PPC_FUNC(__imp__sub_82813940);
 PPC_FUNC(sub_82813940)
 {
@@ -1449,6 +1486,20 @@ void FeProbe_Report()
                          e.second.mode, e.second.modeExit,
                          e.second.mode != e.second.modeExit ? " <== FLIPS IN-BODY" : "",
                          (unsigned long long)e.second.count);
+        {
+            std::lock_guard<std::mutex> bqlock(g_bqMutex);
+            std::fprintf(stderr,
+                         "[fe]   BITS BATCHES at sub_8273C3D0 — {batch, capacity, high-water, pass, DROPPED}:\n");
+            for (const auto& e : g_bitsBatch)
+                std::fprintf(stderr,
+                             "[fe]     batch 0x%08X  cap %5u  hi %5u  pass %8llu  DROPPED %8llu%s\n",
+                             e.first, e.second.cap, e.second.hiCount,
+                             (unsigned long long)e.second.pass,
+                             (unsigned long long)e.second.drop,
+                             e.second.cap == 0 ? "  <== NEVER ALLOCATED" : "");
+            if (g_bitsBatch.empty())
+                std::fprintf(stderr, "[fe]     (never called)\n");
+        }
         std::fprintf(stderr,
                      "[fe]   meter submit chain: begin %llu  submit %llu  end %llu\n",
                      (unsigned long long)g_batchBegin.load(),
