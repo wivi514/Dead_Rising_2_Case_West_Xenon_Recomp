@@ -1250,8 +1250,7 @@ void FeProbe_Report()
         size_t shown = 0;
         for (const auto& r : rows)
         {
-            if (shown++ >= 120)
-                break;
+            (void)shown;   // print EVERY row — a capped list is not a count (gotcha 109)
             std::fprintf(stderr,
                          "[fe]     %-28s entered %8llu   pass %8llu  failBit8 %8llu  failAlpha %8llu\n",
                          NameOfId(r.first), (unsigned long long)r.second->entered,
