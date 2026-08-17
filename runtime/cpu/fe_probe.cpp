@@ -76,6 +76,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
+#include <thread>
 
 #include <ppc_config.h>   // ppc_context.h #errors without it
 #include <ppc_context.h>
@@ -1324,6 +1326,33 @@ PPC_FUNC(sub_82784588)
     g_createNames.emplace_back(nb);
     g_createCounts.push_back({ made ? 1u : 0u, made ? 0u : 1u });
 }
+
+void FeProbe_Report();
+
+// CW_FE_AUTOREPORT=<seconds>: emit the report mid-run after a delay, once.
+// Exists so an autonomous boot (no operator to close the window) still yields
+// data — every counter is atomic and every list mutex-guarded, so a mid-run
+// print is safe; the normal shutdown report still runs afterwards.
+namespace
+{
+struct FeAutoReport
+{
+    FeAutoReport()
+    {
+        const char* e = std::getenv("CW_FE_AUTOREPORT");
+        if (!e || !*e)
+            return;
+        const long secs = std::strtol(e, nullptr, 10);
+        if (secs <= 0)
+            return;
+        std::thread([secs] {
+            std::this_thread::sleep_for(std::chrono::seconds(secs));
+            std::fprintf(stderr, "[fe] AUTOREPORT after %lds:\n", secs);
+            FeProbe_Report();
+        }).detach();
+    }
+} g_feAutoReport;
+} // namespace
 
 void FeProbe_Report()
 {
