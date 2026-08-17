@@ -75,6 +75,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 
 #include <ppc_config.h>   // ppc_context.h #errors without it
 #include <ppc_context.h>
@@ -414,8 +415,51 @@ std::vector<std::pair<uint32_t, uint64_t>> g_ancFailVt[3];
 std::vector<std::pair<uint32_t, uint64_t>> g_meterAncFail;   // {ancestor VA, count}
 } // namespace
 
+// THE INTERVENTION ARM — CW_FE_FORCESHOW=1. Round 5 found the meters' own
+// containers hidden (bit8 clear) or transparent (alpha 0) while NONE of the
+// twelve frontend hide/show functions ever ran, so the actor writes the flag
+// word by some idiom the static scans did not cover. Before hunting it, prove
+// the causal chain end to end: force bit8 set and alpha positive on every
+// node of every meter's ancestor chain and let the operator LOOK. Widgets
+// appearing = findings 48-50 are the whole story and the remaining defect is
+// "who should show these groups"; nothing appearing = a fourth gate exists.
+// The same binary without the env var is the control arm, and the forced-write
+// counters below prove engagement either way (gotcha 151).
+namespace
+{
+const bool kForceShow = [] {
+    const char* e = std::getenv("CW_FE_FORCESHOW");
+    return e && *e && *e != '0';
+}();
+std::atomic<uint64_t> g_forcedBit8{ 0 }, g_forcedAlpha{ 0 };
+
+inline void GuestStoreU32(uint8_t* b, uint32_t va, uint32_t v)
+{
+    uint8_t* p = b + va;
+    p[0] = uint8_t(v >> 24); p[1] = uint8_t(v >> 16); p[2] = uint8_t(v >> 8); p[3] = uint8_t(v);
+}
+} // namespace
+
 inline void TreeSample(uint8_t* b, uint32_t self, int c)
 {
+    if (c == 0 && kForceShow)
+    {
+        uint32_t w = self;
+        for (int d = 0; d < 32 && w >= 0x1000; d++, w = GuestU32(b, w + 0xB0))
+        {
+            const uint32_t fl = GuestU32(b, w + 0x10);
+            if (!(fl & 0x00800000u))
+            {
+                GuestStoreU32(b, w + 0x10, fl | 0x00800000u);
+                g_forcedBit8.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (!(GuestF32(b, w + 0x6C) > 0.0f))
+            {
+                GuestStoreU32(b, w + 0x6C, 0x3F800000u);   // 1.0f
+                g_forcedAlpha.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
     const uint32_t parent = GuestU32(b, self + 0xB0);
     if (parent < 0x1000)
     {
@@ -1023,6 +1067,10 @@ void FeProbe_Report()
                                  ch, GuestU32(b, ch), GuestU32(b, ch + 0x10));
             }
     }
+    std::fprintf(stderr,
+                 "[fe]   FORCESHOW arm %s: forced bit8 %llu x, forced alpha %llu x\n",
+                 kForceShow ? "ARMED" : "off", (unsigned long long)g_forcedBit8.load(),
+                 (unsigned long long)g_forcedAlpha.load());
     std::fprintf(stderr, "[fe]   HIDE/SHOW calls — {function, caller LR, r3, [r3+0x3C4]}:\n");
     {
         std::lock_guard<std::mutex> hslock(g_hsMutex);
