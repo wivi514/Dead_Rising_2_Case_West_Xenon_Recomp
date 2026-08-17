@@ -90,12 +90,13 @@
 namespace
 {
 
+// The ctors and the 0x1CC accessors that used to sit in this list moved into the
+// three-class vtable census below, where their counts come back CLASS-FILTERED.
 #define CW_FE_FUNCS(X)                                                                   \
     X(827815D0, "CONTROL A: name intern (everything registers through here)")            \
-    X(82815B80, "cFEMeter creator  [TABLE ENTRY 16] alloc 0x2F0")                        \
-    X(8280D300, "cFEMeter CONSTRUCTOR — writes vtable 0x820BDBE8")                        \
-    X(8280D438, "cFEMeter SET field 0x1CC — is the meter ever given a value?")            \
-    X(8280D448, "cFEMeter get field 0x248")
+    X(82815B80, "cFEMeter  creator [TABLE ENTRY 16] alloc 0x2F0")                        \
+    X(82814A50, "cFEBitmap creator [TABLE ENTRY  6] alloc 0xF0")                         \
+    X(828168D0, "cFEText   creator [TABLE ENTRY  4] alloc 0x2C0")
 
 #define X(addr, what) std::atomic<uint64_t> g_fe_##addr{ 0 };
 CW_FE_FUNCS(X)
@@ -114,6 +115,215 @@ CW_FE_FUNCS(X)
         __imp__sub_##addr(ctx, base);                                                    \
     }
 CW_FE_FUNCS(X)
+#undef X
+
+// ============================================================================
+// THE THREE-CLASS VTABLE CENSUS — the measurement part 4 exists to make.
+//
+// Part 3 ended with cFEMeter's whole lifecycle healthy (created 70, linked,
+// walked, updated 100% class-specifically, laid out ~1.5x each — finding 47)
+// and still not one draw with the shader that paints meters. Guessing which
+// vtable slot is "the draw" failed four times, so the question is converted
+// into a comparison: WHICH SLOT DO WIDGETS THAT DRAW RECEIVE THAT METERS DO
+// NOT? cFEBitmap (1000 built last session) and cFEText (247) both render
+// correctly, so their censuses beside the meter's is the diff that names the
+// missing call — or, if every slot matches, proves the draw is not a widget
+// virtual at all, which is also an answer.
+//
+// PROVENANCE of the two new chains — factory table entries [6] and [4], READ
+// OUT OF GUEST MEMORY on the 2026-08-16 run (the meter's off-by-one, gotcha
+// 322, is why nothing here comes from reading registration code by eye), then
+// thunk -> allocator -> ctor -> the vtable store in each ctor's body:
+//   cFEBitmap [ 6] creator 0x828194E0 -> 0x82814A50 (alloc 0xF0)  -> ctor 0x8280B990
+//                  ctor stores vtable 0x820BD8D8 at [this+0]
+//   cFEText   [ 4] creator 0x828194C0 -> 0x828168D0 (alloc 0x2C0) -> ctor 0x8280DCD8
+//                  ctor stores vtable 0x820BDE50 at [this+0]
+// The vtable CONTENTS are a static read of default_image.bin at those
+// addresses — the one inference left in this chain. Two things check it: the
+// meter row of the same read reproduced part 3's runtime census exactly (13
+// active slots, same functions), and the ctor hooks below read [this+0] AFTER
+// construction at runtime and the report compares that against the constant —
+// a mismatch voids the census and says so in the output rather than
+// zero-filling it (gotcha 30: an instrument must be able to fail loudly).
+//
+// KNOWN BLIND SPOT, unchanged from part 3: a slot invoked on an adjusted
+// sub-object pointer carries a `this` whose [0] is not the class's primary
+// vtable, fails the filter, and reads 0. A zero here is "not observed on the
+// primary this", not "never called".
+namespace
+{
+
+constexpr uint32_t kMeterVtable  = 0x820BDBE8;
+constexpr uint32_t kBitmapVtable = 0x820BD8D8;
+constexpr uint32_t kTextVtable   = 0x820BDE50;
+constexpr uint32_t kVtOf[3]      = { kMeterVtable, kBitmapVtable, kTextVtable };
+const char* const  kVtClassName[3] = { "cFEMeter", "cFEBitmap", "cFEText" };
+constexpr int      kVtSlotCount  = 40;
+
+// Slots 0..39 of each vtable, from default_image.bin. Beyond slot 39 the
+// meter's table holds a zero word, so 40 is the base class's method count.
+constexpr uint32_t kVtSlots[3][kVtSlotCount] = {
+    { // cFEMeter 0x820BDBE8
+      0x82815BC8, 0x82816368, 0x82806000, 0x82463648, 0x8281C0A8, 0x8280FD98,
+      0x8281A5E0, 0x82463648, 0x82815C18, 0x82804808, 0x82810160, 0x82466CB8,
+      0x8280FEB0, 0x82805D70, 0x82804840, 0x8280D448, 0x828023B8, 0x82802408,
+      0x828107D8, 0x82810628, 0x82810698, 0x82810708, 0x828064F8, 0x82810210,
+      0x828048C0, 0x82466CB8, 0x828109D8, 0x82810A60, 0x82466CB8, 0x82810AF0,
+      0x8280D438, 0x8280D440, 0x821C3380, 0x82809A70, 0x82809AB0, 0x8280D458,
+      0x82332528, 0x821C3380, 0x828162C8, 0x82815A78 },
+    { // cFEBitmap 0x820BD8D8
+      0x82814A98, 0x82814AE8, 0x82806000, 0x82463648, 0x8281BB70, 0x8280FD98,
+      0x821C3380, 0x82466CB8, 0x8280FF30, 0x82803678, 0x82810160, 0x82466CB8,
+      0x8280FEB0, 0x82805D70, 0x828036F0, 0x8280BA10, 0x8280BBA0, 0x8280BB08,
+      0x828107D8, 0x82810628, 0x82810698, 0x82810708, 0x828064F8, 0x82810210,
+      0x82810960, 0x82466CB8, 0x828109D8, 0x82810A60, 0x82466CB8, 0x82810AF0,
+      0x821C3380, 0x82466CB8, 0x821C3380, 0x82809A70, 0x82809AB0, 0x8280BD38,
+      0x82803ED0, 0x82803928, 0x8280BEB8, 0x8281B8E0 },
+    { // cFEText 0x820BDE50
+      0x82816920, 0x8280E308, 0x82806000, 0x82463648, 0x8281C370, 0x8280FD98,
+      0x821C3380, 0x82466CB8, 0x8280FF30, 0x82816970, 0x82810160, 0x82466CB8,
+      0x8280FEB0, 0x82805D70, 0x82804D98, 0x8280DDF8, 0x82807EA8, 0x82807E48,
+      0x828107D8, 0x82810628, 0x82810698, 0x82810708, 0x828064F8, 0x82816BB0,
+      0x82810960, 0x82466CB8, 0x828109D8, 0x82810A60, 0x82466CB8, 0x82810AF0,
+      0x821C3380, 0x82466CB8, 0x8280E978, 0x82809A70, 0x82809AB0, 0x82805C38,
+      0x8280DE00, 0x82816AA8, 0x82804DB0, 0x8280BA10 },
+};
+
+inline uint32_t GuestU32(uint8_t* b, uint32_t va)
+{
+    const uint8_t* p = b + va;
+    return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+}
+
+// -1 = not one of the three (or not a plausible pointer). The filter is the
+// object's own vtable pointer, written by its constructor — the one label the
+// guest itself provides (the rule findings 43/44/46 bought).
+inline int VtClass(uint8_t* b, uint32_t self)
+{
+    if (self < 0x1000)
+        return -1;
+    const uint32_t vt = GuestU32(b, self);
+    for (int c = 0; c < 3; c++)
+        if (vt == kVtOf[c])
+            return c;
+    return -1;
+}
+
+inline bool IsMeter(uint8_t* b, uint32_t self)
+{
+    return self >= 0x1000 && GuestU32(b, self) == kMeterVtable;
+}
+
+} // namespace
+
+// One counter TRIPLE per distinct function in the union of the three vtables
+// (65 of them). Counts are per FUNCTION: where the same function occupies
+// several slots of one vtable (the shared no-op stubs do), the report repeats
+// the total on each slot and marks it.
+#define CW_VT_ALL(X)                                                                     \
+    X(821C3380) X(82332528) X(82463648) X(82466CB8) X(828023B8) X(82802408)              \
+    X(82803678) X(828036F0) X(82803928) X(82803ED0) X(82804808) X(82804840)              \
+    X(828048C0) X(82804D98) X(82804DB0) X(82805C38) X(82805D70) X(82806000)              \
+    X(828064F8) X(82807E48) X(82807EA8) X(82809A70) X(82809AB0) X(8280BA10)              \
+    X(8280BB08) X(8280BBA0) X(8280BD38) X(8280BEB8) X(8280D438) X(8280D440)              \
+    X(8280D448) X(8280D458) X(8280DDF8) X(8280DE00) X(8280E308) X(8280E978)              \
+    X(8280FD98) X(8280FEB0) X(8280FF30) X(82810160) X(82810210) X(82810628)              \
+    X(82810698) X(82810708) X(828107D8) X(82810960) X(828109D8) X(82810A60)              \
+    X(82810AF0) X(82814A98) X(82814AE8) X(82815A78) X(82815BC8) X(82815C18)              \
+    X(828162C8) X(82816368) X(82816920) X(82816970) X(82816AA8) X(82816BB0)              \
+    X(8281A5E0) X(8281B8E0) X(8281BB70) X(8281C0A8) X(8281C370)
+
+// Hooks for the union MINUS sub_8281A5E0 and sub_8280D440, which keep their
+// richer custom hooks below; those feed the same counters so the census stays
+// complete.
+#define CW_VT_HOOKS(X)                                                                   \
+    X(821C3380) X(82332528) X(82463648) X(82466CB8) X(828023B8) X(82802408)              \
+    X(82803678) X(828036F0) X(82803928) X(82803ED0) X(82804808) X(82804840)              \
+    X(828048C0) X(82804D98) X(82804DB0) X(82805C38) X(82805D70) X(82806000)              \
+    X(828064F8) X(82807E48) X(82807EA8) X(82809A70) X(82809AB0) X(8280BA10)              \
+    X(8280BB08) X(8280BBA0) X(8280BD38) X(8280BEB8) X(8280D438)                          \
+    X(8280D448) X(8280D458) X(8280DDF8) X(8280DE00) X(8280E308) X(8280E978)              \
+    X(8280FD98) X(8280FEB0) X(8280FF30) X(82810160) X(82810210) X(82810628)              \
+    X(82810698) X(82810708) X(828107D8) X(82810960) X(828109D8) X(82810A60)              \
+    X(82810AF0) X(82814A98) X(82814AE8) X(82815A78) X(82815BC8) X(82815C18)              \
+    X(828162C8) X(82816368) X(82816920) X(82816970) X(82816AA8) X(82816BB0)              \
+    X(8281B8E0) X(8281BB70) X(8281C0A8) X(8281C370)
+
+namespace
+{
+
+#define X(addr) std::atomic<uint64_t> g_vtc_##addr[3];
+CW_VT_ALL(X)
+#undef X
+
+struct VtCtrRow
+{
+    uint32_t addr;
+    std::atomic<uint64_t>* c;   // [3], indexed by class
+};
+const VtCtrRow kVtCtrRows[] = {
+#define X(addr) { 0x##addr, g_vtc_##addr },
+    CW_VT_ALL(X)
+#undef X
+};
+
+inline std::atomic<uint64_t>* VtCtrFor(uint32_t addr)
+{
+    for (const auto& r : kVtCtrRows)
+        if (r.addr == addr)
+            return r.c;
+    return nullptr;
+}
+
+inline void VtNote(uint8_t* b, uint32_t self, std::atomic<uint64_t>* ctr3)
+{
+    const int c = VtClass(b, self);
+    if (c >= 0)
+        ctr3[c].fetch_add(1, std::memory_order_relaxed);
+}
+
+} // namespace
+
+#define X(addr)                                                                          \
+    extern "C" PPC_FUNC(__imp__sub_##addr);                                              \
+    PPC_FUNC(sub_##addr)                                                                 \
+    {                                                                                    \
+        VtNote(base, ctx.r3.u32, g_vtc_##addr);                                          \
+        __imp__sub_##addr(ctx, base);                                                    \
+    }
+CW_VT_HOOKS(X)
+#undef X
+
+// THE CTOR HOOKS, which are the census's validity gate. Each counts (the
+// count must reproduce CreateWidget's independent name-based count, the same
+// two-direction agreement that settled the meter's chain in finding 45) and
+// records the FIRST vtable pointer observed at [this+0] after construction —
+// the runtime check on the three constants every filter above depends on.
+namespace
+{
+std::atomic<uint64_t> g_ctorCount[3];
+std::atomic<uint32_t> g_ctorVtSeen[3];
+} // namespace
+
+#define CW_FE_CTORS(X)                                                                   \
+    X(8280D300, 0)                                                                       \
+    X(8280B990, 1)                                                                       \
+    X(8280DCD8, 2)
+
+#define X(addr, cls)                                                                     \
+    extern "C" PPC_FUNC(__imp__sub_##addr);                                              \
+    PPC_FUNC(sub_##addr)                                                                 \
+    {                                                                                    \
+        g_ctorCount[cls].fetch_add(1, std::memory_order_relaxed);                        \
+        __imp__sub_##addr(ctx, base);                                                    \
+        if (ctx.r3.u32 >= 0x1000)                                                        \
+        {                                                                                \
+            uint32_t expect = 0;                                                         \
+            g_ctorVtSeen[cls].compare_exchange_strong(expect, GuestU32(base, ctx.r3.u32),\
+                                                      std::memory_order_relaxed);        \
+        }                                                                                \
+    }
+CW_FE_CTORS(X)
 #undef X
 
 // THE WIDGET FACTORY'S LOOKUP, which is where a missing class becomes silence.
@@ -235,6 +445,7 @@ std::atomic<uint64_t> g_getCalls{ 0 };
 extern "C" PPC_FUNC(__imp__sub_8280D440);
 PPC_FUNC(sub_8280D440)
 {
+    VtNote(base, ctx.r3.u32, g_vtc_8280D440);   // meter vtable slot 31
     const uint32_t lr = uint32_t(ctx.lr);
     g_getCalls.fetch_add(1, std::memory_order_relaxed);
     {
@@ -269,25 +480,16 @@ PPC_FUNC(sub_8280D440)
 // something the guest itself wrote, not by where they sit.
 namespace
 {
-constexpr uint32_t kMeterVtable = 0x820BDBE8;
 std::atomic<uint64_t> g_updAll{ 0 }, g_updMeter{ 0 };
 std::atomic<uint64_t> g_actAll{ 0 }, g_actMeter{ 0 };
 std::atomic<uint64_t> g_f254nz{ 0 }, g_fGT{ 0 };
-inline uint32_t GuestU32(uint8_t* b, uint32_t va)
-{
-    const uint8_t* p = b + va;
-    return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
-}
-inline bool IsMeter(uint8_t* b, uint32_t self)
-{
-    return self >= 0x1000 && GuestU32(b, self) == kMeterVtable;
-}
 } // namespace
 
 extern "C" PPC_FUNC(__imp__sub_8281A5E0);
 PPC_FUNC(sub_8281A5E0)
 {
     const uint32_t self = ctx.r3.u32;
+    VtNote(base, self, g_vtc_8281A5E0);   // meter vtable slot 6
     g_updAll.fetch_add(1, std::memory_order_relaxed);
     if (IsMeter(base, self))
     {
@@ -311,66 +513,8 @@ PPC_FUNC(sub_82816128)
     __imp__sub_82816128(ctx, base);
 }
 
-// THE METER'S WHOLE VTABLE, counted per slot and filtered to cFEMeter instances.
-//
-// The update path turned out healthy (finding 47): sub_8281A5E0 runs 183,190 times, 100% of
-// them on meters, and its guarded action fires 106 times — about 1.5 per meter, which is what
-// a one-shot layout looks like. So the meter is updated; it just never submits geometry. The
-// draw must therefore be a DIFFERENT vtable slot reached by a different traversal, and rather
-// than guess which of 40 it is, every slot is counted.
-//
-// Same filter as before — the object's own vtable pointer — so a slot shared with widget
-// classes that draw correctly still reports only its meter calls. Slots whose `this` is an
-// adjusted sub-object pointer will not match the filter and will read 0; that is a known
-// blind spot of this instrument rather than a result, and it is written here so a zero from
-// one of those is not read as "the meter never receives this call".
-#define CW_METER_VT(X)                                                                   \
-    X(82815BC8, 0)                                                                      \
-    X(82816368, 1)                                                                      \
-    X(82806000, 2)                                                                      \
-    X(82463648, 3)                                                                      \
-    X(8281C0A8, 4)                                                                      \
-    X(8280FD98, 5)                                                                      \
-    X(82815C18, 8)                                                                      \
-    X(82804808, 9)                                                                      \
-    X(82810160, 10)                                                                     \
-    X(82466CB8, 11)                                                                     \
-    X(8280FEB0, 12)                                                                     \
-    X(82805D70, 13)                                                                     \
-    X(82804840, 14)                                                                     \
-    X(828023B8, 16)                                                                     \
-    X(82802408, 17)                                                                     \
-    X(828107D8, 18)                                                                     \
-    X(82810628, 19)                                                                     \
-    X(82810698, 20)                                                                     \
-    X(82810708, 21)                                                                     \
-    X(828064F8, 22)                                                                     \
-    X(82810210, 23)                                                                     \
-    X(828048C0, 24)                                                                     \
-    X(828109D8, 26)                                                                     \
-    X(82810A60, 27)                                                                     \
-    X(82810AF0, 29)                                                                     \
-    X(821C3380, 32)                                                                     \
-    X(82809A70, 33)                                                                     \
-    X(82809AB0, 34)                                                                     \
-    X(8280D458, 35)                                                                     \
-    X(82332528, 36)                                                                     \
-    X(828162C8, 38)                                                                     \
-    X(82815A78, 39)                                                                     
-
-#define X(addr, slot) extern "C" PPC_FUNC(__imp__sub_##addr); std::atomic<uint64_t> g_vt_##addr{ 0 };
-CW_METER_VT(X)
-#undef X
-
-#define X(addr, slot)                                                                    \
-    PPC_FUNC(sub_##addr)                                                                 \
-    {                                                                                    \
-        if (IsMeter(base, ctx.r3.u32))                                                   \
-            g_vt_##addr.fetch_add(1, std::memory_order_relaxed);                         \
-        __imp__sub_##addr(ctx, base);                                                    \
-    }
-CW_METER_VT(X)
-#undef X
+// (Part 3's meter-only vtable census lived here; the three-class census above
+// replaces it — same filter, same hooks, plus the two drawing classes.)
 
 // THE BYTE AT +0x6A, which gates the frontend's slot-21 call on a widget.
 //
@@ -513,13 +657,56 @@ void FeProbe_Report()
                  (unsigned long long)g_flagMeterSet.load(),
                  (unsigned long long)g_walkOther.load(),
                  (unsigned long long)g_flagOtherSet.load());
-    std::fprintf(stderr, "[fe]   cFEMeter VTABLE slots that actually run on a meter:\n");
-#define X(addr, slot)                                                                    \
-    if (g_vt_##addr.load())                                                              \
-        std::fprintf(stderr, "[fe]     slot %2d  sub_%s  %10llu x\n", slot, #addr,      \
-                     (unsigned long long)g_vt_##addr.load());
-    CW_METER_VT(X)
-#undef X
+    // ------------------------------------------------------------------
+    // THE THREE-CLASS VTABLE CENSUS.
+    // First its validity gate: the ctor counts (compare against CreateWidget's
+    // independent name-based counts above) and the vtable pointer each ctor was
+    // OBSERVED to write, against the constant the filters use.
+    std::fprintf(stderr, "[fe]   THREE-CLASS VTABLE CENSUS — ctor validity gate first:\n");
+    bool vtValid = true;
+    for (int c = 0; c < 3; c++)
+    {
+        const uint32_t seen = g_ctorVtSeen[c].load();
+        const bool ok = seen == kVtOf[c];
+        if (g_ctorCount[c].load() && !ok)
+            vtValid = false;
+        std::fprintf(stderr,
+                     "[fe]     %-10s ctor %6llu x   [this+0] observed 0x%08X  expected 0x%08X  %s\n",
+                     kVtClassName[c], (unsigned long long)g_ctorCount[c].load(), seen,
+                     kVtOf[c], g_ctorCount[c].load() == 0 ? "(never ran)"
+                                                          : ok ? "OK" : "MISMATCH");
+    }
+    if (!vtValid)
+        std::fprintf(stderr,
+                     "[fe]   A CTOR WROTE A DIFFERENT VTABLE THAN THE FILTER USES — every\n"
+                     "[fe]   count below for that class is VOID. Re-derive the constant.\n");
+    // Counts are PER FUNCTION: a function occupying several slots of one vtable
+    // repeats its total on each ('*'). A zero can also be a sub-object `this`
+    // missing the filter — a blind spot, not proof of absence.
+    std::fprintf(stderr,
+                 "[fe]   slot |        cFEMeter        |        cFEBitmap       |         cFEText\n");
+    for (int s = 0; s < kVtSlotCount; s++)
+    {
+        char cols[3][40];
+        uint64_t cnt[3] = { 0, 0, 0 };
+        for (int c = 0; c < 3; c++)
+        {
+            const uint32_t fn = kVtSlots[c][s];
+            std::atomic<uint64_t>* ctr = VtCtrFor(fn);
+            cnt[c] = ctr ? ctr[c].load() : 0;
+            int dup = 0;
+            for (int t = 0; t < kVtSlotCount; t++)
+                if (kVtSlots[c][t] == fn)
+                    dup++;
+            std::snprintf(cols[c], sizeof cols[c], "%08X %8llu%s", fn,
+                          (unsigned long long)cnt[c], dup > 1 ? "*" : " ");
+        }
+        const bool drawersOnly = cnt[0] == 0 && (cnt[1] || cnt[2]);
+        const bool meterOnly = cnt[0] && !cnt[1] && !cnt[2];
+        std::fprintf(stderr, "[fe]    %2d  | %s | %s | %s %s\n", s, cols[0], cols[1],
+                     cols[2],
+                     drawersOnly ? "<== DRAWERS ONLY" : meterOnly ? "<== meter only" : "");
+    }
 
     // The factory table, read out of guest memory rather than inferred from the code.
     if (uint8_t* b = g_base.load(std::memory_order_relaxed))
