@@ -444,3 +444,19 @@ consecutive captures.
 Thirteen captures, all consumed, **nothing outstanding and no place gap** — Case West is
 set entirely inside the Phenotrans facility, so these drives cover the game's area classes.
 
+
+## R2_ui_bars — round 2, the UI progress widgets (delivered 2026-08-16)
+
+Two **single-frame F4 GPU traces** with frame-locked PNGs, from one gameplay session.
+`trace_gpu_stream` was OFF for the whole run (mandatory: F4 during an active stream
+screenshots but emits no per-frame `.xtr` — the round-1 B1 contamination lesson).
+
+| file | what |
+|---|---|
+| `loading_popup.xtr` / `.png` | guest frame #2511 — the "Loading content" pop-up with its **SEGMENTED progress bar caught MID-FILL** (one blue segment among ~28 grey). 29.1 MB, 851 draws |
+| `pp_mission_bar.xtr` / `.png` | guest frame #6300 — Safehouse bathroom HUD: **LV.40 dial, PP bar, LIFE (5 filled + 2 EMPTY squares)**, and the mission bar "Case 1-2: Access Codes" with its progress line. 61.5 MB, 2,175 draws |
+| `xenia_R2_ui.log.gz` | same-run L3 correlation log |
+| `cw_R2_ui_shaders.zip` | 589 shaders dumped over the session |
+
+md5s verified on copy-in against `R2_UI_BARS_NOTES.txt`. Consumed by **finding 36**.
+0 `.bik` opened this run — the pop-up is a content/save load, not Bink.
