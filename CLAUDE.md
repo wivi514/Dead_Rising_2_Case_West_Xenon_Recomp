@@ -24,13 +24,29 @@ low-risk — the import table says so.
 
 ## Status — and where a new conversation starts
 
-> **THE LIVE HAND-OFF IS `docs/part3-kickoff.md`.** Read it first in a new conversation:
+> **THE LIVE HAND-OFF IS `docs/part4-kickoff.md`.** Read it first in a new conversation:
 > it says what already exists (so it is not rebuilt), names where to start, and lists the
 > gates that are run and owed. When a part ends, write the next `part<N>-kickoff.md`,
 > demote this pointer to it, and refresh the memory directory.
-> **`docs/part2-kickoff.md` is superseded** and is kept as the cautionary example: its
+> `docs/part3-kickoff.md` is superseded too. **`docs/part2-kickoff.md` is superseded** and is kept as the cautionary example: its
 > problem statement was false and part 2 refuted it with the measurement that section
 > itself asked for.
+
+## Status: part 3 complete (2026-08-16) — one open defect, and it is ours
+
+**The active task is the PROGRESS-WIDGET defect** — the PP bar, the LIFE meter's empty
+squares, the mission timer bar and the loading pop-up's segmented bar do not render. Findings
+**35-47**; the live hand-off `docs/part4-kickoff.md` names the next measurement.
+
+The meter is **created, linked, walked 183,190 times, updated and laid out** — and never
+becomes geometry. Every GPU-side explanation is eliminated by measurement, and so is every
+guest-side lifecycle stage. What has not been found is the call that turns a laid-out meter
+into draws.
+
+**Part 3's expensive lesson: four readings in a row had correct counters and a wrong story
+attached** (findings 43, 44, 46, 47). What worked every time was identifying things by what
+the guest itself wrote — the factory table read from guest memory, `CreateWidget`'s own name
+argument, the link register, the object's vtable pointer — never by static reading. Gotcha 322.
 
 ## Status: part 2 complete (2026-08-16) — THE PORT PLAYS
 

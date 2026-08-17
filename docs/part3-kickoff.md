@@ -1,4 +1,9 @@
-# Part 3 kickoff — the live hand-off
+# Part 3 kickoff — SUPERSEDED, history only
+
+> **⛔ NOT THE LIVE HAND-OFF. `docs/part4-kickoff.md` is.** Superseded 2026-08-16.
+> Its §3 said "there is no known defect of our own" — true when written, and part 3 then
+> found one: the progress-widget defect, findings 35-47. Sections 1, 2 and 4 (what exists,
+> the instruments, the oracle having run out) are still accurate.
 
 **Written at the end of part 2 (2026-08-16). This is the live one.** `docs/part2-kickoff.md`
 is **superseded** — read it only as history, and see §5 for why it is also this project's best
