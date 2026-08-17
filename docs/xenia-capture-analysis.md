@@ -1805,3 +1805,78 @@ not-indexed path** and would be drawn as auto-index. That is *not* this defect �
 remove a draw from the census — but if this title ever emits an immediate-index draw it would
 render wrong geometry silently. **Unmeasured: nobody has counted `sourceSelect == 1` in B2.**
 Recorded as a lead, not a claim.
+
+---
+
+## 40. **A WIDGET-CONSTRUCTION CENSUS — the instrument exists, and the answer needs one gameplay run** — 2026-08-16
+
+Finding 39 put the defect upstream of the GPU, in guest code. This is the first instrument on
+that side of the line: **`runtime/cpu/fe_probe.cpp`**, which hooks the frontend's widget-class
+creators and counts constructions.
+
+### How the addresses were derived
+
+`cFEMeter`'s string (`0x820BEEF0`) has exactly one referencing site, and it is one entry in a
+run of `{creator, id, name}` triples that registers **22 widget classes** into a factory table.
+Extracting the whole run gives every class's creator; `cFEMeter`'s is `0x82819630`, a thunk
+tail-calling `0x82817488`, which allocates **0x8920 bytes** and calls the constructor at
+**`0x8280F468`**. `cFEText`'s equivalent chain is `0x828194B0 -> 0x82815088 -> 0x8280C028`
+(0x400 bytes).
+
+**The first version of this probe hooked the wrong class and got a confident wrong answer.**
+The creator is stored into the table *before* its own class name is loaded, so reading the site
+by eye attributes the next class's creator to this one — and the first cut hooked
+**cFEParticleFX** as "cFEMeter", chased it through a real allocator to a real constructor to a
+real 40-method vtable at `0x820BDBE8`, and reported *"no cFEMeter is ever built"*. Every step
+was genuine; all of it was the wrong class. Extracting all 22 triples programmatically is what
+caught it. **Gotcha 322.**
+
+### The census, on the title screen + loading pop-up
+
+Always-on counters, reported from both shutdown paths, one relaxed atomic each:
+
+```
+CONTROL A  widget-name intern   1,044,644   (the frontend ran)
+
+CONSTRUCTED        cFESpinGroup 321 · cFEShape 309 · cFEEBMText 108 · cFEText 56
+                   cFEAnim 56 · cFEKeyFrame 4 · cFEBitmap 3
+NEVER CONSTRUCTED  cFEMeter 0 · cFEFlipBook 0 · cFEFlipFrame 0 · cFETextList 0
+                   cFETextBox 0 · cFEBitmapList 0 · cFETable 0 · cFEParticleFX 0
+                   cFEEdit 0 · cFENineGrid 0 · cFEThreeGrid 0 · cFEGenericTable 0
+                   cFEMovieBox 0 · cFELockBox 0
+```
+
+**Both broken families — `cFEMeter` and `cFEFlipBook` — are never constructed**, on a screen
+where seven sibling classes are constructed 857 times between them.
+
+### THIS IS NOT YET THE ANSWER, and saying so is the point
+
+**A title screen plausibly has no meter.** The fourteen zeros include `cFEEdit`, `cFELockBox`,
+`cFEMovieBox` and `cFETable` — classes no title screen would ever build — so "zero" is exactly
+what a correct runtime would also report for most of that list. The census cannot yet tell
+"this class is broken" from "this screen does not use this class".
+
+The one thing that argues it is more than that: **hardware's loading pop-up, on this same
+screen, draws a segmented progress bar** (finding 36), so *something* meter-shaped ought to
+exist here. But whether that bar is a `cFEMeter` or a composite of `cFEShape`/`cFEBitmap` is
+unmeasured, and inferring it from the picture would be exactly the kind of step this port keeps
+having to retract.
+
+### The run that settles it — and it is automatic now
+
+**Gameplay, where hardware demonstrably has a PP bar, a LIFE meter and a mission bar.** The
+probe is always on and reports on window close, so:
+
+```
+cd runtime/build && CW_VKDRAW=1 ./cw_runtime 2> run.log     # play, then close the window
+```
+
+- **`cFEMeter` nonzero in gameplay** → meters are built and the defect is downstream, in the
+  inherited draw path. The vtable its constructor writes is then the map, and the next hook is
+  its draw method.
+- **`cFEMeter` still zero while `cFEText` is in the hundreds** → the widgets are never built at
+  all, and the defect is in screen construction or the factory — far upstream of anything
+  rendering-shaped.
+
+Either way it is one number from one ordinary play session, with a sibling control in the same
+run.
