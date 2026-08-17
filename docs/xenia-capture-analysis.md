@@ -2443,3 +2443,59 @@ call that turns a laid-out meter into geometry.
 **Four readings in a row have now had correct counters and a wrong story attached** (findings
 43, 44, 46, and this one's slot-21 lead). The counters have never been wrong. Nothing here is
 claimed beyond what the numbers say.
+
+---
+
+## 48. **THE THREE-CLASS VTABLE CENSUS: the draw traversal is slots 8/9, and it nearly skips meters** — part 4, 2026-08-16
+
+Part 4 ran the measurement finding 47 named: the same vtable census on `cFEBitmap`
+(1000 built) and `cFEText` (247+7) beside `cFEMeter`, each filtered by the vtable
+pointer its own constructor writes. The two new chains were derived from the factory
+table **as read out of guest memory** (entries [6] and [4] of the 2026-08-16 dump):
+
+```
+cFEBitmap  [ 6] creator 0x828194E0 -> 0x82814A50 (alloc 0xF0)  -> ctor 0x8280B990 -> vt 0x820BD8D8
+cFEText    [ 4] creator 0x828194C0 -> 0x828168D0 (alloc 0x2C0) -> ctor 0x8280DCD8 -> vt 0x820BDE50
+```
+
+**The census validated itself from three directions** before any number was believed:
+each ctor hook re-read `[this+0]` at runtime and all three matched the constants; ctor
+counts matched `CreateWidget`'s independent name-based counts exactly (70 = 70,
+1000 = 1000, and text ctor 254 = cFEText 247 + cFEEBMText 7, the subclass running the
+base ctor); and the static vtable read had already reproduced part 3's runtime meter
+census slot for slot.
+
+### The answer is a disproportion, not a hole
+
+The exact-zero "drawers only" slots are small-count lifecycle noise (slot 0 at
+294/100 — destructor magnitude; slots 10, 14, 15, 35, 38 all double-digit). The signal
+is **slots 8 and 9, called together — identical counts per class, always**:
+
+```
+                 slot 8 = slot 9      per created widget
+cFEBitmap            32,024                 ~32
+cFEText               9,247                 ~37
+cFEMeter                118                 ~1.7    <- layout magnitude (cf. 106)
+```
+
+A traversal visits drawing widgets at per-frame rates and **visits meters almost
+never** — while the *update* walk visits those same meters 4,480 times in the same
+session. Slot 9 is a fully per-class override (bitmap `0x82803678`, text `0x82816970`,
+meter `0x82804808`); slot 8 is shared by the drawers (`0x8280FF30`) and **overridden by
+the meter with its own large, float-heavy body** (`0x82815C18`) — which reads the
+guards this investigation has already met (`[this+0x254]`, the `0xB0` object) and ran
+those 118 times without producing geometry.
+
+**Both slot-8 bodies open identically: test `[this+0x10] & 0x02000000`, do nothing if
+clear.** A visibility-shaped gate, tested in the callee — and possibly also by the
+caller, which would explain the skip.
+
+### What this does NOT yet establish
+
+That slot 8/9 **is** the draw is magnitude-plus-structure, not proof; four readings in
+part 3 had correct counters and wrong stories. What is measured: the pair runs at
+per-frame rates on classes that render and at one-shot rates on the class that does
+not. The next probe (committed with this finding) converts the remaining question into
+two comparisons: the `0x02000000` flag per class at slot-8 entry **and** in the update
+walk, plus the LR at slot-8 entry — which names the walker, and with it the caller-side
+gate that decides who gets drawn.
