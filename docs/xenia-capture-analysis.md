@@ -2632,3 +2632,43 @@ visible by a deliberately blunt arm. Operator: *"A lot of thing that shouldn't b
   (slot 18, FindChildById, compares its argument against it), CONTROL A now doubles as
   the name↔id dictionary, and FindChildById records {id, caller LR} — whoever looks up a
   blocked container by name is the game code that manipulates it.
+
+---
+
+## 52. **EVERY BLOCKER HAS A NAME — the HUD tree is legible, and one contradiction remains** — part 4, 2026-08-16
+
+`[widget+0x4]` is the interned name id (slot 18 compares its argument against it), so with
+CONTROL A doubling as an id→name dictionary (36k ids recorded) the whole picture reads in
+plain text. The player HUD chain:
+
+```
+IGOverlay → HUD → HUD → Main → player → c_hud_player → hud_player
+  → cFELockBox_healthbar → { small_healthbar → health_pp_meter → pp_meter_container,
+                              health_pips, w_KO_bar (HIDDEN), in, out }
+```
+
+(`in` / `out` / `enter` are class-0x820BD848 children — named ANIMATIONS on the groups.)
+
+**The blocked-ancestor census, by name.** Contextual UI that is plausibly *correctly*
+hidden: `npc2-10`, `prop1-5`, `w_boss_health`, `w_coop_health`, `w_KO_bar`,
+`reticle_crosshair`, `w_slot6-12`, inactive `mission1-5`, `w_weapon_slots` (alpha 0). The
+defect candidates: **six `meter_sub_mission` containers, bit8=0 — one per mission row
+including the ACTIVE `mission0`** (whose row is alpha 0.5 and whose text renders — that is
+the missing mission-timer bar exactly), and `health_meter` under `npc1`.
+
+**The game band manipulates widgets by name.** FindChildById rows put game code at
+`0x824D7F40-0x824D8510` resolving `w_coop_health`/`w_npc_health`/`w_boss_health`/
+`health_meter`/`w_red_meter`/`w_meter`/`w_meter_star`, and `0x824E93xx-95xx` resolving
+`w_missions`/`w_mission_text`/`meter_group`/`w_meter`/`meter_sub_mission` — the mission-HUD
+controller knows the blocked containers by name.
+
+### The contradiction that names the next measurement
+
+The pp/health chain passes bit8+alpha in essentially every update-walk sample
+(`health_pp_meter` blocked once all session), every class on that chain uses the standard
+recursive slot 8 (base `cFEWidget` and `cFELockBox` share `0x8280FF30`; the screen-node
+class `0x820BE440` wraps it), and yet meters collect ~250 draw-walk entries a session.
+**The only reading that fits all counters: the gates flip within the frame** — healthy when
+the update walk samples them, hidden when the draw recursion arrives. The round-9
+instrument (committed) measures at draw time, by name: slot-8 reach per widget id, and
+every child's bit8/alpha sampled at the walker's own decision point.
