@@ -351,20 +351,52 @@ CW_FE_CTORS(X)
 //     splits the outcomes: meters flag-clear in the update walk -> the defect
 //     is whoever should SET the flag; meters flag-set but still skipped ->
 //     the pruning is upstream of the flag (parent chain or list membership).
+// ROUND 2 REFINED THE QUESTION. The flag census answered: meters are 97%
+// bit-0x02000000-SET in the update walk, so THAT bit is not the defect — and
+// the recorded LRs (0x828100E8 / 0x8281014C, 60,668 calls between them) name
+// the walker: the drawers' slot-8 body ITSELF recurses over a child list at
+// [child+0xC], and its per-child gate is NOT the bit the callee tests:
+//
+//     lwz  r11, 0x10(child)
+//     oris r11, r11, 0x200        ; the walker SETS 0x02000000 itself (loop A)
+//     rlwinm. r10, r11, 0, 8, 8   ; ...and gates on bit 0x00800000
+//     beq  -> skip child
+//     lfs  f0, 0x6C(child) ; fcmpu ; ble -> skip child   ; alpha-shaped float
+//     bctrl [vt+0x20]             ; child->slot8()
+//
+// So the per-class samples that decide the defect are bit 0x00800000 and the
+// float at [this+0x6C], taken where every widget is reachable — the update
+// walk.
 namespace
 {
 std::atomic<uint64_t> g_s8Flag[3][2];    // [class][bit 0x02000000 clear/set] at slot-8 entry
 std::atomic<uint64_t> g_updFlag[3][2];   // same, sampled in the update walk
+std::atomic<uint64_t> g_updBit8[3][2];   // bit 0x00800000 — the WALKER's gate
+std::atomic<uint64_t> g_updAlpha[3][2];  // [this+0x6C] <= 0 / > 0 — the walker's other gate
 std::mutex g_s8Mutex;
 std::vector<std::pair<uint32_t, uint64_t>> g_s8Callers;   // {LR, count} across both bodies
+
+inline float GuestF32(uint8_t* b, uint32_t va)
+{
+    const uint32_t u = GuestU32(b, va);
+    float f;
+    std::memcpy(&f, &u, sizeof f);
+    return f;
+}
 
 inline void FlagSample(uint8_t* b, uint32_t self, std::atomic<uint64_t> (*ctr)[2])
 {
     const int c = VtClass(b, self);
     if (c < 0)
         return;
-    const bool set = (GuestU32(b, self + 0x10) & 0x02000000u) != 0;
-    ctr[c][set ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+    const uint32_t flags = GuestU32(b, self + 0x10);
+    ctr[c][(flags & 0x02000000u) ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+    if (ctr == g_updFlag)   // the update walk samples the walker's gates too
+    {
+        g_updBit8[c][(flags & 0x00800000u) ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+        g_updAlpha[c][GuestF32(b, self + 0x6C) > 0.0f ? 1 : 0]
+            .fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 inline void NoteSlot8(uint8_t* b, uint32_t self, uint32_t lr)
@@ -802,6 +834,16 @@ void FeProbe_Report()
                      (unsigned long long)g_s8Flag[c][1].load(),
                      (unsigned long long)g_updFlag[c][0].load(),
                      (unsigned long long)g_updFlag[c][1].load());
+    std::fprintf(stderr,
+                 "[fe]   THE WALKER'S GATES, sampled in the update walk, per class:\n"
+                 "[fe]                bit 0x00800000          [this+0x6C]\n"
+                 "[fe]                clear      SET         <=0        >0\n");
+    for (int c = 0; c < 3; c++)
+        std::fprintf(stderr, "[fe]     %-10s %9llu %9llu   %9llu %9llu\n", kVtClassName[c],
+                     (unsigned long long)g_updBit8[c][0].load(),
+                     (unsigned long long)g_updBit8[c][1].load(),
+                     (unsigned long long)g_updAlpha[c][0].load(),
+                     (unsigned long long)g_updAlpha[c][1].load());
     std::fprintf(stderr, "[fe]   slot-8 CALL SITES (return addresses, both bodies):\n");
     {
         std::lock_guard<std::mutex> s8lock(g_s8Mutex);
