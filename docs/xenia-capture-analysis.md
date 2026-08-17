@@ -1572,3 +1572,81 @@ cd runtime/build && CW_VKDRAW=1 CW_CAPTURE_KEY=<dir> ./cw_runtime
 
 It writes the picture, the pose and a full per-draw census. **The same press at the safehouse
 bathroom save point makes it a matched pair with `pp_mission_bar.xtr`.**
+
+---
+
+## 37. **THE DRAWS ARE NEVER ISSUED — and the frame that proved it nearly proved nothing** — part 2, 2026-08-16
+
+Finding 36 asked for one thing: our own per-draw census of a gameplay frame with the HUD up,
+to decide whether `vs_a4ae7c2b7c1818c4`'s draws are *issued and broken downstream* or *never
+issued at all*. The operator pressed F9 and delivered frame **2387**.
+
+```
+our frame 2387 : 2,783 draws  ·  draws using vs_a4ae7c2b7c1818c4:  0
+hardware frame : 2,175 draws  ·  draws using vs_a4ae7c2b7c1818c4: 55
+```
+
+### The trap in this frame, which is the port's own recurring one
+
+**Our frame 2387 does not contain the LV/PP/LIFE cluster at all.** Not "renders it wrongly" —
+the top-left is bare wall. Measured rather than eyeballed, over the region the cluster occupies
+on hardware:
+
+```
+region x70-390 y45-95      hardware mean 63, MAX 248   (bright yellow LIFE pips, cyan PP bar)
+                           ours     mean 85, MAX 115   (wall; no bright element anywhere)
+```
+
+Case Zero already recorded why: **partial HUD is context-dependent** — its part 24 built a
+headless metric counting frames where the LIFE pips were absent, got a beautifully
+reproducible 69%, and had to retract the whole thing because the metric tracked *where Chuck
+was standing*.
+
+So a "0 draws" reading taken from this frame alone would have been **exactly this port's
+characteristic error for the sixth time**: an absence that is a fact about what was looked at.
+The claim "the draws are never issued" was one step from being published off a frame that
+contains no such widget.
+
+### What rescues it: the mission bar IS in both frames
+
+`Case 2-1: Chuck's Evidence` is on screen in ours; `Case 1-2: Access Codes` in hardware's.
+Same widget, both frames. Scanning brightness per row across the bar's track:
+
+```
+HARDWARE  rows 257-262   mean 191-193   <- a bright, full-width progress line
+OURS      rows 256-263   mean  61- 63   <- flat dark; no line at all
+```
+
+**So there is a widget demonstrably present on our screen whose progress line hardware draws
+and we do not — in the same frame whose census contains zero `vs_a4ae7c2b7c1818c4` draws.**
+That makes the reading admissible for the mission bar, and the LIFE/PP half is simply not
+answered by this capture.
+
+### The answer, scoped to what was actually measured
+
+**For the mission progress line: the draws never reach the renderer.** They are not issued
+wrongly, not culled by topology, not missing a shader, and not served a stale stream — they
+are absent from a per-draw census that lists every draw reaching `DoDraw`.
+
+**One distinction this does NOT yet make**, and it matters: the census is written *inside* the
+renderer, so a draw dropped earlier — predicated out by the bin mask in `gpu/pm4.cpp` — never
+reaches it and is indistinguishable here from a draw the guest never sent. B2 measured
+`SET_BIN_MASK_LO` as the **most common type-3 opcode in the game** (16.5 M, more than
+`DRAW_INDX`; finding 34), so this is not a remote possibility.
+
+### The next measurement, and it separates those two in one run
+
+```
+cd runtime/build && CW_VKDRAW=1 CW_RING_TRACE=1 CW_PM4_BIN_CENSUS=1 \
+  CW_CAPTURE_KEY=<dir> ./cw_runtime  2> run.log
+#   play to ANY frame where LV / PP / LIFE are visible top-left, then press F9
+```
+
+- `ring: pm4 ... (predicated out=N)` and the bin census say whether draws are being discarded
+  before the renderer, and by which bin-mask pair.
+- **A frame with the top-left HUD actually raised** also settles the LIFE/PP half, which frame
+  2387 could not.
+
+Both readings come from one session. If `predicated out` is large and the bin census names a
+pair, the defect is ours in `pm4.cpp`; if it is ~0, the guest is not submitting these draws and
+the cause is upstream of the GPU entirely.
