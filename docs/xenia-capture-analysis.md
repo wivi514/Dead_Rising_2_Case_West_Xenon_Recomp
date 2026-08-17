@@ -2360,3 +2360,86 @@ that *do* draw, which makes it the right place to look and the wrong place to ho
 
 Read it before instrumenting it: if it dispatches again per class, the meter's own branch is
 the target; if it draws directly, the question becomes what it does differently for a meter.
+
+---
+
+## 47. **The meter's update path is HEALTHY. The vtable census, and a lead that did not survive** — 2026-08-16
+
+Finding 46 named `sub_8281A5E0` as the per-widget operation the meter receives. Measured, with
+the class filtered by its own vtable pointer (`0x820BDBE8`, written by its constructor):
+
+```
+per-widget update sub_8281A5E0 : 183,190 calls, 183,190 ON A METER   (100%)
+  guards        [0x254]!=0 47,106 x   ·   [0x268]>[0x264] 136,034 x
+guarded action sub_82816128    :     106 calls,     106 ON A METER
+```
+
+**Two things fall out, and both are negative results worth having.**
+
+`sub_8281A5E0` is **cFEMeter-specific**, not shared — 100% of its calls are on meters. That
+also validates the vtable filter from the positive side, which the title-screen run could not.
+
+And **the guarded action is not blocked**: 106 firings across 70 meters, ~1.5 each, is what a
+one-shot layout looks like rather than something being suppressed. The guards failing on most
+calls is normal for an update that only acts on change. **So the update path is healthy and is
+not the defect.**
+
+### The vtable census
+
+All 32 hookable slots of `0x820BDBE8`, filtered to meter instances:
+
+```
+slot  1   785      slot  4    70      slot  9    396      slot 19  6,726
+slot  2     2      slot  5    70      slot 11     70      slot 20  5,007
+slot  3   140      slot  8   396      slot 18    840      slot 22      2   ·  slot 32  136
+```
+
+Thirteen slots run; the rest read zero. **Slots 19 and 20 are hot and near-identical** (both
+test the top bits of the flag word at `[this+0x10]`), and **slot 21 — sitting between them in
+memory, structurally different, loading a float and calling out — never runs at all.**
+
+### The lead, and why it is not a finding
+
+Both frontend call sites through vtable slot 21 are gated the same way:
+
+```
+lbz  r11, 0x6A(widget) ; cmplwi r11,0 ; beq -> SKIP
+lwz  r3, 0xB0(self) ; lwz r11,0(r3) ; lwz r11,0x54(r11) ; bctrl
+```
+
+A zero byte at `widget+0x6A` skips the call. That is suggestive and it is **not** established,
+for two reasons written down before measuring: the call is made on `[self+0xB0]` **with the
+widget as an argument**, so that slot 21 belongs to a *renderer* object rather than the widget
+and need not be the same call as cFEMeter's unused slot 21; and at the second site the guard
+compares a **constant address** against zero, so that branch can never be taken.
+
+**Measured: `sub_82803570` was called ZERO times** — meters and non-meters alike. That
+traversal is not on this title's live path, so the flag was never sampled and **the lead is
+neither confirmed nor refuted.** It is recorded as untested, not as evidence.
+
+### Where this leaves the meter
+
+```
+created 70 · linked into the widget list 69 · walked 183,190 x · updated (100% meter-specific)
+· laid out 106 x · thirteen vtable slots active
+...and no draw in any captured frame uses the shader that paints it
+```
+
+Everything measurable about the meter's *lifecycle* is healthy. What has not been found is the
+call that turns a laid-out meter into geometry.
+
+### Next, and the honest state of it
+
+- **`sub_82803308` is the other slot-21 call site** and the one whose guard is real. It has
+  **not** been hooked. Its widget is iterated inside the function rather than passed in, so a
+  useful probe needs the loop body, not the entry.
+- **"Slot 21 is the draw" remains unproven.** The vtable census says slot 21 never runs on a
+  meter; it does not say slot 21 draws.
+- The cheapest thing that would settle direction: find which vtable slot the classes that DO
+  draw receive and meters do not. That needs the same census run against `cFEBitmap` or
+  `cFEText` — the filter is a one-constant change, and the comparison is the measurement this
+  investigation has been missing.
+
+**Four readings in a row have now had correct counters and a wrong story attached** (findings
+43, 44, 46, and this one's slot-21 lead). The counters have never been wrong. Nothing here is
+claimed beyond what the numbers say.
