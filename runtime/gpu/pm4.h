@@ -180,8 +180,65 @@ uint64_t Pm4_PacketCount();
 // for the walk's own cost (`docs/perf-cpu-plan.md` §2). Differenced per second by
 // `[vkprof]`, it turns the walk's milliseconds into a cost per dword.
 uint64_t Pm4_RegisterWriteCount();
+// The split of those dwords between the bulk run copy (part 47) and the per-dword
+// fallback taken when a run's destination range touches the scratch mirror or the
+// const-watch window. CW_PM4_NO_BULK_REGS=1 forces everything down the fallback and is
+// the same-binary control arm.
+uint64_t Pm4_RegRunBulkDwords();
+uint64_t Pm4_RegRunSlowDwords();
+// Dwords the bulk path wrote that the per-dword path disagrees with, under
+// CW_PM4_VERIFY_BULK_REGS=1. Must be 0.
+uint64_t Pm4_RegRunMismatches();
 uint64_t Pm4_TypeCount(uint32_t type);      // type 0..3
 uint64_t Pm4_OpcodeCount(uint32_t opcode);  // type-3 opcode 0x00..0x7F
+// All of the counts above are kept PER WALKING THREAD as of part 48 and summed here,
+// because as bus-locked atomics they were four `lock xadd`s on every packet — ~326,000
+// per frame on the operator's stream, for pure instrumentation.
+// CW_PM4_ATOMIC_COUNTERS=1 restores the atomic form and is the control arm.
+//
+// How many of the 135 counters the two forms DISAGREE on under
+// CW_PM4_VERIFY_COUNTERS=1, which drives both from every site. Must be 0, and
+// CW_PM4_VERIFY_COUNTERS_POISON=1 must make it non-zero before that means anything.
+// `threads` (optional) receives the number of threads that have ever walked a packet;
+// it is 1 in this runtime and the exactness of the comparison depends on that.
+uint64_t Pm4_CensusMismatches(uint64_t* threads);
+// The filler-run census (part 50 item 1a). A run of consecutive type-2 no-op dwords is
+// consumed by ONE `ExecutePacket` call; `Pm4_TypeCount(2) / Pm4_FillerRuns()` is the mean
+// run length and therefore the factor by which the item reduces calls. It is printed
+// because the item's whole value is that ratio and nothing had ever measured it — a share
+// of 28.7% is consistent both with one enormous run and with 23,000 isolated dwords, and
+// only the second of those makes this change worthless. CW_PM4_NO_FILLER_RUNS=1 is the arm.
+uint64_t Pm4_FillerRuns();
+uint64_t Pm4_FillerRingDwords();   // ...of the type-2 dwords, those walked at ring level
+uint64_t Pm4_FillerHist(uint32_t bucket);  // run length, log2 buckets: 1,2,4,8..128+
+// The shader-content memo (part 52 item 1.0). `BindShader` hashed the whole microcode on
+// every one of ~1,300-2,200 shader-load packets a frame, which a `perf` symbol profile
+// with the instruments off put at 12.47% of the pump thread — ~71% of its samples on the
+// four `imulq`s of the FNV chain. The memo answers by `memcmp` against the bytes it
+// hashed last time instead. The plan's cheaper `(va, size, first, last)` PROBE key was
+// built first and refuted by the verify arm below; pm4.cpp's header comment has the
+// transcript and why the failure would have been silent.
+//
+// The hit rate is the item's own measurement and is printed by `[vkprof]`: a low one
+// means the memo is thrashing rather than working, and evictions separate "the guest
+// binds more shaders than the table holds" from "the guest keeps re-uploading".
+// CW_PM4_NO_SHADER_MEMO=1 is the control arm.
+uint64_t Pm4_ShaderMemoHits();
+uint64_t Pm4_ShaderMemoMisses();
+uint64_t Pm4_ShaderMemoEvictions();
+// ...of which were CAPACITY misses — every way of the set was already occupied, so the
+// table shape is what cost the hit and more ways or more sets would remove it. The
+// complement is a compulsory miss (a shader seen for the first time), which nothing can
+// remove. Split because "N% of loads still hash" means two completely different things
+// depending on which it is (gotcha 339: a share is not a shape).
+uint64_t Pm4_ShaderMemoCollisions();
+// Disagreements between the memo's answer and a real fold of the microcode, under
+// CW_PM4_VERIFY_SHADER_HASH=1 (which does BOTH on every load). **Must be 0**, and
+// CW_PM4_VERIFY_SHADER_POISON=1 must make it non-zero before that zero means anything.
+uint64_t Pm4_ShaderMemoMismatches();
+// Bumped by every write that touches the ALU constant file. See WriteRegister for why
+// it is monotonic, why both write paths are covered, and what a missed bump costs.
+uint64_t Pm4_AluConstVersion(uint32_t half);   // 0 = VS window, 1 = PS window
 uint64_t Pm4_DrawCount();
 uint64_t Pm4_FrameCount();                  // XE_SWAP packets = frames
 uint64_t Pm4_InterruptCount();

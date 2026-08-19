@@ -141,6 +141,75 @@ void TraceIsrMirror(const char* when)
 const bool g_isrPerCpu = getenv("CW_ISR_SINGLE_CPU") == nullptr;
 std::atomic<uint64_t> g_isrPerCpuDeliveries{ 0 };
 
+// The frame rate cap (CW_FPS_CAP), as the value the title's D3D present-interval field
+// takes: 0 = 60 fps, 2 = 30 fps, 4 = 20 fps, -1 = leave the title alone. Set once in
+// the pump before the loop; read on every vblank. See kDevicePresentInterval in vd.h
+// for the derivation of those numbers out of the title's own code.
+int g_fpsCapValue = -1;
+
+// THE VBLANK PERIOD, and as of part 49 it is what the frame rate cap actually moves.
+//
+// The operator's report on the first attempt — interval 1 at a 16 ms vblank — was
+// exact: *"when it is 60 fps the game plays perfectly"*, but *"when it drops it still
+// goes back to 30 fps"*. That is not the compositor (which was fixed separately and
+// stayed fixed) and it is not a bug. The title's presents are VBLANK-QUANTISED by
+// construction: `sub_82841878` schedules `due = cursor + interval` and the walker
+// retires a record only once `due <= tick`, so a present can only land on a vblank
+// boundary. At a 16 ms period a frame needing 20 ms of CPU cannot present at 20 — it
+// waits for the next tick at 32. The ladder is 62.5 / 31.2 / 20.8 fps with nothing in
+// between, which is precisely the 60-or-30 they described.
+//
+// So the lever is the PERIOD, not the interval. At 8 ms with the title's OWN interval
+// of 2 the cap is unchanged at 2 x 8 = 16 ms = 62.5 fps, but the ladder becomes
+// 62.5 / 41.7 / 31.2 / 25 — the same ceiling and half the step. And the title's pacing
+// logic is left completely alone: it still asks for two vblanks and still gets exactly
+// two, which is what `docs/phase5-notes.md` §6am asks for.
+//
+// `CW_VBLANK_MS` still overrides this outright, for experiments.
+int VblankPeriodMs()
+{
+    static const int ms = [] {
+        if (const char* e = getenv("CW_VBLANK_MS"))
+            return std::max(1, atoi(e));
+        // ~~60 fps IS THE DEFAULT as of part 49~~ — **500 as of part 53**, on the
+        // operator's instruction again, and for a reason that only became true in part 53:
+        // their frame went UNDER the 16 ms ceiling that a 60 fps cap imposes, so the cap
+        // started rounding them down. Their measured soak is 14.44 ms of work, which at a
+        // period of 8 ms presents at exactly 16.0 — 62.5 fps where the work supports 69 —
+        // and a 6.8 ms light-zone frame presents at 16.0 as well.
+        //
+        // AND THE LEVER IS THE PERIOD, NOT THE CEILING, which is the part worth reading
+        // twice: raising the cap to 120 or 250 leaves that 14.44 ms frame presenting at
+        // 16.0 all the same, because the ladder's STEP is the period and neither 4 nor 2
+        // divides finely enough there. Only a 1 ms period moves it (to 15.0). Measured on
+        // their machine with every instrument off (`phase5-notes.md` §6cj §13):
+        //
+        //   menus 166 fps | light zones 119-147 | ordinary play 83-114 | their soak 69-71
+        //
+        // THE COST, stated rather than buried: the period is also the guest's vblank ISR
+        // cadence, so this fires it 1000 times a second against 125 at the old default. It
+        // measured 0.0% of the pump at a 4 ms period. `CW_FPS_CAP=60` is the same-binary
+        // control arm for this change and `CW_FPS_CAP=30` still restores the shipped
+        // pacing exactly — see the note on the division below.
+        const char* c = getenv("CW_FPS_CAP");
+        const int fps = c ? atoi(c) : 500;
+        // The title's interval is 2, so the period that caps at `fps` is 1000/(2*fps).
+        // TRUNCATING division, not rounding, and that is load-bearing: it makes 30 fps
+        // come out at exactly 16 ms — the period this runtime has used since phase 1 —
+        // so the control arm reproduces the shipped pacing bit for bit rather than
+        // approximately. 60 -> 8, 45 -> 11, 30 -> 16, 20 -> 25.
+        if (fps >= 20 && fps <= 500)
+            return std::max(1, 1000 / (2 * fps));
+        return 16;
+    }();
+    return ms;
+}
+// How many times the field had to be written. 1 means the title set it once at start-up
+// and never touched it again; a number that climbs means the title is actively setting
+// it back and the cap is fighting it, which is a fact worth knowing rather than
+// discovering as a frame rate that drifts.
+std::atomic<uint64_t> g_fpsCapWrites{ 0 };
+
 // gpu/pump_stats.h — where the pump's wall time goes. See that header for why a cycles
 // profile structurally cannot answer this: the pump spends most of a frame asleep, and
 // a sleeping thread contributes no samples.
@@ -148,6 +217,9 @@ std::atomic<uint64_t> g_pumpTicks{ 0 };
 std::atomic<uint64_t> g_pumpSleepNs{ 0 };
 std::atomic<uint64_t> g_pumpWalkNs{ 0 };
 std::atomic<uint64_t> g_pumpIsrNs{ 0 };
+// Part 51: was that sleep on the critical path? gpu/pump_stats.h has the argument.
+std::atomic<uint64_t> g_pumpProgressTicks{ 0 };
+std::atomic<uint64_t> g_pumpSleepBeforeProgressNs{ 0 };
 
 inline uint64_t NowNs()
 {
@@ -245,8 +317,7 @@ void GraphicsInterruptPump()
     // symptom appears: if a guest behaviour is quantised to a multiple of this
     // number, halving it says so in one run. Gotcha 7 — an instrument needs a
     // control, and here the control is the same binary at a different cadence.
-    const char* env = getenv("CW_VBLANK_MS");
-    const int vblankMs = env ? std::max(1, atoi(env)) : 16;
+    const int vblankMs = VblankPeriodMs();
 
     // CW_PM4_TICK_MS — how often the RING is walked, as opposed to how often the guest
     // sees a vblank. Those have been the same number since phase 1 and there is no
@@ -269,8 +340,96 @@ void GraphicsInterruptPump()
     const int tickMs =
         tickEnv ? std::max(1, std::min(atoi(tickEnv), vblankMs)) : std::min(1, vblankMs);
 
-    KLOG("graphics interrupt pump started (%d ms vblank cadence, %d ms ring tick)\n",
-         vblankMs, tickMs);
+    // CW_PM4_TICK_US — the same knob with the floor taken off, and part 51's arm.
+    //
+    // The 1 ms above is not a measured period, it is the smallest number the MILLISECOND
+    // knob can express, and the loop sleeps it unconditionally before every walk. At the
+    // ~3.0 ticks a frame this title runs at, that is ~3 ms of every frame with the pump
+    // off the CPU — 10-18% of the wall clock in the `pump` line — while the title's Draw
+    // Thread spins on our read pointer at 93% of a core waiting for exactly the progress
+    // that sleep is deferring (finding 38, and part 51 §item 0 for the profile). Nothing
+    // in the frame-time budget of `docs/perf-plan-part50.md` accounts for it, because
+    // every item there makes the pump's WORK smaller and this is not work.
+    //
+    // **100 us IS NOW THE DEFAULT**, measured rather than assumed, and the campaign that
+    // promoted it is §6ch §4-§5. Three arms, one pinned binary, three unprofiled runs
+    // each, read by draw bin:
+    //
+    //   3,000-5,000 draws   19 ms -> 16 ms, -15.8%, OUTSIDE its own 5.3% floor, and the
+    //                       16 ms-PINNED share goes 24-36% -> 72-95%: the frame stops
+    //                       being CPU-bound and lands on the vblank floor.
+    //   the 4 ms POSITIVE CONTROL is what licenses the rest: +34.8% to +56.2% and
+    //                       outside the floor in every bin, i.e. the sleep converts to
+    //                       frame time at ~1:1, so the 2.7 ms this removes is real even
+    //                       in the bins where the direct comparison sits inside its
+    //                       noise (gotcha 331 — an arm that can only make things better
+    //                       is a hope, not an experiment).
+    //
+    // `CW_PM4_TICK_MS` is deliberately untouched and still means exactly what it meant:
+    // setting it explicitly gives the millisecond behaviour, so `CW_PM4_TICK_MS=1` is the
+    // control arm for this change and `CW_PM4_TICK_MS=16` remains the control arm for
+    // every claim part 18 made.
+    //
+    // Floor of 10 us so a typo cannot turn the pump into a spinner that starves the guest
+    // threads it is waiting for — that would be the same defect in the other direction,
+    // and on a 16-core machine with 13 cores idle it would still be an unmeasured change.
+    // What is NOT yet judged is how this FEELS: a tick period changes when things happen
+    // rather than how much work there is, and pacing is felt before it is counted. That
+    // is `tools/part51_operator_session.sh`'s question and it is part 52's item 0.
+    constexpr int kDefaultTickUs = 100;
+    const char* tickUsEnv = getenv("CW_PM4_TICK_US");
+    const int tickUs = tickUsEnv
+                           ? std::max(10, std::min(atoi(tickUsEnv), vblankMs * 1000))
+                           : tickEnv ? tickMs * 1000
+                                     : std::min(kDefaultTickUs, vblankMs * 1000);
+
+    KLOG("graphics interrupt pump started (%d ms vblank cadence, %d us ring tick)\n",
+         vblankMs, tickUs);
+
+    // CW_FPS_CAP — the frame rate cap, expressed the way a player would say it and
+    // translated here into the device field the title's own configuration writes.
+    // Unset means "leave the title alone", which is 30 fps, so the default behaviour of
+    // this runtime is unchanged unless asked.
+    //
+    // Only the three intervals the title's own packer recognises are offered. There is
+    // deliberately no "uncapped" — and the DEFAULT of 500 is not it: it is a 2 ms ceiling,
+    // which nothing in this game approaches, so it never binds. Interval 0 means present
+    // immediately, and
+    // `CW_PM4_NO_STOP_ON_WAIT=1` already showed what an unpaced command processor does
+    // here — it overflows the flip queue in 10 runs out of 10. An unsupported number
+    // is refused loudly rather than rounded to something plausible (gotcha 5).
+    {
+        const char* capEnv = getenv("CW_FPS_CAP");
+        const int cap = capEnv ? atoi(capEnv) : 500;
+        if (capEnv && (cap < 20 || cap > 500))
+            fprintf(stderr,
+                    "[vd] CW_FPS_CAP=%s is out of range (20..500) — IGNORED, using the "
+                    "500 fps default.\n", capEnv);
+        else
+        {
+            // THE INTERVAL IS PINNED AT THE TITLE'S OWN 2, and the PERIOD does the
+            // work. The first version of this did the opposite — interval 1 at a 16 ms
+            // vblank — and the operator found what is wrong with that within minutes:
+            // the ceiling was right and the ladder underneath it had one rung, so any
+            // frame over 16 ms fell straight to 31 fps. Pinning the interval also makes
+            // the cap deterministic whatever the game's own config says.
+            g_fpsCapValue = 2;
+            // CW_PRESENT_INTERVAL=1|2|3 overrides which interval the title is given,
+            // so the PERIOD and the INTERVAL can be varied independently. They are two
+            // different things — the period sets the granularity of the frame-time
+            // ladder and costs one guest ISR each, the interval sets how many rungs up
+            // that ladder the cap sits — and the first attempt at this conflated them.
+            if (const char* iv = getenv("CW_PRESENT_INTERVAL"))
+            {
+                const int n = atoi(iv);
+                g_fpsCapValue = n == 1 ? 0 : n == 2 ? 2 : n == 3 ? 4 : 2;
+            }
+            const int ivN = g_fpsCapValue == 0 ? 1 : g_fpsCapValue == 2 ? 2 : 3;
+            KLOG("fps cap: %d fps requested — vblank period %d ms, present interval %d, "
+                 "so the cap is %d ms and the ladder steps %d ms\n",
+                 cap, vblankMs, ivN, vblankMs * ivN, vblankMs);
+        }
+    }
 
     // Registered here rather than at construction: the sink runs guest code on THIS
     // thread's context, so it must not be reachable before the context exists.
@@ -298,15 +457,16 @@ void GraphicsInterruptPump()
         Pm4_SetDrawSink(VkRenderer_Draw);
 
     uint64_t ticks = 0;   // VBLANKS delivered — every `ticks %` below means vblanks
-    int sinceVblankMs = 0; // ms of ring ticks accumulated toward the next vblank
+    int sinceVblankUs = 0; // us of ring ticks accumulated toward the next vblank
     auto nextVblankAt = std::chrono::steady_clock::now(); // ...or the deadline, below
     for (;;)
     {
         // Timed, because this sleep is the single largest term in a gameplay frame and
         // no instrument in this port could see it (gpu/pump_stats.h).
         const uint64_t tSleep = NowNs();
-        std::this_thread::sleep_for(std::chrono::milliseconds(tickMs));
-        g_pumpSleepNs.fetch_add(NowNs() - tSleep, std::memory_order_relaxed);
+        std::this_thread::sleep_for(std::chrono::microseconds(tickUs));
+        const uint64_t sleptNs = NowNs() - tSleep;
+        g_pumpSleepNs.fetch_add(sleptNs, std::memory_order_relaxed);
         g_pumpTicks.fetch_add(1, std::memory_order_relaxed);
 
         // Keep the exported KeTimeStampBundle current before waking the guest. The
@@ -378,6 +538,18 @@ void GraphicsInterruptPump()
             if (const uint32_t slot = g_rptrWriteback.load())
                 PPC_STORE_U32(slot, cursor);
 
+            // Did this walk have anything to do? A cursor that moved means the sleep
+            // just taken delayed real ring progress by up to its whole duration; a
+            // cursor that did not move means the sleep cost nothing. That is the only
+            // honest way this side can separate the two, and it is an upper bound by
+            // construction — gpu/pump_stats.h says why, and says to quote it as one.
+            static uint32_t lastCursor = 0xFFFFFFFFu;
+            if (cursor != lastCursor)
+            {
+                lastCursor = cursor;
+                g_pumpProgressTicks.fetch_add(1, std::memory_order_relaxed);
+                g_pumpSleepBeforeProgressNs.fetch_add(sleptNs, std::memory_order_relaxed);
+            }
         }
 
         // Everything below this line is the VBLANK, and it keeps the guest's own
@@ -418,10 +590,13 @@ void GraphicsInterruptPump()
         }
         else
         {
-            sinceVblankMs += tickMs;
-            if (sinceVblankMs < vblankMs)
+            // Accumulated in MICROSECONDS since part 51, so a sub-millisecond tick
+            // cannot silently round to zero here and stop the tick-count vblank arm
+            // from ever firing.
+            sinceVblankUs += tickUs;
+            if (sinceVblankUs < vblankMs * 1000)
                 continue;
-            sinceVblankMs -= vblankMs;
+            sinceVblankUs -= vblankMs * 1000;
         }
 
         // CW_RING_TRACE=1: the words the command processor runs on, sampled once a
@@ -482,20 +657,32 @@ void GraphicsInterruptPump()
             // ring nothing will ever release (streak without bound). Every other
             // counter on these lines reads identically in both cases (gotcha 81).
             //
-            // The streak is in TICKS, and a tick is CW_PM4_TICK_MS milliseconds — which
+            // The streak is in TICKS, and a tick is CW_PM4_TICK_US microseconds — which
             // stopped being the vblank period in part 18. It is printed here so the
             // number stays comparable across arms that tick at different rates: at a
             // 1 ms tick a wait released by the next VBLANK legitimately reads ~16, and
             // reading that against a figure recorded at a 16 ms tick would score a
             // healthy run as a 16x regression (gotcha 157).
-            KLOG("ring: waits unmet=%llu held=%llu streak=%llu max=%llu (tick=%dms)%s\n",
+            //
+            // PART 51 HAD TO FIX THIS LINE TWICE OVER, and both breakages are the very
+            // trap the paragraph above was written about. Adding a sub-millisecond tick
+            // made `tick=%dms` print `1` for a pump ticking at 100 us — a label that is
+            // not merely coarse but WRONG — and it made the "over a second" test below
+            // fire after 6 ms, on every healthy run, because 60 was a tick count chosen
+            // when a tick was a millisecond. The threshold is now a DURATION and the
+            // label is now the real period. A warning that fires on healthy runs is
+            // worse than no warning: it teaches the reader to skip the line.
+            const uint64_t streakUs = Pm4_HoldStreak() * uint64_t(tickUs);
+            KLOG("ring: waits unmet=%llu held=%llu streak=%llu max=%llu (tick=%dus, "
+                 "streak=%.1f ms)%s\n",
                  (unsigned long long)Pm4_WaitUnmetCount(),
                  (unsigned long long)Pm4_RingHeldCount(),
                  (unsigned long long)Pm4_HoldStreak(),
-                 (unsigned long long)Pm4_HoldStreakMax(), tickMs,
-                 Pm4_HoldStreak() > 60 ? "   <-- the ring has sat on ONE wait for over a "
-                                         "second: nothing is going to release it"
-                                       : "");
+                 (unsigned long long)Pm4_HoldStreakMax(), tickUs,
+                 double(streakUs) * 1e-3,
+                 streakUs > 1000000 ? "   <-- the ring has sat on ONE wait for over a "
+                                      "second: nothing is going to release it"
+                                    : "");
             // The GPU/CPU hand-off chain, link by link (cpu/chain_stats.h). Read it as
             // a chain of RATIOS: arms -> ints is how many times the command processor
             // executed each arm block, ints -> isr is the per-CPU acknowledge's own
@@ -554,6 +741,52 @@ void GraphicsInterruptPump()
         if (vblankGate)
             PPC_STORE_U32(kDisplayControllerGate,
                           PPC_LOAD_U32(kDisplayControllerGate) | 1);
+
+        // CW_FPS_CAP=60|30|20 — THE FRAME RATE CAP, which is the title's own D3D
+        // present interval and not anything this runtime imposes. See the derivation
+        // above `kDevicePresentInterval` in vd.h: the field selects how many vblank
+        // ticks apart the title schedules its presents, the shipped default is 2 (30
+        // fps), and 60 fps is the value the game's OWN "vsync 1" configuration
+        // produces. So this selects a configuration the title already supports rather
+        // than defeating its pacing — which matters, because `docs/phase5-notes.md`
+        // §6am says in terms that the two-vblank WAIT must not be "optimised". It is
+        // not being: the title still waits for exactly the interval it asked for.
+        // ~~our vblank cadence is untouched at 16 ms~~ — RETRACTED as of part 49, which
+        // is where the cap became the PERIOD rather than the interval, and the period is
+        // 1 ms as of part 53's default. The interval the title asked for is still
+        // honoured exactly; what changed is how long a vblank lasts, which is what makes
+        // the frame-time ladder fine enough to be worth the cap at all (VblankPeriodMs).
+        //
+        // WHY IT IS RE-ASSERTED EVERY VBLANK rather than written once. The setter
+        // `sub_8283E920` is called from `sub_827D31D0` only when the title's own
+        // cached copy CHANGES, so a hook there would fire an unknown number of times
+        // and possibly once, before the device exists — and a mode that silently did
+        // not engage would present as "the fix did nothing", which is the failure this
+        // project has paid for repeatedly (gotcha 151). Writing the field is a single
+        // store at 62 Hz; the counter below is what proves it took.
+        if (g_fpsCapValue >= 0 && userData)
+        {
+            const uint32_t want = uint32_t(g_fpsCapValue);
+            const uint32_t had = PPC_LOAD_U32(userData + kDevicePresentInterval);
+            if (had != want)
+            {
+                PPC_STORE_U32(userData + kDevicePresentInterval, want);
+                // Counted, not just logged: the FIRST write is the title booting with
+                // its own default, and every write after that is the title setting it
+                // back — two different facts that one startup log line could not tell
+                // apart. The old value is captured BEFORE the store, or the line would
+                // report the value it just wrote as the value it replaced.
+                if (g_fpsCapWrites.fetch_add(1, std::memory_order_relaxed) == 0)
+                    // Names the INTERVAL, not an fps. It used to name an fps, which
+                    // silently became false the moment the cap started moving the vblank
+                    // PERIOD instead: interval 2 is 30 fps at a 16 ms period and 60 fps
+                    // at 8 ms, so the field alone does not determine a frame rate.
+                    KLOG("fps cap: the title asked for present-interval field %u "
+                         "(%u vblanks); forcing %u (%u vblanks)\n",
+                         had, had == 0 || had == 1 ? 1u : had == 2 ? 2u : had == 4 ? 3u : 0u,
+                         want, want == 0 ? 1u : want == 2 ? 2u : 3u);
+            }
+        }
 
         // CW_SWAPQ_TRACE=1 — the swap queue once a second. Head and tail are the
         // measurement that separates "the walker has nothing to do" from "the walker
@@ -694,7 +927,9 @@ PumpStats PumpStats_Read()
     return PumpStats{ g_pumpTicks.load(std::memory_order_relaxed),
                       g_pumpSleepNs.load(std::memory_order_relaxed),
                       g_pumpWalkNs.load(std::memory_order_relaxed),
-                      g_pumpIsrNs.load(std::memory_order_relaxed) };
+                      g_pumpIsrNs.load(std::memory_order_relaxed),
+                      g_pumpProgressTicks.load(std::memory_order_relaxed),
+                      g_pumpSleepBeforeProgressNs.load(std::memory_order_relaxed) };
 }
 
 // ---------------------------------------------------------------------------
@@ -711,7 +946,19 @@ void Vd_FillVideoMode(XVIDEO_MODE* mode)
     mode->IsInterlaced = 0;
     mode->IsWidescreen = 1;
     mode->IsHighDefinition = 1;
-    mode->RefreshRate = 0x42700000; // 60.0f
+    // THE REFRESH RATE MUST MATCH THE VBLANK WE ACTUALLY DELIVER. This was hardcoded
+    // 60.0f, which was true while the period was 16 ms and becomes a lie the moment
+    // `CW_FPS_CAP` shortens it. The guest reads this in `sub_8284C818`, stores it at
+    // `dev+21764`, and its swap scheduler `sub_82841878` divides by it to decide
+    // whether enough of the current refresh has elapsed to nudge the due tick forward
+    // by one. Told 60 while being given 125, that heuristic reads over 100% and can add
+    // a spurious tick — i.e. the wrong belief costs a frame, silently and only
+    // sometimes, which is the worst shape of defect this project deals in.
+    const float hz = 1000.0f / float(VblankPeriodMs());
+    uint32_t hzBits;
+    static_assert(sizeof hzBits == sizeof hz, "float/uint32 pun");
+    memcpy(&hzBits, &hz, sizeof hzBits);
+    mode->RefreshRate = hzBits;
     mode->VideoStandard = 1;        // NTSC-M
     mode->Unknown4A = 0x4A;
     mode->Unknown01 = 0x01;

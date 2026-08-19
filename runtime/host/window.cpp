@@ -75,6 +75,12 @@ bool Host_PadState(uint32_t, HostPadState&) { return false; }
 void Host_DebugMenuSetItems(const std::vector<std::string>&) {}
 void Host_DebugMenuSetVisible(bool) {}
 bool Host_DebugMenuConsumeAction(uint32_t&, int32_t&) { return false; }
+bool Host_DebugOverlayRender(std::vector<uint8_t>&, uint32_t&, uint32_t&, uint32_t&,
+                            uint32_t&, uint32_t&, uint32_t&) { return false; }
+bool Host_VulkanSwapchainWanted() { return false; }
+std::vector<const char*> Host_VulkanInstanceExtensions() { return {}; }
+bool Host_VulkanCreateSurface(void*, uint64_t*) { return false; }
+void Host_VulkanDrawableSize(uint32_t* w, uint32_t* h) { if (w) *w = 0; if (h) *h = 0; }
 
 #else
 
@@ -86,6 +92,11 @@ bool Host_DebugMenuConsumeAction(uint32_t&, int32_t&) { return false; }
 #include <vector>
 
 #include <SDL.h>
+// vulkan.h before SDL_vulkan.h so the latter uses the real handle types rather than
+// its own forward declarations — the surface below is a VkSurfaceKHR either way, but
+// VK_NULL_HANDLE only exists with the real header.
+#include <vulkan/vulkan.h>
+#include <SDL_vulkan.h>
 
 #include "../gpu/vk_renderer.h"
 #include "../cpu/gap_probe.h"
@@ -114,7 +125,48 @@ constexpr uint16_t XI_Y              = 0x8000;
 
 bool          g_active = false;
 SDL_Window*   g_window = nullptr;
+// Null in the CW_VK_SWAPCHAIN arm, where the window carries SDL_WINDOW_VULKAN and the
+// renderer thread owns presentation. Every use of it in this file is guarded, and the
+// guard is `g_renderer` itself rather than a second flag so the two can never disagree.
 SDL_Renderer* g_renderer = nullptr;
+bool          g_wantVulkanSwapchain = false;
+// The window's DRAWABLE size, published by the event loop and read by the renderer's
+// pump thread. Atomics rather than an SDL call from the pump: SDL documents window
+// queries as belonging to the thread that created the window, and the renderer needs this
+// every frame. The loop already sees every resize, so publishing it there is free and
+// correct — and it is what tells the swapchain it has gone stale (part 54's blurry
+// picture: the swapchain was built once at 1280x720 and a window enlarged after that kept
+// being upscaled from it by the compositor).
+std::atomic<uint32_t> g_drawableW{ 0 }, g_drawableH{ 0 };
+
+// IT RUNS IN BOTH PRESENT ARMS, and that is a deliberate repair rather than tidiness.
+//
+// The first version only tracked the drawable when the swapchain wanted it, so the
+// readback arm reported its window size NOWHERE — and part 54 then measured a present-path
+// A/B into a 1088x612 window, wrote the result down as a property of the internal
+// resolution, and had to be corrected by the operator playing it maximised at 2560x1417.
+// A present-path number has TWO resolutions and naming only one of them is naming none
+// (gotcha 353); the arm that cannot state one of them makes that mistake unavoidable.
+//
+// So the size is logged on every change in BOTH arms. It costs one line per resize.
+void PublishDrawableSize()
+{
+    if (!g_window)
+        return;
+    int w = 0, h = 0;
+    if (g_renderer)
+        SDL_GetRendererOutputSize(g_renderer, &w, &h);
+    else
+        SDL_Vulkan_GetDrawableSize(g_window, &w, &h);
+    if (w <= 0 || h <= 0)
+        return;
+    const uint32_t nw = uint32_t(w), nh = uint32_t(h);
+    if (nw != g_drawableW.exchange(nw, std::memory_order_acq_rel) ||
+        nh != g_drawableH.exchange(nh, std::memory_order_acq_rel))
+        fprintf(stderr, "[host] window drawable %ux%u (%s present) — quote this with any "
+                        "frame time from this run\n",
+                nw, nh, g_renderer ? "readback" : "swapchain");
+}
 SDL_GameController* g_controller = nullptr;
 SDL_JoystickID      g_controllerId = -1;
 bool g_inputTrace = false;
@@ -230,21 +282,65 @@ const char* Glyph(char c)
     }
 }
 
-void DrawText(int x, int y, const std::string& text, int scale,
-              uint8_t r, uint8_t g, uint8_t b)
+// THE DEBUG OVERLAY, AS A LIST OF RECTANGLES — one layout, two backends.
+//
+// It used to be SDL_RenderFillRect calls inline. Part 54 made the Vulkan swapchain the
+// default present path, and a window carrying SDL_WINDOW_VULKAN has no SDL_Renderer, so
+// the overlay needed a second backend that rasterises into a buffer the renderer can blit.
+//
+// Writing that as a second copy of the layout is how two drawings of the same menu drift
+// apart — one of them gains a row, or a colour, or a scroll offset, and nobody notices
+// until an operator reports that the menu "looks different in the other mode". So the
+// LAYOUT is here, once, and it emits rectangles to whatever wants them; the two backends
+// are a `SDL_RenderFillRect` and a memory fill, and neither knows anything about menus.
+template <typename Rect>
+void EmitDebugOverlay(int w, int h, Rect&& rect)   // rect(x,y,w,h,r,g,b,a)
 {
-    SDL_SetRenderDrawColor(g_renderer, r, g, b, 255);
-    for (char c : text)
+    // Caller holds g_debugOverlayMutex.
+    const int panelX = 24, panelY = 24;
+    const int panelW = w > 760 ? 720 : w - 48;
+    const int panelH = h - 48;
+    if (panelW <= 0 || panelH <= 0)
+        return;
+    // The panel is the ONE translucent element -- 225/255, so the game reads through it.
+    // Every other rect is opaque. Alpha is a parameter rather than something a backend
+    // infers from the colour, which is what the SDL backend used to do and which broke the
+    // moment a second backend needed the same information.
+    rect(panelX, panelY, panelW, panelH, 8, 26, 96, 225);            // panel
+    rect(panelX, panelY, panelW, 1, 70, 150, 255, 255);              // border, four edges
+    rect(panelX, panelY + panelH - 1, panelW, 1, 70, 150, 255, 255);
+    rect(panelX, panelY, 1, panelH, 70, 150, 255, 255);
+    rect(panelX + panelW - 1, panelY, 1, panelH, 70, 150, 255, 255);
+
+    auto text = [&](int tx, int ty, const std::string& str, int scale,
+                    uint8_t r, uint8_t g, uint8_t b) {
+        for (char c : str)
+        {
+            if (const char* bits = Glyph(c))
+                for (int row = 0; row < 7; ++row)
+                    for (int col = 0; col < 5; ++col)
+                        if (bits[row * 5 + col] == '1')
+                            rect(tx + col * scale, ty + row * scale, scale, scale, r, g, b, 255);
+            tx += 6 * scale;
+        }
+    };
+
+    text(44, 42, "CASE ZERO DEBUG MENU", 3, 255, 255, 255);
+    text(44, 70, "UP/DOWN SELECT  ENTER USE  LEFT/RIGHT EDIT  F4 CLOSE", 2, 145, 205, 255);
+
+    const size_t rows = panelH > 120 ? size_t((panelH - 110) / 18) : 0;
+    const size_t start = g_debugOverlaySelection >= rows
+        ? g_debugOverlaySelection - rows + 1 : 0;
+    for (size_t line = 0; line < rows && start + line < g_debugOverlayItems.size(); ++line)
     {
-        if (const char* bits = Glyph(c))
-            for (int row = 0; row < 7; ++row)
-                for (int col = 0; col < 5; ++col)
-                    if (bits[row * 5 + col] == '1')
-                    {
-                        SDL_Rect p{x + col * scale, y + row * scale, scale, scale};
-                        SDL_RenderFillRect(g_renderer, &p);
-                    }
-        x += 6 * scale;
+        const size_t index = start + line;
+        const bool selected = index == g_debugOverlaySelection;
+        if (selected)
+            rect(38, 98 + int(line) * 18, panelW - 28, 17, 35, 105, 205, 255);
+        std::string label = (selected ? "> " : "  ") + g_debugOverlayItems[index];
+        if (label.size() > 54) label.resize(54);
+        text(44, 101 + int(line) * 18, label, 2,
+             selected ? 255 : 205, selected ? 255 : 225, 255);
     }
 }
 
@@ -253,37 +349,19 @@ void DrawDebugOverlay()
     std::lock_guard<std::mutex> lock(g_debugOverlayMutex);
     if (!g_debugOverlayVisible.load(std::memory_order_acquire))
         return;
-
     int w = 0, h = 0;
     SDL_GetRendererOutputSize(g_renderer, &w, &h);
+    // BLEND stays on for the SDL backend, because that is what it has always looked like
+    // and this refactor must not change the picture of the arm it is not about. The panel
+    // is drawn at alpha 225 there and opaque in the Vulkan backend, which is the one
+    // deliberate difference between them and is noted at the Vulkan blit.
     SDL_SetRenderDrawBlendMode(g_renderer, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(g_renderer, 8, 26, 96, 225);
-    SDL_Rect panel{24, 24, w > 760 ? 720 : w - 48, h - 48};
-    SDL_RenderFillRect(g_renderer, &panel);
-    SDL_SetRenderDrawColor(g_renderer, 70, 150, 255, 255);
-    SDL_RenderDrawRect(g_renderer, &panel);
-    DrawText(44, 42, "CASE ZERO DEBUG MENU", 3, 255, 255, 255);
-    DrawText(44, 70, "UP/DOWN SELECT  ENTER USE  LEFT/RIGHT EDIT  F4 CLOSE",
-             2, 145, 205, 255);
-
-    const size_t rows = panel.h > 120 ? size_t((panel.h - 110) / 18) : 0;
-    const size_t start = g_debugOverlaySelection >= rows
-        ? g_debugOverlaySelection - rows + 1 : 0;
-    for (size_t line = 0; line < rows && start + line < g_debugOverlayItems.size(); ++line)
-    {
-        const size_t index = start + line;
-        const bool selected = index == g_debugOverlaySelection;
-        if (selected)
-        {
-            SDL_SetRenderDrawColor(g_renderer, 35, 105, 205, 255);
-            SDL_Rect hi{38, 98 + int(line) * 18, panel.w - 28, 17};
-            SDL_RenderFillRect(g_renderer, &hi);
-        }
-        std::string label = (selected ? "> " : "  ") + g_debugOverlayItems[index];
-        if (label.size() > 54) label.resize(54);
-        DrawText(44, 101 + int(line) * 18, label, 2,
-                 selected ? 255 : 205, selected ? 255 : 225, 255);
-    }
+    EmitDebugOverlay(w, h, [&](int x, int y, int rw, int rh,
+                               uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+        SDL_SetRenderDrawColor(g_renderer, r, g, b, a);
+        SDL_Rect p{ x, y, rw, rh };
+        SDL_RenderFillRect(g_renderer, &p);
+    });
     SDL_SetRenderDrawBlendMode(g_renderer, SDL_BLENDMODE_NONE);
 }
 
@@ -578,9 +656,85 @@ bool Host_WindowInit()
         return false;
     }
 
+    // CW_VK_SWAPCHAIN=1 — the renderer presents its own image through a Vulkan
+    // swapchain on this window instead of reading it back and handing us pixels.
+    //
+    // THE DECISION HAS TO BE MADE HERE, before the window exists, and that is the whole
+    // reason this arm is an env var read in Host_WindowInit rather than a renderer
+    // option: `SDL_WINDOW_VULKAN` cannot be added to a window afterwards, and a window
+    // carrying it cannot also carry an `SDL_Renderer` (SDL2 has no Vulkan renderer
+    // backend — its accelerated backends are GL/GLES/D3D/Metal). So the two present
+    // paths are mutually exclusive by construction, which is the honest shape: they are
+    // two arms, not a fallback chain.
+    // THE DEFAULT SINCE PART 54, on the operator's decision after judging both arms.
+    //
+    // `CW_VK_NO_SWAPCHAIN=1` is the control arm and restores the readback present path
+    // exactly — three full-frame copies and a GPU->CPU->GPU round trip — which is what
+    // every measurement before part 54 was taken on. It is not deprecated: it is the arm
+    // that any future present-path claim has to be compared against.
+    //
+    // WHAT DECIDED IT, recorded here because a default with no reason attached is one
+    // nobody can re-open. Their soak A/B, both arms in one session: −21.1% of the frame at
+    // ~2,400 draws and −3.5% (+2.4 fps) at ~6,800, which is where they play; and a
+    // smoothness win that the frame rate does not carry — frame-time mean against median
+    // IN TRANSIT is +3.3% for MAILBOX against +5.9% for the compositor-paced SDL present.
+    // The picture correlates with hardware's own screenshot at both internal resolutions.
+    //
+    // NOTHING IS LOST WITH IT. The one thing this arm could not do was draw the F4 debug
+    // overlay, and that was ported rather than accepted (see the blit in vk_renderer.cpp),
+    // because a default that quietly removes a feature is exactly the shape this project
+    // spends its time undoing.
+    g_wantVulkanSwapchain = getenv("CW_VK_NO_SWAPCHAIN") == nullptr;
+
+    // CW_WINDOW_SIZE=WxH and CW_WINDOW_MAXIMIZED=1 — the window as a CONTROLLED VARIABLE.
+    //
+    // Set at CREATION, not by resizing afterwards, and part 54 paid for the difference.
+    // A present-path A/B has to hold the window fixed across its arms (gotcha 353), and
+    // the obvious way — `CW_WINDOW_RESIZE_AT`, which exists as the positive control for the
+    // swapchain rebuild — turned out to be useless for it: the window bounced through
+    // 1280x720, 1088x613, 2560x1417, 1088x613, 3012x1600, 3544x1881 in a single run as
+    // the compositor placed it and SDL's scale conversion argued with it. A variable that
+    // moves six times during the run it is meant to hold constant is not a control.
+    //
+    // MAXIMIZED is the one to reach for, because it is what the operator actually plays
+    // and it needs no arithmetic about display scale — this desktop has one output at 85%
+    // and one at 100%, so a logical size means two different pixel counts depending on
+    // where the window lands.
+    int startW = kDefaultWidth, startH = kDefaultHeight;
+    if (const char* ws = getenv("CW_WINDOW_SIZE"))
+    {
+        int w = 0, h = 0;
+        if (sscanf(ws, "%dx%d", &w, &h) == 2 && w >= 64 && h >= 64 && w <= 16384 &&
+            h <= 16384)
+        {
+            startW = w;
+            startH = h;
+        }
+        else
+            fprintf(stderr, "[host] CW_WINDOW_SIZE=%s is not a usable WxH — IGNORED.\n", ws);
+    }
+    const Uint32 windowFlags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE |
+                               (g_wantVulkanSwapchain ? SDL_WINDOW_VULKAN : 0u) |
+                               (getenv("CW_WINDOW_MAXIMIZED") ? SDL_WINDOW_MAXIMIZED : 0u);
     g_window = SDL_CreateWindow("Dead Rising 2: Case West", SDL_WINDOWPOS_CENTERED,
-                                SDL_WINDOWPOS_CENTERED, kDefaultWidth, kDefaultHeight,
-                                SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+                                SDL_WINDOWPOS_CENTERED, startW, startH,
+                                windowFlags);
+    if (!g_window && g_wantVulkanSwapchain)
+    {
+        // Losing the Vulkan flag must not silently cost the window, and it must not
+        // silently cost the ARM either: falling back to the copy path while the operator
+        // believes they are measuring the swapchain would make the A/B report zero and
+        // look like a null result (gotcha 7). So it says which of the two happened.
+        fprintf(stderr, "[host] SDL_CreateWindow with SDL_WINDOW_VULKAN failed: %s — "
+                        "the swapchain present path is NOT in force; falling back to the "
+                        "readback present path. This is a DEGRADED default, not a "
+                        "configuration: expect the frame times of part 53.\n",
+                SDL_GetError());
+        g_wantVulkanSwapchain = false;
+        g_window = SDL_CreateWindow("Dead Rising 2: Case West", SDL_WINDOWPOS_CENTERED,
+                                    SDL_WINDOWPOS_CENTERED, startW, startH,
+                                    windowFlags & ~Uint32(SDL_WINDOW_VULKAN));
+    }
     if (!g_window)
     {
         fprintf(stderr, "[host] SDL_CreateWindow failed: %s — RUNNING HEADLESS.\n",
@@ -592,15 +746,33 @@ bool Host_WindowInit()
     // No SDL_RENDERER_PRESENTVSYNC. The guest's swap rate is the frame clock here
     // (one XE_SWAP per frame, verified against B1), and a vsync-paced present would
     // add a second clock that silently becomes the slower of the two.
-    g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_ACCELERATED);
-    if (!g_renderer)
+    //
+    // NOT ASKING FOR VSYNC IS NOT THE SAME AS ASKING FOR NO VSYNC, and part 49 paid for
+    // the difference. Omitting the flag leaves the decision to the backend, and a
+    // compositor throttles `SDL_RenderPresent` to the display refresh whatever SDL was
+    // asked for. That is invisible while the guest is capped at 30 fps — the second
+    // clock is the faster one and never binds — and the moment `CW_FPS_CAP=60` lifted
+    // the guest's own cap it became the binding one. Its failure mode is the sharp one:
+    // with no triple buffering a frame that takes just OVER 16.67 ms cannot present
+    // until the NEXT refresh, so the frame rate snaps 60 -> 30 with nothing in between,
+    // which is exactly what the operator reported ("it seems to go back to around
+    // 30 fps, pretty sure it's vsync"). Headless reads 62.5 fps because there is no
+    // window and therefore no compositor in the path — the arm that localises this.
+    SDL_SetHint(SDL_HINT_RENDER_VSYNC, "0");
+    // No SDL_Renderer on a Vulkan window: the renderer thread owns presentation from
+    // here on, and everything below that touches `g_renderer` is skipped. What that
+    // costs is named out loud at the end of this function rather than discovered later.
+    g_renderer = g_wantVulkanSwapchain
+        ? nullptr
+        : SDL_CreateRenderer(g_window, -1, SDL_RENDERER_ACCELERATED);
+    if (!g_renderer && !g_wantVulkanSwapchain)
     {
         fprintf(stderr, "[host] accelerated renderer unavailable (%s) — falling back "
                         "to software.\n",
                 SDL_GetError());
         g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_SOFTWARE);
     }
-    if (!g_renderer)
+    if (!g_renderer && !g_wantVulkanSwapchain)
     {
         fprintf(stderr, "[host] SDL_CreateRenderer failed: %s — RUNNING HEADLESS.\n",
                 SDL_GetError());
@@ -612,6 +784,53 @@ bool Host_WindowInit()
 
     g_inputTrace = getenv("CW_INPUT_TRACE") != nullptr;
     g_active = true;
+
+    // ...and say so out loud, per renderer, because the hint above is a REQUEST. SDL
+    // 2.0.18 added the explicit call, which is the one that can also FAIL and say so —
+    // and under a compositor that owns presentation it may well fail, in which case the
+    // right answer is to know that rather than to believe the hint took.
+    //
+    // CW_HOST_VSYNC=1 puts it back on: the same-binary control arm, so "the frame rate
+    // is capped by the display" and "the frame rate is capped by our own work" can be
+    // told apart in one run instead of argued about.
+    const bool wantVsync = getenv("CW_HOST_VSYNC") != nullptr;
+    if (g_renderer)
+    {
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+        const int vsRc = SDL_RenderSetVSync(g_renderer, wantVsync ? 1 : 0);
+#else
+        const int vsRc = -1;
+#endif
+        SDL_RendererInfo ri{};
+        SDL_GetRendererInfo(g_renderer, &ri);
+        fprintf(stderr,
+                "[host] present vsync: requested %s, SDL_RenderSetVSync %s, renderer "
+                "reports PRESENTVSYNC %s\n",
+                wantVsync ? "ON (CW_HOST_VSYNC=1)" : "OFF",
+                vsRc == 0 ? "accepted" : "UNAVAILABLE (hint only)",
+                (ri.flags & SDL_RENDERER_PRESENTVSYNC) ? "SET — the display is still "
+                                                         "pacing us, and the frame rate "
+                                                         "above 60 fps will be its "
+                                                         "refresh rate"
+                                                       : "clear");
+    }
+    else
+    {
+        // The swapchain arm chooses its own present mode inside the renderer, and
+        // CW_HOST_VSYNC is meaningless here — say so rather than letting a run be
+        // configured with a flag that does nothing (gotcha 5).
+        fprintf(stderr,
+                "[host] swapchain present (the default; CW_VK_NO_SWAPCHAIN=1 is the "
+                "control arm): this window carries SDL_WINDOW_VULKAN and has "
+                "NO SDL_Renderer. The renderer presents its own image; the present "
+                "readback and its two copies do not run, and the present MODE is chosen "
+                "by the renderer (see the [vk] swapchain line), not by SDL.%s\n"
+                "[host] WHAT THIS ARM COSTS, said out loud: the host-rendered F4 debug "
+                "overlay is drawn HERE rather than by SDL, at a fixed 1280x720 scaled "
+                "to the window, with an opaque panel instead of SDL's 88%% one.\n",
+                wantVsync ? " CW_HOST_VSYNC=1 is IGNORED here." : "");
+    }
+    PublishDrawableSize();
 
     fprintf(stderr, "[host] window %dx%d up on SDL video driver '%s'.\n", kDefaultWidth,
             kDefaultHeight, SDL_GetCurrentVideoDriver());
@@ -673,6 +892,122 @@ void Host_PresentPixels(const uint8_t* rgba, uint32_t width, uint32_t height)
     g_havePixels = true;
 }
 
+// ===================================================================================
+// The Vulkan swapchain seam (CW_VK_SWAPCHAIN=1). See window.h for why it exists and
+// what it costs.
+// ===================================================================================
+// These four are the ONLY functions in this file the renderer thread calls, and none of
+// them touches the event loop's state. SDL_Vulkan_GetInstanceExtensions and
+// SDL_Vulkan_CreateSurface are documented as safe to call from any thread once the
+// window exists; SDL_Vulkan_GetDrawableSize reads the window's size, which the loop only
+// ever grows through SDL's own resize handling — a stale value here costs one
+// swapchain rebuild, which the renderer does on VK_SUBOPTIMAL_KHR anyway.
+// The second backend of EmitDebugOverlay. Called from the renderer's pump thread, which
+// is why it takes the same mutex the event loop's key handling does — the menu's selection
+// index is written there.
+//
+// It rasterises THE PANEL, not the screen. See window.h for why that is the correctness of
+// the whole thing and not an optimisation.
+bool Host_DebugOverlayRender(std::vector<uint8_t>& rgba, uint32_t& width, uint32_t& height,
+                             uint32_t& outX, uint32_t& outY, uint32_t& baseW,
+                             uint32_t& baseH)
+{
+    // The overlay's own logical screen. EmitDebugOverlay places the panel against these,
+    // and the caller scales the returned rectangle to whatever the window is.
+    constexpr int kW = 1280, kH = 720;
+    std::lock_guard<std::mutex> lock(g_debugOverlayMutex);
+    if (!g_active || !g_debugOverlayVisible.load(std::memory_order_acquire))
+        return false;
+
+    // The panel's rectangle, computed the same way EmitDebugOverlay does. Taken from its
+    // first emitted rect rather than duplicated: the layout is emitted once and this asks
+    // it where it put things, so the two cannot drift.
+    int px = 0, py = 0, pw = 0, ph = 0;
+    bool havePanel = false;
+    EmitDebugOverlay(kW, kH, [&](int x, int y, int rw, int rh, uint8_t, uint8_t, uint8_t,
+                                 uint8_t) {
+        if (!havePanel) { px = x; py = y; pw = rw; ph = rh; havePanel = true; }
+    });
+    if (!havePanel || pw <= 0 || ph <= 0)
+        return false;
+
+    width = uint32_t(pw);
+    height = uint32_t(ph);
+    outX = uint32_t(px);
+    outY = uint32_t(py);
+    baseW = uint32_t(kW);
+    baseH = uint32_t(kH);
+    rgba.assign(size_t(pw) * ph * 4, 0);
+    // Every rect is emitted in SCREEN coordinates and written at panel-relative ones.
+    // Anything falling outside the panel is clipped away rather than wrapping, which is
+    // what a rect drawn at a negative offset would otherwise do.
+    EmitDebugOverlay(kW, kH, [&](int x, int y, int rw, int rh,
+                                 uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+        const int x0 = std::max(px, x), y0 = std::max(py, y);
+        const int x1 = std::min(px + pw, x + rw), y1 = std::min(py + ph, y + rh);
+        for (int sy = y0; sy < y1; ++sy)
+        {
+            uint8_t* row = rgba.data() + (size_t(sy - py) * pw + (x0 - px)) * 4;
+            for (int sx = x0; sx < x1; ++sx)
+            {
+                // THE ALPHA IS CARRIED, not flattened. The caller composites with a copy,
+                // so it does the blend itself against a captured background -- and it can
+                // only do that if this says which pixels are translucent.
+                row[0] = r; row[1] = g; row[2] = b; row[3] = a;
+                row += 4;
+            }
+        }
+    });
+    return true;
+}
+
+bool Host_VulkanSwapchainWanted()
+{
+    return g_active && g_wantVulkanSwapchain;
+}
+
+std::vector<const char*> Host_VulkanInstanceExtensions()
+{
+    std::vector<const char*> out;
+    if (!Host_VulkanSwapchainWanted())
+        return out;
+    unsigned n = 0;
+    if (!SDL_Vulkan_GetInstanceExtensions(g_window, &n, nullptr))
+    {
+        fprintf(stderr, "[host] SDL_Vulkan_GetInstanceExtensions failed: %s\n",
+                SDL_GetError());
+        return out;
+    }
+    out.resize(n);
+    if (!SDL_Vulkan_GetInstanceExtensions(g_window, &n, out.data()))
+    {
+        fprintf(stderr, "[host] SDL_Vulkan_GetInstanceExtensions failed: %s\n",
+                SDL_GetError());
+        out.clear();
+    }
+    return out;
+}
+
+bool Host_VulkanCreateSurface(void* instance, uint64_t* outSurface)
+{
+    if (!Host_VulkanSwapchainWanted() || !instance || !outSurface)
+        return false;
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
+    if (!SDL_Vulkan_CreateSurface(g_window, static_cast<VkInstance>(instance), &surface))
+    {
+        fprintf(stderr, "[host] SDL_Vulkan_CreateSurface failed: %s\n", SDL_GetError());
+        return false;
+    }
+    *outSurface = reinterpret_cast<uint64_t>(surface);
+    return true;
+}
+
+void Host_VulkanDrawableSize(uint32_t* w, uint32_t* h)
+{
+    if (w) *w = g_drawableW.load(std::memory_order_acquire);
+    if (h) *h = g_drawableH.load(std::memory_order_acquire);
+}
+
 bool Host_PadState(uint32_t userIndex, HostPadState& out)
 {
     if (!g_active || userIndex >= 2)
@@ -723,6 +1058,7 @@ void Host_WindowRun()
     uint64_t presented = 0;
     uint64_t framesAtLastTitle = 0;
     auto lastTitle = std::chrono::steady_clock::now();
+    const auto loopStart = lastTitle;
     bool sizedToGuest = false;
 
     for (;;)
@@ -749,6 +1085,16 @@ void Host_WindowRun()
                         g_keyboardFocus = false;
                     else if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED)
                         g_keyboardFocus = true;
+                    // Every event that can change the drawable size, not just RESIZED:
+                    // SIZE_CHANGED also covers a programmatic resize and a
+                    // maximise/restore, and a move between outputs of different scale
+                    // changes the drawable without changing the logical size at all.
+                    else if (e.window.event == SDL_WINDOWEVENT_RESIZED ||
+                             e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
+                             e.window.event == SDL_WINDOWEVENT_MAXIMIZED ||
+                             e.window.event == SDL_WINDOWEVENT_RESTORED ||
+                             e.window.event == SDL_WINDOWEVENT_DISPLAY_CHANGED)
+                        PublishDrawableSize();
                     break;
                 case SDL_KEYDOWN:
                     if (!e.key.repeat)
@@ -791,6 +1137,42 @@ void Host_WindowRun()
             }
         }
 
+        // CW_WINDOW_RESIZE_AT=SECS:WxH — THE POSITIVE CONTROL FOR THE SWAPCHAIN REBUILD.
+        //
+        // The rebuild path fires when the window's drawable size changes, and no headless
+        // gate can change a window's size, so without this the fix for part 54's blurry
+        // picture would ship on the strength of an argument (gotcha 30). This resizes the
+        // window once, at a stated moment, so a run can be checked for the renderer's
+        // "window drawable is now WxH" line and for the second `[vk] swapchain` line
+        // underneath it.
+        //
+        // It is also the reproduction of the DEFECT: before the fix, this resize produced
+        // no new swapchain at all and the compositor upscaled the old one.
+        {
+            static const char* resizeEnv = getenv("CW_WINDOW_RESIZE_AT");
+            static bool resized = false;
+            if (resizeEnv && !resized)
+            {
+                int secs = 0, rw = 0, rh = 0;
+                if (sscanf(resizeEnv, "%d:%dx%d", &secs, &rw, &rh) == 3 && rw > 0 && rh > 0)
+                {
+                    const auto up = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now() - loopStart).count();
+                    if (up >= secs)
+                    {
+                        resized = true;
+                        fprintf(stderr, "[host] CW_WINDOW_RESIZE_AT: resizing the window "
+                                        "to %dx%d at %llds — the swapchain must follow\n",
+                                rw, rh, (long long)up);
+                        SDL_SetWindowSize(g_window, rw, rh);
+                        PublishDrawableSize();
+                    }
+                }
+                else
+                    resized = true;   // malformed: complain once by doing nothing further
+            }
+        }
+
         PublishPad(0, ReadController());
         PublishPad(1, ReadKeyboard());
 
@@ -821,6 +1203,14 @@ void Host_WindowRun()
                     SDL_SetWindowSize(g_window, int(width), int(height));
             }
 
+            // In the CW_VK_SWAPCHAIN arm there is no SDL_Renderer and nothing to blit:
+            // the renderer thread has already presented this frame through its own
+            // swapchain. The loop still runs — it owns the event pump, the pad and the
+            // title bar — it simply has no picture to draw, so the whole blit/overlay/
+            // present block below is skipped and the title-bar clock underneath it keeps
+            // reporting, which is what says the present seam is running in this arm too.
+            if (g_renderer)
+            {
             // Blit the rendered frame if there is one. With CW_VKDRAW off there
             // never is, and the flat clear below is the honest present: the guest's
             // front buffer holds whatever its allocator left there, and showing it
@@ -863,6 +1253,7 @@ void Host_WindowRun()
             }
             DrawDebugOverlay();
             SDL_RenderPresent(g_renderer);
+            }
         }
         else
         {

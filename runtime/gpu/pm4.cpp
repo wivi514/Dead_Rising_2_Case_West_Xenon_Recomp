@@ -223,6 +223,141 @@ std::atomic<uint64_t> g_draws{ 0 };
 // thing that separates "this pass had few draws" from "this pass had many and hardware
 // wanted them in the other tile".
 std::atomic<uint64_t> g_drawsPredicatedOut{ 0 };
+
+// --- the same counters again, ONE SET PER WALKING THREAD (part 48, plan item 1b) ---
+//
+// WHY. Every one of the atomics above was a `lock xadd` on the hottest loop in the
+// runtime, and `ExecutePacket` performs four of them on an ordinary packet — packets,
+// types, opcodes, regWrites — plus a fifth on a draw. On the operator's frame that is
+// 81,533 packets and roughly 326,000 bus-locked read-modify-writes, ~20 cycles each
+// even completely uncontended, for pure instrumentation. It is the same defect class
+// as part 47's items 1.2 and 1.3, one subsystem over (gotcha 230), and part 48's
+// opcode census sharpened it: **28.7% of the packets paying that toll are type-2 ring
+// filler**, which does no other work whatsoever.
+//
+// WHY NOT SIMPLY DELETE THE COUNTERS. They are not decoration. The walk runs on the
+// graphics pump and `[vkprof]` differences them per window to produce ns-per-packet
+// and dwords-per-packet, which is how part 47 discovered that the operator's packet
+// mix differs from the headless route's in kind. Removing them would remove the only
+// description of the thing being optimised.
+//
+// WHAT REPLACES THEM. One instance per thread that walks, linked into a list, summed
+// by the accessors. In this runtime there is exactly ONE such thread — `vd.cpp` is the
+// only caller of `Pm4_Execute` and its comment says so explicitly — so the list has one
+// element and the sum is a single load. The list exists anyway because a second walker
+// would otherwise corrupt the numbers silently, and the verify report below prints the
+// instance count so that assumption is checked rather than trusted (gotcha 13).
+//
+// WHY THE FIELDS ARE STILL `std::atomic`. Because the storage class is not what costs:
+// a RELAXED `store(load() + n)` is `mov`/`add`/`mov` with no bus lock, where
+// `fetch_add` is `lock xadd`. Only the owning thread ever writes an instance, so the
+// load/store pair cannot lose an update; the atomics are here so the accessors'
+// cross-thread READ is defined behaviour rather than a data race in a number nobody
+// would ever think to suspect.
+struct alignas(64) Census
+{
+    std::atomic<uint64_t> packets{ 0 };
+    std::atomic<uint64_t> types[4];
+    std::atomic<uint64_t> opcodes[128];
+    std::atomic<uint64_t> regWrites{ 0 };
+    std::atomic<uint64_t> draws{ 0 };
+    std::atomic<uint64_t> drawsPredicatedOut{ 0 };
+    // --- the filler-run census (part 50 item 1a) ---
+    //
+    // WHY A HISTOGRAM AND NOT JUST A COUNT. The plan prices "skip runs of type-2 filler"
+    // at 1.5-2 ms on the strength of `t2 28.7%` — 23,000 of the operator's 81,106
+    // packets a frame. But that share says nothing about whether those 23,000 dwords
+    // arrive as ONE run of 23,000 or as 23,000 isolated dwords between real packets, and
+    // the whole value of the item is the difference: coalescing turns N calls into one
+    // per RUN, so at a mean run length of 1 it saves precisely nothing and costs a scan.
+    // Nobody has ever measured the run length here, so the item is built with the
+    // measurement that can refute it, and `fillerRuns` against `types[2]` is that
+    // measurement in one division.
+    std::atomic<uint64_t> fillerRuns{ 0 };      // coalesced runs, i.e. calls that hit filler
+    std::atomic<uint64_t> fillerRingDwords{ 0 };// ...of which came from the ring (depth 0)
+    std::atomic<uint64_t> fillerHist[8];        // run length, log2 buckets: 1,2,4,8,...,128+
+    Census* next = nullptr;
+};
+std::atomic<Census*> g_censusList{ nullptr };
+thread_local Census* t_census = nullptr;
+// Never written, only read: the sink the bump helpers use under the atomic arm so that
+// arm pays no thread-local lookup at all and is a faithful copy of the pre-48 walk.
+Census g_censusUnused;
+
+// CW_PM4_ATOMIC_COUNTERS=1 restores the pre-part-48 form — the same-binary control arm
+// for this item, and the reference implementation the verifier below judges against.
+const bool g_atomicCounters = getenv("CW_PM4_ATOMIC_COUNTERS") != nullptr;
+// CW_PM4_VERIFY_COUNTERS=1 drives BOTH forms from every call site and compares the
+// totals. This is the correctness check, and it has to be this rather than "compare two
+// runs' totals": nothing about this title's packet stream is reproducible run to run, so
+// two runs' counts differ for reasons that have nothing to do with the change. Within
+// one run the two forms are bumped by the same call with the same argument, so they are
+// equal at every point between calls and any difference is a real defect — a site that
+// bumps one and not the other (gotcha 322: the incumbent implementation is the oracle).
+const bool g_verifyCounters = getenv("CW_PM4_VERIFY_COUNTERS") != nullptr;
+// ...and the check must be shown able to fail before a zero from it means anything
+// (gotcha 30). This drops exactly one per-thread packet increment in ten thousand.
+const bool g_verifyPoison = getenv("CW_PM4_VERIFY_COUNTERS_POISON") != nullptr;
+
+// CW_PM4_NO_FILLER_RUNS=1 restores the pre-part-50 form — one `ExecutePacket` call per
+// filler dword — and is the same-binary control arm for item 1a.
+const bool g_noFillerRuns = getenv("CW_PM4_NO_FILLER_RUNS") != nullptr;
+// ...and the POSITIVE CONTROL for it. Neither PM4 boundary oracle can see this change —
+// both are Python models of capture B1 and neither executes our walk — so the gates that
+// stand between item 1a and a desync are `truncated=0`, the unknown-opcode report and the
+// picture. A gate that has never been shown able to fail proves nothing by passing
+// (gotcha 30), and the failure this item could actually cause is exactly one thing: a run
+// that consumes the wrong number of dwords. So this makes one run in 4,096 over-consume
+// by one, and the pair must be run — the poisoned arm has to produce truncations, unknown
+// opcodes or a visibly broken picture, or those gates are blind here and something else
+// is needed.
+const bool g_fillerPoison = getenv("CW_PM4_VERIFY_FILLER_POISON") != nullptr;
+
+Census& ThreadCensus()
+{
+    if (!t_census)
+    {
+        Census* c = new Census();  // one per walking thread, never freed
+        Census* head = g_censusList.load(std::memory_order_relaxed);
+        do
+        {
+            c->next = head;
+        } while (!g_censusList.compare_exchange_weak(head, c, std::memory_order_release,
+                                                     std::memory_order_relaxed));
+        t_census = c;
+    }
+    return *t_census;
+}
+
+// The one place the two forms are selected between. Both conditions are `const bool`s
+// fixed for the process, so this is a perfectly predicted branch rather than a bus lock.
+inline void CensusAdd(std::atomic<uint64_t>& local, std::atomic<uint64_t>& global,
+                      uint64_t n = 1)
+{
+    if (!g_atomicCounters)
+        local.store(local.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
+    if (g_atomicCounters || g_verifyCounters)
+        global.fetch_add(n, std::memory_order_relaxed);
+}
+inline void CensusSub(std::atomic<uint64_t>& local, std::atomic<uint64_t>& global,
+                      uint64_t n = 1)
+{
+    if (!g_atomicCounters)
+        local.store(local.load(std::memory_order_relaxed) - n, std::memory_order_relaxed);
+    if (g_atomicCounters || g_verifyCounters)
+        global.fetch_sub(n, std::memory_order_relaxed);
+}
+// Sum one field across every walking thread. `Field` is a lambda taking a `Census&`,
+// because `types[]` and `opcodes[]` are arrays and a pointer-to-member cannot index one.
+template <typename Field>
+uint64_t CensusSum(Field f)
+{
+    uint64_t n = 0;
+    for (Census* c = g_censusList.load(std::memory_order_acquire); c; c = c->next)
+        n += f(*c).load(std::memory_order_relaxed);
+    return n;
+}
+
 std::atomic<uint64_t> g_frames{ 0 };
 std::atomic<uint64_t> g_interrupts{ 0 };
 void (*g_interruptSink)() = nullptr;
@@ -426,8 +561,213 @@ void DumpShader(uint32_t type, uint64_t hash, const uint8_t* code, uint32_t size
     }
 }
 
+// --- the shader-content memo (part 52 item 1.0) ------------------------------------
+//
+// WHY THIS EXISTS. `BindShader` runs on every IM_LOAD / IM_LOAD_IMMEDIATE packet —
+// **~1,300-1,900 a frame** by the opcode census — and hashed the ENTIRE microcode every
+// time. A `perf` symbol profile with every instrument off (part 52's recon,
+// `tools/part52_recon.sh nostats`) put `BindShader` at **12.47% of the pump thread**,
+// the third-largest symbol in the process behind the guard fold and `DoDraw`, and an
+// instruction-level annotation put **~95% of its samples on four `imulq`s** — the FNV-1a
+// multiply chain, one 5-cycle-latency multiply per BYTE with the accumulator on the
+// dependency chain, i.e. about a byte per cycle. On the order of 9 MB of microcode
+// hashed per frame to recompute the same ~250 distinct hashes it computed last frame,
+// and the frame before.
+//
+// WHY THE HASH CANNOT SIMPLY BE MADE FASTER, WHICH IS THE FIRST TRAP HERE. It is the
+// SHADER CACHE KEY. `assets/shader_spv/vs_<hash>.spv`, `tools/build_shader_spv.sh`, the
+// `[imload]` line and the renderer's "no translated shader" miss report all name a
+// shader by this exact value, and the offline pipeline computes it with the same
+// function over the same bytes. Swapping in a wider or vectorised fold would rename all
+// 435 cache entries at once and present as a silently unshaded world. **So the hash has
+// to be AVOIDED, not accelerated.**
+//
+// WHY THE KEY IS THE WHOLE MICROCODE AND NOT A CHEAP PROBE, WHICH IS THE SECOND TRAP AND
+// THE EXPENSIVE ONE. `perf-plan-part52.md` §3 item 1.0 specifies the memo as
+// `(ucodeVa, sizeDwords)` plus "the first and last dword of the microcode alongside —
+// two loads, and it catches the overwhelming majority of a re-upload", and argues that a
+// wrong answer would be loud because it would read as a cache MISS. **Both halves were
+// measured and both are false**, by the verify arm below on its first full run:
+//
+//   [pm4] SHADER MEMO MISMATCH #2: VS va=00000000 size=102 — memo said f2ef2d2f8de976d0,
+//         the microcode hashes to 8ed00911a7bc1eb1 (first=F1555004 last=A9A9C68D)
+//   [pm4] SHADER MEMO MISMATCH #3: VS va=00000000 size=102 — memo said 8ed00911a7bc1eb1,
+//         the microcode hashes to f2ef2d2f8de976d0 (first=F1555004 last=A9A9C68D)
+//
+// Two DIFFERENT shaders, identical in size and in both probe dwords, alternating — so
+// the probe was wrong roughly half the time it was consulted for that pair. Microcode is
+// far too regular for two dwords to identify it: dword 0 is a control-flow instruction
+// pair whose encoding repeats across every shader a compiler emits from one template,
+// and the last dword is as often as not the tail of a padded block. The same happened at
+// a real address (`va=BC73D080 size=120 first=F5556005`), which is the driver recycling
+// one staging buffer — the case the probe was specifically supposed to catch.
+//
+// And the failure is SILENT, not loud. The plan's argument was that a wrong hash names
+// nothing in the cache, so the standing `grep -c "no translated shader"` gate would see
+// it. But a wrong hash here is not a random number — it is **another real shader's
+// hash**, which is in the cache, so the renderer would bind a real, wrong, translated
+// shader and draw with it. That is a stale-mesh-class defect (part 46) with no gate
+// pointing at it. Gotcha: when a cache key is a PROBE rather than the content, ask what
+// the wrong answer IS, not just how likely it is — a probe that fails into another valid
+// key fails invisibly.
+//
+// WHAT IS DONE INSTEAD. The key is the microcode itself, compared with `memcmp` against
+// a stored copy. That is exact — there is no probability left in it — and it is still a
+// large win, because the cost being removed is a serial multiply chain and not a memory
+// read: FNV-1a here runs at ~1 byte/cycle, `__memcmp_avx2_movbe` at tens of bytes per
+// cycle over the same bytes, and those bytes are hot (each of ~250 shaders is re-bound
+// several times a frame). The `(va, size, first dword)` triple survives only as a way to
+// pick which stored copy to compare against, where being wrong costs a wasted compare
+// and nothing else.
+//
+// The table is set-associative rather than direct-mapped **because of the measurement
+// above**: the alternating pair is real, and a one-entry-per-slot table would evict on
+// every load and hash every time. Four ways per set hold it.
+struct ShaderMemoEntry
+{
+    uint32_t va = 0;
+    uint32_t sizeDwords = 0;   // 0 = empty way
+    uint32_t first = 0;        // microcode dword 0 — a cheap reject before the memcmp
+    uint64_t hash = 0;
+    std::vector<uint8_t> bytes;  // the microcode as the guest holds it, big-endian
+};
+// 256 sets x 4 ways = 1024 entries against ~250 distinct shaders a run. The bytes are
+// held per entry, so the whole table is on the order of a megabyte at this title's
+// shader sizes; it is allocated lazily, one `std::vector` per distinct shader actually
+// seen, and never freed.
+constexpr uint32_t kShaderMemoSets = 256;
+constexpr uint32_t kShaderMemoWays = 4;
+ShaderMemoEntry g_shaderMemo[kShaderMemoSets][kShaderMemoWays];
+uint32_t g_shaderMemoNextWay[kShaderMemoSets];
+std::atomic<uint64_t> g_shaderMemoHits{ 0 };
+std::atomic<uint64_t> g_shaderMemoMisses{ 0 };
+std::atomic<uint64_t> g_shaderMemoEvictions{ 0 };
+std::atomic<uint64_t> g_shaderMemoMismatches{ 0 };
+// Of the misses, the ones where every way of the set was already occupied — i.e.
+// CAPACITY pressure, which more ways or more sets would remove. The complement is a
+// compulsory miss (a shader seen for the first time), which nothing can remove. Split
+// because "N% of loads still hash" means two completely different things depending on
+// which it is, and guessing which would be exactly the "a share is not a shape" error
+// part 50 made twice (gotcha 339).
+std::atomic<uint64_t> g_shaderMemoCollisions{ 0 };
+
+// CW_PM4_NO_SHADER_MEMO=1 restores the pre-part-52 form — a full hash on every load —
+// and is the same-binary control arm for the item.
+const bool g_noShaderMemo = getenv("CW_PM4_NO_SHADER_MEMO") != nullptr;
+// CW_PM4_VERIFY_SHADER_HASH=1 takes the memo's answer AND computes the real hash on
+// every single load, and reports every disagreement with the address, the size and both
+// hashes. This is the correctness gate, it is the incumbent-as-oracle shape the counter
+// verifier next door already uses (gotcha 322), and **it earned its keep the first time
+// it ran** — see the mismatch transcript above.
+const bool g_verifyShaderHash = getenv("CW_PM4_VERIFY_SHADER_HASH") != nullptr;
+// ...and a gate that has never been shown able to fail proves nothing by passing
+// (gotcha 30). This corrupts one memoized hash in every 1024 hits, so the verify arm
+// must SCREAM on a poisoned run before its silence on a clean one means anything.
+const bool g_verifyShaderPoison = getenv("CW_PM4_VERIFY_SHADER_POISON") != nullptr;
+
+uint32_t ShaderMemoSet(uint32_t va, uint32_t sizeDwords)
+{
+    uint64_t k = (uint64_t(va) << 32) ^ (uint64_t(sizeDwords) * 0x9E3779B97F4A7C15ull);
+    k ^= k >> 33;
+    k *= 0xFF51AFD7ED558CCDull;
+    return uint32_t(k >> 32) & (kShaderMemoSets - 1);
+}
+
+// The microcode's first dword, read big-endian — i.e. exactly as the guest holds it, the
+// same convention `Fnv1a` hashes in, so the pointer path and the immediate path produce
+// the same value for the same shader.
+inline uint32_t UcodeDwordBE(const uint8_t* p)
+{
+    return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) |
+           uint32_t(p[3]);
+}
+
+// The lookup. `code` is `sizeDwords * 4` bytes of microcode as the guest holds them —
+// for the pointer path that is guest memory read in place, with no copy at all. Returns
+// 0 on a miss; on a hit it returns the memoized hash AND has already bound it.
+uint64_t ShaderMemoLookup(uint32_t type, uint32_t va, uint32_t sizeDwords,
+                          const uint8_t* code)
+{
+    const size_t nbytes = size_t(sizeDwords) * 4;
+    const uint32_t first = UcodeDwordBE(code);
+    ShaderMemoEntry* set = g_shaderMemo[ShaderMemoSet(va, sizeDwords)];
+    uint32_t occupied = 0;
+    for (uint32_t w = 0; w < kShaderMemoWays; w++)
+    {
+        ShaderMemoEntry& e = set[w];
+        if (!e.sizeDwords)
+            continue;
+        occupied++;
+        if (e.sizeDwords != sizeDwords || e.va != va || e.first != first)
+            continue;
+        if (memcmp(e.bytes.data(), code, nbytes) != 0)
+            continue;
+        g_shaderMemoHits.store(g_shaderMemoHits.load(std::memory_order_relaxed) + 1,
+                               std::memory_order_relaxed);
+        uint64_t hash = e.hash;
+        if (g_verifyShaderPoison &&
+            (g_shaderMemoHits.load(std::memory_order_relaxed) & 0x3FF) == 0)
+            hash ^= 1;   // the positive control: one hit in 1024 answers wrongly
+        g_boundShaders[type] = { va, sizeDwords, hash };
+        return hash;
+    }
+    g_shaderMemoMisses.store(g_shaderMemoMisses.load(std::memory_order_relaxed) + 1,
+                             std::memory_order_relaxed);
+    if (occupied == kShaderMemoWays)
+        g_shaderMemoCollisions.store(
+            g_shaderMemoCollisions.load(std::memory_order_relaxed) + 1,
+            std::memory_order_relaxed);
+    return 0;
+}
+
+void ShaderMemoInsert(uint32_t va, uint32_t sizeDwords, const uint8_t* code, uint64_t hash)
+{
+    const uint32_t setIndex = ShaderMemoSet(va, sizeDwords);
+    ShaderMemoEntry* set = g_shaderMemo[setIndex];
+    uint32_t victim = kShaderMemoWays;
+    for (uint32_t w = 0; w < kShaderMemoWays; w++)
+        if (!set[w].sizeDwords)
+        {
+            victim = w;
+            break;
+        }
+    if (victim == kShaderMemoWays)
+    {
+        // Round-robin rather than random, so a set thrashed by K > ways distinct shaders
+        // degrades smoothly instead of pinning one entry; and evictions are counted so
+        // "the memo is thrashing" is a number rather than a suspicion.
+        victim = g_shaderMemoNextWay[setIndex] % kShaderMemoWays;
+        g_shaderMemoNextWay[setIndex] = victim + 1;
+        g_shaderMemoEvictions.store(
+            g_shaderMemoEvictions.load(std::memory_order_relaxed) + 1,
+            std::memory_order_relaxed);
+    }
+    ShaderMemoEntry& e = set[victim];
+    e.va = va;
+    e.sizeDwords = sizeDwords;
+    e.first = UcodeDwordBE(code);
+    e.hash = hash;
+    e.bytes.assign(code, code + size_t(sizeDwords) * 4);
+}
+
+// The reusable staging buffer both load paths snapshot into.
+//
+// It replaces a `std::vector<uint8_t>` constructed per packet — a malloc and a free on
+// every one of ~1,900 shader loads a frame, which is a large share of the `_int_malloc`
+// the recon found on the frame path (`perf-plan-part52.md` item 3.3). Nothing retains
+// the pointer past `BindShader`, and only the pump thread walks packets, so one buffer
+// is enough; it is `static` rather than `thread_local` for the same reason the rest of
+// this module is single-threaded by construction.
+std::vector<uint8_t> g_ucodeStaging;
+
 // The shared body of both load packets: validate, hash, bind, dump, announce once.
-void BindShader(uint32_t type, uint32_t ucodeVa, const uint8_t* code, uint32_t sizeDwords)
+//
+// `expectHash` is non-zero only under CW_PM4_VERIFY_SHADER_HASH, where the memo has
+// already answered and this call exists solely to check that answer against the real
+// fold. The real fold wins in that case — the verify arm reports a disagreement, it does
+// not propagate one.
+void BindShader(uint32_t type, uint32_t ucodeVa, const uint8_t* code, uint32_t sizeDwords,
+                uint64_t expectHash = 0)
 {
     if (type > 1 || !sizeDwords || sizeDwords > 0x10000)
         return;
@@ -447,6 +787,34 @@ void BindShader(uint32_t type, uint32_t ucodeVa, const uint8_t* code, uint32_t s
 
     const uint64_t hash = Fnv1a(code, size_t(sizeDwords) * 4);
     g_boundShaders[type] = { ucodeVa, sizeDwords, hash };
+
+    // Publish these exact bytes as the key for their own hash. The copy is taken from
+    // the SNAPSHOT and not from a re-read of guest memory, so the stored key and the
+    // stored value describe the same bytes even though the driver may be rewriting that
+    // staging area while we work — which is the reason the caller snapshots at all.
+    //
+    // Skipped when the memo already answered CORRECTLY, which only happens under the
+    // verify arm — and it matters, because without the test the verify arm re-inserts on
+    // every load, fills all four ways of a set with the same shader and reports an
+    // eviction count 46x its own miss count. An instrument that destroys the statistic it
+    // is standing next to is still an instrument that changed the measurement (gotcha 7);
+    // here the fix is one comparison. A DISAGREEMENT still inserts, so the verify arm
+    // repairs the table as well as reporting it.
+    if (expectHash != hash)
+        ShaderMemoInsert(ucodeVa, sizeDwords, code, hash);
+
+    if (expectHash && expectHash != hash)
+    {
+        const uint64_t n = g_shaderMemoMismatches.fetch_add(1);
+        if (n < 32)
+            fprintf(stderr,
+                    "[pm4] SHADER MEMO MISMATCH #%llu: %s va=%08X size=%u — memo said "
+                    "%016llx, the microcode hashes to %016llx (first=%08X last=%08X)\n",
+                    static_cast<unsigned long long>(n), type == 0 ? "VS" : "PS", ucodeVa,
+                    sizeDwords, static_cast<unsigned long long>(expectHash),
+                    static_cast<unsigned long long>(hash), UcodeDwordBE(code),
+                    UcodeDwordBE(code + (size_t(sizeDwords) - 1) * 4));
+    }
 
     // One line per distinct shader, always on. The renderer's own miss report says
     // "hash X is not in the cache"; this is what says which stage it was and how big,
@@ -477,6 +845,32 @@ struct Source
     {
         const uint32_t index = wrapDwords ? (i % wrapDwords) : i;
         return GuestLoad32(base, va + index * 4);
+    }
+
+    // A RUN of consecutive dwords, byte-swapped into `dst`.
+    //
+    // The point is what it does NOT do per dword: the wrap test and the modulo are
+    // hoisted out of the loop, and on the linear (indirect-buffer) path — which is where
+    // essentially every constant run arrives — what is left is a byte-swapping copy that
+    // runs at memory bandwidth. The operator's profiled frame carries **797,624 register
+    // dwords at ~17.8 ns each**, i.e. 50-70 cycles for what should be a load, a bswap
+    // and a store, and a per-dword `i % wrapDwords` on a runtime divisor is 20-26 cycles
+    // of that on its own. `docs/perf-plan-part47.md` §2.1.
+    void Read(uint32_t i, uint32_t count, uint32_t* dst) const
+    {
+        if (wrapDwords)
+        {
+            for (uint32_t k = 0; k < count; k++)
+                dst[k] = GuestLoad32(base, va + ((i + k) % wrapDwords) * 4);
+            return;
+        }
+        const uint8_t* p = base + va + size_t(i) * 4;
+        for (uint32_t k = 0; k < count; k++)
+        {
+            uint32_t raw;
+            memcpy(&raw, p + size_t(k) * 4, 4);   // memcpy, not a cast: the packet
+            dst[k] = __builtin_bswap32(raw);      // stream has no alignment guarantee
+        }
     }
 };
 
@@ -821,12 +1215,47 @@ void ConstWatchRecord(uint32_t index, uint32_t value)
     }
 }
 
+// A VERSION STAMP ON THE ALU CONSTANT FILE — the whole point of which is that DoDraw can
+// ask "have these 512 float4 registers changed since the last draw?" in one comparison.
+//
+// It exists because the constant copy is 8 KB PER DRAW: 256 float4 for the vertex shader
+// and 256 for the pixel shader, swapped dword by dword into the per-frame arena. At the
+// operator's soak load that is ~57 MB a frame and over 5 GB/s, it is 7.5% of the pump
+// thread (`vk_renderer.cpp:8330` and `:8333`, 18.90% and 18.89% of `DoDraw` once part
+// 55's container work stopped hiding them), and it is most of why putting the arena in
+// video memory made the frame 14% LONGER (gotcha 363).
+//
+// The stamp is bumped on every write that TOUCHES the range, not on every write, and it
+// is a monotonic counter rather than a dirty flag so a consumer can hold one across an
+// arbitrary gap. Both writers of `g_regs` are covered — the per-dword path here and the
+// bulk run below — because a version that misses a write does not merely lose the
+// optimisation, it serves a draw the PREVIOUS draw's transform matrix, which draws a mesh
+// somewhere else entirely. The two arms in the renderer exist for that reason.
+//
+// Single-threaded by construction: every register write comes from the PM4 executor,
+// which is the graphics pump, and so does every read in DoDraw. If that ever stops being
+// true this needs to become an atomic, and the symptom of forgetting would be a torn
+// stale-constant frame under load.
+// TWO stamps, not one, and the reason is a measurement: a single stamp over the whole
+// file was served on only 3.6-7.1% of draws, because this guest rewrites SOMETHING in the
+// constant file almost every draw. But the file is two independent windows — the vertex
+// shader's 0..255 and the pixel shader's 256..511 — and what changes per draw is
+// overwhelmingly the vertex half (a world matrix per object). Stamping them separately
+// lets the pixel half be reused even while the vertex half is rewritten, which is half the
+// 8 KB.
+uint64_t g_aluConstVersion[2] = { 1, 1 };
+constexpr uint32_t kAluLo = xenos::kAluConstantBase;
+constexpr uint32_t kAluMid = xenos::kAluConstantBase + 256 * 4;  // PS window starts here
+constexpr uint32_t kAluHi = xenos::kAluConstantBase + 512 * 4;   // one past the end
+
 void WriteRegister(uint8_t* base, uint32_t index, uint32_t value)
 {
     if (index >= kRegCount)
         return;
     if (index >= g_constWatchLo && index <= g_constWatchHi)
         ConstWatchRecord(index, value);
+    if (index >= kAluLo && index < kAluHi)
+        ++g_aluConstVersion[index >= kAluMid];
     g_regs[index] = value;
 
     // Scratch-register writeback: when SCRATCH_UMSK enables a scratch register, each
@@ -848,6 +1277,129 @@ void WriteRegister(uint8_t* base, uint32_t index, uint32_t value)
     }
 }
 
+// --- bulk register runs ------------------------------------------------------------
+//
+// WHY THIS EXISTS. The PM4 walk is 14.2 ms of the operator's 61.7 ms frame and it is a
+// register-write loop: 94,098 packets a frame carrying **797,624 register dwords at
+// ~17.8 ns each**. A register write is a store. Everything above 2-3 ns is the overhead
+// around it — the wrap modulo in `Source::operator()`, the bounds test, the const-watch
+// range test and the scratch range test, all evaluated per dword for a destination range
+// that is fixed for the whole run.
+//
+// So ask the two range questions ONCE per run. `WriteRegister` stays the definition of
+// correct and is still what runs whenever a run touches a register whose write has a
+// side effect; the bulk path is only taken when the destination range provably has none,
+// which for `SET_CONSTANT`/`SET_CONSTANT2`/`LOAD_ALU_CONSTANT` (banks at 0x2000 and
+// above) is every time. The fallback is COUNTED rather than assumed rare: if it turns
+// out to be common this item is worth much less than it looks, and a share is the only
+// thing that can say so (gotcha 151 — an arm with no counter cannot be shown to have
+// engaged).
+//
+// CW_PM4_NO_BULK_REGS=1 restores the per-dword path for every run — the same-binary
+// control arm, and the thing to run the PM4 boundary oracles against.
+// Atomic for the same reason g_packets and g_regWrites are: the walk runs on the
+// graphics pump and `[vkprof]` differences these from the renderer's own thread, so a
+// plain uint64_t here would be a data race for a number nobody would ever suspect. They
+// are incremented once per RUN, not per dword, so a relaxed add costs nothing measurable.
+std::atomic<uint64_t> g_regRunBulk{ 0 };   // dwords taken by the bulk copy
+std::atomic<uint64_t> g_regRunSlow{ 0 };   // ...and by the per-dword fallback
+// Dwords the bulk path got WRONG, as judged by the per-dword path it replaced. Only
+// counted under CW_PM4_VERIFY_BULK_REGS; it must be 0, and the check must be shown able
+// to report a positive before a 0 from it means anything (gotcha 30).
+std::atomic<uint64_t> g_regRunMismatch{ 0 };
+const bool g_noBulkRegs = getenv("CW_PM4_NO_BULK_REGS") != nullptr;
+
+// Does any register in [index, index+count) have a side effect on write? Two windows:
+// the scratch mirror (a real reporting channel the guest polls) and the const-watch
+// instrument (a diagnostic, whose window is empty unless CW_PM4_CONST_WATCH is set —
+// which is item 2.2: with an empty window this is one predictable branch per RUN now
+// rather than two compares per dword).
+inline bool RegRunHasSideEffects(uint32_t index, uint32_t count)
+{
+    const uint32_t last = index + count - 1;
+    return (index <= kRegScratch7 && last >= kRegScratch0) ||
+           (index <= g_constWatchHi && last >= g_constWatchLo);
+}
+
+// Write `count` consecutive registers from `count` consecutive dwords of the packet
+// stream. Semantically identical to calling WriteRegister in a loop, including the
+// out-of-range drop that an unknown constant bank relies on.
+void WriteRegisterRun(uint8_t* base, const Source& fetch, uint32_t srcPos,
+                      uint32_t index, uint32_t count)
+{
+    if (index >= kRegCount || !count)
+        return;
+    // Clip rather than drop: WriteRegister drops each out-of-range index individually,
+    // so a run that starts in range and walks off the end must write the part that fits.
+    if (count > kRegCount - index)
+        count = kRegCount - index;
+    if (g_noBulkRegs || RegRunHasSideEffects(index, count))
+    {
+        g_regRunSlow.fetch_add(count, std::memory_order_relaxed);
+        for (uint32_t i = 0; i < count; i++)
+            WriteRegister(base, index + i, fetch(srcPos + i));
+        return;
+    }
+    g_regRunBulk.fetch_add(count, std::memory_order_relaxed);
+    // One overlap test per RUN, not per dword — this path exists precisely because the
+    // per-dword path was too slow, and a per-dword check here would give that back.
+    if (index < kAluHi && index + count > kAluLo)
+    {
+        // A run can straddle the two windows; bump whichever halves it overlaps.
+        if (index < kAluMid && index + count > kAluLo)
+            ++g_aluConstVersion[0];
+        if (index < kAluHi && index + count > kAluMid)
+            ++g_aluConstVersion[1];
+    }
+    fetch.Read(srcPos, count, g_regs + index);
+
+    // CW_PM4_VERIFY_BULK_REGS=1 — CHECK THE NEW PATH AGAINST THE OLD ONE, which is
+    // still right here.
+    //
+    // The two PM4 boundary oracles cannot see this change: they verify the packet-LENGTH
+    // and indirect-walk arithmetic, and this touches neither. A picture correlation
+    // cannot see it either — a wrong constant produces a plausible wrong picture, which
+    // is the failure mode this project has spent whole sessions on. But the thing being
+    // replaced is still compiled in, and `Source::operator()` has been the definition of
+    // "read a dword of the packet stream" for 47 parts, so it is an oracle that is not
+    // our new code (the rule this project keeps: two of your own components agreeing is a
+    // consistency check unless one of them is the incumbent).
+    //
+    // What can actually differ is exactly one thing: `Source::Read` hoists the wrap test
+    // and the modulo out of the loop and reads the linear case with an unaligned memcpy.
+    // So compare every dword. It is far too slow to leave on — that is the point of the
+    // flag — and it must be run on a route that reaches gameplay, because the ring path
+    // (wrapDwords != 0) and the indirect path are different branches.
+    // CW_PM4_VERIFY_POISON=1 is the POSITIVE CONTROL, and it is not decoration: a check
+    // that has never been shown capable of failing proves nothing by passing (gotcha 30,
+    // and gotcha 234 for the time this project shipped a comparison that could only ever
+    // read 100%). It corrupts one dword in every 4,096 bulk-written runs, so the verifier
+    // must report mismatches and the picture must visibly break. Run the pair.
+    static const bool verifyPoison = getenv("CW_PM4_VERIFY_POISON") != nullptr;
+    if (verifyPoison && count && (g_regRunBulk.load() & 0xFFFu) == 0)
+        g_regs[index] ^= 0x40000000u;
+
+    static const bool verify = getenv("CW_PM4_VERIFY_BULK_REGS") != nullptr;
+    if (verify)
+    {
+        for (uint32_t i = 0; i < count; i++)
+        {
+            const uint32_t want = fetch(srcPos + i);
+            if (g_regs[index + i] != want)
+            {
+                g_regRunMismatch.fetch_add(1, std::memory_order_relaxed);
+                if (g_regRunMismatch.load() <= 16)
+                    fprintf(stderr,
+                            "[pm4] BULK REGISTER MISMATCH at reg %04X (+%u of %u): bulk "
+                            "wrote %08X, the per-dword path reads %08X  [src=%s]\n",
+                            index + i, i, count, g_regs[index + i], want,
+                            g_constWatchSource);
+                g_regs[index + i] = want;   // repair, so one bug is not a cascade
+            }
+        }
+    }
+}
+
 bool EvalWaitCondition(uint32_t func, uint32_t value, uint32_t mask, uint32_t ref)
 {
     const uint32_t v = value & mask;
@@ -864,6 +1416,67 @@ bool EvalWaitCondition(uint32_t func, uint32_t value, uint32_t mask, uint32_t re
     }
 }
 
+// --- type-2 filler runs (part 50 item 1a) --------------------------------------------
+//
+// WHY. A type-2 packet is a one-dword no-op, and executing one used to cost everything a
+// real packet costs except the handler: the call, the `Source` fetch with its wrap
+// modulo, the header decode, the thread-local census lookup, two counter updates, the
+// return, and the caller's own loop bookkeeping. Part 48's opcode census — the first time
+// anything in this runtime had looked — priced that at **28.7% of every packet walked**
+// on the operator's frame, ~23,000 calls a frame doing no work whatsoever.
+//
+// WHAT THE MEASUREMENT SAID, because the share on its own does not decide this. 28.7%
+// type-2 is equally consistent with one enormous run of padding and with 23,000 isolated
+// dwords wedged between real packets, and coalescing is worth everything in the first case
+// and nothing in the second. So the histogram was built before the fast path and it says:
+// **mean run length 2.3**, and the distribution is bimodal — 28% of runs are a single
+// dword, 72% are runs of 2-3, and there is a thin tail of ~1,100 runs of 32-63 a window
+// with NOTHING in between. Coalescing alone would therefore remove only 57% of the calls,
+// which is why the caller in `ExecuteLinear` checks the type itself and removes 100% of
+// them: it has already fetched the header for its own trail, so the test is free there.
+//
+// AND IT IS ALL IN INDIRECT BUFFERS: `fillerRingDwords` reads **0%**. This is not the
+// driver padding the ring to a wrap boundary, which is what "filler" suggests and what
+// the ring path is written to expect. It is the title's own command buffers, padded
+// packet by packet — which is why the fast path lives in the linear walk and the ring
+// keeps the general one rather than both being changed on a guess.
+//
+// WHAT IS DELIBERATELY NOT CHANGED IS THE CENSUS. The run is charged dword by dword to
+// `packets` and `types[2]`, in one update each, so every rate `[vkprof]` derives from
+// them (ns per packet, register dwords per packet, the type mix) means exactly what it
+// meant before and the arms remain comparable. A walk that skipped its own accounting
+// here would read as one that got faster per packet because it stopped counting the cheap
+// ones — the same defect one level up as gotcha 325.
+//
+// `avail` bounds the scan, which is what makes it safe on the ring: a dword past the
+// write pointer is memory the driver has not written yet, and reading it to decide it is
+// not filler would be using uninitialised memory to make a control-flow decision. The
+// scan stops there and the next tick continues from the same place.
+//
+// The first dword at `pos` must already be known to be type 2.
+inline uint32_t ConsumeFillerRun(Census& cs, const Source& fetch, uint32_t pos,
+                                 uint32_t avail, int depth)
+{
+    uint32_t n = 1;
+    if (!g_noFillerRuns)
+        while (n < avail && (fetch(pos + n) >> 30) == 2)
+            n++;
+    CensusAdd(cs.packets, g_packets, n);
+    CensusAdd(cs.types[2], g_types[2], n);
+    const uint64_t runs = cs.fillerRuns.load(std::memory_order_relaxed) + 1;
+    cs.fillerRuns.store(runs, std::memory_order_relaxed);
+    if (g_fillerPoison && (runs & 0xFFFu) == 0 && n < avail)
+        return n + 1;   // the deliberate desync; see g_fillerPoison
+    if (depth == 0)
+        cs.fillerRingDwords.store(cs.fillerRingDwords.load(std::memory_order_relaxed) + n,
+                                  std::memory_order_relaxed);
+    // 31 - clz(n) = floor(log2 n); bucket 7 collects everything from 128 up.
+    const uint32_t b = std::min(7u, 31u - static_cast<uint32_t>(__builtin_clz(n)));
+    cs.fillerHist[b].store(cs.fillerHist[b].load(std::memory_order_relaxed) + 1,
+                           std::memory_order_relaxed);
+    return n;
+}
+
 // Execute one packet at `pos`. Returns the dwords consumed, or 0 when the packet
 // claims more than `avail` — which at ring level means the driver has written the
 // header but not yet the body, and the right answer is to come back next tick rather
@@ -873,19 +1486,35 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t pos, uint32_
 {
     const uint32_t header = fetch(pos);
     const uint32_t type = header >> 30;
-    g_packets.fetch_add(1, std::memory_order_relaxed);
-    g_types[type].fetch_add(1, std::memory_order_relaxed);
+    // Hoisted once per packet rather than looked up at each of the five census sites
+    // below, so the whole census costs one thread-local read per packet. Under the
+    // atomic arm it is a reference to an instance nothing ever writes, which is how that
+    // arm avoids paying even that.
+    Census& cs = g_atomicCounters ? g_censusUnused : ThreadCensus();
 
-    if (type == 2) // filler
-        return 1;
+    // Filler. `ExecuteLinear` catches this before the call — which is where all of it
+    // actually is — but the ring walk does not pre-fetch its header, so this stays as
+    // the general path and is what makes the fast path an optimisation rather than the
+    // only implementation.
+    if (type == 2)
+        return ConsumeFillerRun(cs, fetch, pos, avail, depth);
+
+    // The poison drives the GLOBAL only, so the two forms diverge by one every ten
+    // thousand packets and the verifier must report it. Meaningful only with
+    // CW_PM4_VERIFY_COUNTERS=1, which is what bumps the global at all.
+    if (g_verifyPoison && (g_packets.load(std::memory_order_relaxed) % 10000) == 0)
+        g_packets.fetch_add(1, std::memory_order_relaxed);
+    else
+        CensusAdd(cs.packets, g_packets);
+    CensusAdd(cs.types[type], g_types[type]);
 
     // An all-zero dword at ring level is memory the driver has not written yet.
     // Parsing it as a type-0 "write one register at index 0" would silently consume
     // two dwords of a packet still being written and desync the stream.
     if (header == 0 && depth == 0)
     {
-        g_packets.fetch_sub(1, std::memory_order_relaxed);
-        g_types[type].fetch_sub(1, std::memory_order_relaxed);
+        CensusSub(cs.packets, g_packets);
+        CensusSub(cs.types[type], g_types[type]);
         return 0;
     }
 
@@ -915,7 +1544,7 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t pos, uint32_
         if (avail < 3)
             return 0;
         g_constWatchSource = "TYPE1";
-        g_regWrites.fetch_add(2, std::memory_order_relaxed);
+        CensusAdd(cs.regWrites, g_regWrites, 2);
         WriteRegister(base, header & 0x7FF, fetch(pos + 1));
         WriteRegister(base, (header >> 11) & 0x7FF, fetch(pos + 2));
         return 3;
@@ -930,17 +1559,22 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t pos, uint32_
         const uint32_t reg = header & 0x7FFF;
         const bool oneReg = (header >> 15) & 1;
         g_constWatchSource = oneReg ? "TYPE0(one-reg)" : "TYPE0(run)";
-        g_regWrites.fetch_add(bodyCount, std::memory_order_relaxed);
-        for (uint32_t i = 0; i < bodyCount; i++)
-            WriteRegister(base, oneReg ? reg : reg + i, fetch(pos + 1 + i));
+        CensusAdd(cs.regWrites, g_regWrites, bodyCount);
+        // ONE-REG is not a run — every dword lands on the same index, and its scratch
+        // mirror must fire once per write, not once. It stays on the per-dword path.
+        if (oneReg)
+            for (uint32_t i = 0; i < bodyCount; i++)
+                WriteRegister(base, reg, fetch(pos + 1 + i));
+        else
+            WriteRegisterRun(base, fetch, pos + 1, reg, bodyCount);
         return bodyCount + 1;
     }
 
     // type 3
     const uint32_t opcode = (header >> 8) & 0x7F;
-    g_opcodes[opcode].fetch_add(1, std::memory_order_relaxed);
+    CensusAdd(cs.opcodes[opcode], g_opcodes[opcode]);
     if (opcode == 0x22 || opcode == 0x36)
-        g_draws.fetch_add(1, std::memory_order_relaxed);
+        CensusAdd(cs.draws, g_draws);
 
     // An opcode this command processor does not have is reported, once each. B1's
     // census says there are exactly 21 and all are named, so any of these is either a
@@ -984,9 +1618,29 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t pos, uint32_
     // CW_PM4_BIN_TRACE_ARM=hex holds the trace until the bin select first takes that
     // value, because the interesting era is a quarter of a million packets into the
     // boot and a budget spent on the untiled prologue says nothing (gotcha 139).
-    if (getenv("CW_PM4_BIN_TRACE"))
+    //
+    // THE `getenv` IS HOISTED, and that is not tidiness. This branch is evaluated once
+    // per TYPE-3 PACKET — 29,000 a frame on the outdoor route and more on the operator's
+    // — and `getenv` is a linear walk of the environment block, so the disabled
+    // diagnostic was costing the walk on every packet of the phase that is 16.6 ms of
+    // the operator's frame. Found by applying gotcha 329's own grep (`getenv` NOT
+    // preceded by `static`) to this file after part 48 found the same shape on the
+    // per-draw path in the renderer; every other environment read in this module was
+    // already a global or a function-local static, which is what made the two exceptions
+    // unreadable.
+    //
+    // CW_PM4_ENV_PER_PACKET=1 restores the per-packet `getenv` and is the same-binary
+    // control arm. It exists because the claim here is about SIZE, not correctness — the
+    // two forms are behaviourally identical, so nothing in the picture or in any gate
+    // could separate them, and without an arm the only measurement available would be
+    // against a different binary (gotcha 50: the control is the other arm of the same
+    // binary, run now).
+    static const char* binTraceCached = getenv("CW_PM4_BIN_TRACE");
+    static const bool envPerPacket = getenv("CW_PM4_ENV_PER_PACKET") != nullptr;
+    const char* binTraceEnv = envPerPacket ? getenv("CW_PM4_BIN_TRACE") : binTraceCached;
+    if (binTraceEnv)
     {
-        static int left = atoi(getenv("CW_PM4_BIN_TRACE"));
+        static int left = atoi(binTraceEnv);
         static const char* armEnv = getenv("CW_PM4_BIN_TRACE_ARM");
         static const char* armMaskEnv = getenv("CW_PM4_BIN_TRACE_ARMMASK");
         static const uint64_t armSelect = armEnv ? strtoull(armEnv, nullptr, 16) : 0;
@@ -1036,7 +1690,7 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t pos, uint32_
     if (predicated)
     {
         if (opcode == 0x22 || opcode == 0x36)
-            g_drawsPredicatedOut.fetch_add(1, std::memory_order_relaxed);
+            CensusAdd(cs.drawsPredicatedOut, g_drawsPredicatedOut);
         if (!noPredication)
             return bodyCount + 1;
     }
@@ -1349,18 +2003,17 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t pos, uint32_
                 default: index = kRegCount;     // unknown bank: drop
             }
             g_constWatchSource = "SET_CONSTANT";
-            g_regWrites.fetch_add(bodyCount - 1, std::memory_order_relaxed);
-            for (uint32_t i = 1; i < bodyCount; i++)
-                WriteRegister(base, index + i - 1, body(i));
+            CensusAdd(cs.regWrites, g_regWrites, bodyCount - 1);
+            // `body(i)` is `fetch(pos + 1 + i)`, so body(1) is at pos + 2.
+            WriteRegisterRun(base, fetch, pos + 2, index, bodyCount - 1);
             break;
         }
 
         case 0x55: // SET_CONSTANT2 / SET_SHADER_CONSTANTS: absolute index in body(0)
         case 0x56:
             g_constWatchSource = "SET_CONSTANT2";
-            g_regWrites.fetch_add(bodyCount - 1, std::memory_order_relaxed);
-            for (uint32_t i = 1; i < bodyCount; i++)
-                WriteRegister(base, (body(0) & 0xFFFF) + i - 1, body(i));
+            CensusAdd(cs.regWrites, g_regWrites, bodyCount - 1);
+            WriteRegisterRun(base, fetch, pos + 2, body(0) & 0xFFFF, bodyCount - 1);
             break;
 
         case 0x2F: // LOAD_ALU_CONSTANT: addr, offset_type, size — constants from memory
@@ -1380,9 +2033,15 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t pos, uint32_
             const uint32_t addr = PhysToVa(body(0) & 0x3FFFFFFC);
             const uint32_t size = body(2) & 0xFFF;
             g_constWatchSource = "LOAD_ALU_CONSTANT";
-            g_regWrites.fetch_add(size, std::memory_order_relaxed);
-            for (uint32_t i = 0; i < size; i++)
-                WriteRegister(base, index + i, GuestLoad32(base, addr + i * 4));
+            CensusAdd(cs.regWrites, g_regWrites, size);
+            // The source here is GUEST MEMORY, not the packet stream — but a `Source`
+            // with no wrap IS a linear big-endian dword reader at a guest address, so
+            // the same bulk run applies verbatim. That reuse is the reason `Source` is a
+            // struct with a base and a va rather than a closure over the packet walk.
+            {
+                const Source mem{ base, addr, 0 };
+                WriteRegisterRun(base, mem, 0, index, size);
+            }
             break;
         }
 
@@ -1400,11 +2059,25 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t pos, uint32_
                 // staging area while our executor works through the ring, so reading
                 // the target twice — once to hash, once to translate — can see two
                 // different shaders and produce a name that matches neither.
+                //
+                // ...but ask the memo FIRST, because on a hit neither the snapshot nor
+                // the fold has to happen at all (part 52 item 1.0). The comparison is
+                // made against guest memory IN PLACE, with no copy: `memcmp` is the
+                // whole test, and a torn read simply fails it and falls through to the
+                // honest path below. It cannot produce a wrong hash, only a missed
+                // saving — which is precisely what the two-dword probe the plan
+                // specified could NOT promise (see the memo's header comment).
                 if (size && size <= 0x10000)
                 {
-                    std::vector<uint8_t> code(size_t(size) * 4);
-                    memcpy(code.data(), base + va, code.size());
-                    BindShader(type, va, code.data(), size);
+                    const uint8_t* src = base + va;
+                    const uint64_t memo =
+                        g_noShaderMemo ? 0 : ShaderMemoLookup(type, va, size, src);
+                    if (!memo || g_verifyShaderHash)
+                    {
+                        g_ucodeStaging.resize(size_t(size) * 4);
+                        memcpy(g_ucodeStaging.data(), src, g_ucodeStaging.size());
+                        BindShader(type, va, g_ucodeStaging.data(), size, memo);
+                    }
                 }
             }
             break;
@@ -1418,9 +2091,21 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t pos, uint32_
                 {
                     // Written back out big-endian on purpose: `body()` has already
                     // swapped, and the hash must be over the bytes as the guest holds
-                    // them or this path names a shader differently from the pointer
-                    // path above (see Fnv1a's comment).
-                    std::vector<uint8_t> code(size_t(size) * 4);
+                    // them or this path names a shader differently from the pointer path
+                    // above (see Fnv1a's comment).
+                    //
+                    // The memo applies here too, but unlike the pointer path this one
+                    // cannot skip building the bytes: the microcode is INSIDE the packet
+                    // stream, so there is nothing contiguous to compare against until it
+                    // has been swapped out. What the memo still removes is the fold,
+                    // which is the expensive half by an order of magnitude — the swap
+                    // loop is a load, a bswap and a store per dword with no dependency
+                    // chain. The buffer is reused rather than allocated, so this path no
+                    // longer mallocs either. The key's `va` is 0 for every immediate
+                    // load; that is not a collision farm, because the stored bytes are
+                    // the key and the set index only decides where to look.
+                    g_ucodeStaging.resize(size_t(size) * 4);
+                    uint8_t* code = g_ucodeStaging.data();
                     for (uint32_t k = 0; k < size; k++)
                     {
                         const uint32_t w = body(2 + k);
@@ -1429,7 +2114,10 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t pos, uint32_
                         code[k * 4 + 2] = uint8_t(w >> 8);
                         code[k * 4 + 3] = uint8_t(w);
                     }
-                    BindShader(type, 0, code.data(), size);
+                    const uint64_t memo =
+                        g_noShaderMemo ? 0 : ShaderMemoLookup(type, 0, size, code);
+                    if (!memo || g_verifyShaderHash)
+                        BindShader(type, 0, code, size, memo);
                 }
             }
             break;
@@ -1440,7 +2128,8 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t pos, uint32_
             {
                 const uint32_t addr = body(0);
                 const uint32_t size = body(1) & 0xFFFFF;
-                if (getenv("CW_PM4_IB_TRACE"))
+                static const bool ibTrace = getenv("CW_PM4_IB_TRACE") != nullptr;
+                if (ibTrace)
                 {
                     static std::atomic<uint64_t> n{ 0 };
                     if (n.fetch_add(1) < 64)
@@ -1518,9 +2207,24 @@ uint32_t ExecuteLinear(uint8_t* base, uint32_t va, uint32_t sizeDwords, int dept
     };
     Step trail[8] = {};
     uint32_t steps = 0;
+    Census& cs = g_atomicCounters ? g_censusUnused : ThreadCensus();
     while (pos < sizeDwords)
     {
         const uint32_t header = fetch(pos);
+        // The filler fast path (item 1a). 100% of this title's type-2 dwords arrive here
+        // rather than at ring level, and they are ~30% of every packet walked, so the one
+        // test that keeps them out of `ExecutePacket` entirely is the whole item. It is
+        // free: the header is fetched above for the trail regardless.
+        //
+        // The trail is skipped for filler on purpose. It exists so a TRUNCATION can name
+        // the packet whose length arithmetic was wrong, and a no-op has no length
+        // arithmetic — leaving filler out keeps eight real packets in the eight slots
+        // instead of the two or three that survive a stream 30% padded.
+        if ((header >> 30) == 2 && !g_noFillerRuns)
+        {
+            pos += ConsumeFillerRun(cs, fetch, pos, sizeDwords - pos, depth);
+            continue;
+        }
         const uint32_t consumed = ExecutePacket(base, fetch, pos, sizeDwords - pos, depth);
         trail[steps % 8] = { pos, header, consumed };
         steps++;
@@ -1858,12 +2562,123 @@ uint64_t Pm4_HoldStreakMax() { return g_holdStreakMax.load(); }
 void Pm4_SetFenceWord(uint32_t va) { g_fenceWord.store(va, std::memory_order_relaxed); }
 uint64_t Pm4_FenceRegressionCount() { return g_fenceRegressions.load(); }
 
-uint64_t Pm4_PacketCount() { return g_packets.load(); }
-uint64_t Pm4_RegisterWriteCount() { return g_regWrites.load(); }
-uint64_t Pm4_TypeCount(uint32_t type) { return type < 4 ? g_types[type].load() : 0; }
-uint64_t Pm4_OpcodeCount(uint32_t opcode) { return opcode < 128 ? g_opcodes[opcode].load() : 0; }
-uint64_t Pm4_DrawCount() { return g_draws.load(); }
-uint64_t Pm4_DrawsPredicatedOut() { return g_drawsPredicatedOut.load(); }
+// The census accessors. Under the atomic arm the globals are the live counters; by
+// default the per-thread instances are, and the globals stay at zero. The selection is
+// made once here rather than at each of the eight bump sites.
+uint64_t Pm4_PacketCount()
+{
+    return g_atomicCounters ? g_packets.load()
+                            : CensusSum([](Census& c) -> std::atomic<uint64_t>& { return c.packets; });
+}
+uint64_t Pm4_RegisterWriteCount()
+{
+    return g_atomicCounters ? g_regWrites.load()
+                            : CensusSum([](Census& c) -> std::atomic<uint64_t>& { return c.regWrites; });
+}
+// How the register dwords were written: in bulk runs, or one at a time because the
+// destination range touched the scratch mirror or the const-watch window. The share is
+// what says whether the bulk path is worth what it is estimated at (perf-plan-part47
+// §2.1); a fallback share near 100% would mean it is worth nothing.
+uint64_t Pm4_RegRunBulkDwords() { return g_regRunBulk.load(); }
+uint64_t Pm4_RegRunSlowDwords() { return g_regRunSlow.load(); }
+uint64_t Pm4_RegRunMismatches() { return g_regRunMismatch.load(); }
+uint64_t Pm4_TypeCount(uint32_t type)
+{
+    if (type >= 4)
+        return 0;
+    return g_atomicCounters
+               ? g_types[type].load()
+               : CensusSum([type](Census& c) -> std::atomic<uint64_t>& { return c.types[type]; });
+}
+uint64_t Pm4_OpcodeCount(uint32_t opcode)
+{
+    if (opcode >= 128)
+        return 0;
+    return g_atomicCounters
+               ? g_opcodes[opcode].load()
+               : CensusSum([opcode](Census& c) -> std::atomic<uint64_t>& { return c.opcodes[opcode]; });
+}
+uint64_t Pm4_AluConstVersion(uint32_t half) { return g_aluConstVersion[half & 1]; }
+uint64_t Pm4_DrawCount()
+{
+    return g_atomicCounters ? g_draws.load()
+                            : CensusSum([](Census& c) -> std::atomic<uint64_t>& { return c.draws; });
+}
+uint64_t Pm4_DrawsPredicatedOut()
+{
+    return g_atomicCounters
+               ? g_drawsPredicatedOut.load()
+               : CensusSum([](Census& c) -> std::atomic<uint64_t>& { return c.drawsPredicatedOut; });
+}
+
+// The filler-run census (item 1a). These have no atomic twin, because they describe the
+// part-50 walk rather than the pre-48 one, and under CW_PM4_ATOMIC_COUNTERS they simply
+// read zero — which is honest: that arm is the pre-part-48 counter form, and the filler
+// coalescing it still performs is described by `Pm4_TypeCount(2)` divided by nothing.
+uint64_t Pm4_FillerRuns()
+{
+    return CensusSum([](Census& c) -> std::atomic<uint64_t>& { return c.fillerRuns; });
+}
+uint64_t Pm4_FillerRingDwords()
+{
+    return CensusSum([](Census& c) -> std::atomic<uint64_t>& { return c.fillerRingDwords; });
+}
+uint64_t Pm4_FillerHist(uint32_t bucket)
+{
+    if (bucket >= 8)
+        return 0;
+    return CensusSum(
+        [bucket](Census& c) -> std::atomic<uint64_t>& { return c.fillerHist[bucket]; });
+}
+
+// The shader memo's own numbers. Plain globals rather than per-thread `Census` fields
+// because shader loads happen only on the walking thread and there is exactly one of
+// those in this runtime — the per-thread split next door exists to remove `lock xadd`
+// from a path taken 326,000 times a frame, and this one is taken 1,919 times.
+uint64_t Pm4_ShaderMemoHits() { return g_shaderMemoHits.load(); }
+uint64_t Pm4_ShaderMemoMisses() { return g_shaderMemoMisses.load(); }
+uint64_t Pm4_ShaderMemoEvictions() { return g_shaderMemoEvictions.load(); }
+uint64_t Pm4_ShaderMemoCollisions() { return g_shaderMemoCollisions.load(); }
+uint64_t Pm4_ShaderMemoMismatches() { return g_shaderMemoMismatches.load(); }
+
+// The verifier. Returns the number of the 135 counters on which the per-thread form and
+// the atomic form DISAGREE, and 0 when the check is not running — which is why the
+// caller must print it only under CW_PM4_VERIFY_COUNTERS, or it would be a clean result
+// from a test that never ran (gotcha 30, the same rule the bulk-register check follows).
+//
+// The comparison is exact, not approximate, and that is a property of this runtime
+// rather than of the code: `vd.cpp` is the only caller of `Pm4_Execute` and states that
+// only the pump thread walks, so there is one instance and no other thread can advance
+// either form while this reads them. `threads` is returned so that assumption is checked
+// on every run rather than trusted — a 2 here invalidates the exactness, not the change.
+uint64_t Pm4_CensusMismatches(uint64_t* threads)
+{
+    if (threads)
+    {
+        uint64_t n = 0;
+        for (Census* c = g_censusList.load(std::memory_order_acquire); c; c = c->next)
+            n++;
+        *threads = n;
+    }
+    if (!g_verifyCounters)
+        return 0;
+    uint64_t bad = 0;
+    const auto cmp = [&](uint64_t a, uint64_t b) { bad += (a != b) ? 1 : 0; };
+    cmp(g_packets.load(),
+        CensusSum([](Census& c) -> std::atomic<uint64_t>& { return c.packets; }));
+    cmp(g_regWrites.load(),
+        CensusSum([](Census& c) -> std::atomic<uint64_t>& { return c.regWrites; }));
+    cmp(g_draws.load(), CensusSum([](Census& c) -> std::atomic<uint64_t>& { return c.draws; }));
+    cmp(g_drawsPredicatedOut.load(),
+        CensusSum([](Census& c) -> std::atomic<uint64_t>& { return c.drawsPredicatedOut; }));
+    for (uint32_t t = 0; t < 4; t++)
+        cmp(g_types[t].load(),
+            CensusSum([t](Census& c) -> std::atomic<uint64_t>& { return c.types[t]; }));
+    for (uint32_t op = 0; op < 128; op++)
+        cmp(g_opcodes[op].load(),
+            CensusSum([op](Census& c) -> std::atomic<uint64_t>& { return c.opcodes[op]; }));
+    return bad;
+}
 
 // The (mask, select) pair table, in the same shape `tools/xtr_bin_predication.py`
 // prints for capture B1. Enabled by CW_PM4_BIN_CENSUS=1 and printed by the ring trace.

@@ -127,6 +127,61 @@ fix is the thing holding it closed.
 
 ---
 
+## 2. The performance campaign — parts 47-55, wholesale
+
+| | |
+|---|---|
+| **Imported** | 2026-08-18 (part 4) |
+| **Source** | Case Zero `82d181f..444631f` — the whole performance campaign, parts 47 through 55+ (177 commits), taken at their HEAD of 2026-08-18 |
+| **Files changed here** | `runtime/gpu/vk_renderer.cpp`, `gpu/pm4.cpp/.h`, `gpu/vd.cpp/.h`, `host/window.cpp/.h`, `kernel/imports.cpp`, `main.cpp`; NEW `cpu/thread_budget.cpp/.h`, `gpu/pump_stats.h`; `CMakeLists.txt` |
+| **Method** | per-file `git diff 82d181f..HEAD` patches with the transplant's textual `CZ_`→`CW_` rename applied to the patch itself; applied clean except one merge conflict (the A2M block, resolved to CZ HEAD's form). Residual diff vs CZ HEAD afterwards is only this port's own instruments (`CW_VK_CENSUS_FRAME`, `CW_VK_VS_CENSUS`, the LT/RT synthetic tokens) plus provenance comments — verified by normalising back and diffing. |
+| **Re-measured here?** | **YES — operator, 2026-08-18, in play at 2560x1440 internal: "Framerate is about 4x higher and even more and cannot see any regression."** Their gameplay baseline on the old build was **16-24 fps** (often well under the 31 fps the title-screen measurements showed — one scene is one sample, gotcha 133); the new build runs **68-120 fps**, at 4x the pixels. Profiler snapshot during their session: 67.5-68.0 fps, 14.7-14.8 ms/frame at 6,961 draws/frame — with the profiler's own ~4.3 ms/frame bill included. |
+
+### What came across (the headline items, with their sibling parts)
+
+- **Part 47** — texture content guard runs once per frame per entry under its own budget;
+  per-fetch sampler lookup and PM4 register writes go flat/bulk; vertex+index bind state
+  cache. Their operator A/B: −21.3 ms at matched draws.
+- **Part 48** — `getenv`/`snprintf` off the per-draw and per-packet paths (245→119 ns/draw
+  in `other`); PM4 census counters per-thread; the A2M mode read becomes a static
+  (`CW_VK_A2M_MODE`, default 2).
+- **Part 49** — **the frame-rate ladder fix and 60 fps by default**: vblank period 1 ms,
+  present interval pinned at the title's own 2, host vsync explicitly off. `CW_FPS_CAP=30`
+  restores shipped pacing and is the control arm.
+- **Part 50** — type-2 PM4 filler consumed in one call; the profiler prints its own bill.
+- **Part 54** — **the Vulkan swapchain is the DEFAULT present path** (MAILBOX; the readback
+  and its two full-frame copies no longer run). `CW_VK_NO_SWAPCHAIN=1` is the control arm.
+  Swapchain follows window resizes; `CW_WINDOW_SIZE` / `CW_WINDOW_MAXIMIZED` make the window
+  a controlled variable. **`CW_VK_RES=2560x1440` / `CW_VK_RES_SCALE=N`** — internal
+  resolution as an integer multiple of the title's 1280x720.
+- **Part 55** — **one thread budget for the whole runtime, sized from PHYSICAL cores**
+  (`cpu/thread_budget.*`; on the operator's 8-core machine: 3 workers granted, machine
+  stays usable); the per-frame stream cache, shader table, cross-frame store index and
+  texture cache all become flat open-addressed tables; tables pre-sized with every grow
+  counted; per-window ALU constant-copy memo; `CW_VK_VRAM_STREAMS=1` arm (geometry in
+  device-local memory — an arm, not the default).
+
+### Gates run here
+
+Build + link clean first try; `cw_runtime --smoke` passes; an autonomous DebugJump run
+reached in-game (swapchain, thread budget, fps-cap lines all visibly engaged — the rename
+gate every imported `CW_` arm must pass); then the operator's own 1440p session, quoted
+above. **Not re-measured here**: the individual per-item A/Bs (each has its Case Zero
+control arm renamed and kept, so any one of them can be re-litigated on this title if a
+regression ever points at it).
+
+### Two defaults changed by this import — what to watch
+
+1. **Pacing**: the title now runs at its 60 fps configuration instead of the 30 fps ladder.
+   Case Zero registered and refuted "the cap doubles simulation speed" (their part 49);
+   taken on the sibling's evidence — same engine — and nothing in the operator's session
+   contradicted it. If sim speed ever looks wrong, `CW_FPS_CAP=30`.
+2. **A2M dither** (`CW_VK_A2M_MODE` default 2, per-sample). Case West has no outdoor
+   foliage, so the screen-door trade that motivated mode 1 there may never apply here.
+   Operator saw no regression.
+
+---
+
 ## PENDING — defects known to be Case Zero's, waiting on a fix there
 
 **These are NOT to be investigated in this port.** They were reported here by the operator
@@ -137,7 +192,7 @@ fix for the same defect. Watch the named item, import when it closes, add a row 
 | defect here | Case Zero item | state there (checked 2026-08-16) | what to watch |
 |---|---|---|---|
 | **Decals not rendering properly** — minor visual, operator says fix later | **00m** in `docs/open-items.md` | Reported at their part 47, **explicitly NOT investigated**, no captures requested. Theirs to characterise once the performance work lands. | any commit touching decals / the decal draw pass |
-| **Performance** | **00l**, parts 47-48 | Actively in progress. Part 47's A/B reached the two-vblank pacing floor on their headless route. **Their working tree carries uncommitted part-47 work on `vk_renderer.cpp`** — a three-way `record` profiler split and a four-lane `GuardFold`. | that work being committed, then import as a row above |
+| ~~**Performance**~~ | ~~**00l**, parts 47-48~~ | **IMPORTED 2026-08-18 — row 2 above.** The campaign ran to their part 55+ and came across wholesale. | further perf commits there; `git log 444631f..HEAD -- runtime/` in the sibling gives the delta |
 
 Their likely handle on decals, recorded so it is not re-derived: decals are a separate draw
 pass with their own blend state, so a draw census plus draw-ID on a frame containing one

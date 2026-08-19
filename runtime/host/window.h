@@ -121,6 +121,78 @@ void Host_RequestDebugMenu();
 void Host_RequestSnapDump();
 bool Host_ConsumeSnapDumpPressed();
 
+// ===================================================================================
+// THE VULKAN SWAPCHAIN SEAM — CW_VK_SWAPCHAIN=1 (part 54, plan §7)
+// ===================================================================================
+// Everything above presents by COPYING: the renderer reads its colour target back into
+// host memory, `Host_PresentPixels` copies that into the window's back buffer, and the
+// event loop uploads it again with `SDL_UpdateTexture`. Three full frames of traffic and
+// a GPU->CPU->GPU round trip, per presented frame, for pixels that never left the card
+// in the first place.
+//
+// That was the right trade while the guest ran at 30 fps into a 1280x720 target — 3.5 MB
+// a frame is nothing, and it kept Vulkan off the window's thread, which is the separation
+// phase 3 was built around. Part 53's internal resolution knob changed the arithmetic:
+// the copy is the scale SQUARED, so at `CW_VK_RES=2560x1440` it is 14.1 MB a frame, and
+// MEASURED (part 54, windowed, ~3,700 draws) it is:
+//
+//     1280x720    readback 8.1-8.7% of the frame     ~0.65 ms
+//     2560x1440   readback 16.4-17.9%                ~1.7-2.2 ms
+//
+// — the largest single non-draw phase at 2x, and the only cost in this renderer that
+// grows when the operator raises the resolution.
+//
+// So this seam exists to let the renderer present the image it already has, in place.
+// It is an ARM, not a replacement: without `CW_VK_SWAPCHAIN` not one line of it runs and
+// the copy path above is untouched, which is what makes the two same-binary arms of one
+// A/B rather than a rewrite that has to be trusted.
+//
+// THE FLAG HAS TO BE DECIDED AT WINDOW-CREATION TIME. `SDL_WINDOW_VULKAN` cannot be added
+// to a window that already exists, and a window carrying it cannot also carry an
+// `SDL_Renderer` — so the choice is made once, in Host_WindowInit, before the guest
+// starts. The renderer asks about it later, from the pump thread, through
+// Host_VulkanSwapchainWanted().
+bool Host_VulkanSwapchainWanted();
+
+// The instance extensions SDL needs for a surface on this window (VK_KHR_surface plus the
+// platform one). Empty when there is no Vulkan window, which is the honest answer for a
+// headless run and makes the renderer's "no swapchain here" branch data-driven rather
+// than a second env-var read.
+std::vector<const char*> Host_VulkanInstanceExtensions();
+
+// Create the surface for this window. `instance` and `outSurface` are `VkInstance` and
+// `VkSurfaceKHR*` passed as void*/uintptr_t so that this header — which the whole runtime
+// includes — does not have to pull in vulkan.h. Returns false and says why on failure.
+bool Host_VulkanCreateSurface(void* instance, uint64_t* outSurface);
+
+// The window's drawable size in pixels, which on a scaled display is NOT its logical
+// size. The swapchain is created at this extent and re-created when it changes.
+void Host_VulkanDrawableSize(uint32_t* w, uint32_t* h);
+
+// The debug overlay, rasterised into an RGBA8 buffer for a caller that has no
+// SDL_Renderer — i.e. the Vulkan swapchain present path, which is the default since part
+// 54. Returns false when the menu is not open, in which case nothing is written.
+//
+// The buffer is a FIXED logical size (the out params say which) rather than the window's,
+// because the caller scales it: rasterising a 3440x1368 overlay on the CPU every frame to
+// draw a menu panel would be a real cost for a debug feature, and the glyphs are 5x7
+// blocks that scale without looking any worse than they already do.
+//
+// It exists because making the swapchain the default would otherwise have DELETED the F4
+// menu, and the one honest way to ship a default is that nothing is quietly lost with it.
+// `rgba` is the PANEL ONLY, `width`/`height` are its size, and `x`/`y` are where it sits
+// inside a `baseW` x `baseH` logical screen so the caller can scale the rectangle to a
+// window of any size.
+//
+// IT IS THE PANEL AND NOT THE SCREEN, and that is the whole correctness of it: the caller
+// composites with a BLIT, and a blit is a copy, not a blend. A full-screen overlay bitmap
+// with transparent margins therefore overwrites everything around the panel with black —
+// which is exactly what the first version of this did, hiding the entire game behind the
+// menu. Handing back only the panel's rectangle means the copy touches only the pixels
+// the menu actually occupies, and needs no blending to be correct.
+bool Host_DebugOverlayRender(std::vector<uint8_t>& rgba, uint32_t& width, uint32_t& height,
+                             uint32_t& x, uint32_t& y, uint32_t& baseW, uint32_t& baseH);
+
 // Host-rendered replacement for the retail build's missing blue debug-menu layer.
 // The labels still come from the genuine guest cDebugMenu nodes.
 void Host_DebugMenuSetItems(const std::vector<std::string>& items);
