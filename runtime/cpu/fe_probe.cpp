@@ -1782,12 +1782,20 @@ void FeProbe_Report()
     // address) are searched the same way — those are the shader OBJECTS, and their
     // absence or presence names the divergence: bank never loaded, loaded but never
     // wrapped, or wrapped but never selected.
-    if (uint8_t* b3 = g_base.load(std::memory_order_relaxed))
+    // OPT-IN ONLY since 2026-08-19. This scan memmem-walks the whole guest window
+    // once for the needle and once more PER HIT for the pointer searches (16 sweeps
+    // of up to ~3 GB with 8 hits) — and the report runs synchronously on the window
+    // thread at close, so the default-on scan made every Case West window close sit
+    // in "not responding" for the duration (operator report; Case Zero closes
+    // instantly because it has no fe_probe). Its question is also ANSWERED: finding
+    // 58 located the shader and the whole widget mechanism. Kept behind its env for
+    // any future "is this microcode staged" question.
+    const char* ucodePath = std::getenv("CW_FE_UCODE_SCAN");
+    if (!ucodePath)
+        std::fprintf(stderr, "[fe]   UCODE SCAN skipped (set CW_FE_UCODE_SCAN=<path> "
+                             "to run it; it sweeps the guest window and stalls close)\n");
+    if (uint8_t* b3 = ucodePath ? g_base.load(std::memory_order_relaxed) : nullptr)
     {
-        const char* ucodePath = std::getenv("CW_FE_UCODE_SCAN");
-        if (!ucodePath)
-            ucodePath = "/home/wivi514/DR2CW-troubleshooting/ucode-dumps/"
-                        "vs_a4ae7c2b7c1818c4.ucode";
         FILE* uf = std::fopen(ucodePath, "rb");
         if (!uf)
             std::fprintf(stderr, "[fe]   UCODE SCAN: cannot open %s\n", ucodePath);
