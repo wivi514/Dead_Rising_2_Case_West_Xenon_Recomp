@@ -11975,9 +11975,19 @@ void VkRenderer_Draw(uint8_t* base, const Pm4Draw& draw)
     // door each meter draw takes.
     static const bool meterTrace = getenv("CW_PM4_METER_TRACE") != nullptr;
     const bool meterVs = meterTrace && Pm4_BoundShader(0).hash == 0xa4ae7c2b7c1818c4ull;
+    const bool bitsVs = meterTrace && Pm4_BoundShader(0).hash == 0x667b04293a65b5caull;
     // The resolve discriminator, and the only one: RB_MODECONTROL's edram_mode.
     if ((regs[0x2208] & 7) == 6)
     {
+        if (bitsVs)
+        {
+            static uint64_t n = 0;
+            ++n;
+            if (n <= 8 || (n & (n - 1)) == 0)
+                fprintf(stderr, "[mtrbits]   renderer: BIT draw #%llu took the RESOLVE "
+                                "door (modecontrol=%08X)\n",
+                        (unsigned long long)n, regs[0x2208]);
+        }
         if (meterVs)
         {
             static uint64_t n = 0;
@@ -11998,6 +12008,17 @@ void VkRenderer_Draw(uint8_t* base, const Pm4Draw& draw)
             fprintf(stderr, "[mtrvs]   renderer: meter draw #%llu entered DoDraw "
                             "(ps=%016llx prim=%u count=%u indexed=%u)\n",
                     (unsigned long long)n,
+                    (unsigned long long)Pm4_BoundShader(1).hash, draw.primType,
+                    draw.indexCount, draw.indexed ? 1u : 0u);
+    }
+    if (bitsVs)
+    {
+        static uint64_t n = 0;
+        ++n;
+        if (n <= 8 || (n & (n - 1)) == 0)
+            fprintf(stderr, "[mtrbits]   renderer: BIT draw #%llu entered DoDraw "
+                            "(frame=%llu ps=%016llx prim=%u count=%u indexed=%u)\n",
+                    (unsigned long long)n, (unsigned long long)R->frame,
                     (unsigned long long)Pm4_BoundShader(1).hash, draw.primType,
                     draw.indexCount, draw.indexed ? 1u : 0u);
     }

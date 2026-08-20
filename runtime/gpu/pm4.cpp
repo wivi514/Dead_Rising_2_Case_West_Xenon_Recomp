@@ -1716,6 +1716,25 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t pos, uint32_
                         (unsigned long long)transitions);
         }
     }
+    // The BIT GEOMETRY shader (vs_667b04293a65b5ca) — the class hardware draws 60x
+    // per frame for the widget segments and our in-game census contains ZERO of.
+    // Counted at the packet with its predication verdict, because predication is the
+    // one mechanism in this walk that can eat a draw class silently.
+    if (meterTrace && (opcode == 0x22 || opcode == 0x36) &&
+        g_boundShaders[0].hash == 0x667b04293a65b5caull)
+    {
+        static uint64_t seen = 0, pred = 0;
+        ++seen;
+        if (predicated)
+            ++pred;
+        if (seen <= 16 || (seen & (seen - 1)) == 0)
+            fprintf(stderr,
+                    "[mtrbits] draw #%llu with the BIT shader bound -> %s  "
+                    "(mask=%016llX select=%016llX; %llu of %llu predicated so far)\n",
+                    (unsigned long long)seen, predicated ? "PREDICATED OUT" : "EXECUTED",
+                    (unsigned long long)g_binMask, (unsigned long long)g_binSelect,
+                    (unsigned long long)pred, (unsigned long long)seen);
+    }
     if (meterTrace && (opcode == 0x22 || opcode == 0x36) &&
         g_boundShaders[0].hash == 0xa4ae7c2b7c1818c4ull)
     {

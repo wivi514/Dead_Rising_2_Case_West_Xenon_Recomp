@@ -2876,3 +2876,42 @@ the first dest whose sequence (paint count, region, clear extent) diverges from 
 — then check what our clear-after actually clears** (whole stand-in? copy region only?).
 Nothing GPU-side remains unexplained above this point: the loss is inside the
 resolve/EDRAM-state semantics, not in draw delivery.
+
+## 59. **THE WIDGET GEOMETRY IS `vs_667b04293a65b5ca`, AND THE GUEST STOPS EMITTING IT IN-GAME** — part 4, 2026-08-19
+
+Finding 58's open edge is closed and the defect has a name. Measured today, all on one
+binary, with pictures:
+
+- **The missing draw class**: hardware's in-game HUD frame carries **60 draws** of
+  `vs_667b04293a65b5ca` / `ps_6a348c839d760e93` — quad lists (prim 13), auto-indexed,
+  1,560-2,396 verts, sampling the resolved 32x1/1x1 strip textures. **Six of our in-game
+  frame censuses contain ZERO.** That class IS the widget segments.
+- **It is not a renderer drop**: `CW_PM4_METER_TRACE=1` now traces this hash too
+  (`[mtrbits]`). The draws execute unpredicated by the tens of thousands and enter
+  DoDraw with valid shaders and topology — **but only during the TITLE/MENU era**
+  (frames ~2,162-4,871 of a 1s-token run); the stream then stops. In-game: zero. So
+  **the guest itself stops emitting the widget draws in-game in our runtime**, where
+  hardware emits 60 per frame. The loss is a guest-side per-frame emission gate.
+- **Snapshot content, photographed** (poison run, `CW_VK_CLEAR_POISON=1` + F9 capture):
+  the 128-class widget textures are pure clear-color copies (solid magenta under
+  poison), and of the nine 64x64 square textures the first holds real gold art while
+  the other eight are painted SOLID BLACK by their one paint draw each. No magenta
+  appears in the HUD, so nothing composites those textures as-is.
+- **The HUD itself photographed in-game for the first time on this port**
+  (`cap_poison6/capture_016793`): LIFE's filled squares render, the PP bar and the
+  mission progress line are absent — the defect exactly as the operator reported it.
+
+**Recipe note:** the perf import changed all boot timings; the operator's DebugJump
+recipe re-derived at `CW_FAKE_START_MS=1000` granularity (same wall-clock seconds,
+1s tokens), and the operator's capture guidance is F9 at +1 s and +3 s after the final
+A, no LT needed.
+
+**THE ARMED NEXT MEASUREMENT — the two-era counter diff.** The title screen is a
+same-binary CONTROL where the emission works. A title-era fe report (35 s idle) reads:
+flush dispatch 506 / bits-write 1,657,908 / begin 388,018 / submit 592,379 /
+end 2,612,622, batches pass ~2,900 with high-water 0 and DROPPED 0 (`run_eraT.log`).
+Take the matching IN-GAME report (DebugJump recipe + `CW_FE_AUTOREPORT=75`), normalise
+to rates, and the first chain stage that is active at the title and flat in-game names
+the gate that stops the widget draws. (Note the title batches' high-water reading 0
+while bit draws demonstrably fire — read that counter's meaning before trusting it,
+gotcha 30.)
