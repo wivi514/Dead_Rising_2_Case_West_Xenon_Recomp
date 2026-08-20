@@ -1687,6 +1687,56 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t pos, uint32_
     if (g_binCensus && (opcode == 0x22 || opcode == 0x36))
         BinCensusRecord(g_binMask, g_binSelect, predicated);
 
+    // CW_PM4_METER_TRACE=1 — the meter-shader question, asked AT THE PACKET.
+    //
+    // The guest IM_LOADs vs_a4ae7c2b7c1818c4 (the meter/bits shader, 15 dwords,
+    // va=0 = inline immediate form) yet the renderer's pipeline census never sees a
+    // draw with it bound. Between those two facts sits exactly this walk, and the
+    // one mechanism in it that can eat a draw silently is predication. So: while
+    // that hash is the bound VS, count every draw packet and say which door it took
+    // — executed, or predicated out (and under which mask/select). A static bool
+    // guards the whole thing off the hot path (gotcha 329: no getenv per packet).
+    static const bool meterTrace = getenv("CW_PM4_METER_TRACE") != nullptr;
+    if (meterTrace)
+    {
+        // The bind TRANSITIONS, so "zero draws while bound" is distinguishable from
+        // "never bound in this stretch" — a zero with nothing to anchor it is a fact
+        // about what was looked at (the port's recurring lesson), so the tracer
+        // proves the arm engaged by logging the binds themselves, bounded.
+        static bool wasMeter = false;
+        const bool isMeter = g_boundShaders[0].hash == 0xa4ae7c2b7c1818c4ull;
+        if (isMeter != wasMeter)
+        {
+            wasMeter = isMeter;
+            static uint64_t transitions = 0;
+            ++transitions;
+            if (transitions <= 16 || (transitions & (transitions - 1)) == 0)
+                fprintf(stderr, "[mtrvs] meter VS %s (transition #%llu)\n",
+                        isMeter ? "BOUND" : "replaced",
+                        (unsigned long long)transitions);
+        }
+    }
+    if (meterTrace && (opcode == 0x22 || opcode == 0x36) &&
+        g_boundShaders[0].hash == 0xa4ae7c2b7c1818c4ull)
+    {
+        static uint64_t seen = 0, pred = 0;
+        ++seen;
+        if (predicated)
+            ++pred;
+        if (seen <= 32 || (seen & (seen - 1)) == 0) // first 32, then powers of two
+            fprintf(stderr,
+                    "[mtrvs] draw #%llu with the meter VS bound -> %s  "
+                    "(mask=%016llX select=%016llX scissor=%u,%u..%u,%u; %llu of %llu "
+                    "predicated so far)\n",
+                    (unsigned long long)seen, predicated ? "PREDICATED OUT" : "EXECUTED",
+                    (unsigned long long)g_binMask, (unsigned long long)g_binSelect,
+                    g_regs[xenos::kPaScWindowScissorTl] & 0x7FFF,
+                    (g_regs[xenos::kPaScWindowScissorTl] >> 16) & 0x7FFF,
+                    g_regs[xenos::kPaScWindowScissorBr] & 0x7FFF,
+                    (g_regs[xenos::kPaScWindowScissorBr] >> 16) & 0x7FFF,
+                    (unsigned long long)pred, (unsigned long long)seen);
+    }
+
     if (predicated)
     {
         if (opcode == 0x22 || opcode == 0x36)

@@ -1858,6 +1858,39 @@ void FeProbe_Report()
                     }
                 }
                 std::fprintf(stderr, nptr ? "\n" : " (none)\n");
+                // GOTCHA 267: a structure handed to the GPU holds PHYSICAL addresses.
+                // The physical arena at guest 0xA0000000 aliases physical 0x00000000,
+                // so a shader OBJECT pointing the hardware at this copy stores
+                // (h & 0x1FFFFFFF), not h — the first pass above cannot see those.
+                // A 4-byte BE needle of a small integer will also match noise, so the
+                // result is a list of candidate addresses to inspect, not a verdict.
+                if (h >= 0xA0000000u)
+                {
+                    const uint32_t hp = h & 0x1FFFFFFFu;
+                    uint8_t pptr[4] = { uint8_t(hp >> 24), uint8_t(hp >> 16),
+                                        uint8_t(hp >> 8), uint8_t(hp) };
+                    std::fprintf(stderr,
+                                 "[fe]       physical form 0x%08X; pointers to it:", hp);
+                    int npp = 0;
+                    for (const auto& r : regions)
+                    {
+                        const uint8_t* p = reinterpret_cast<const uint8_t*>(r.first);
+                        size_t len = r.second - r.first;
+                        while (len >= 4 && npp < 8)
+                        {
+                            const void* m = memmem(p, len, pptr, 4);
+                            if (!m)
+                                break;
+                            std::fprintf(stderr, " 0x%08X",
+                                         uint32_t(uintptr_t(m) - uintptr_t(b3)));
+                            ++npp;
+                            const size_t adv = uintptr_t(m) - uintptr_t(p) + 1;
+                            p += adv;
+                            len -= adv;
+                        }
+                    }
+                    std::fprintf(stderr, npp ? "\n" : " (none)\n");
+                }
             }
             if (hits.empty())
                 std::fprintf(stderr,

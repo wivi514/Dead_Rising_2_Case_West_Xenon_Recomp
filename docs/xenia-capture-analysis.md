@@ -2836,3 +2836,43 @@ across sessions of different lengths, so `sub_82763900/82753FF8/8274C488` are a
 BOOT-TIME build pass, not the per-frame flush; only the bits-write counter scales with
 session length. The per-frame consumer of the bits batches remains the open question in
 the progress-widget investigation.
+
+## 58. **vs_a4ae7c2b7c1818c4 IS THE RESOLVE-RECT SHADER — the widgets are made by RESOLVES, and our guest emits them all** — part 4, 2026-08-19
+
+**Finding 36's interpretation is RETRACTED IN PART, in place.** "One vertex shader draws all
+the broken widgets" was read as *the widget geometry's* vertex shader. It is not: it is the
+title's **resolve-rectangle shader**. Measured three ways today:
+
+- **Our PM4 walk** (`CW_PM4_METER_TRACE=1`, new): >1,048,576 draws executed with a4ae bound
+  in one session — **every one with RB_MODECONTROL edram_mode=6 (kCopy)**, ~6% predicated,
+  the rest handed to the renderer, where **all take the RESOLVE door**. That is why the
+  pipeline-level VS census (`CW_VK_VS_CENSUS=1`, run today: 37 distinct VS, no a4ae) never
+  sees it — resolves do not build pipelines.
+- **Hardware says the same** (`tools/xtr_meter_resolves.py`, new, over the operator's
+  `R2_ui_bars` traces): in `pp_mission_bar.xtr` ALL 59 a4ae draws are modecontrol=6 — and
+  they are the frame's ONLY mode-6 draws; every real draw uses other shaders at modes 4/5.
+  So even in hardware's frame the "55 widget draws" were resolves.
+- **The widget mechanism**: paint into EDRAM with ordinary draws → **convert-resolve**
+  (RB_COPY_CONTROL copy_command=CONVERT, colour+depth **clear-after**, ctl=0x0010030x) into a
+  small texture (destPitch encodes it: 64x64 per LIFE square, 128x64, 512x256...), composite
+  that texture later with the normal FE shaders. Draws 887-893 = seven consecutive 64x64
+  resolves = the 7 LIFE squares.
+
+**What is measured HEALTHY in our runtime:** the resolves run (snapshots created, regions
+correct, `entered==accepted` on every pass — a new `drawsEnteredThisPass` counter separates
+"guest emitted nothing" from "we dropped it in DoDraw", and NOTHING is dropped).
+
+**The open divergence, where the next session starts:** our resolve trace at the boot
+loading popup shows the 64x64 widget resolves each preceded by exactly ONE 3-vertex paint
+draw (plausibly healthy), but the 128x128/128x64 resolves preceded by **ZERO paint draws**
+— they copy out EDRAM that the PREVIOUS resolve's clear-after just wiped, i.e. blank.
+Hardware's `loading_popup.xtr` ALSO shows zero-paint resolves (`since=0` runs at draws
+36-41), so "zero paint draws" is not by itself the defect — the question is what those
+zero-paint resolves COPY on hardware: EDRAM content that survives from an earlier pass
+because the clear-after only wipes the copy region / uses different extents, versus our
+EDRAM stand-in whose state at that point differs. **Next measurement: run
+`tools/xtr_meter_resolves.py` against our own resolve sequence at the same screen and find
+the first dest whose sequence (paint count, region, clear extent) diverges from hardware's
+— then check what our clear-after actually clears** (whole stand-in? copy region only?).
+Nothing GPU-side remains unexplained above this point: the loss is inside the
+resolve/EDRAM-state semantics, not in draw delivery.

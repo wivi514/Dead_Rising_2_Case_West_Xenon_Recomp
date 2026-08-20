@@ -2994,6 +2994,11 @@ struct Renderer
     // completely different investigations that look identical in a snapshot.
     uint64_t drawsThisPass = 0;
     uint64_t verticesThisPass = 0;
+    // Draws that ENTERED DoDraw this pass, before any early-out. `drawsThisPass` counts
+    // survivors only, so entered==accepted means the guest emitted nothing extra, and
+    // entered>accepted names a drop INSIDE DoDraw — two different suspects that one
+    // counter cannot separate (the progress-widget hunt needed exactly this split).
+    uint64_t drawsEnteredThisPass = 0;
     // Which resolve snapshots the draws of the current pass SAMPLED, and how many
     // textures they took from guest memory instead.
     //
@@ -8207,6 +8212,7 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     // the phases, computed at print time; it is not measured separately, because a sum
     // and a second measurement of the same interval can only ever disagree.
     ProfScope _pDraw(&g_prof.drawOther);
+    ++R->drawsEnteredThisPass;
     // CW_VK_PROFILE_EXTRA_SCOPES=N — THE POSITIVE CONTROL for the instrument line at the
     // bottom of the profile print, and the only thing that can refute its model.
     //
@@ -8228,6 +8234,14 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     ProfScope _pShader(&g_prof.otherShader);
     if (!vsBind.hash || !psBind.hash)
     {
+        if (vsBind.hash == 0xa4ae7c2b7c1818c4ull)
+        {
+            static uint64_t n = 0;
+            ++n;
+            if (n <= 8 || (n & (n - 1)) == 0)
+                fprintf(stderr, "[mtrvs]   renderer: meter draw #%llu dropped — NO PS "
+                                "BOUND\n", (unsigned long long)n);
+        }
         Count("draw: no shader bound");
         return;
     }
@@ -8332,6 +8346,14 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     }
     if (!draw.indexCount)
     {
+        if (vsBind.hash == 0xa4ae7c2b7c1818c4ull)
+        {
+            static uint64_t n = 0;
+            ++n;
+            if (n <= 8 || (n & (n - 1)) == 0)
+                fprintf(stderr, "[mtrvs]   renderer: meter draw #%llu dropped — ZERO "
+                                "INDICES\n", (unsigned long long)n);
+        }
         Count("draw: zero indices");
         return;
     }
@@ -10842,9 +10864,19 @@ void DoResolve(uint8_t* base, const uint32_t* regs)
     // hour deciding whether a 1024x1024 cascade was being clipped, and every input the
     // trace printed said it was not. What is missing from a register dump is the
     // DECISION the renderer made from them.
+    // CW_PM4_METER_TRACE=1 also traces every resolve issued with the meter/resolve
+    // VS (a4ae) bound, on its own budget — the widget segments are PRODUCED by these
+    // resolves (hardware: all 59 a4ae draws in pp_mission_bar.xtr are modecontrol=6,
+    // copy_command=CONVERT, clear-after), so the decision line below IS the defect
+    // surface for the progress-widget hunt.
+    static const bool meterTraceHere = getenv("CW_PM4_METER_TRACE") != nullptr;
+    static int meterPassesLeft = 48;
+    const bool meterResolve =
+        meterTraceHere && Pm4_BoundShader(0).hash == 0xa4ae7c2b7c1818c4ull;
     const bool traceThisPass =
-        EnvOn("CW_VK_RESOLVE_TRACE") && passesLeft > 0 &&
-        R->frame >= uint64_t(strtoul(Env("CW_VK_RESOLVE_TRACE"), nullptr, 10));
+        (EnvOn("CW_VK_RESOLVE_TRACE") && passesLeft > 0 &&
+         R->frame >= uint64_t(strtoul(Env("CW_VK_RESOLVE_TRACE"), nullptr, 10))) ||
+        (meterResolve && meterPassesLeft > 0 && (--meterPassesLeft, true));
     if (traceThisPass)
     {
         --passesLeft;
@@ -10853,7 +10885,7 @@ void DoResolve(uint8_t* base, const uint32_t* regs)
                     "[vkresolve] frame=%llu dest=%08X src=%s destPitch=%u destHeight=%u "
                     "surfacePitch=%u scissor=%u,%u..%u,%u win=%u,%u..%u,%u "
                     "winoff=%08X ctl=%08X info=%08X "
-                    "front=%08X rtFmt=%u draws=%llu verts=%llu\n",
+                    "front=%08X rtFmt=%u draws=%llu entered=%llu verts=%llu\n",
                     (unsigned long long)R->frame, dest,
                     srcSelect == 4 ? "DEPTH" : "colour",
                     regs[xenos::kRbCopyDestPitch] & 0x3FFF,
@@ -10871,6 +10903,7 @@ void DoResolve(uint8_t* base, const uint32_t* regs)
                     regs[xenos::kRbCopyDestInfo], R->frontBuffer,
                     (regs[xenos::kRbColorInfo] >> 16) & 0xF,
                     (unsigned long long)R->drawsThisPass,
+                    (unsigned long long)R->drawsEnteredThisPass,
                     (unsigned long long)R->verticesThisPass);
         }
         // The pass's INPUTS, which is what says whether a compose is reading the scene.
@@ -10888,6 +10921,7 @@ void DoResolve(uint8_t* base, const uint32_t* regs)
         fprintf(stderr, "\n");
     }
     R->drawsThisPass = 0;
+    R->drawsEnteredThisPass = 0;
     R->verticesThisPass = 0;
     R->snapshotsSampledThisPass.clear();
     R->guestTexturesThisPass = 0;
@@ -11935,11 +11969,37 @@ void VkRenderer_Draw(uint8_t* base, const Pm4Draw& draw)
     // link (gotcha 162), including the link between two modules.
     COUNT("draw: handed to the renderer");
     const uint32_t* regs = Pm4_Registers();
+    // CW_PM4_METER_TRACE=1 — the renderer half of pm4.cpp's [mtrvs] tracer. PM4
+    // executes >1M draws with the meter VS bound and the pipeline census never sees
+    // one, so the loss is between this function's entry and the key build: name the
+    // door each meter draw takes.
+    static const bool meterTrace = getenv("CW_PM4_METER_TRACE") != nullptr;
+    const bool meterVs = meterTrace && Pm4_BoundShader(0).hash == 0xa4ae7c2b7c1818c4ull;
     // The resolve discriminator, and the only one: RB_MODECONTROL's edram_mode.
     if ((regs[0x2208] & 7) == 6)
     {
+        if (meterVs)
+        {
+            static uint64_t n = 0;
+            ++n;
+            if (n <= 8 || (n & (n - 1)) == 0)
+                fprintf(stderr, "[mtrvs]   renderer: meter draw #%llu took the RESOLVE "
+                                "door (modecontrol=%08X)\n",
+                        (unsigned long long)n, regs[0x2208]);
+        }
         DoResolve(base, regs);
         return;
+    }
+    if (meterVs)
+    {
+        static uint64_t n = 0;
+        ++n;
+        if (n <= 8 || (n & (n - 1)) == 0)
+            fprintf(stderr, "[mtrvs]   renderer: meter draw #%llu entered DoDraw "
+                            "(ps=%016llx prim=%u count=%u indexed=%u)\n",
+                    (unsigned long long)n,
+                    (unsigned long long)Pm4_BoundShader(1).hash, draw.primType,
+                    draw.indexCount, draw.indexed ? 1u : 0u);
     }
     DoDraw(base, draw, regs, Pm4_BoundShader(0), Pm4_BoundShader(1));
 }
