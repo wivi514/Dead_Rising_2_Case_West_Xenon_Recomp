@@ -61,6 +61,17 @@ void VkRenderer_OnSwap(uint8_t* base, uint32_t frontBuffer, uint32_t width,
 // instead of a hunt.
 void VkRenderer_DumpStats();
 
+// Ask the swapchain to rebuild at the next present even though the drawable size is
+// unchanged — the seam a live VSync change needs (part 60): the present mode is a
+// property of the swapchain, so FIFO<->MAILBOX means recreating it. Callable from
+// any thread; a no-op in the readback present arm.
+void VkRenderer_RequestSwapchainRebuild();
+
+// Change the internal render scale (1..4 over 1280x720) at the next frame
+// boundary — the settings panel's resolution row (part 60). Refused loudly when
+// CW_VK_RES/CW_VK_RES_SCALE pin the scale for a measurement run.
+void VkRenderer_RequestRenderScale(uint32_t scale);
+
 // ===================================================================================
 // Phase C (the D3D pivot): the SAME renderer driven from the API line
 // ===================================================================================

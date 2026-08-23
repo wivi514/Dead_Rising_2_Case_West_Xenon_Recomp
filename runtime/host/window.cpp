@@ -34,14 +34,39 @@ std::atomic<bool> g_debugMenuPressed{false};
 // need SDL at the consuming end.
 std::atomic<bool> g_snapDumpPressed{false};
 
+// F8 — RECORD EVERY PRESENTED FRAME FOR ABOUT A SECOND, on demand.
+//
+// The operator asked for this by describing a defect that no single frame can show:
+// *"The decals how it looks like is pretty much normal but it appears and disappear like
+// flicker make it so when I press f8 it records all frame for a second so you can see it."*
+//
+// That is the right instrument for the right reason. A screenshot of a flicker is a
+// screenshot of one phase of it, and which phase you get is luck (gotcha 133 — one frame of
+// an animated scene is ONE SAMPLE). F9 answers "what does it look like"; F8 answers "what
+// does it do over time", and for an intermittent defect the second question is the only one
+// with an answer.
+//
+// It also discriminates between the two mechanisms that look identical in a still: if the
+// decal's DRAW is issued every frame and only the pixels change, the draw is losing a depth
+// fight; if the draw list itself changes, the geometry is being dropped somewhere. The
+// burst's manifest carries the draw count and the draw fingerprint per frame for exactly
+// that reason, so the burst answers the question rather than just illustrating it.
+std::atomic<bool> g_burstDumpPressed{false};
+
 void Host_RequestDebugJump() { g_debugJumpPressed.store(true, std::memory_order_release); }
 void Host_RequestDebugEnter() { g_debugEnterPressed.store(true, std::memory_order_release); }
 void Host_RequestDebugMenu() { g_debugMenuPressed.store(true, std::memory_order_release); }
 void Host_RequestSnapDump() { g_snapDumpPressed.store(true, std::memory_order_release); }
+void Host_RequestBurstDump() { g_burstDumpPressed.store(true, std::memory_order_release); }
 
 bool Host_ConsumeSnapDumpPressed()
 {
     return g_snapDumpPressed.exchange(false, std::memory_order_acq_rel);
+}
+
+bool Host_ConsumeBurstDumpPressed()
+{
+    return g_burstDumpPressed.exchange(false, std::memory_order_acq_rel);
 }
 
 bool Host_ConsumeDebugJumpPressed()
@@ -81,6 +106,8 @@ bool Host_VulkanSwapchainWanted() { return false; }
 std::vector<const char*> Host_VulkanInstanceExtensions() { return {}; }
 bool Host_VulkanCreateSurface(void*, uint64_t*) { return false; }
 void Host_VulkanDrawableSize(uint32_t* w, uint32_t* h) { if (w) *w = 0; if (h) *h = 0; }
+bool Host_DisplaySize(uint32_t* w, uint32_t* h) { if (w) *w = 0; if (h) *h = 0; return false; }
+int Host_DisplayModeList(uint32_t*, int) { return 0; }
 
 #else
 
@@ -88,6 +115,7 @@ void Host_VulkanDrawableSize(uint32_t* w, uint32_t* h) { if (w) *w = 0; if (h) *
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <mutex>
 #include <vector>
 
@@ -101,6 +129,7 @@ void Host_VulkanDrawableSize(uint32_t* w, uint32_t* h) { if (w) *w = 0; if (h) *
 #include "../gpu/vk_renderer.h"
 #include "../cpu/gap_probe.h"
 #include "../cpu/fe_probe.h"
+#include "settings.h"
 
 namespace {
 
@@ -161,12 +190,130 @@ void PublishDrawableSize()
     if (w <= 0 || h <= 0)
         return;
     const uint32_t nw = uint32_t(w), nh = uint32_t(h);
-    if (nw != g_drawableW.exchange(nw, std::memory_order_acq_rel) ||
-        nh != g_drawableH.exchange(nh, std::memory_order_acq_rel))
+    // BOTH exchanges must run UNCONDITIONALLY. The first version had them inside one
+    // `||`, and `||` short-circuits: on the very first publish the width exchange
+    // returned "changed", so the HEIGHT EXCHANGE ON THE RIGHT NEVER EXECUTED — height
+    // stayed 0 while this line printed "1280x720" from the locals. The pump then read
+    // (1280, 0), clamped the zero to the surface minimum, and built a 1280x1 swapchain
+    // the compositor smeared over the window: the launch-stretch defect, fixed by any
+    // manual resize because a resize re-runs this with the width now equal, which let
+    // the height write finally execute. A side effect on the right of `||` is a write
+    // that happens only when the left side is false.
+    const uint32_t ow = g_drawableW.exchange(nw, std::memory_order_acq_rel);
+    const uint32_t oh = g_drawableH.exchange(nh, std::memory_order_acq_rel);
+    if (nw != ow || nh != oh)
         fprintf(stderr, "[host] window drawable %ux%u (%s present) — quote this with any "
                         "frame time from this run\n",
                 nw, nh, g_renderer ? "readback" : "swapchain");
 }
+// THE DISPLAY'S OWN SIZE (part 60 night item 4) — the desktop mode of whichever
+// display the window currently sits on, published for the settings panel so its
+// Resolution row only offers sizes the player's screen can show. Refreshed from the
+// window thread (SDL rule) at init and once a second from the title-bar block, which
+// also covers the window being dragged to another monitor without needing a
+// display-event subscription of its own. Zero until the window exists; consumers
+// treat unknown as "no clamp".
+std::atomic<uint32_t> g_displayW{ 0 }, g_displayH{ 0 };
+
+// The display's MODE LIST (part 60, operator revision 3): every distinct WxH the
+// display reports that the renderer can honestly produce (Settings_ValidInternalRes)
+// and that fits the desktop, ascending — what the Resolution row offers, the way a
+// game's own menu mirrors the monitor's list. Guarded by its own mutex because the
+// window thread rewrites it on monitor drags while the guest thread's panel input
+// reads it.
+std::mutex g_displayModesMutex;
+std::vector<std::pair<uint32_t, uint32_t>> g_displayModes;
+
+void PublishDisplaySize()
+{
+    if (!g_window)
+        return;
+    const int index = SDL_GetWindowDisplayIndex(g_window);
+    SDL_DisplayMode mode{};
+    if (index < 0 || SDL_GetDesktopDisplayMode(index, &mode) != 0 || mode.w <= 0 ||
+        mode.h <= 0)
+        return;
+    const uint32_t ow = g_displayW.exchange(uint32_t(mode.w), std::memory_order_acq_rel);
+    const uint32_t oh = g_displayH.exchange(uint32_t(mode.h), std::memory_order_acq_rel);
+    if (ow != uint32_t(mode.w) || oh != uint32_t(mode.h))
+        fprintf(stderr, "[host] display %d is %dx%d — the settings panel clamps its "
+                        "resolution list to this\n", index, mode.w, mode.h);
+
+    // The mode list, refreshed whenever the desktop size changed (first publish
+    // included). SDL reports one entry per (size, refresh, format); the menu wants
+    // distinct sizes, so dedupe. Modes the renderer cannot express (odd widths,
+    // sub-720 heights, narrower than 16:9 — the 4:3 and 5:4 legacy modes) are
+    // filtered here so the panel never offers a row it cannot honor.
+    if (ow != uint32_t(mode.w) || oh != uint32_t(mode.h))
+    {
+        std::vector<std::pair<uint32_t, uint32_t>> modes;
+        const int n = SDL_GetNumDisplayModes(index);
+        for (int i = 0; i < n; ++i)
+        {
+            SDL_DisplayMode m{};
+            if (SDL_GetDisplayMode(index, i, &m) != 0 || m.w <= 0 || m.h <= 0)
+                continue;
+            const uint32_t w = uint32_t(m.w), h = uint32_t(m.h);
+            if (!Settings_ValidInternalRes(w, h))
+                continue;
+            if (w > uint32_t(mode.w) || h > uint32_t(mode.h))
+                continue;
+            if (std::find(modes.begin(), modes.end(), std::make_pair(w, h)) ==
+                modes.end())
+                modes.emplace_back(w, h);
+        }
+        std::sort(modes.begin(), modes.end(),
+                  [](const auto& a, const auto& b) {
+                      return a.second != b.second ? a.second < b.second
+                                                  : a.first < b.first;
+                  });
+        fprintf(stderr, "[host] display %d offers %zu usable modes:", index,
+                modes.size());
+        for (const auto& [w, h] : modes)
+            fprintf(stderr, " %ux%u", w, h);
+        fprintf(stderr, "\n");
+        std::lock_guard<std::mutex> lock(g_displayModesMutex);
+        g_displayModes = std::move(modes);
+    }
+}
+
+// Apply a display mode to the live window. WINDOW THREAD ONLY (the SDL rule this
+// whole file exists to keep): Host_WindowInit calls it once after creation for the
+// persisted mode, and the loop calls it when the PC options screen changes the
+// setting mid-run. The resulting SIZE_CHANGED event flows through the normal event
+// path, so PublishDrawableSize fires and the swapchain rebuilds itself exactly as it
+// does for a manual resize — no second resize path to keep correct.
+void ApplyDisplayModeNow(CzDisplayMode m)
+{
+    if (!g_window)
+        return;
+    switch (m)
+    {
+        case CzDisplayMode::Windowed:
+            SDL_SetWindowFullscreen(g_window, 0);
+            break;
+        case CzDisplayMode::Borderless:
+            SDL_SetWindowFullscreen(g_window, SDL_WINDOW_FULLSCREEN_DESKTOP);
+            break;
+        case CzDisplayMode::Fullscreen:
+        {
+            // Exclusive fullscreen AT THE DESKTOP MODE, never at the window's current
+            // size: mode-switching a 2560-wide desktop to 1280x720 because that was
+            // the creation size is the classic wrong spelling of "Fullscreen".
+            SDL_DisplayMode dm{};
+            const int display = SDL_GetWindowDisplayIndex(g_window);
+            if (SDL_GetDesktopDisplayMode(display < 0 ? 0 : display, &dm) == 0)
+                SDL_SetWindowDisplayMode(g_window, &dm);
+            SDL_SetWindowFullscreen(g_window, SDL_WINDOW_FULLSCREEN);
+            break;
+        }
+    }
+    fprintf(stderr, "[host] display mode -> %s\n",
+            m == CzDisplayMode::Windowed ? "windowed"
+            : m == CzDisplayMode::Borderless ? "borderless fullscreen"
+                                             : "fullscreen");
+}
+
 SDL_GameController* g_controller = nullptr;
 SDL_JoystickID      g_controllerId = -1;
 bool g_inputTrace = false;
@@ -278,6 +425,7 @@ const char* Glyph(char c)
         case ':': return "00000011000110000000011000110000000";
         case '/': return "00001000100001000100010001000010000";
         case '>': return "10000010000010000010001000100010000";
+        case '<': return "00001000100010001000001000001000001";
         default:  return nullptr;
     }
 }
@@ -293,10 +441,108 @@ const char* Glyph(char c)
 // until an operator reports that the menu "looks different in the other mode". So the
 // LAYOUT is here, once, and it emits rectangles to whatever wants them; the two backends
 // are a `SDL_RenderFillRect` and a memory fill, and neither knows anything about menus.
+// THE SETTINGS PANEL (part 60) — same one-layout-two-backends contract as the
+// debug overlay below, same rect sink, so it works identically in the readback
+// and swapchain present arms. Drawn over the game's own Help & Options hub: the
+// shipped PC options screen is a shell (its input, focus and exit handshake were
+// compiled out of the 360 XEX), so the menu is HOST property end to end — drawn
+// here, driven from the pad seam in cpu/pc_options.cpp, persisted by settings.cpp.
+template <typename Rect>
+void EmitSettingsOverlay(int w, int h, Rect&& rect)
+{
+    const int panelW = 640, panelH = 380;   // 380: six rows since part 61 (FOV)
+    const int panelX = (w - panelW) / 2, panelY = (h - panelH) / 2 - 30;
+    if (panelW <= 0 || panelH <= 0)
+        return;
+    rect(panelX, panelY, panelW, panelH, 20, 22, 26, 235);
+    rect(panelX, panelY, panelW, 2, 200, 170, 60, 255);
+    rect(panelX, panelY + panelH - 2, panelW, 2, 200, 170, 60, 255);
+    rect(panelX, panelY, 2, panelH, 200, 170, 60, 255);
+    rect(panelX + panelW - 2, panelY, 2, panelH, 200, 170, 60, 255);
+
+    auto text = [&](int tx, int ty, const std::string& str, int scale,
+                    uint8_t r, uint8_t g, uint8_t b) {
+        for (char c : str)
+        {
+            if (const char* bits = Glyph(c))
+                for (int row = 0; row < 7; ++row)
+                    for (int col = 0; col < 5; ++col)
+                        if (bits[row * 5 + col] == '1')
+                            rect(tx + col * scale, ty + row * scale, scale, scale,
+                                 r, g, b, 255);
+            tx += 6 * scale;
+        }
+    };
+
+    text(panelX + 20, panelY + 16, "PC SETTINGS", 3, 245, 235, 200);
+    text(panelX + 20, panelY + 46, "UP/DOWN ROW   LEFT/RIGHT CHANGE   B CLOSE", 2,
+         160, 160, 170);
+
+    static const char* kModeNames[] = { "WINDOW", "BORDERLESS", "FULLSCREEN" };
+    static const char* kOnOff[] = { "OFF", "ON" };
+    static const char* kTiers[] = { "LOW", "MEDIUM", "HIGH" };
+    const uint32_t scale = Settings_RenderScale();
+    // The Resolution row shows the persisted internal resolution directly (operator
+    // revision 3: the value IS a width x height, stepped through the display's own
+    // mode list in pc_options.cpp).
+    char resName[20];
+    {
+        uint32_t rw = 0, rh = 0;
+        Settings_InternalRes(rw, rh);
+        snprintf(resName, sizeof resName, "%u X %u", rw, rh);
+    }
+    // The frame cap's display name. Values come from the validated set in
+    // settings.cpp, so the fallback only fires on a hand-edited file mid-run.
+    char capName[8] = "OFF";
+    if (const int cap = Settings_FpsCap(); cap > 0)
+        snprintf(capName, sizeof capName, "%d", cap);
+    // The FOV row shows "OG" at 0 — the plan's language for "exactly the game's own
+    // camera" — and a signed degree adjustment otherwise. Applies LIVE.
+    char fovName[8] = "OG";
+    if (const int fov = Settings_Fov(); fov != 0)
+        snprintf(fovName, sizeof fovName, "%+d", fov);
+    const char* rows[6][2] = {
+        { "RESOLUTION", resName },
+        { "DISPLAY MODE", kModeNames[int(Settings_DisplayMode()) % 3] },
+        { "VSYNC", kOnOff[Settings_VSync() ? 1 : 0] },
+        { "SHADOW QUALITY", kTiers[Settings_ShadowTier() % 3] },
+        { "FRAME CAP", capName },
+        { "FIELD OF VIEW", fovName },
+    };
+    const int sel = Settings_OverlaySelection();
+    for (int i = 0; i < 6; ++i)
+    {
+        const int y = panelY + 86 + i * 40;
+        if (i == sel)
+            rect(panelX + 12, y - 6, panelW - 24, 30, 70, 55, 20, 255);
+        text(panelX + 28, y, rows[i][0], 2, i == sel ? 255 : 200,
+             i == sel ? 240 : 200, i == sel ? 180 : 205);
+        std::string value = std::string("< ") + rows[i][1] + " >";
+        text(panelX + panelW - 28 - int(value.size()) * 12, y, value, 2,
+             i == sel ? 255 : 190, i == sel ? 240 : 210, i == sel ? 120 : 210);
+    }
+    // The Shadow row is LIVE as of part 60 (the renderer re-reads the tier each
+    // frame), but the tier scales are floored at the title's own 1280x720 base — so
+    // at render scale 1 every tier is 1x and the row is honestly inert, which the
+    // footer says rather than letting a dead row pretend (the gamma-slider rule).
+    text(panelX + 20, panelY + panelH - 30,
+         scale > 1 ? "RESOLUTION: NEXT LAUNCH - SHADOW: LIVE"
+                   : "RESOLUTION: NEXT LAUNCH - SHADOW INERT AT 720P",
+         2, 150, 140, 120);
+}
+
 template <typename Rect>
 void EmitDebugOverlay(int w, int h, Rect&& rect)   // rect(x,y,w,h,r,g,b,a)
 {
     // Caller holds g_debugOverlayMutex.
+    if (Settings_OverlayVisible())
+    {
+        // The settings panel BORROWS this whole path — emit, both backends, the
+        // swapchain blit — instead of duplicating it. Debug menu and settings
+        // panel are never wanted at once; if both are up, settings wins.
+        EmitSettingsOverlay(w, h, rect);
+        return;
+    }
     const int panelX = 24, panelY = 24;
     const int panelW = w > 760 ? 720 : w - 48;
     const int panelH = h - 48;
@@ -347,7 +593,8 @@ void EmitDebugOverlay(int w, int h, Rect&& rect)   // rect(x,y,w,h,r,g,b,a)
 void DrawDebugOverlay()
 {
     std::lock_guard<std::mutex> lock(g_debugOverlayMutex);
-    if (!g_debugOverlayVisible.load(std::memory_order_acquire))
+    if (!g_debugOverlayVisible.load(std::memory_order_acquire) &&
+        !Settings_OverlayVisible())
         return;
     int w = 0, h = 0;
     SDL_GetRendererOutputSize(g_renderer, &w, &h);
@@ -487,6 +734,7 @@ HostPadState ReadKeyboard()
     static bool f2WasDown = false;
     static bool f3WasDown = false;
     static bool f4WasDown = false;
+    static bool f8WasDown = false;
     static bool f9WasDown = false;
     if (g_keyboardFocus)
     {
@@ -494,6 +742,10 @@ HostPadState ReadKeyboard()
         const bool f2Down = keys[SDL_SCANCODE_F2] != 0;
         const bool f3Down = keys[SDL_SCANCODE_F3] != 0;
         const bool f4Down = keys[SDL_SCANCODE_F4] != 0;
+        const bool f8Down = keys[SDL_SCANCODE_F8] != 0;
+        if (f8Down && !f8WasDown)
+            g_burstDumpPressed.store(true, std::memory_order_release);
+        f8WasDown = f8Down;
         const bool f9Down = keys[SDL_SCANCODE_F9] != 0;
         if (f9Down && !f9WasDown)
             g_snapDumpPressed.store(true, std::memory_order_release);
@@ -713,7 +965,23 @@ bool Host_WindowInit()
         else
             fprintf(stderr, "[host] CW_WINDOW_SIZE=%s is not a usable WxH — IGNORED.\n", ws);
     }
-    const Uint32 windowFlags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE |
+    // The persisted display mode (part 60's PC options screen). CW_WINDOW_SIZE and
+    // CW_WINDOW_MAXIMIZED are measurement controls and win over it: a run pinning the
+    // window for an A/B must not have the settings file silently un-pin it.
+    Uint32 modeFlag = 0;
+    if (!getenv("CW_WINDOW_SIZE") && !getenv("CW_WINDOW_MAXIMIZED"))
+    {
+        switch (Settings_DisplayMode())
+        {
+            case CzDisplayMode::Borderless: modeFlag = SDL_WINDOW_FULLSCREEN_DESKTOP; break;
+            case CzDisplayMode::Fullscreen: modeFlag = SDL_WINDOW_FULLSCREEN_DESKTOP; break;
+            case CzDisplayMode::Windowed: default: break;
+        }
+        // Exclusive fullscreen is applied AFTER creation (below): creating directly
+        // with SDL_WINDOW_FULLSCREEN would mode-switch the display to the window's
+        // 1280x720 creation size, which is never what "Fullscreen" means today.
+    }
+    const Uint32 windowFlags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | modeFlag |
                                (g_wantVulkanSwapchain ? SDL_WINDOW_VULKAN : 0u) |
                                (getenv("CW_WINDOW_MAXIMIZED") ? SDL_WINDOW_MAXIMIZED : 0u);
     g_window = SDL_CreateWindow("Dead Rising 2: Case West", SDL_WINDOWPOS_CENTERED,
@@ -742,6 +1010,11 @@ bool Host_WindowInit()
         SDL_Quit();
         return false;
     }
+
+    // The persisted EXCLUSIVE fullscreen upgrades the borderless creation flag here,
+    // once the window exists to measure its display against (see the flags comment).
+    if (modeFlag != 0 && Settings_DisplayMode() == CzDisplayMode::Fullscreen)
+        ApplyDisplayModeNow(CzDisplayMode::Fullscreen);
 
     // No SDL_RENDERER_PRESENTVSYNC. The guest's swap rate is the frame clock here
     // (one XE_SWAP per frame, verified against B1), and a vsync-paced present would
@@ -831,6 +1104,7 @@ bool Host_WindowInit()
                 wantVsync ? " CW_HOST_VSYNC=1 is IGNORED here." : "");
     }
     PublishDrawableSize();
+    PublishDisplaySize();
 
     fprintf(stderr, "[host] window %dx%d up on SDL video driver '%s'.\n", kDefaultWidth,
             kDefaultHeight, SDL_GetCurrentVideoDriver());
@@ -916,7 +1190,8 @@ bool Host_DebugOverlayRender(std::vector<uint8_t>& rgba, uint32_t& width, uint32
     // and the caller scales the returned rectangle to whatever the window is.
     constexpr int kW = 1280, kH = 720;
     std::lock_guard<std::mutex> lock(g_debugOverlayMutex);
-    if (!g_active || !g_debugOverlayVisible.load(std::memory_order_acquire))
+    if (!g_active || (!g_debugOverlayVisible.load(std::memory_order_acquire) &&
+                      !Settings_OverlayVisible()))
         return false;
 
     // The panel's rectangle, computed the same way EmitDebugOverlay does. Taken from its
@@ -1006,6 +1281,33 @@ void Host_VulkanDrawableSize(uint32_t* w, uint32_t* h)
 {
     if (w) *w = g_drawableW.load(std::memory_order_acquire);
     if (h) *h = g_drawableH.load(std::memory_order_acquire);
+}
+
+// See window.h: the desktop size of the display the window is on, for the settings
+// panel's resolution clamp. False (and zeros) until the window thread has published
+// one, which headless runs never do — the caller treats that as "no clamp".
+bool Host_DisplaySize(uint32_t* w, uint32_t* h)
+{
+    const uint32_t dw = g_displayW.load(std::memory_order_acquire);
+    const uint32_t dh = g_displayH.load(std::memory_order_acquire);
+    if (w) *w = dw;
+    if (h) *h = dh;
+    return dw && dh;
+}
+
+int Host_DisplayModeList(uint32_t* wh, int maxPairs)
+{
+    std::lock_guard<std::mutex> lock(g_displayModesMutex);
+    int n = 0;
+    for (const auto& [w, h] : g_displayModes)
+    {
+        if (n >= maxPairs)
+            break;
+        wh[n * 2] = w;
+        wh[n * 2 + 1] = h;
+        ++n;
+    }
+    return n;
 }
 
 bool Host_PadState(uint32_t userIndex, HostPadState& out)
@@ -1137,6 +1439,11 @@ void Host_WindowRun()
             }
         }
 
+        // A display-mode change from the PC options screen (part 60). The verb runs on
+        // a guest thread; the SDL calls have to happen HERE, on the window thread.
+        if (const int pending = Settings_ConsumePendingDisplayMode(); pending >= 0)
+            ApplyDisplayModeNow(CzDisplayMode(pending));
+
         // CW_WINDOW_RESIZE_AT=SECS:WxH — THE POSITIVE CONTROL FOR THE SWAPCHAIN REBUILD.
         //
         // The rebuild path fires when the window's drawable size changes, and no headless
@@ -1241,7 +1548,36 @@ void Host_WindowRun()
                     {
                         SDL_UpdateTexture(g_frameTexture, nullptr, g_pixelsFront.data(),
                                           int(g_pixelsWidth) * 4);
-                        SDL_RenderCopy(g_renderer, g_frameTexture, nullptr, nullptr);
+                        // ASPECT-FIT AS OF PART 60 (same rule and same arm as the
+                        // swapchain path — Host_AspectFitRect in window.h is the one
+                        // shared computation): the frame keeps its shape inside the
+                        // window and the bars are black. `CW_VK_STRETCH=1` restores
+                        // the old full-window stretch. The clear runs only when bars
+                        // exist, because SDL keeps the previous frame's pixels in the
+                        // bar regions otherwise.
+                        static const bool stretchArm =
+                            getenv("CW_VK_STRETCH") != nullptr;
+                        SDL_Rect dst{ 0, 0, 0, 0 };
+                        SDL_Rect* dstPtr = nullptr;
+                        if (!stretchArm)
+                        {
+                            int ow = 0, oh = 0;
+                            SDL_GetRendererOutputSize(g_renderer, &ow, &oh);
+                            int32_t fx = 0, fy = 0;
+                            uint32_t fw = 0, fh = 0;
+                            Host_AspectFitRect(g_pixelsWidth, g_pixelsHeight,
+                                               uint32_t(ow > 0 ? ow : 0),
+                                               uint32_t(oh > 0 ? oh : 0), fx, fy, fw,
+                                               fh);
+                            if (fx || fy || int(fw) != ow || int(fh) != oh)
+                            {
+                                SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 0xFF);
+                                SDL_RenderClear(g_renderer);
+                            }
+                            dst = { fx, fy, int(fw), int(fh) };
+                            dstPtr = &dst;
+                        }
+                        SDL_RenderCopy(g_renderer, g_frameTexture, nullptr, dstPtr);
                         blitted = true;
                     }
                 }
@@ -1268,6 +1604,9 @@ void Host_WindowRun()
             std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTitle).count();
         if (sinceTitle >= 1000)
         {
+            // Cheap and covers monitor drags: the display the window sits on is
+            // re-queried at the title-bar cadence rather than via display events.
+            PublishDisplaySize();
             const double fps = double(presented - framesAtLastTitle) * 1000.0 / double(sinceTitle);
             framesAtLastTitle = presented;
             lastTitle = now;

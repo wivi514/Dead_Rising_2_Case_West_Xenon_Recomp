@@ -77,6 +77,31 @@ constexpr uint32_t kRbDepthClear = 0x231D;
 constexpr uint32_t kRbColorClear = 0x231E;
 
 constexpr uint32_t kPaSuScModeCntl = 0x2205 + 0x7B; // 0x2280: cull/front-face/fill
+// THE POLYGON OFFSET, and the reason it is here with a health warning rather than simply
+// used. Decals are drawn exactly coplanar with the surface they are painted on, and the
+// hardware separates them with a polygon offset; a renderer that ignores it gets
+// z-fighting, which under a moving camera looks like FLICKER — the operator's part-56
+// report ("appears and disappear like flicker", stable when the camera is still, which is
+// the signature).
+//
+// `depthBiasEnable` appears NOWHERE in this renderer, and the Fable 2 port carries a
+// comment saying the same of itself, so this is a gap in BOTH ports rather than a
+// title-specific defect (CLAUDE.md's shared-decode table is exactly for this).
+//
+// **THE INDICES ARE NOT INHERITED FROM FABLE 2 AND MUST BE CENSUSED BEFORE USE.** That
+// port reads the offset ENABLE bits from `0x2205 >> 11`, and 0x2205 is RB_BLENDCONTROL1
+// in the map above — the very confusion that cost this port two parts on the alpha test
+// (see kRbColorControl). Our PA_SU block starts at 0x2280, so the enables belong in
+// PA_SU_SC_MODE_CNTL and the four offset words in the block below; both are recorded here
+// as the CANDIDATE decode, and `CW_VK_DRAW_CENSUS` prints them per draw so this title's
+// own stream can confirm or refute them before a line of pipeline state depends on it
+// (gotcha 3: the zero we have is one draw, not a census).
+constexpr uint32_t kPaSuPolyOffsetFrontScale = 0x2380;
+constexpr uint32_t kPaSuPolyOffsetFrontOffset = 0x2381;
+constexpr uint32_t kPaSuPolyOffsetBackScale = 0x2382;
+constexpr uint32_t kPaSuPolyOffsetBackOffset = 0x2383;
+// PA_SU_SC_MODE_CNTL bits 11..13: front-enable, back-enable, para-enable (candidate).
+constexpr uint32_t kPaSuPolyOffsetEnableShift = 11;
 constexpr uint32_t kPaScWindowOffset = 0x2080;
 constexpr uint32_t kPaScWindowScissorTl = 0x2081;
 constexpr uint32_t kPaScWindowScissorBr = 0x2082;
@@ -85,6 +110,37 @@ constexpr uint32_t kPaScWindowScissorBr = 0x2082;
 // hardware applies; a term whose enable bit is clear is the identity, NOT the register
 // value, and reading the register anyway is a silent geometry bug rather than a crash.
 constexpr uint32_t kPaClVteCntl = 0x2206;
+// THE USER CLIP PLANES — candidates, censused before anything is built on them (part 56).
+//
+// WHY THEY MATTER HERE. The operator's zombie-slicing defect is now split in two by the
+// stencil work: the cross-section CAP is masked correctly, and the BODIES are not —
+// *"they are still full zombies and they just get a double instead of slicing in two
+// different part"*. So the game draws the whole body twice and something clips each copy
+// at the cut plane, and it is not the stencil. Hardware user clip planes are exactly that
+// mechanism, and `ClipDistance` appears NOWHERE in this renderer or in Fable 2's.
+//
+// PA_CL_CLIP_CNTL sits next to PA_CL_VTE_CNTL (0x2206, verified) in the A2xx block, and
+// the six planes are four floats each. Both are CANDIDATES until this title's own stream
+// says otherwise — the draw census prints them for that reason, and the check is whether
+// the values are purposeful (a plane is a normal plus a distance; a body-cut plane should
+// change as the corpse falls) rather than whether they look like a register document.
+constexpr uint32_t kPaClClipCntl = 0x2204;   // CONFIRMED: bit 0 = UCP_ENA_0, set on 312 draws
+// THE PLANE REGISTERS ARE NOT 0x2240 — that was a guess and the census refuted it (all
+// 2,484 draws read 0/0/0/0 while 312 of them ENABLED plane 0, which cannot both be true).
+// The viewport block above ends at PA_CL_VPORT_ZOFFSET = 0x2114 and on this hardware family
+// the six clip planes follow it immediately. Rather than guess a second time, the census
+// SCANS the range and reports the first non-zero register it finds, so one capture of a
+// sliced zombie names the block instead of confirming a hope.
+// FOUND BY DUMPING, after two wrong guesses (0x2240 and a scan of 0x2115..0x2140 both read
+// nothing while 312 draws ENABLED plane 0). The whole register file at a clip-enabled draw
+// holds exactly one plane-shaped quad of floats:
+//
+//     2388  -2.10425e-05   2389  0.362499   238A  -29.4662   238B  29.078
+//
+// i.e. a normal of about (0, 0.012, -1.0) at distance 0.987 once normalised — an almost
+// axis-aligned cutting plane, sitting just past the polygon-offset block at 0x2380..0x2383
+// that was confirmed the same way. `PA_CL_CLIP_CNTL` bit 0 selects it.
+constexpr uint32_t kPaClUcp0X = 0x2388;   // .. 0x239F = six planes of four floats
 constexpr uint32_t kPaClVportXScale = 0x210F;
 constexpr uint32_t kPaClVportXOffset = 0x2110;
 constexpr uint32_t kPaClVportYScale = 0x2111;

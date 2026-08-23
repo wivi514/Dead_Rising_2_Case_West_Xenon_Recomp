@@ -66,6 +66,7 @@
 // intrinsics headers are read) because timebase.h pulls <x86intrin.h> in itself
 // before shadowing, which sets the guard; nothing below re-declares __rdtsc.
 #include "../cpu/timebase.h"
+#include "../host/settings.h"
 #include "../host/window.h"   // XamInputGetState's device (phase 3)
 #include "content.h"          // the save-data layer: enumerators and their message
 #include "guestcall.h"
@@ -3970,7 +3971,7 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
         uint16_t mask;
         int16_t lx, ly, rx, ry;
         bool hold;              // stick entries deflect for the whole interval
-        int hostKey = 0;        // 2/3/4 = the F2/F3/F4 debug edges, 9 = F9's frame
+        int hostKey = 0;        // 2/3/4 = the F2/F3/F4 debug edges, 8 = F8's burst, 9 = F9
                                 // dump/census, all of them pulses with no pad state
         bool barrier = false;   // WAITJUMP: park here until the screen request lands
         uint8_t lt = 0, rt = 0; // trigger entries HOLD like sticks; LT re-shows the
@@ -4011,6 +4012,11 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
         // identity, and a self-test that could only be driven by a human at a window would
         // make every check of it an operator errand (gotcha 190).
         { "F9", 0, 0,0,0,0, false, 9 },
+        // F8 — the burst recorder. Headless for the same reason F9 is: an instrument that
+        // can only be driven by a human at a window makes every check of it an operator
+        // errand, and this one has to be checkable because a burst that silently records
+        // nothing looks exactly like a defect that did not happen (gotchas 30, 151, 190).
+        { "F8", 0, 0,0,0,0, false, 8 },
         // WAITJUMP — a BARRIER, and the thing that makes an F2 recipe reproducible.
         //
         // Every entry before this one is placed at a fixed wall-clock offset, which is
@@ -4245,6 +4251,7 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
                 case 2: Host_RequestDebugJump(); break;
                 case 3: Host_RequestDebugEnter(); break;
                 case 4: Host_RequestDebugMenu(); break;
+                case 8: Host_RequestBurstDump(); break;
                 case 9: Host_RequestSnapDump(); break;
             }
             // Loud, because the whole point of this entry is that its effect appears
@@ -4328,6 +4335,7 @@ void DebugTunables_ToggleFullDebugMenu(PPCContext& ctx, uint8_t* base);
 void DebugTunables_PumpPendingScreen(PPCContext& ctx, uint8_t* base);
 void DebugTunables_PumpAutoChuck(PPCContext& ctx, uint8_t* base);
 void DebugTunables_PumpDebugMenu(PPCContext& ctx, uint8_t* base);
+void PcOptions_Pump(PPCContext& ctx, uint8_t* base, uint32_t buttons);
 
 // Rumble. Accepted and discarded: there is no motor, and reporting failure would
 // send sub_825D7AC8's callers down an error path over an effect that does not
@@ -4371,6 +4379,16 @@ GUEST_FUNCTION_HOOK(__imp__XamInputGetCapabilities, XamInputGetCapabilities_x)
 PPC_FUNC(__imp__XamInputGetState)
 {
     KCALL("__imp__XamInputGetState");
+    // Captured before Dispatch clobbers the registers: the PC options screen's
+    // input driver (part 60) reads the buttons the guest just received — the
+    // screen's own input handling was compiled out of the 360 build, so the pad
+    // is read at this seam and driven from the host.
+    const uint32_t padUser = ctx.r3.u32;
+    // THREE arguments, not two: the XAM import is (user, flags, pState) — the
+    // title's own wrapper at 0x825D7AB8 passes flags in r4 and the buffer in r5.
+    // Reading r4 as the pointer dereferenced guest address 5 (the flags word,
+    // 1, plus the field offset) on the first input poll of the boot.
+    const uint32_t padState = ctx.r5.u32;
     guestcall::Dispatch<XamInputGetState_x>(ctx, base);
 
     // The honest answer, captured BEFORE the debug bridges run. Each of them makes
@@ -4399,6 +4417,21 @@ PPC_FUNC(__imp__XamInputGetState)
     // writes the menu item does.
     DebugTunables_PumpAutoChuck(ctx, base);
     DebugTunables_PumpDebugMenu(ctx, base);
+    // Part 60: the PC options screen's setup and its host-driven input.
+    {
+        uint32_t buttons = 0;
+        if (padUser == 0 && uint32_t(result) == 0 && padState >= 0x1000)
+        {
+            buttons = (uint32_t(base[padState + 4]) << 8) | base[padState + 5];
+            // While the host settings panel is up it OWNS the pad: the gamepad
+            // fields the guest just received are zeroed so the hub underneath
+            // does not also navigate. packetNumber stays — a frozen packet
+            // number reads as a disconnected pad to some titles.
+            if (Settings_OverlayVisible())
+                memset(base + padState + 4, 0, 12);
+        }
+        PcOptions_Pump(ctx, base, buttons);
+    }
 
     ctx.r3.u64 = result;
 }

@@ -79,6 +79,49 @@ void Host_WindowRun();
 // guest in it, which is indistinguishable from a hang.
 void Host_RequestQuit(const char* why);
 
+// ASPECT-CORRECT PRESENTATION (part 60). The fitted rectangle for presenting a
+// srcW x srcH frame inside a dstW x dstH window without changing its shape: the
+// largest centered rectangle with the source's aspect ratio that fits. A 16:9
+// frame on a 21:9 display gets side bars; a 21:9 frame on a 16:9 display gets
+// top/bottom bars. This is the ONE computation both present paths share — the
+// Vulkan swapchain blit and the SDL readback copy — because two copies of an
+// aspect division are how the two arms drift into showing different pictures.
+// `CW_VK_STRETCH=1` is the control arm (each caller checks it); stretch was the
+// only behavior before part 60.
+//
+// Inline and header-only on purpose: it is called once per presented frame from
+// two modules and pure arithmetic, and 64-bit intermediates keep 5120x2880-scale
+// products out of overflow.
+inline void Host_AspectFitRect(uint32_t srcW, uint32_t srcH, uint32_t dstW,
+                               uint32_t dstH, int32_t& x, int32_t& y, uint32_t& w,
+                               uint32_t& h)
+{
+    if (!srcW || !srcH || !dstW || !dstH)
+    {
+        x = y = 0;
+        w = dstW;
+        h = dstH;
+        return;
+    }
+    if (uint64_t(srcW) * dstH >= uint64_t(dstW) * srcH)
+    {
+        // Source is at least as wide as the window, proportionally: full width,
+        // letterbox (top/bottom bars).
+        w = dstW;
+        h = uint32_t(uint64_t(dstW) * srcH / srcW);
+    }
+    else
+    {
+        // Window is wider than the source: full height, pillarbox (side bars).
+        h = dstH;
+        w = uint32_t(uint64_t(dstH) * srcW / srcH);
+    }
+    if (!w) w = 1;
+    if (!h) h = 1;
+    x = int32_t(dstW - w) / 2;
+    y = int32_t(dstH - h) / 2;
+}
+
 // One XInput-shaped pad state, in XInput's units and sign conventions (NOT SDL's —
 // see the axis note in window.cpp).
 struct HostPadState
@@ -120,6 +163,12 @@ void Host_RequestDebugMenu();
 // the person who can see the spot presses the key.
 void Host_RequestSnapDump();
 bool Host_ConsumeSnapDumpPressed();
+
+// F8 — record EVERY presented frame for about a second, into CW_BURST_DUMP's directory,
+// with a manifest carrying each frame's draw count and fingerprints. For a defect that
+// FLICKERS, which no single screenshot can show. See its definition in window.cpp.
+void Host_RequestBurstDump();
+bool Host_ConsumeBurstDumpPressed();
 
 // ===================================================================================
 // THE VULKAN SWAPCHAIN SEAM — CW_VK_SWAPCHAIN=1 (part 54, plan §7)
@@ -168,6 +217,20 @@ bool Host_VulkanCreateSurface(void* instance, uint64_t* outSurface);
 // The window's drawable size in pixels, which on a scaled display is NOT its logical
 // size. The swapchain is created at this extent and re-created when it changes.
 void Host_VulkanDrawableSize(uint32_t* w, uint32_t* h);
+
+// The desktop size of the DISPLAY the window currently sits on (part 60): what the
+// settings panel clamps its resolution list against, so the menu reads like a game's
+// and not like a debug knob — no 5120x2880 entry on a 1440p monitor. Refreshed by the
+// window thread once a second, which also covers a window dragged between monitors.
+// Returns false (and zeros) when no window has published one — headless runs — and
+// every consumer treats that as "no clamp" rather than refusing.
+bool Host_DisplaySize(uint32_t* w, uint32_t* h);
+
+// The display's usable MODE LIST: distinct WxH pairs the display reports AND the
+// renderer can produce (Settings_ValidInternalRes), ascending, written as w,h pairs
+// into `wh` (2*maxPairs u32 capacity). Returns the pair count; 0 when headless or
+// not yet published — the caller falls back to a synthesized list.
+int Host_DisplayModeList(uint32_t* wh, int maxPairs);
 
 // The debug overlay, rasterised into an RGBA8 buffer for a caller that has no
 // SDL_Renderer — i.e. the Vulkan swapchain present path, which is the default since part

@@ -52,6 +52,8 @@
 #include <string>
 #include <vector>
 
+#include "pc_options_cw.h"
+
 #include <ppc_config.h>   // ppc_context.h #errors without it
 #include <ppc_context.h>
 
@@ -231,6 +233,17 @@ PPC_FUNC(sub_824A4C90)
 PPC_FUNC(sub_82812410)
 {
     g_frontendTransitionManager = ctx.r3.u32;
+    // THE VISUALS PANEL (imported from Case Zero part 60). Selecting Visuals in the
+    // title's own options hub is swallowed entirely — we return the dispatcher's own
+    // "not handled" (0) and open the host-drawn settings panel instead, so the hub
+    // stays alive underneath and gets its input back when the panel closes. Before
+    // the trace below on purpose: a swallowed transition is not a screen change and
+    // should not read as one in the log.
+    if (PcOptions_FilterScreenTransition(ctx, base))
+    {
+        ctx.r3.u64 = 0;
+        return;
+    }
     if (getenv("CW_SCREEN_TRACE"))
     {
         static std::vector<uint32_t> seen;

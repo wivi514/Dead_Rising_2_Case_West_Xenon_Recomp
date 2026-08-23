@@ -4,12 +4,14 @@
 #include "pump_stats.h"
 #include "drawid_ps_spv.h"
 #include "xenos.h"
+#include "../host/settings.h"
 #include "../host/window.h"
 #include "../cpu/thread_budget.h"
 
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -17,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -88,7 +91,14 @@ constexpr uint32_t kSharedPosOffset = 360;
 constexpr uint32_t kSharedLoopConstants = 384;
 constexpr uint32_t kSharedBoolFile = 512;
 constexpr uint32_t kSharedVfetchTable = 544;
-constexpr uint32_t kSharedSize = 544 + 96 * 16; // one entry per vertex fetch slot
+// USER CLIP PLANES (part 57). Six float4 plane equations, dotted against the raw
+// clip-space position by the vertex shader's XE_USER_CLIP_PLANES epilogue — Vulkan has
+// no fixed-function clip planes, so the distance must be computed and exported as
+// ClipDistance by the shader itself. The shared block is memset to zero every draw,
+// and a zero plane dots to distance 0, which Vulkan KEEPS — so a draw with no planes
+// enabled clips nothing by construction, and only the enabled planes are ever written.
+constexpr uint32_t kSharedClipPlanes = 544 + 96 * 16;                 // 2080
+constexpr uint32_t kSharedSize = kSharedClipPlanes + 6 * 16;          // 2176
 
 // BOTH stages get 256 float4 registers, and the pixel shader's 256 is load-bearing.
 //
@@ -1086,39 +1096,281 @@ bool EnvOn(const char* n) { return getenv(n) != nullptr; }
 //
 //   CW_VK_RES=2560x1440   the resolution, said the way a player says it
 //   CW_VK_RES_SCALE=2     the same thing as a multiplier
-uint32_t ResScale()
+// THE INTERNAL RESOLUTION — an explicit WIDTH x HEIGHT since operator revision 3
+// (the menu lists the display's own modes, and 1920x1080 is no integer multiple of
+// 1280x720). The renderer scales RATIONALLY and TRUNCATING: Y extents by H/720, X
+// extents by W/1280 — floor(a)+floor(b) <= floor(a+b) holds for any fixed rational
+// (gotcha 373), so a converted offset+extent can never overrun a converted surface,
+// and the title's two 640-wide tile scissors stay exact for any EVEN width
+// (640*W/1280 = W/2). 16:9 integer multiples reproduce the old integer path bit for
+// bit. Latched at boot; changed only by ApplyPendingRenderScale between frames.
+// 0 until the first InternalRes() call computes the boot value.
+std::atomic<uint32_t> g_internalW{ 0 }, g_internalH{ 0 };
+// True when an env var chose the resolution: the measurement arm wins and menu
+// requests are refused loudly rather than silently overriding an A/B.
+bool g_resScaleLocked = false;
+std::atomic<uint32_t> g_resScalePending{ 0 };
+
+void InternalRes(uint32_t& w, uint32_t& h)
 {
-    static const uint32_t s = [] () -> uint32_t {
-        constexpr uint32_t kBaseW = 1280, kBaseH = 720, kMaxScale = 4;
-        if (const char* r = Env("CW_VK_RES"))
+    w = g_internalW.load(std::memory_order_relaxed);
+    h = g_internalH.load(std::memory_order_relaxed);
+    if (w && h)
+        return;
+    uint32_t bw = 0, bh = 0;
+    // CW_VK_RES=WxH — any resolution the store validates (even width, H 720..2880,
+    // at least 16:9). The old integer-multiple forms still parse, so every recipe
+    // in the docs is unchanged.
+    if (const char* r = Env("CW_VK_RES"))
+    {
+        uint32_t pw = 0, ph = 0;
+        if (sscanf(r, "%ux%u", &pw, &ph) == 2 && Settings_ValidInternalRes(pw, ph))
         {
-            uint32_t w = 0, h = 0;
-            if (sscanf(r, "%ux%u", &w, &h) == 2 && w && h && w % kBaseW == 0 &&
-                h % kBaseH == 0 && w / kBaseW == h / kBaseH &&
-                w / kBaseW >= 1 && w / kBaseW <= kMaxScale)
-                return w / kBaseW;
-            fprintf(stderr,
-                    "[vk] CW_VK_RES=%s is not an integer multiple of this title's own "
-                    "1280x720 (up to %ux) — IGNORED, rendering at 1280x720. Try %s.\n",
-                    r, kMaxScale, "1280x720, 2560x1440, 3840x2160 or 5120x2880");
-            return 1;
+            g_resScaleLocked = true;
+            bw = pw;
+            bh = ph;
         }
+        else
+            fprintf(stderr, "[vk] CW_VK_RES=%s is not a resolution this renderer can "
+                            "produce (even width, height 720..2880, at least 16:9) — "
+                            "IGNORED, rendering at 1280x720.\n", r);
+    }
+    if (!bw)
         if (const char* n = Env("CW_VK_RES_SCALE"))
         {
             const long v = strtol(n, nullptr, 10);
-            if (v >= 1 && v <= long(kMaxScale))
-                return uint32_t(v);
-            fprintf(stderr,
-                    "[vk] CW_VK_RES_SCALE=%s is out of range (1..%u) — IGNORED.\n", n,
-                    kMaxScale);
+            if (v >= 1 && v <= 4)
+            {
+                g_resScaleLocked = true;
+                bw = 1280 * uint32_t(v);
+                bh = 720 * uint32_t(v);
+            }
+            else
+                fprintf(stderr, "[vk] CW_VK_RES_SCALE=%s is out of range (1..4) — "
+                                "IGNORED.\n", n);
         }
-        return 1;
-    }();
-    return s;
+    if (!bw)
+    {
+        // The persisted setting from the PC options screen. Env wins above so an
+        // A/B arm can never be silently overridden by whatever the menu last wrote.
+        Settings_InternalRes(bw, bh);
+        // Clamped to the DISPLAY on load: a settings file written on one monitor
+        // must not strand an impossible size on another. Env arms are deliberately
+        // not clamped (measurement wins); unknown display (headless) clamps nothing.
+        uint32_t dw = 0, dh = 0;
+        if (Host_DisplaySize(&dw, &dh) && (bw > dw || bh > dh))
+        {
+            fprintf(stderr, "[vk] %ux%u from cz_settings.txt is larger than the "
+                            "%ux%u display — clamped to 1280x720\n", bw, bh, dw, dh);
+            bw = 1280;
+            bh = 720;
+        }
+        if (bw != 1280 || bh != 720)
+            fprintf(stderr, "[vk] internal resolution %ux%u from cz_settings.txt\n",
+                    bw, bh);
+    }
+    // The legacy wide arms, applied ON TOP so their headless A/B recipes survive:
+    // CW_VK_WIDE=1 widens to the exact-21:9 width (the night's verified 21/16),
+    // CW_VK_WIDE=0 forces 16:9, CW_VK_WIDE_NUM=n picks the numerator over 32.
+    if (const char* e = Env("CW_VK_WIDE"))
+    {
+        uint32_t num = atoi(e) != 0 ? 42u : 32u;
+        if (const char* wn = Env("CW_VK_WIDE_NUM"))
+        {
+            const long v = strtol(wn, nullptr, 10);
+            if (v >= 33 && v <= 64 && num != 32)
+                num = uint32_t(v);
+        }
+        bw = ((uint64_t(bh) * 1280 / 720) * num / 32) & ~1u;
+        fprintf(stderr, "[vk] CW_VK_WIDE=%s%s — internal %ux%u (env wins)\n", e,
+                num != 32 && num != 42 ? " (CW_VK_WIDE_NUM)" : "", bw, bh);
+    }
+    if (!Settings_ValidInternalRes(bw, bh))
+    {
+        bw = 1280;
+        bh = 720;
+    }
+    g_internalW.store(bw, std::memory_order_relaxed);
+    g_internalH.store(bh, std::memory_order_relaxed);
+    w = bw;
+    h = bh;
 }
-// A guest extent, in host pixels. Every use is a guest coordinate crossing into Vulkan.
-inline uint32_t RS(uint32_t v) { return v * ResScale(); }
-inline int32_t RSi(int32_t v) { return v * int32_t(ResScale()); }
+inline uint32_t InternalW() { uint32_t w, h; InternalRes(w, h); return w; }
+inline uint32_t InternalH() { uint32_t w, h; InternalRes(w, h); return h; }
+
+// The LEGACY integer view, for the parked live-scale seam and a few logs: the
+// nearest whole multiple of 720 rows. New code converts extents with RS/RSX or the
+// per-pass forms below, never with this.
+uint32_t ResScale()
+{
+    return std::min(4u, std::max(1u, (InternalH() + 360) / 720));
+}
+
+// A guest extent, in host pixels — Y by H/720, X by W/1280, truncating (see the
+// header comment above). The Pass* forms take an explicit internal resolution, for
+// the shadow tier's per-pass size and for a snapshot's own build size.
+inline uint32_t PassY(uint32_t v, uint32_t ph) { return uint32_t(uint64_t(v) * ph / 720); }
+inline int32_t PassYi(int32_t v, uint32_t ph)
+{
+    return int32_t(int64_t(v) * int64_t(ph) / 720);
+}
+inline uint32_t PassX(uint32_t v, uint32_t pw)
+{
+    return uint32_t(uint64_t(v) * pw / 1280);
+}
+inline int32_t PassXi(int32_t v, uint32_t pw)
+{
+    return int32_t(int64_t(v) * int64_t(pw) / 1280);
+}
+inline uint32_t RS(uint32_t v) { return PassY(v, InternalH()); }
+inline int32_t RSi(int32_t v) { return PassYi(v, InternalH()); }
+inline uint32_t RSX(uint32_t v) { return PassX(v, InternalW()); }
+inline int32_t RSXi(int32_t v) { return PassXi(v, InternalW()); }
+
+// Wider than 16:9? Exact comparison on purpose: a 16:9 internal resolution must
+// take the bit-identical legacy path (no projection patch, no UCP compensation).
+inline bool WideMode()
+{
+    uint32_t w, h;
+    InternalRes(w, h);
+    return uint64_t(w) * 9 > uint64_t(h) * 16;
+}
+// The horizontal fov factor the wide frame carries relative to 16:9 at the same
+// height: k = (W/1280) / (H/720) = 9W/16H. 1.0 at 16:9 by construction.
+inline float WideFovFactor()
+{
+    uint32_t w, h;
+    InternalRes(w, h);
+    return (9.0f * float(w)) / (16.0f * float(h));
+}
+
+// THE 16:9 SCENE PROJECTION, recognized structurally in a VS constant window's c0..c3.
+// The shape is the one part 58's pose work measured (tools/pose_read.py,
+// clip_plane_space.py): row 3 exactly (0,0,1,0) — w_clip = z_view, a perspective —
+// rows 0/1 diagonal, and |xscale/yscale| = 9/16 exactly, because this title's scene
+// cameras are all 16:9 whatever their fov. The shadow orthos (row 3 = (0,0,0,1)) and
+// the CUBE FACE cameras (1:1 ratio) fail the test and stay untouched, which is what
+// keeps shadows and reflections correct in wide mode.
+inline bool Is169Perspective(const uint32_t* c)
+{
+    float m[16];
+    memcpy(m, c, sizeof m);
+    if (m[12] != 0.0f || m[13] != 0.0f || m[14] != 1.0f || m[15] != 0.0f)
+        return false;
+    if (m[1] != 0.0f || m[2] != 0.0f || m[3] != 0.0f || m[4] != 0.0f ||
+        m[6] != 0.0f || m[7] != 0.0f || m[8] != 0.0f || m[9] != 0.0f)
+        return false;
+    if (m[0] == 0.0f || m[5] == 0.0f)
+        return false;
+    const float ratio = std::fabs(m[0] / m[5]);
+    return std::fabs(ratio - 0.5625f) <= 0.002f;   // 9/16, small float slack
+}
+
+// Widen the horizontal fov of a recognized scene projection by the inverse of the
+// surface widening — the wide frame then carries NEW content at the flanks instead
+// of a stretch. Called on the VS constant window as it is copied into the arena
+// (and on the verify arm's recompute, so the memo verifier compares patched against
+// patched). Returns whether it patched, so the caller can count.
+inline bool PatchWideProjection(uint32_t* c)
+{
+    if (!Is169Perspective(c))
+        return false;
+    float a;
+    memcpy(&a, c, 4);
+    a /= WideFovFactor();
+    memcpy(c, &a, 4);
+    return true;
+}
+
+// The ratio B'/B the slider applies to a recognized projection's y scale:
+// the game's vertical half-fov is atan(1/|B|), the patched one adds halfRad, and
+// B' = 1/tan(patched half-fov). Clamped so the patched half-fov stays inside
+// (0.5°, 89°) — outside that a tan pole would flip or explode the projection.
+// Sign-safe: computed on |B|, and a RATIO carries no sign, so a y-flipped
+// projection keeps its flip.
+inline float FovScaleRatio(float b, float halfRad)
+{
+    const float ab = std::fabs(b);
+    if (!(ab > 0.0f))
+        return 1.0f;
+    float half = std::atan(1.0f / ab) + halfRad;
+    constexpr float kMinHalf = 0.0087266f;   // 0.5 degrees
+    constexpr float kMaxHalf = 1.5533430f;   // 89 degrees
+    if (half < kMinHalf)
+        half = kMinHalf;
+    if (half > kMaxHalf)
+        half = kMaxHalf;
+    return (1.0f / std::tan(half)) / ab;
+}
+
+// CW_VK_FOV_CENSUS=1 — print every DISTINCT recognized projection (A, B, and the
+// z-row terms m10/m11, which encode zn/zf) the first time it is seen. The question
+// it answers (part 61): does the title's UI ride the SAME projection as the 3D
+// scene, or a structurally distinguishable one? The wide patch WANTS to catch UI
+// (that is the part-60 self-centering); a fov slider that catches UI shrinks the
+// HUD, so if the two populations separate on a structural field, the fov patch can
+// exempt the UI's. Env-gated and first-occurrence-only: free when off, and a
+// bounded number of lines when on.
+inline void FovCensus(const uint32_t* c, uint32_t depthControl)
+{
+    static const bool on = Env("CW_VK_FOV_CENSUS") != nullptr;
+    if (!on || !Is169Perspective(c))
+        return;
+    static std::mutex mu;
+    static std::map<std::array<uint32_t, 5>, uint64_t> seen;
+    static uint64_t calls = 0;
+    // Key: the projection's A/B and z-row terms, PLUS the draw's depth-test and
+    // depth-write enables (RB_DEPTHCONTROL bits 1 and 2). The state bits are in the
+    // key because the projection alone turned out not to discriminate — one shared
+    // projection serves the whole frame — so the question became whether SCENE and
+    // UI populations separate on depth state instead.
+    const std::array<uint32_t, 5> key{ c[0], c[5], c[10], c[11],
+                                       depthControl & 0x6 };
+    std::lock_guard<std::mutex> lock(mu);
+    const bool fresh = ++seen[key] == 1;
+    ++calls;
+    if (fresh)
+    {
+        float a, b, z0, z1;
+        memcpy(&a, &c[0], 4);
+        memcpy(&b, &c[5], 4);
+        memcpy(&z0, &c[10], 4);
+        memcpy(&z1, &c[11], 4);
+        fprintf(stderr, "[fov-census] #%zu A=%.6f B=%.6f m10=%.6f m11=%.6f "
+                        "(vfov=%.2f deg) ztest=%u zwrite=%u\n", seen.size(), a, b,
+                z0, z1, 2.0 * std::atan(1.0 / std::fabs(b)) * 57.29578,
+                (depthControl >> 1) & 1, (depthControl >> 2) & 1);
+    }
+    // The population counts, dumped periodically — first-occurrence lines name the
+    // variants; this says how many draws each variant actually carries.
+    if (calls % 200000 == 0)
+        for (const auto& [k, n] : seen)
+            fprintf(stderr, "[fov-census] count: A=%08X B=%08X z=%08X/%08X "
+                            "depth=%X -> %llu draws\n", k[0], k[1], k[2], k[3],
+                    k[4], (unsigned long long)n);
+}
+
+// Apply the slider to a recognized 16:9 scene projection: B scales by the ratio and
+// A scales by the SAME ratio so the aspect is untouched — which is also what keeps
+// Is169Perspective true afterwards, so this composes with PatchWideProjection
+// (ORDER: fov first, wide second; the wide patch then divides A alone). Same call
+// sites and same memo/verify discipline as the wide patch above.
+inline bool PatchFovProjection(uint32_t* c, float halfRad)
+{
+    if (halfRad == 0.0f || !Is169Perspective(c))
+        return false;
+    float a, b;
+    memcpy(&a, c + 0, 4);
+    memcpy(&b, c + 5, 4);
+    const float r = FovScaleRatio(b, halfRad);
+    if (r == 1.0f)
+        return false;
+    a *= r;
+    b *= r;
+    memcpy(c + 0, &a, 4);
+    memcpy(c + 5, &b, 4);
+    return true;
+}
 
 // ===================================================================================
 // THE CONTENT GUARDS, ON OTHER CORES — part 53, plan item 1.1
@@ -1811,6 +2063,16 @@ struct PipelineKey
     // pipeline dimension for the same reason alphaTest is: the fragment module and the
     // blend state are baked at creation. Off by default and on for exactly one frame.
     uint32_t drawIdPass;
+    // THE POLYGON OFFSET, as a pipeline dimension rather than dynamic state (part 56).
+    // Dynamic would have been cheaper in principle — the value varies per draw — but a
+    // declared dynamic state MUST be set before EVERY draw with that pipeline, and this
+    // renderer has draw paths (the resolve blits, the draw-ID pass, the overlay) that do
+    // not pass through the per-draw state block. Declaring it produced 40
+    // `VUID-vkCmdDraw-None-08608` from exactly those. The title uses only two or three
+    // distinct offsets, so baking them costs a handful of pipelines and no correctness.
+    // Stored as the raw register bits so the key stays trivially comparable.
+    uint32_t polyOffsetScale;
+    uint32_t polyOffsetOffset;
 
     bool operator<(const PipelineKey& o) const
     {
@@ -1831,8 +2093,9 @@ struct PipelineKey
 // separate cache line holding a red-black node, so the cost is 9 likely misses and 9
 // 48-byte `memcmp`s. A hash table is one hash of a fixed 48 bytes and one bucket.
 //
-// The key is a POD with no padding (two `uint64_t` then eight `uint32_t` = exactly 48
-// bytes), which is what makes both the `memcmp` comparison and this hash correct —
+// The key is a POD with no padding (two `uint64_t` then TEN `uint32_t` = exactly 56
+// bytes — the polygon offset added two in part 56), which is what makes both the
+// `memcmp` comparison and this hash correct —
 // hashing raw bytes of a struct WITH padding would hash uninitialised memory and give
 // two equal keys different hashes. If a field is ever added, keep that property or the
 // table silently starts missing.
@@ -1840,9 +2103,9 @@ struct PipelineKeyHash
 {
     size_t operator()(const PipelineKey& k) const
     {
-        static_assert(sizeof(PipelineKey) == 48, "PipelineKey must stay padding-free");
+        static_assert(sizeof(PipelineKey) == 56, "PipelineKey must stay padding-free");
         uint64_t h = 0xCBF29CE484222325ull;
-        uint64_t w[6];
+        uint64_t w[7];
         memcpy(w, &k, sizeof w);
         for (uint64_t v : w)
         {
@@ -1970,6 +2233,13 @@ uint64_t g_flatCacheLookups = 0;
 // grow — of which there are a handful in a whole run — so it is free.
 // The constant memo (part 55). Hit rate is the claim, not a side note: the item is
 // worthless below ~30% and the counter is how a run says so.
+// How many draws asked for a polygon offset. THE ARM NEEDS A COUNTER: "the decals look
+// better" is a judgement, and this is the number that says the code ran at all — on the
+// title backdrop it should read ~80 a frame and `CW_VK_NO_POLY_OFFSET=1` must take it to 0.
+uint64_t g_polyOffsetDraws = 0;
+// Draws that enabled the STENCIL TEST. ~18% of a gameplay frame on the operator's own
+// captures, and this renderer honoured none of them until part 56.
+uint64_t g_stencilDraws = 0;
 bool g_constMemoOff = false;
 bool g_psConstScaleActive = false;   // CW_VK_PS_CONST_SCALE mutates in place; see its use
 bool g_constMemoVerify = false;
@@ -2388,6 +2658,11 @@ struct Snapshot
     // chose to keep it in. Deriving it by division would work and would put a scale
     // factor at every one of those sites instead of at the two that create the image.
     uint32_t guestW = 0, guestH = 0;
+    // The PASS internal resolution the host image was built at (the scene's, or
+    // the shadow tier's). A live change rebuilds each snapshot lazily through the
+    // same path a guest-extent change does; comparing the stored pair is what
+    // makes that trigger without touching the store eagerly at switch time.
+    uint32_t builtW = 1280, builtH = 720;
     uint32_t slot = 0;   // bindless heap index, so a fetch can be served without a copy
     uint64_t frameSeen = 0;
     // Keyed (width << 16) | height. Refreshed from `image` by whatever resolve next
@@ -2423,6 +2698,7 @@ struct CubeSnapshot
     Image image;               // six layers, CUBE view, registered in set 2
     uint32_t slot = 0;         // index into set 2's heap, NOT set 0's
     uint32_t faceExtent = 0;   // one face is faceExtent x faceExtent
+    uint32_t builtScale = 1;   // rebuild trigger on a live resolution change
     uint32_t faceStride = 0;   // guest bytes between one face's base and the next
     // Which faces have ever been copied in, as a bitmask. A COUNTER, because "the cube
     // is bound" and "the cube has six faces in it" are different claims and the second
@@ -2450,6 +2726,22 @@ struct CubeSnapshot
 // describe the frame being RECORDED, not the pixels being looked at. `frame_compare.py`
 // aligns two runs by exactly those fingerprints, so an off-by-one here does not look like
 // a bug, it looks like a picture regression. Captured at submit, read at present.
+// An image whose owner replaced it mid-frame, kept alive until every command
+// buffer that could reference it has retired. THE REASON THIS EXISTS is the
+// shadow-tier freeze (part 60): the snapshot-resize path destroyed the old atlas
+// with a vkDeviceWaitIdle, but a wait-idle only covers SUBMITTED work — the frame
+// being RECORDED had already sampled the old image in earlier passes, so the
+// submit that followed referenced destroyed handles. That is undefined behavior
+// that presented as a wedged queue (the operator: "it froze the game"), and the
+// per-resize wait-idle was ALSO the stutter the live-rescale path documents. A
+// retired image is destroyed once `retireFrame + framesInFlight + 1 <= R->frame`,
+// by which point its last possible referencing fence has been waited.
+struct RetiredImage
+{
+    uint64_t retireFrame = 0;
+    Image image;
+};
+
 struct FrameSlot
 {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -2507,6 +2799,9 @@ struct SwapchainState
     // Set when a present reported SUBOPTIMAL or OUT_OF_DATE; consumed at the top of the
     // next frame's blit, where tearing the old objects down is safe.
     bool rebuildWanted = false;
+    // Consecutive creations whose extent disagreed with the window drawable (the
+    // launch-stretch guard) — reset to 0 by any creation that matches.
+    uint32_t mismatchRetries = 0;
     // The F4 debug overlay. All of it is allocated the first time the menu is opened and
     // never in a run that does not open it.
     Image overlay;          // the composited panel, uploaded and blitted
@@ -2782,6 +3077,13 @@ struct Renderer
         VkRect2D scissor{};
         float blend[4]{};
         bool haveViewport = false, haveScissor = false, haveBlend = false;
+        // The polygon offset, tracked like the blend constants: it is dynamic state, it
+        // changes on ~3% of draws, and re-setting it on the other 97% would be three
+        // driver calls a draw for nothing.
+        float biasSlope = 0.0f, biasConstant = 0.0f;
+        bool haveDepthBias = false;
+        uint32_t stencilRef = 0, stencilMask = 0, stencilWriteMask = 0;
+        bool haveStencil = false;
         bool setsBound = false;
         // The vertex and index bindings, tracked but NOT yet acted on — see
         // `BindSkips` for why the counter comes before the change. 16 is above the
@@ -2805,6 +3107,7 @@ struct Renderer
     struct BindSkips
     {
         uint64_t pipeline = 0, viewport = 0, scissor = 0, blend = 0, sets = 0, draws = 0;
+        uint64_t depthBias = 0, stencil = 0;
         // The vertex and index binds, COUNTED ONLY. `docs/perf-cpu-plan.md` §1a
         // hypothesis A is that a crowd — many copies of a few zombie meshes — rebinds
         // the same buffer at the same offset draw after draw, and that extending the
@@ -2900,6 +3203,7 @@ struct Renderer
     // slot each time, i.e. gotcha 192's descriptor-heap exhaustion. A fetch picks the
     // one it meant by its own FORMAT: `k_24_8` and `k_24_8_FLOAT` are depth surfaces.
     std::unordered_map<uint32_t, Snapshot> snapshots;
+    std::deque<RetiredImage> retired;   // see RetiredImage
     uint32_t nextTextureSlot = 1; // slot 0 is the dummy
     // Descriptor set 2 is its OWN unbounded array of TextureCube views, so it has its own
     // slot space. Sharing `nextTextureSlot` would work but would waste the sparser heap's
@@ -2912,6 +3216,22 @@ struct Renderer
     // goes to. Zero means disarmed, which is every frame until F9 is pressed.
     uint64_t drawCensusFrame = 0;
     uint64_t capturePictureFrame = 0;   // CW_CAPTURE_KEY: write this frame's picture
+    // F8's burst — see the write site for what it is and why a flicker needs one.
+    bool burstActive = false;
+    uint32_t burstSeq = 0;          // which press this is, so two bursts never collide
+    uint32_t burstFrames = 0;       // frames written in THIS burst
+    uint64_t burstEndNs = 0;        // steady-clock deadline
+    FILE* burstManifest = nullptr;
+    // The burst's PER-DRAW CENSUS (part 57). Part 56's burst carried pixels and
+    // per-frame fingerprints but no draw list, so a decal seen blinking could not be
+    // asked whether its draw was ISSUED that frame — which is exactly the question the
+    // burst exists to discriminate, and exactly where the analysis stopped. One file per
+    // burst, one full census line per draw, each prefixed with its frame number so the
+    // lines align with the PPMs exactly. Default-on with the burst (a burst is already a
+    // diagnostic act); CW_BURST_CENSUS=0 declines it, CW_BURST_CENSUS_EVERY=N thins it.
+    FILE* burstCensusFile = nullptr;
+    bool burstCensusThisFrame = false;  // decided once per frame at the swap
+    uint64_t burstCensusLines = 0;
     uint64_t captureSnapFrame = 0;      // ... and its resolve snapshots
     FILE* drawCensusFile = nullptr;
     uint64_t drawCensusLines = 0;
@@ -3040,6 +3360,126 @@ struct Renderer
 };
 
 Renderer* R = nullptr;
+
+// ===================================================================================
+// SHADOW-RESOLUTION TIERS — the Shadow Quality row, wired (part 60 night item 2)
+// ===================================================================================
+// Until part 60 the shadow cascades rode CW_VK_RES with everything else: the cascade
+// pass renders into the shared EDRAM at the scene scale and the 4096x1024 atlas
+// snapshot is created at RS(). The tier gives the SHADOW pass its own scale — High is
+// the scene scale, Medium half of it, Low a quarter, floored at 1x of the title's own
+// base — applied to the cascade draws' viewport/scissor and to the atlas resolve's
+// copy extents and snapshot size, so the snapshot and its normalized-UV fetches stay
+// consistent at any tier. At scale 1 every tier floors to 1x and the knob is honestly
+// inert (said so in the panel); at 1440p High=2x Med/Low=1x; at 4K the spread is
+// 4x/2x/1x.
+//
+// THE PASS IS IDENTIFIED BY ITS EDRAM SURFACE PITCH, measured, not assumed: a
+// CW_VK_VIEWPORT_TRACE census over the outdoor DebugJump route shows the cascade
+// pass — and nothing else in the frame — bound to surfacePitch=1040, msaa=0
+// (surfaceInfo=10000410; the main draws at depthControl=16/97/B7, the strip and
+// full-extent clears included). 1040 is not arbitrary: EDRAM pitch aligns to the
+// 80-pixel tile, and 1024 rounds up to 13*80 = 1040 — i.e. the pitch MEANS "a
+// 1024-wide EDRAM surface", and this title's only 1024-wide surface is the shadow
+// cascade. The same predicate serves DoDraw and DoResolve, reading the same live
+// register, so a pass can never be drawn at one scale and resolved at another.
+inline bool IsShadowSurface(const uint32_t* regs)
+{
+    return (regs[xenos::kRbSurfaceInfo] & 0x3FFF) == 1040 &&
+           ((regs[xenos::kRbSurfaceInfo] >> 16) & 3) == 0;
+}
+
+// The shadow pass's own internal resolution this frame. `CW_VK_SHADOW_TIER=0|1|2`
+// is the measurement arm and wins over the settings file (the env-wins rule);
+// otherwise the panel's persisted Shadow Quality row drives it, re-read once per
+// FRAME so a menu change applies live while draws and resolves within one frame
+// always agree. Tier 2 (High) is the scene resolution — bit-identical to the
+// pre-tier renderer, the control arm. Medium halves the HEIGHT (floored at the
+// title's own 720) and Low quarters it; the width follows so the pass keeps the
+// scene's aspect.
+void ShadowRes(uint32_t& sw, uint32_t& sh)
+{
+    static const int envTier = [] {
+        if (const char* e = Env("CW_VK_SHADOW_TIER"))
+        {
+            const long t = strtol(e, nullptr, 10);
+            if (t >= 0 && t <= 2)
+            {
+                fprintf(stderr, "[vk] CW_VK_SHADOW_TIER=%ld — the env arm wins over "
+                                "the settings file's shadow_tier\n", t);
+                return int(t);
+            }
+            fprintf(stderr, "[vk] CW_VK_SHADOW_TIER=%s is not 0..2 — IGNORED\n", e);
+        }
+        return -1;
+    }();
+    static uint64_t cachedFrame = ~0ull;
+    static uint32_t cachedW = 0, cachedH = 0;
+    if (!cachedW || cachedFrame != R->frame)
+    {
+        cachedFrame = R->frame;
+        int tier = envTier >= 0 ? envTier : Settings_ShadowTier();
+        // CW_TEST_TIER_FLIP=N — cycle the tier 2,1,0 every N frames, headlessly
+        // exercising the LIVE flip the panel row performs (the shadow-tier freeze's
+        // repro arm: the resize path destroys and rebuilds the atlas mid-run on
+        // every boundary this crosses).
+        static const long flipEvery = [] {
+            const char* e = Env("CW_TEST_TIER_FLIP");
+            return e ? strtol(e, nullptr, 10) : 0;
+        }();
+        if (flipEvery > 0)
+            tier = 2 - int((R->frame / uint64_t(flipEvery)) % 3);
+        uint32_t w, h;
+        InternalRes(w, h);
+        uint32_t th = tier == 2 ? h : tier == 1 ? h / 2 : h / 4;
+        if (th < 720)
+            th = 720;
+        cachedH = th;
+        cachedW = uint32_t(uint64_t(w) * th / h);
+        if ((cachedW & 1) != 0)
+            --cachedW;   // even, so the tile arithmetic stays whole pixels
+    }
+    sw = cachedW;
+    sh = cachedH;
+}
+
+// THE FOV SLIDER (part 61, docs/rt-and-fov-plan.md §0). The settings row carries N
+// degrees of ADJUSTMENT to the game's own camera (-10..+30, 0 = OG); this returns
+// N/2 in radians — the term added to the projection's vertical HALF-fov by
+// PatchFovProjection — re-read once per FRAME (the shadow-tier pattern above) so a
+// live menu change applies at the next frame boundary while every draw within one
+// frame sees one value. That per-frame latch is also what keeps the constant memo
+// safe: the memo never survives a frame (constMemoFrame), so patched bytes can
+// never be reused under a different slider value. `CW_VK_FOV=N` is the measurement
+// arm and wins over the file (including CW_VK_FOV=0, which PINS the slider off).
+float FovHalfRadThisFrame()
+{
+    static const bool envSet = Env("CW_VK_FOV") != nullptr;
+    static const int envDeg = [] {
+        if (const char* e = Env("CW_VK_FOV"))
+        {
+            const long d = strtol(e, nullptr, 10);
+            if (d >= -10 && d <= 30)
+            {
+                fprintf(stderr, "[vk] CW_VK_FOV=%ld — the env arm wins over the "
+                                "settings file's fov\n", d);
+                return int(d);
+            }
+            fprintf(stderr, "[vk] CW_VK_FOV=%s is outside -10..+30 — IGNORED, "
+                            "slider pinned to OG\n", e);
+        }
+        return 0;
+    }();
+    static uint64_t cachedFrame = ~0ull;
+    static float cachedHalfRad = 0.0f;
+    if (cachedFrame != R->frame)
+    {
+        cachedFrame = R->frame;
+        const int deg = envSet ? envDeg : Settings_Fov();
+        cachedHalfRad = float(deg) * 0.00872664626f;   // pi/360: degrees -> half-radians
+    }
+    return cachedHalfRad;
+}
 
 // The cross-frame store's index, through one seam so the container is a runtime choice.
 // A raw pointer rather than an iterator because that is what both containers can return
@@ -3755,6 +4195,17 @@ bool CreateDevice()
         else
             fprintf(stderr, "[vk] device lacks samplerAnisotropy — distance "
                             "filtering stays trilinear on this device\n");
+        // USER CLIP PLANES (part 57): a shader cache built with XE_USER_CLIP_PLANES
+        // exports six ClipDistance values, and a pipeline whose VS declares the
+        // built-in needs this feature whether or not any plane is enabled that draw.
+        // Same pattern as anisotropy: ask only if the device has it, and name its
+        // absence out loud, because on such a device the clip-plane cache would fail
+        // pipeline creation rather than silently not clip.
+        if (haveF.shaderClipDistance)
+            f2.features.shaderClipDistance = VK_TRUE;
+        else
+            fprintf(stderr, "[vk] device lacks shaderClipDistance — an "
+                            "XE_USER_CLIP_PLANES shader cache cannot run on it\n");
     }
     // CW_VK_ROBUST=1 — bound out-of-range buffer reads instead of undefined behaviour.
     // A Xenos vfetch past a stream's declared size returns ZERO (the fetch-constant
@@ -4361,33 +4812,76 @@ void RefreshSnapshotView(VkCommandBuffer cb, Image& src, SnapshotView& view,
     Barrier(cb, src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, aspect);
 }
 
+// See RetiredImage: queue an image for destruction once no in-flight or
+// in-recording command buffer can reference it, and clear the owner's handle.
+void RetireImage(Image& im)
+{
+    if (im.image || im.view || im.memory)
+        R->retired.push_back({ R->frame, im });
+    im = Image{};
+}
+
+// Destroy every retired image whose last possible referencing frame has been
+// fence-waited. Called at the present boundary, right after the oldest frame's
+// fence wait — the one moment the age arithmetic below is known true.
+void DrainRetiredImages()
+{
+    while (!R->retired.empty() &&
+           R->retired.front().retireFrame + R->framesInFlight + 1 <= R->frame)
+    {
+        Image& im = R->retired.front().image;
+        if (im.view)
+            vkDestroyImageView(R->device, im.view, nullptr);
+        if (im.image)
+            vkDestroyImage(R->device, im.image, nullptr);
+        if (im.memory)
+            vkFreeMemory(R->device, im.memory, nullptr);
+        R->retired.pop_front();
+        Count("retired image destroyed after its fences");
+    }
+}
+
 // Copy one resolve snapshot into one FACE of a cube snapshot, in the command buffer
 // given. Both images end back in SHADER_READ_ONLY, which is the layout their descriptors
 // were written with — the snapshot because other passes sample it as an ordinary 2D
 // surface in the same frame, the cube because a draw may sample it immediately.
 //
-// The extent is the intersection of the two. A face is bounded by the snapshot that
-// feeds it: if the guest resolved a 32x32 region into a 64x64 face's address we copy
-// what exists rather than reading 64 rows out of a 32-row image, and the shortfall is
+// The mapping is GUEST-space: the source snapshot represents guestW x guestH texels of
+// the face, and they land in the same guest region of the (square, uniformly-scaled)
+// cube layer, clamped to the face — if the guest resolved a 32x32 region into a 64x64
+// face's address we fill that quarter rather than stretching it, and the shortfall is
 // visible as a face that is only partly filled rather than as undefined content.
-void CopyFaceIntoCube(VkCommandBuffer cb, Image& src, CubeSnapshot& cube, uint32_t face)
+//
+// A BLIT rather than a copy since wide mode (part 60): a Vulkan cube image must be
+// SQUARE, so cube faces are the one render-pipeline surface whose X does NOT widen —
+// the face's snapshot arrives 21/16 wider than the cube layer wants and the blit
+// squeezes it back. At 16:9 the extents are equal and the blit degenerates to the old
+// copy exactly.
+void CopyFaceIntoCube(VkCommandBuffer cb, const Snapshot& snap, CubeSnapshot& cube,
+                      uint32_t face)
 {
-    const uint32_t w = std::min(src.width, cube.faceExtent);
-    const uint32_t h = std::min(src.height, cube.faceExtent);
-    if (!w || !h || face >= 6)
+    const Image& src = snap.image;
+    const uint32_t dstW =
+        std::min(PassY(snap.guestW, snap.builtH), cube.faceExtent);
+    const uint32_t dstH =
+        std::min(PassY(snap.guestH, snap.builtH), cube.faceExtent);
+    if (!dstW || !dstH || !src.width || !src.height || face >= 6)
         return;
-    Barrier(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    Barrier(cb, const_cast<Image&>(src), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_IMAGE_ASPECT_COLOR_BIT);
     Barrier(cb, cube.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             VK_IMAGE_ASPECT_COLOR_BIT);
-    VkImageCopy c{};
-    c.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    c.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, face, 1 };
-    c.extent = { w, h, 1 };
-    vkCmdCopyImage(cb, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, cube.image.image,
-                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+    VkImageBlit b{};
+    b.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    b.srcOffsets[1] = { int32_t(src.width), int32_t(src.height), 1 };
+    b.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, face, 1 };
+    b.dstOffsets[1] = { int32_t(dstW), int32_t(dstH), 1 };
+    vkCmdBlitImage(cb, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, cube.image.image,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
     Barrier(cb, cube.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             VK_IMAGE_ASPECT_COLOR_BIT);
-    Barrier(cb, src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    Barrier(cb, const_cast<Image&>(src), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_IMAGE_ASPECT_COLOR_BIT);
     cube.facesFilled |= 1u << face;
 }
 
@@ -4418,7 +4912,8 @@ uint32_t CubeSnapshotSlot(const xenos::TextureFetch& t, uint32_t faceStride)
         // A face's extent is part of its identity for the same reason a snapshot's is:
         // a different extent at the same address is a different surface, and copying
         // into the old image would leave the previous one's pixels around the edge.
-        if (it->second.faceExtent != t.width)
+        // The build scale is identity too, since part 60's live resolution switch.
+        if (it->second.faceExtent != t.width || it->second.builtScale != ResScale())
         {
             Count("texture: CUBE snapshot extent changed — declined");
             return 0;
@@ -4440,6 +4935,7 @@ uint32_t CubeSnapshotSlot(const xenos::TextureFetch& t, uint32_t faceStride)
 
     CubeSnapshot cube;
     cube.faceExtent = t.width;
+    cube.builtScale = ResScale();
     cube.faceStride = faceStride;
     cube.slot = R->nextCubeSlot++;
     // R8G8B8A8_UNORM, matching what a colour resolve snapshot is stored as: vkCmdCopyImage
@@ -4475,7 +4971,7 @@ uint32_t CubeSnapshotSlot(const xenos::TextureFetch& t, uint32_t faceStride)
             auto s = R->snapshots.find(basePhys + f * faceStride);
             if (s == R->snapshots.end())
                 continue;
-            CopyFaceIntoCube(cb, s->second.image, cube, f);
+            CopyFaceIntoCube(cb, s->second, cube, f);
         }
     });
 
@@ -4553,7 +5049,11 @@ uint32_t SnapshotViewSlot(Snapshot& snap, uint32_t w, uint32_t h)
     // snapshot into it and the snapshot is scaled. A guest-sized view here would serve
     // the top-left 1/scale^2 of the surface, which reads as a zoomed texture and not as
     // a missing one.
-    if (!CreateImage(view.image, RS(w), RS(h), snap.image.format,
+    // The snapshot's OWN build resolution, not the scene's: a shadow-tier snapshot
+    // (part 60) is built below the scene size, and a view larger than its source
+    // would make RefreshSnapshotView copy rows the source image does not have.
+    if (!CreateImage(view.image, PassX(w, snap.builtW), PassY(h, snap.builtH),
+                     snap.image.format,
                      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                          VK_IMAGE_USAGE_SAMPLED_BIT,
                      aspect, VK_IMAGE_VIEW_TYPE_2D, 1, 1,
@@ -4563,8 +5063,8 @@ uint32_t SnapshotViewSlot(Snapshot& snap, uint32_t w, uint32_t h)
         Count("texture: snapshot view image creation FAILED");
         return 0;
     }
-    NameImage(view.image, "snapshot view %ux%u slot %u%s", RS(w), RS(h), view.slot,
-              snap.fromDepth ? " DEPTH" : "");
+    NameImage(view.image, "snapshot view %ux%u slot %u%s", PassX(w, snap.builtW),
+              PassY(h, snap.builtH), view.slot, snap.fromDepth ? " DEPTH" : "");
 
     VkDescriptorImageInfo ii{};
     ii.imageView = view.image.view;
@@ -4585,6 +5085,66 @@ uint32_t SnapshotViewSlot(Snapshot& snap, uint32_t w, uint32_t h)
     const uint32_t slot = view.slot;
     snap.views.emplace(key, std::move(view));
     return slot;
+}
+
+// PACKED LEVEL OFFSETS — where a mip level (LEVEL 0 INCLUDED) sits inside the shared
+// 32x32-unit tile, in UNITS (blocks for DXT). Once a texture's shorter dimension is
+// <= 16 texels the whole chain packs into one tile, and that includes the base: a
+// 32x16 DXT1's level 0 lives at block (0,4), not (0,0). Reading level 0 at the tile
+// origin — what this renderer did until part 59 — reads the sub-4x4 tail region and
+// padding, which is why every tiny far-LOD sheet (the gas sign's letters and disc,
+// 79 distinct textures in one R6 street frame) painted as dark garbage at distance.
+//
+// The layout rule is transcribed from Xenia's GetPackedMipOffset
+// (src/xenia/gpu/texture_util.cc, BSD-3-Clause — a ~20-line layout fact, licence
+// recorded here per the project rule), and then VERIFIED against hardware's own bytes
+// rather than trusted (gotcha 308):
+//   * its square-tail half reproduces tools/packed_mip_derive.py's independently
+//     brute-forced table EXACTLY ((4,0)/(2,0)/(1,0), 378/378 votes on the R6 trace);
+//   * over the R6 trace's whole mipAddr=0 class, 69 of 70 informative textures form
+//     a consistent mip chain at these offsets (score <= 24 where our old (0,0) base
+//     read scores 57.7 on the letters texture), 1 marginal at 26.9 — which the
+//     endpoint-luma divergence guard polices at upload anyway.
+// The 3D z-packing arm of the original is deliberately not carried: depth is 1 on
+// every texture this path takes, and a 3D packed texture should decline loudly.
+static bool PackedLevelOffset(uint32_t width, uint32_t height, uint32_t blockDim,
+                              uint32_t mip, uint32_t& xUnits, uint32_t& yUnits)
+{
+    auto log2ceil = [](uint32_t v) {
+        uint32_t l = 0;
+        while ((1u << l) < v)
+            ++l;
+        return l;
+    };
+    const uint32_t log2w = log2ceil(width);
+    const uint32_t log2h = log2ceil(height);
+    const uint32_t log2size = std::min(log2w, log2h);
+    if (log2size > 4 + mip)
+        return false;                       // this level is not packed
+    const uint32_t packedBase = (log2size > 4) ? (log2size - 4) : 0;
+    const uint32_t packedMip = mip - packedBase;
+    uint32_t xTexels = 0, yTexels = 0;
+    if (packedMip < 3)
+    {
+        // Wider than tall lays the packed levels out vertically (offsets in Y);
+        // taller-or-square horizontally (offsets in X). 16 >> packedMip texels.
+        if (log2w > log2h)
+            yTexels = 16u >> packedMip;
+        else
+            xTexels = 16u >> packedMip;
+    }
+    else
+    {
+        const uint32_t off =
+            (1u << ((log2w > log2h ? log2w : log2h) - packedBase)) >> (packedMip - 2);
+        if (log2w > log2h)
+            xTexels = off;
+        else
+            yTexels = off;
+    }
+    xUnits = xTexels / blockDim;
+    yUnits = yTexels / blockDim;
+    return true;
 }
 
 // Upload the texture a fetch constant describes and return its bindless slot, or 0 for
@@ -5230,6 +5790,20 @@ uint32_t UploadTexture(uint8_t* base, const uint32_t* regs, uint32_t constIdx,
     const uint64_t dstBytes = faceDstBytes * layers;
     std::vector<uint8_t> pixels(dstBytes);
 
+    // A SMALL PACKED TEXTURE'S BASE IS NOT AT THE TILE ORIGIN (part 59, the R6
+    // gas-sign trace). When packed_mips is set and the shorter dimension is <= 16,
+    // level 0 itself sits at a packed offset inside the shared tile — see
+    // PackedLevelOffset above for the rule, its provenance and its verification.
+    // CW_VK_NO_PACKED_SMALL=1 is the same-binary control arm for the whole feature
+    // (this offset AND the mipAddr=0 chain below).
+    static const bool noPackedSmall = EnvOn("CW_VK_NO_PACKED_SMALL");
+    uint32_t base0X = 0, base0Y = 0;
+    const bool smallPacked =
+        !noPackedSmall && t.packedMips && t.tiled && layers == 1 &&
+        PackedLevelOffset(t.width, t.height, blockDim, 0, base0X, base0Y);
+    if (smallPacked)
+        Count("texture: small-packed BASE read at its tile offset");
+
     // The whole untile below is written for one face. Six faces is that loop six times
     // over, with both cursors advanced by their own stride — so the loop was lifted out
     // rather than the body being duplicated, and a 2D texture takes exactly the path it
@@ -5265,7 +5839,10 @@ uint32_t UploadTexture(uint8_t* base, const uint32_t* regs, uint32_t constIdx,
         for (uint32_t y = 0; y < unitH; y++)
             for (uint32_t x = 0; x < unitW; x++)
             {
-                const uint32_t unit = Tiled2DOffset(x, y, srcPitchUnits, log2bpu);
+                // base0X/base0Y shift a small-packed texture's level 0 to its packed
+                // position inside the shared tile; both are 0 on the ordinary path.
+                const uint32_t unit =
+                    Tiled2DOffset(base0X + x, base0Y + y, srcPitchUnits, log2bpu);
                 const uint64_t off = uint64_t(unit) * bytesPerUnit;
                 // Bounded by ONE FACE, not by the whole source: `src` already points at
                 // this face, so a unit past `faceBytes` would be read out of the next
@@ -5567,6 +6144,68 @@ uint32_t UploadTexture(uint8_t* base, const uint32_t* regs, uint32_t constIdx,
                 chainOff += lFootprint;
         }
         Count(levelCount > 1 ? "mip: chain uploaded" : "mip: chain declared but no level taken");
+    }
+    else if (!noMips && layers == 1 && smallPacked && !t.mipAddress && t.mipMax >= 1)
+    {
+        // THE SMALL-PACKED CHAIN (part 59, the R6 gas-sign trace). A texture whose
+        // shorter dimension is <= 16 carries its WHOLE chain — base and mips — inside
+        // the one tile at `t.address`, with `mipAddr = 0`, so the `t.mipAddress` gate
+        // above skipped these chains entirely for the whole of phase 5. Every level is
+        // read from the base tile at PackedLevelOffset's position. 79 distinct
+        // textures in one R6 street frame are in this class; the sign's letters and
+        // disc far-LOD sheets are the worked examples (phase5-notes §6co).
+        //
+        // The mostly-empty and divergence guards of the unpacked walk are not
+        // repeated here: the layout is not an accumulation model that can drift —
+        // it was verified per-class against hardware bytes (69/70 informative chains
+        // consistent, see PackedLevelOffset), and a small-packed level never shares
+        // a tile with another texture's data the way an accumulated offset can.
+        uint32_t log2bpu = 0;
+        while ((1u << log2bpu) < bytesPerUnit)
+            ++log2bpu;
+        for (uint32_t level = 1; level <= t.mipMax && level < 16; level++)
+        {
+            const uint32_t lw = std::max(1u, t.width >> level);
+            const uint32_t lh = std::max(1u, t.height >> level);
+            if (lw < blockDim || lh < blockDim)
+            {
+                // Below one block the offset cannot be block-aligned; same decline
+                // as the unpacked tail's.
+                Count("mip: small-packed sub-block level — chain ends");
+                break;
+            }
+            uint32_t px = 0, py = 0;
+            if (!PackedLevelOffset(t.width, t.height, blockDim, level, px, py))
+            {
+                Count("mip: small-packed level claims UNPACKED — chain ends");
+                break;
+            }
+            const uint32_t luW = (lw + blockDim - 1) / blockDim;
+            const uint32_t luH = (lh + blockDim - 1) / blockDim;
+            const uint64_t lDstBytes = uint64_t(luW) * luH * bytesPerUnit;
+            const size_t at = pixels.size();
+            pixels.resize(at + size_t(lDstBytes));
+            uint8_t* ldst = pixels.data() + at;
+            const uint8_t* lsrc = base + va;        // the SAME tile level 0 came from
+            for (uint32_t y = 0; y < luH; y++)
+                for (uint32_t x = 0; x < luW; x++)
+                {
+                    const uint64_t off =
+                        uint64_t(Tiled2DOffset(px + x, py + y, srcPitchUnits,
+                                               log2bpu)) * bytesPerUnit;
+                    if (off + bytesPerUnit > faceBytes)
+                        continue;
+                    CopySwapped(&ldst[(uint64_t(y) * luW + x) * bytesPerUnit],
+                                lsrc + off, bytesPerUnit, t.endian);
+                }
+            VkBufferImageCopy c{};
+            c.bufferOffset = at;
+            c.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1 };
+            c.imageExtent = { lw, lh, 1 };
+            copies.push_back(c);
+            levelCount = level + 1;
+            Count("mip: small-packed level TAKEN");
+        }
     }
     else if (!noMips && layers == 6 && t.mipMax >= 1)
     {
@@ -6016,6 +6655,28 @@ VkBlendOp XenosBlendOp(uint32_t op)
     }
 }
 
+// THE STENCIL OPS, in the guest's own encoding. Confirmed by COHERENCE rather than from a
+// register document: decoded with this table, the title's five stencil configurations come
+// out as a matched pair — `ALWAYS / KEEP / REPLACE / KEEP` draws that write a reference of
+// 254 into the buffer, and an `EQUAL / KEEP / KEEP / KEEP` draw that only paints where it
+// finds that value. A wrong layout produces random ops, not a mask-write next to a
+// mask-test, which is why this check is worth more than a header would be (see the
+// RB_COLORCONTROL comment in xenos.h for what a guessed index costs here).
+VkStencilOp XenosStencilOp(uint32_t v)
+{
+    switch (v & 7)
+    {
+    case 0: return VK_STENCIL_OP_KEEP;
+    case 1: return VK_STENCIL_OP_ZERO;
+    case 2: return VK_STENCIL_OP_REPLACE;
+    case 3: return VK_STENCIL_OP_INCREMENT_AND_CLAMP;
+    case 4: return VK_STENCIL_OP_DECREMENT_AND_CLAMP;
+    case 5: return VK_STENCIL_OP_INVERT;
+    case 6: return VK_STENCIL_OP_INCREMENT_AND_WRAP;
+    default: return VK_STENCIL_OP_DECREMENT_AND_WRAP;
+    }
+}
+
 VkCompareOp XenosCompareOp(uint32_t f)
 {
     switch (f & 7)
@@ -6167,8 +6828,51 @@ VkPipeline GetPipeline(const PipelineKey& key, const ShaderMeta& vs, const Shade
         VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO
     };
     rs.polygonMode = VK_POLYGON_MODE_FILL;
+    // THE POLYGON OFFSET (part 56). Enabled in every pipeline and supplied as DYNAMIC
+    // state, which is the whole reason this costs nothing: with the bias values at zero
+    // the result is `constantFactor * r + slopeFactor * slope` = 0, i.e. bit-identical to
+    // having it disabled, so the 2,388 draws a frame that ask for no offset are unaffected
+    // and only the ~80 that do change. Putting the two floats in the PipelineKey instead
+    // would have multiplied a 509-pipeline cache by however many distinct offsets the
+    // title uses, for a value that changes per draw.
+    // Static, from the key — see PipelineKey::polyOffsetScale for why this is not dynamic
+    // state. Zero factors are arithmetically identical to a disabled bias, so the ~82% of
+    // draws that ask for no offset are untouched and land on the same pipeline.
+    {
+        static const bool noPolyOffset = EnvOn("CW_VK_NO_POLY_OFFSET");
+        static const float poScale = [] {
+            const char* v = Env("CW_VK_POLY_OFFSET_SCALE");
+            return v ? float(atof(v)) : 1.0f;
+        }();
+        const float slope = noPolyOffset ? 0.0f : F32(key.polyOffsetScale) * poScale;
+        // 2^24: the depth buffer is D24_UNORM. Xenos's offset is in depth units; Vulkan
+        // multiplies `depthBiasConstantFactor` by the minimum resolvable difference.
+        const float konst =
+            noPolyOffset ? 0.0f : F32(key.polyOffsetOffset) * 16777216.0f * poScale;
+        rs.depthBiasEnable = (slope != 0.0f || konst != 0.0f) ? VK_TRUE : VK_FALSE;
+        rs.depthBiasSlopeFactor = slope;
+        rs.depthBiasConstantFactor = konst;
+        rs.depthBiasClamp = 0.0f;
+    }
     rs.cullMode = VK_CULL_MODE_NONE;
-    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    // WHICH WAY IS FRONT — ANSWERED BY EXPERIMENT IN PART 58: for this title's state
+    // (Xenos FACE=0, our negative-height-viewport Y flip), Vulkan's CLOCKWISE is
+    // hardware's front. Facing's only consumer in this renderer is the TWO-SIDED
+    // STENCIL (culling is NONE above, and the title censuses su=00080008 — cull off,
+    // FACE=0 — on every draw of a frame), so the previous hardcoded CCW sat unverified
+    // and inert from phase 5 until part 56 wired ds.front/ds.back — and then it was the
+    // whole slicing see-through: the gore cap is a 6-vert quad stencil-tested EQUAL
+    // against a per-piece ref that the two-sided passes WRITE (front REPLACE / back
+    // ZERO); with front and back swapped the written region complements and the quad
+    // fails exactly where the cap belongs, view-dependently — the operator's report
+    // verbatim. One arm flipped it and the verdict was "it is perfect now".
+    // CW_VK_STENCIL_CCW_FRONT=1 is the same-binary control arm (the pre-part-58
+    // renderer). The part-58 experiment arm CW_VK_STENCIL_FLIP_FACES is RETIRED and no
+    // longer read: setting it would ask for what is now the default, and two variables
+    // steering one bit invites the contradictory pair.
+    static const bool ccwFront = EnvOn("CW_VK_STENCIL_CCW_FRONT");
+    rs.frontFace =
+        ccwFront ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
     rs.lineWidth = 1.0f;
 
     VkPipelineMultisampleStateCreateInfo ms{
@@ -6190,6 +6894,56 @@ VkPipeline GetPipeline(const PipelineKey& key, const ShaderMeta& vs, const Shade
         (!noDepthTest && ((key.depthControl >> 1) & 1)) ? VK_TRUE : VK_FALSE;
     ds.depthWriteEnable = ((key.depthControl >> 2) & 1) ? VK_TRUE : VK_FALSE;
     ds.depthCompareOp = XenosCompareOp((key.depthControl >> 4) & 7);
+
+    // ---- THE STENCIL TEST (part 56) ---------------------------------------------
+    //
+    // Never implemented before this: `stencilTestEnable` did not appear anywhere in this
+    // renderer, while RB_DEPTHCONTROL bit 0 IS `stencil_enable` — our own comment above
+    // says so, and the code read bits 1, 2 and 4..6 and stepped over it.
+    //
+    // WHAT IT COSTS TO IGNORE, measured on the operator's own frames: **350 of 1980 and
+    // 326 of 1823 draws enable it**, ~18% of a gameplay frame. Their report is what
+    // identified the consequence — cutting a zombie in half yields *"two full zombie and
+    // the blood is a square"*. The game does not build half-meshes: it draws the WHOLE
+    // body twice and masks each copy to one side of the cut, and draws the cross-section
+    // cap as a quad masked to the body's silhouette. With nothing masking either, both
+    // copies render whole AND the cap renders as a full rhombus — two symptoms, one cause.
+    //
+    // The reference and the masks are DYNAMIC state, so they do not enter the pipeline
+    // key; only the compare and the four ops do, and only when the test is enabled.
+    static const bool noStencil = EnvOn("CW_VK_NO_STENCIL");
+    ds.stencilTestEnable = (!noStencil && (key.depthControl & 1)) ? VK_TRUE : VK_FALSE;
+    if (ds.stencilTestEnable)
+    {
+        ds.front.compareOp = XenosCompareOp((key.depthControl >> 8) & 7);
+        ds.front.failOp = XenosStencilOp((key.depthControl >> 11) & 7);
+        ds.front.passOp = XenosStencilOp((key.depthControl >> 14) & 7);
+        ds.front.depthFailOp = XenosStencilOp((key.depthControl >> 17) & 7);
+        // BACKFACE_ENABLE (bit 7) is what says the back-face fields mean anything. With
+        // it clear the guest expects one set of ops for both faces, and copying the front
+        // set is the only reading that does not invent state: the back fields are then
+        // undefined in the stream, and this title leaves them at values that would
+        // decode as ZERO/KEEP nonsense if taken literally.
+        if ((key.depthControl >> 7) & 1)
+        {
+            ds.back.compareOp = XenosCompareOp((key.depthControl >> 20) & 7);
+            ds.back.failOp = XenosStencilOp((key.depthControl >> 23) & 7);
+            ds.back.passOp = XenosStencilOp((key.depthControl >> 26) & 7);
+            ds.back.depthFailOp = XenosStencilOp((key.depthControl >> 29) & 7);
+            // Engagement counters, at pipeline creation because facing is pipeline
+            // state: the first says two-sided stencil states were MET this run (a
+            // facing verdict from a run where this never fires means nothing), the
+            // second that the pre-part-58 control arm was live.
+            COUNT("pipeline: two-sided stencil built (facing matters here)");
+            if (ccwFront)
+                COUNT("pipeline: two-sided stencil built with FRONT=CCW "
+                      "(CW_VK_STENCIL_CCW_FRONT control arm)");
+        }
+        else
+        {
+            ds.back = ds.front;
+        }
+    }
     // CW_VK_DEPTH_ALWAYS=1 — the arm that CW_VK_NO_DEPTH_TEST above cannot be.
     //
     // Vulkan ties depth WRITES to the depth TEST: with `depthTestEnable` false the
@@ -6252,12 +7006,33 @@ VkPipeline GetPipeline(const PipelineKey& key, const ShaderMeta& vs, const Shade
     bs.attachmentCount = 1;
     bs.pAttachments = &cb;
 
-    const VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
-                                   VK_DYNAMIC_STATE_BLEND_CONSTANTS };
+    // THE STENCIL DYNAMIC STATES ARE DECLARED ONLY WHEN THE PIPELINE USES THEM, and that
+    // is a correctness requirement rather than tidiness: Vulkan says a declared dynamic
+    // state MUST be set before ANY draw with that pipeline, and this renderer has draw
+    // paths that never pass through the per-draw state block — the resolve blits, the
+    // draw-ID pass, the overlay. Declaring the three unconditionally produced 40
+    // `VUID-vkCmdDraw-None-08608` from exactly those, caught by `CW_VK_VALIDATION=1` and
+    // by nothing else: the picture was unaffected and every gate passed.
+    VkDynamicState dyn[6] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                              VK_DYNAMIC_STATE_BLEND_CONSTANTS };
+    uint32_t dynCount = 3;
+    if (ds.stencilTestEnable)
+    {
+        dyn[dynCount++] = VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK;
+        dyn[dynCount++] = VK_DYNAMIC_STATE_STENCIL_WRITE_MASK;
+        dyn[dynCount++] = VK_DYNAMIC_STATE_STENCIL_REFERENCE;
+    }
     VkPipelineDynamicStateCreateInfo dsi{
         VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO
     };
-    dsi.dynamicStateCount = 3;
+    // COUNTED FROM THE ARRAY, not written out again. This was a hardcoded `3` and the
+    // array had grown to four: `VK_DYNAMIC_STATE_DEPTH_BIAS` was added, never declared,
+    // and therefore never took effect — the pipeline used its static (zero) bias while
+    // `vkCmdSetDepthBias` was called every draw and ignored. Nothing reported it: not the
+    // validation layer (setting an undeclared dynamic state is not an error), not a gate,
+    // not the picture. An array and a separately-written count WILL drift; the only fix
+    // that stays fixed is deriving one from the other.
+    dsi.dynamicStateCount = dynCount;
     dsi.pDynamicStates = dyn;
 
     VkPipelineShaderStageCreateInfo stages[2]{};
@@ -6294,6 +7069,11 @@ VkPipeline GetPipeline(const PipelineKey& key, const ShaderMeta& vs, const Shade
     rci.colorAttachmentCount = 1;
     rci.pColorAttachmentFormats = &colorFormat;
     rci.depthAttachmentFormat = R->depth.format;
+    // The stencil aspect must be declared too, or a pipeline with the stencil test on is
+    // rendering into an attachment the pipeline says does not exist. The render pass has
+    // always bound the same image as both (`ri.pStencilAttachment = &depthAtt`).
+    rci.stencilAttachmentFormat = FormatHasStencil(R->depth.format) ? R->depth.format
+                                                                   : VK_FORMAT_UNDEFINED;
     rci.stencilAttachmentFormat = R->depth.format;
 
     VkGraphicsPipelineCreateInfo pci{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
@@ -6790,6 +7570,19 @@ bool CreateSwapchain(uint32_t wantW, uint32_t wantH)
         extent.height = std::clamp(wantH, caps.minImageExtent.height,
                                    caps.maxImageExtent.height);
     }
+    // SAY WHAT THE SURFACE CLAIMED, every time. The operator's "everything is stretched
+    // at launch until you resize the window" was a swapchain created at 1280x1 and then
+    // NEVER rebuilt, and the log carried no way to tell whether the 1 came from a
+    // binding currentExtent, a lying maxImageExtent, or a zero want clamped to min —
+    // three different bugs with three different fixes. Creations are rare; this is one
+    // line per creation.
+    fprintf(stderr,
+            "[vk] swapchain caps: want %ux%u, currentExtent %ux%u, min %ux%u, "
+            "max %ux%u -> using %ux%u\n",
+            wantW, wantH, caps.currentExtent.width, caps.currentExtent.height,
+            caps.minImageExtent.width, caps.minImageExtent.height,
+            caps.maxImageExtent.width, caps.maxImageExtent.height,
+            extent.width, extent.height);
     // A minimised window reports a zero extent, and creating a zero-extent swapchain is
     // invalid. Report it as "no swapchain right now" and let the present path drop the
     // frame; the next resize rebuilds.
@@ -6823,8 +7616,13 @@ bool CreateSwapchain(uint32_t wantW, uint32_t wantH)
     std::vector<VkPresentModeKHR> modes(mcount);
     vkGetPhysicalDeviceSurfacePresentModesKHR(R->physical, R->swap.surface, &mcount,
                                               modes.data());
+    // FIFO if the arm asks for it (env wins), else if the PC options screen's VSync
+    // setting asks for it — FIFO IS vsync here, the display paces the queue — else
+    // MAILBOX, the part-54 default. The swapchain is rebuilt on any resize, so a
+    // mid-run VSync change takes effect by requesting a rebuild (the verb handler
+    // does), not by anything special here.
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;   // always supported
-    if (!EnvOn("CW_VK_SWAPCHAIN_FIFO"))
+    if (!EnvOn("CW_VK_SWAPCHAIN_FIFO") && !Settings_VSync())
         for (VkPresentModeKHR m : modes)
             if (m == VK_PRESENT_MODE_MAILBOX_KHR)
             {
@@ -6953,9 +7751,16 @@ bool CreateSwapchain(uint32_t wantW, uint32_t wantH)
 // only call in this path that can block, and blocking as late as possible means the CPU
 // has already done the frame's whole recording before it ever waits on the presentation
 // engine. With MAILBOX and three images it does not wait at all.
+// An atomic separate from R->swap.rebuildWanted because that bool belongs to the pump
+// thread; this one can be set from the guest thread running a menu verb. The exported
+// setter is defined at global scope near VkRenderer_DumpStats.
+std::atomic<bool> g_swapRebuildRequest{ false };
+
 void RecordSwapchainBlit(Image& source, uint32_t width, uint32_t height)
 {
     R->swap.acquired = UINT32_MAX;
+    if (g_swapRebuildRequest.exchange(false, std::memory_order_acq_rel))
+        R->swap.rebuildWanted = true;
 
     // REBUILD WHEN THE WINDOW HAS CHANGED SIZE — and the reason this is a size COMPARISON
     // rather than a reaction to a driver return code is the defect it fixes.
@@ -6980,6 +7785,17 @@ void RecordSwapchainBlit(Image& source, uint32_t width, uint32_t height)
     // shape: never let a silent tolerance stand in for a decision).
     uint32_t dw = 0, dh = 0;
     Host_VulkanDrawableSize(&dw, &dh);
+    // NEVER CREATE AT AN UNKNOWN SIZE. The first present can arrive before the window
+    // thread has published the drawable size; creating then hands the surface whatever
+    // the half-configured compositor claims (the launch-stretch defect: a 1280x1
+    // swapchain smeared over a 1280x720 window until a manual resize rebuilt it).
+    // Dropping the frame instead costs one black frame at boot and is COUNTED.
+    if (!R->swap.swapchain && (!dw || !dh))
+    {
+        R->swap.acquireFails++;
+        Count("swap: drawable size not yet published, frame DROPPED");
+        return;
+    }
     const bool sizeChanged =
         R->swap.swapchain && dw && dh &&
         (dw != R->swap.width || dh != R->swap.height);
@@ -6997,6 +7813,34 @@ void RecordSwapchainBlit(Image& source, uint32_t width, uint32_t height)
             Count("swap: swapchain unavailable, frame DROPPED");
             return;
         }
+        // A LEGAL SWAPCHAIN CAN STILL BE THE WRONG ONE. When the surface's binding
+        // currentExtent disagrees with the window (Wayland mid-configure), creation
+        // "succeeds" at a size the compositor will scale — the launch stretch. Ask for
+        // a retry next present until it converges; the cap keeps a compositor that
+        // genuinely pins a different size from turning this into a rebuild-per-frame
+        // loop, and giving up is said out loud because a silent tolerance here is how
+        // this defect survived a whole part.
+        if (dw && dh && (R->swap.width != dw || R->swap.height != dh))
+        {
+            if (R->swap.mismatchRetries < 300)
+            {
+                R->swap.mismatchRetries++;
+                R->swap.rebuildWanted = true;
+                Count("swap: created at a size the window disagrees with — retrying");
+            }
+            else if (R->swap.mismatchRetries == 300)
+            {
+                R->swap.mismatchRetries++;
+                fprintf(stderr,
+                        "[vk] swapchain is pinned at %ux%u while the window drawable is "
+                        "%ux%u after 300 retries — giving up; the compositor will scale "
+                        "(this is the launch-stretch defect, and on this machine it "
+                        "should never happen)\n",
+                        R->swap.width, R->swap.height, dw, dh);
+            }
+        }
+        else
+            R->swap.mismatchRetries = 0;
     }
 
     VkSemaphore acq = R->swap.acquireSem[R->swap.acquireIndex];
@@ -7068,11 +7912,50 @@ void RecordSwapchainBlit(Image& source, uint32_t width, uint32_t height)
     // scales, which is the same filtered-down supersampling the SDL path got for free
     // from SDL_RenderCopy. LINEAR for that reason — NEAREST would alias the 2x image
     // down into a 720p window and make the resolution knob look like a downgrade.
+    //
+    // ASPECT-FIT AS OF PART 60: the destination is the largest centered rectangle
+    // that keeps the frame's shape, not the whole swapchain — a 16:9 frame on the
+    // operator's 21:9 display gets black side bars instead of being stretched, which
+    // is what every shipped PC game does. `CW_VK_STRETCH=1` is the control arm and
+    // restores the pre-part-60 full-extent blit. The bars are CLEARED every frame
+    // they exist, because a reused swapchain image still holds whatever was blitted
+    // into it the last time around — including a stale frame from before a resize.
+    static const bool stretchArm = EnvOn("CW_VK_STRETCH");
+    int32_t fitX = 0, fitY = 0;
+    uint32_t fitW = R->swap.width, fitH = R->swap.height;
+    if (!stretchArm)
+        Host_AspectFitRect(width, height, R->swap.width, R->swap.height, fitX, fitY,
+                           fitW, fitH);
+    const bool hasBars =
+        fitX != 0 || fitY != 0 || fitW != R->swap.width || fitH != R->swap.height;
+    if (hasBars)
+    {
+        VkClearColorValue black{};
+        VkImageSubresourceRange all{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        vkCmdClearColorImage(R->cmd, R->swap.images[index],
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
+        // The blit below overwrites the cleared center, so ordering the clear first
+        // needs a barrier to keep the two transfer writes from racing on the same
+        // pixels.
+        VkImageMemoryBarrier clearDone{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+        clearDone.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        clearDone.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        clearDone.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        clearDone.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        clearDone.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        clearDone.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        clearDone.image = R->swap.images[index];
+        clearDone.subresourceRange = all;
+        vkCmdPipelineBarrier(R->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                             1, &clearDone);
+    }
     VkImageBlit blit{};
     blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
     blit.srcOffsets[1] = { int32_t(width), int32_t(height), 1 };
     blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    blit.dstOffsets[1] = { int32_t(R->swap.width), int32_t(R->swap.height), 1 };
+    blit.dstOffsets[0] = { fitX, fitY, 0 };
+    blit.dstOffsets[1] = { fitX + int32_t(fitW), fitY + int32_t(fitH), 1 };
     vkCmdBlitImage(R->cmd, source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    R->swap.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
                    VK_FILTER_LINEAR);
@@ -7110,9 +7993,15 @@ void RecordSwapchainBlit(Image& source, uint32_t width, uint32_t height)
         {
             const size_t bytes = size_t(ow) * oh * 4;
             const double sc = double(R->swap.height) / double(baseH);
-            const int32_t dx0 = int32_t(std::max(0.0, ox * sc));
+            // Centered horizontally when the window is wider than the panel's 16:9
+            // logical frame (a 21:9 window, part 60): the height ratio alone would
+            // park a "centered" panel left of the window's center.
+            const double offX =
+                std::max(0.0, (double(R->swap.width) - double(baseW) * sc) / 2.0);
+            const int32_t dx0 = int32_t(std::max(0.0, offX + ox * sc));
             const int32_t dy0 = int32_t(std::max(0.0, oy * sc));
-            const int32_t dx1 = int32_t(std::min(double(R->swap.width), (ox + ow) * sc));
+            const int32_t dx1 =
+                int32_t(std::min(double(R->swap.width), offX + (ox + ow) * sc));
             const int32_t dy1 = int32_t(std::min(double(R->swap.height), (oy + oh) * sc));
             const bool fits = dx1 > dx0 && dy1 > dy0;
 
@@ -7404,6 +8293,7 @@ int RetireOldestFrame()
         vkWaitForFences(R->device, 1, &fs.fence, VK_TRUE, UINT64_MAX);
     }
     fs.inFlight = false;
+    DrainRetiredImages();
     return int(oldest);
 }
 
@@ -8408,7 +9298,19 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     // separates them in one run each; reading the register table harder cannot.
     static const bool forceColorMask = EnvOn("CW_VK_FORCE_COLORMASK");
     key.colorMask = forceColorMask ? 0xF : (regs[xenos::kRbColorMask] & 0xF);
-    key.depthControl = regs[xenos::kRbDepthControl] & 0xFF;
+    // THE WHOLE REGISTER WHEN STENCIL IS ON, the low byte otherwise. Bits 8..31 carry the
+    // stencil compare and the four ops (front and back), and storing only the low byte
+    // meant every stencil configuration collapsed onto one pipeline — which is how a
+    // renderer can read a register, pass its own gates, and still never honour it.
+    // Masking the high bits away when the test is DISABLED keeps the ~82% of draws that
+    // do not use stencil on a single key, so the pipeline cache does not multiply for a
+    // state those draws do not have.
+    {
+        const uint32_t dc = regs[xenos::kRbDepthControl];
+        key.depthControl = (dc & 1) ? dc : (dc & 0xFF);
+        key.polyOffsetScale = regs[xenos::kPaSuPolyOffsetFrontScale];
+        key.polyOffsetOffset = regs[xenos::kPaSuPolyOffsetFrontOffset];
+    }
     key.modeControl = regs[0x2208] & 7;
 
     // ALPHA TEST (part 38, LIVE AS OF PART 40). RB_COLORCONTROL bits 0..2 are the
@@ -8652,6 +9554,12 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     const bool psHit = memoOn && R->constMemoPsValid &&
                        R->constMemoPsVersion == psVersion &&
                        R->constMemoPsBase == memoPsBase;
+    // Per DRAW (not per memo miss — a copy-site census would only count constant
+    // CHANGES and miss every memo-hit draw's depth state), on the RAW register
+    // window: which recognized projections exist and what depth state their draws
+    // carry. Env-gated; one static bool test per draw when off.
+    FovCensus(&regs[xenos::kAluConstantBase + memoVsBase * 4],
+              regs[xenos::kRbDepthControl]);
     g_constMemoHits += uint32_t(vsHit) + uint32_t(psHit);
     g_constMemoMisses += uint32_t(!vsHit) + uint32_t(!psHit);
     // PER HALF, because the split was a HYPOTHESIS — that what changes per draw is the
@@ -8697,6 +9605,16 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
             uint32_t* dst = reinterpret_cast<uint32_t*>(R->arena.mapped + vsConstAt);
             for (uint32_t i = 0; i < 256 * 4; i++)
                 dst[i] = regs[xenos::kAluConstantBase + vsBase * 4 + i];
+            // 21:9 (part 60) and the FOV slider (part 61): patch a recognized scene
+            // projection in the copy the shaders will read. Patching HERE means memo
+            // hits reuse already-patched bytes, so every draw of a frame sees one
+            // consistent projection. ORDER MATTERS and is fov FIRST: the fov patch
+            // scales A and B by one ratio (aspect preserved, so the projection still
+            // recognizes as 16:9), then the wide patch divides A alone.
+            if (PatchFovProjection(dst, FovHalfRadThisFrame()))
+                COUNT("draw: scene projection fov-adjusted (slider)");
+            if (WideMode() && PatchWideProjection(dst))
+                COUNT("draw: scene projection widened to 21:9");
             R->constMemoVsValid = true;
             R->constMemoVsVersion = vsVersion;
             R->constMemoVsBase = vsBase;
@@ -8725,6 +9643,12 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
                 scratch[i] = regs[xenos::kAluConstantBase + vsBase * 4 + i];
             for (uint32_t i = 0; i < 256 * 4; i++)
                 scratch[256 * 4 + i] = regs[xenos::kAluConstantBase + psBase * 4 + i];
+            // The recompute must apply the same patches the real copy does, in the
+            // same order, or the verifier would report every patched projection as a
+            // memo defect.
+            PatchFovProjection(scratch.data(), FovHalfRadThisFrame());
+            if (WideMode())
+                PatchWideProjection(scratch.data());
             if (g_constMemoVerifyPoison)
                 scratch[0] ^= 0x40000000u;
             const uint32_t* haveVs =
@@ -8885,7 +9809,12 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     // covers exactly one frame: at ~6,800 draws this writes ~6,800 lines, which is a file
     // to grep and not a log to read.
     const bool drawCensus = R->drawCensusFrame && R->frame == R->drawCensusFrame;
-    psbind = psbind || drawCensus;
+    // The burst census (part 57): every draw of every burst frame, in the same format,
+    // into one per-burst file. It reuses this whole formatting path because the fields
+    // that identify a decal (verts, blend, po=, the sN= texture bindings) are exactly
+    // the ones the capture census already carries.
+    const bool burstCensus = R->burstCensusThisFrame && R->burstCensusFile;
+    psbind = psbind || drawCensus || burstCensus;
     if (drawCensus && !R->drawCensusFile)
     {
         // CW_CAPTURE_KEY supplies this path too. The arming site and the OPEN site read
@@ -8949,13 +9878,62 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     // that is how a surface is identified without being able to click on it: the ground
     // is a small number of very large draws, and the HUD is a great many tiny ones.
     int psbindAt =
-        drawCensus
+        (drawCensus || burstCensus)
             ? snprintf(psbindLine, sizeof psbindLine,
                        "draw %llu verts=%u prim=%u vs=%016llx ps=%016llx mask=%X "
-                       "blend=%08X",
+                       "blend=%08X po=%u/%g/%g su=%08X dc=%08X sr=%08X cl=%08X ucp=%g/%g/%g/%g",
                        (unsigned long long)R->drawsThisFrame, draw.indexCount, draw.primType,
                        (unsigned long long)vsBind.hash, (unsigned long long)psBind.hash,
-                       regs[xenos::kRbColorMask] & 0xF, regs[xenos::kRbBlendControl0])
+                       regs[xenos::kRbColorMask] & 0xF, regs[xenos::kRbBlendControl0],
+                       // THE POLYGON OFFSET, so the next capture answers whether this
+                       // title uses one at all. It is the leading hypothesis for the
+                       // decal flicker and NOTHING should be built on it until this
+                       // title's own stream has been read: `po=0/0/0` on every draw
+                       // means the guest never asks for an offset and the flicker is
+                       // something else entirely; a non-zero on the decal draws is the
+                       // confirmation. See xenos.h for why the indices are candidates
+                       // rather than inherited.
+                       (regs[xenos::kPaSuScModeCntl] >> xenos::kPaSuPolyOffsetEnableShift) & 7,
+                       F32(regs[xenos::kPaSuPolyOffsetFrontScale]),
+                       F32(regs[xenos::kPaSuPolyOffsetFrontOffset]),
+                       // THE WHOLE OF PA_SU_SC_MODE_CNTL, so the ENABLE bit can be found
+                       // by PARTITIONING rather than guessed from a register document:
+                       // split the draws on whether they carry a non-zero offset (an
+                       // independent answer this title supplies itself) and see which bit
+                       // moves with it. That is how part 25 located the texture DIMENSION
+                       // field after three wrong guesses (gotcha 244), and it is the only
+                       // method here that cannot be fooled by a plausible-looking map.
+                       regs[xenos::kPaSuScModeCntl],
+                       // RB_DEPTHCONTROL whole, because BIT 0 IS `stencil_enable` and
+                       // this renderer has never set `stencilTestEnable` — the word does
+                       // not appear in it. A guest that clips a severed body's
+                       // cross-section with the stencil buffer would have that cap drawn
+                       // in full by us, which is the operator's "the blood is a square".
+                       regs[xenos::kRbDepthControl],
+                       // RB_STENCILREFMASK beside RB_DEPTHCONTROL, because the two are
+                       // only meaningful together: the ops say what to do and this says
+                       // with WHICH reference and through which masks. Candidate layout
+                       // ref:8, mask:8 @8, writemask:8 @16 — to be confirmed by whether
+                       // the values partition sensibly against the stencil ops, the same
+                       // coherence check that validated the op layout itself.
+                       regs[xenos::kRbStencilRefMask],
+                       // PA_CL_CLIP_CNTL and the first user clip plane. The zombie-slicing
+                       // defect's remaining half is that the BODIES are not clipped at the
+                       // cut — the game draws the whole body twice and something trims
+                       // each copy. Hardware clip planes are that mechanism and this
+                       // renderer implements none. Printed so ONE capture of a sliced
+                       // zombie says whether the guest enables them, before any of it is
+                       // built (gotcha 3: the zero we have is one draw, not a census).
+                       regs[xenos::kPaClClipCntl],
+                       // PLANE 0, at the address the register dump found. THE TEST THIS
+                       // PRINTS FOR: if the two copies of a sliced body carry the SAME
+                       // plane with OPPOSITE SIGNS, that is the slice proven outright —
+                       // one copy keeps what is above the cut and the other what is
+                       // below. Anything else and the enable bit means something other
+                       // than a body cut, and the whole clip-plane theory needs
+                       // re-examining before a line of shader work is done for it.
+                       F32(regs[xenos::kPaClUcp0X]), F32(regs[xenos::kPaClUcp0X + 1]),
+                       F32(regs[xenos::kPaClUcp0X + 2]), F32(regs[xenos::kPaClUcp0X + 3]))
         : psbind ? snprintf(psbindLine, sizeof psbindLine,
                             "[psbind] frame=%llu ps=%016llx mask=%X blend=%08X",
                             (unsigned long long)R->frame,
@@ -8963,6 +9941,83 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
                             regs[xenos::kRbColorMask] & 0xF,
                             regs[xenos::kRbBlendControl0])
                  : 0;
+
+    // v0= — the first vertex's first three dwords, byte-swapped and printed as floats.
+    // For a world-geometry stream that is the first corner's POSITION, and it is the
+    // identity a burst needs: a decal's shader, blend and even texture address are
+    // shared by dozens of draws, but a decal is a quad at a fixed WORLD position, so
+    // this field is what lets frame N's draw list be asked "is THIS decal issued?"
+    // rather than "did the count of decal-shaped draws move?". Printed on capture
+    // censuses too — a clip-plane investigation wants the same anchor. For a non-float
+    // position format the three numbers are garbage AS COORDINATES but still a stable
+    // fingerprint, which is all the matching needs.
+    if ((drawCensus || burstCensus) && vsMeta && psbindAt > 0 &&
+        psbindAt < int(sizeof psbindLine) - 64)
+    {
+        for (const VertexAttribute& a : vsMeta->attributes)
+        {
+            if (a.indirect || a.location < 0 || a.fetchSlot >= 96)
+                continue;
+            const xenos::VertexFetch vf =
+                xenos::DecodeVertexFetch(regs, FetchSlot(a.fetchSlot));
+            const uint32_t sva = PhysToVa(vf.address);
+            if (!vf.address || !GuestRangeOk(sva, 12))
+                break;
+            const uint32_t* p = reinterpret_cast<const uint32_t*>(base + sva);
+            float v[3];
+            for (int k = 0; k < 3; k++)
+            {
+                const uint32_t d = __builtin_bswap32(p[k]);
+                memcpy(&v[k], &d, 4);
+            }
+            // The stream ADDRESS beside its first vertex, because the two separate
+            // mechanisms v0 alone cannot: part 57's first bursts found every decal
+            // draw alternating near-every-frame between v0=0/0/0 and its world
+            // position, in exactly complementary frame sets — which is EITHER the
+            // game ping-ponging two buffers (two addresses, one of whose first slot
+            // is unused) OR one buffer being rewritten in place while our walk reads
+            // it (one address whose CONTENT alternates). Same v0, opposite fixes.
+            psbindAt += snprintf(psbindLine + psbindAt, sizeof psbindLine - psbindAt,
+                                 " va=%08X v0=%g/%g/%g", sva, double(v[0]),
+                                 double(v[1]), double(v[2]));
+            break;
+        }
+    }
+
+    // ---- THE CLIP-DRAW REGISTER DUMP (part 56) ----------------------------------
+    //
+    // WHY A DUMP RATHER THAN ANOTHER CENSUS FIELD. The user clip planes have now been
+    // guessed at twice — 0x2240 read 0/0/0/0 on every draw while 312 of them ENABLED
+    // plane 0, and a scan of 0x2115..0x2140 found nothing either. A third guess is not a
+    // method. This writes the WHOLE register file at the first draw that actually enables
+    // a clip plane, so the values in force can be searched offline for a plane (a
+    // roughly unit normal plus a distance) instead of hoping an address is right.
+    //
+    // Once per capture, gated on `CW_CAPTURE_KEY` being armed and on the draw enabling
+    // the plane, so it costs nothing on any other run or any other draw.
+    if (Env("CW_CAPTURE_KEY") && (regs[xenos::kPaClClipCntl] & 0x3F))
+    {
+        static bool dumped = false;
+        if (!dumped)
+        {
+            dumped = true;
+            char path[512];
+            snprintf(path, sizeof path, "%s/clipdraw_f%06llu.regs", Env("CW_CAPTURE_KEY"),
+                     (unsigned long long)R->frame);
+            if (FILE* f = fopen(path, "w"))
+            {
+                fprintf(f, "# the whole register file at the first draw with a user clip "
+                           "plane enabled\n# PA_CL_CLIP_CNTL(%04X)=%08X  draw %llu\n",
+                        xenos::kPaClClipCntl, regs[xenos::kPaClClipCntl],
+                        (unsigned long long)R->drawsThisFrame);
+                for (uint32_t r = 0x2000; r < 0x2800; r++)
+                    if (regs[r])
+                        fprintf(f, "%04X %08X %g\n", r, regs[r], F32(regs[r]));
+                fclose(f);
+                fprintf(stderr, "[vk] clip-draw register dump -> %s\n", path);
+            }
+        }
+    }
 
     R->lastTexAddr = 0;
     R->lastTexSlot = 0;
@@ -9378,6 +10433,14 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
         if (psbindFull && psbindAt < int(sizeof psbindLine) - 24)
             snprintf(psbindLine + psbindAt, sizeof psbindLine - psbindAt,
                      "  (LINE TRUNCATED)");
+        if (burstCensus)
+        {
+            // The frame number is the join key against the burst's PPMs and manifest,
+            // so it goes on every line rather than in a header a grep would lose.
+            fprintf(R->burstCensusFile, "f%llu %s\n", (unsigned long long)R->frame,
+                    psbindLine);
+            ++R->burstCensusLines;
+        }
         if (drawCensus)
         {
             if (R->drawCensusFile)
@@ -9386,7 +10449,7 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
                 ++R->drawCensusLines;
             }
         }
-        else
+        else if (!burstCensus)
         {
             const char* bindings = strstr(psbindLine, "mask=");
             std::string key(bindings ? bindings : psbindLine);
@@ -9553,6 +10616,138 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     // Everything from here to the command recording: the bool and loop constant files,
     // the viewport decode and the always-on censuses. Closed by `record`'s scope opening.
     ProfScope _pTail(&g_prof.otherTail);
+
+    // --- USER CLIP PLANES (part 57, the zombie-slicing mechanism) --------------------
+    // PA_CL_CLIP_CNTL bits 0..5 enable the six planes at PA_CL_UCP_0..5 (0x2388..0x239F
+    // — plane 0 confirmed by the part-56 register dump, planes 1..5 the standard
+    // contiguous layout, each publish COUNTED per index so a wrong address for a plane
+    // this title never enables can never hide). The game draws a sliced body TWICE and
+    // clips each copy to one side of the cut; this renderer implemented none of it, so
+    // both copies rendered whole ("they just get a double").
+    //
+    // The distances are computed by the VERTEX SHADER (Vulkan has no fixed-function
+    // planes), so this publish does nothing until a cache built with
+    // CW_DXC_DEFINES="-D XE_USER_CLIP_PLANES=1" is selected via CW_SHADER_SPV — the
+    // same second-cache arm pattern as XE_ALPHA_TO_MASK. On the default cache the
+    // constants are simply never read. CW_VK_NO_CLIP_PLANES=1 stops the publish, the
+    // same-cache control arm.
+    {
+        static const bool noClipPlanes = EnvOn("CW_VK_NO_CLIP_PLANES");
+        // THE POSITIVE CONTROL (gotcha 30). A clip plane only fires on a draw the
+        // guest slices, which no headless route reaches — so without this arm every
+        // gate run would report the feature "working" while never executing it.
+        // (0,0,0,-1) dots to -w, negative for every visible vertex: on the clip cache
+        // the world must VANISH under this arm, and on the null cache it must change
+        // nothing. A poison that fails to empty the world means the epilogue, the
+        // feature bit or the constant plumbing is broken, named before an operator
+        // ever tests a zombie.
+        static const bool clipPoison = EnvOn("CW_VK_CLIP_POISON");
+        if (clipPoison && !noClipPlanes)
+        {
+            float* p = reinterpret_cast<float*>(shared + kSharedClipPlanes);
+            p[0] = 0.0f; p[1] = 0.0f; p[2] = 0.0f; p[3] = -1.0f;
+            COUNT("draw: CW_VK_CLIP_POISON plane published");
+        }
+        // CW_VK_CLIP_BIAS=<eps> — adds eps*|P| to every enabled plane's w. KEPT ONLY AS
+        // HISTORY: part 58's offline derivation (tools/clip_plane_space.py) showed this
+        // does not shift the plane at all. The captured planes have c ~ -d (a unit view
+        // plane pushed through Proj^-T blows z/w up by ~1/zn and they cancel), so an
+        // increment landing only in w lands ENTIRELY in the view plane's z-COEFFICIENT
+        // — a ROTATION, worth 0.8-8 METERS of boundary at the zombie for eps=0.01,
+        // which is why part 57's eps=0.01 "un-clipped the whole body": it measured the
+        // rotation, not any margin. Use CW_VK_CLIP_SHIFT below instead.
+        static const float clipBias = []() -> float {
+            const char* b = Env("CW_VK_CLIP_BIAS");
+            return b ? strtof(b, nullptr) : 0.0f;
+        }();
+        // CW_VK_CLIP_SHIFT=<meters> — translate every enabled plane's boundary OUTWARD
+        // (kept side grows) by a true view-space distance. The correct margin probe the
+        // bias arm was meant to be: part 58 proved the register planes are unit view
+        // planes under the scene projection (88/88 at |n| = 1.000 +/- 0.0003), so a
+        // view-space translation by delta meters is Dplane = Proj^-T * (0,0,0,delta):
+        //     c += delta / P23,   d -= P22 * delta / P23
+        // with P22 = zf/(zf-zn) = 1.0001 and P23 = -zn*zf/(zf-zn) = -0.10001 — the
+        // scene camera's z row, DERIVED FROM THE CAPTURES by clip_plane_space.py (zn
+        // 0.1, zf 1000), not assumed. Every clip-enabled draw in the part-57 set is
+        // under that projection. A DIAGNOSTIC ARM, not a fix: if the see-through cut
+        // heals at +0.01..0.05 and worsens at the negative, the gore plug sits within
+        // centimeters of the boundary and our dot errs at precision scale; if +/-0.05
+        // changes nothing, the plug is lost by a non-clip mechanism and the clip branch
+        // is CLOSED.
+        static const float clipShift = []() -> float {
+            const char* s = Env("CW_VK_CLIP_SHIFT");
+            return s ? strtof(s, nullptr) : 0.0f;
+        }();
+        const uint32_t ucpEna = regs[xenos::kPaClClipCntl] & 0x3F;
+        if (!noClipPlanes && ucpEna)
+        {
+            for (uint32_t i = 0; i < 6; i++)
+            {
+                if (!(ucpEna & (1u << i)))
+                    continue;
+                memcpy(shared + kSharedClipPlanes + i * 16,
+                       &regs[xenos::kPaClUcp0X + i * 4], 16);
+                // 21:9 (part 60) and the FOV slider (part 61): the guest computed
+                // this plane in the CLIP SPACE of ITS projection, and the patched
+                // projection scales clip coordinates — oPos.x by r*(16/21), oPos.y
+                // by r, where r is the fov ratio — so the published plane's x and y
+                // coefficients are scaled by the inverses, which makes
+                // dot(plane', oPos_patched) == dot(plane, oPos_original) and keeps
+                // the gore/slice cuts exactly where the game put them. Only when
+                // THIS draw's projection is one the patch recognizes; the shadow
+                // orthos' planes (if any) pass through untouched.
+                const float ucpFovHalf = FovHalfRadThisFrame();
+                if ((WideMode() || ucpFovHalf != 0.0f) &&
+                    Is169Perspective(&regs[xenos::kAluConstantBase + memoVsBase * 4]))
+                {
+                    float* p =
+                        reinterpret_cast<float*>(shared + kSharedClipPlanes + i * 16);
+                    if (ucpFovHalf != 0.0f)
+                    {
+                        float b;
+                        memcpy(&b,
+                               &regs[xenos::kAluConstantBase + memoVsBase * 4 + 5], 4);
+                        const float r = FovScaleRatio(b, ucpFovHalf);
+                        p[0] /= r;
+                        p[1] /= r;
+                        COUNT("draw: user clip plane compensated for the fov slider");
+                    }
+                    if (WideMode())
+                    {
+                        p[0] *= WideFovFactor();
+                        COUNT("draw: user clip plane compensated for the wide "
+                              "projection");
+                    }
+                }
+                if (clipBias != 0.0f)
+                {
+                    float* p = reinterpret_cast<float*>(shared + kSharedClipPlanes + i * 16);
+                    const float mag = sqrtf(p[0] * p[0] + p[1] * p[1] + p[2] * p[2] +
+                                            p[3] * p[3]);
+                    p[3] += clipBias * mag;
+                    COUNT("draw: user clip plane BIASED (CW_VK_CLIP_BIAS)");
+                }
+                if (clipShift != 0.0f)
+                {
+                    float* p = reinterpret_cast<float*>(shared + kSharedClipPlanes + i * 16);
+                    constexpr float kP22 = 1.0001f;    // zf/(zf-zn), zn=0.1 zf=1000
+                    constexpr float kP23 = -0.10001f;  // -zn*zf/(zf-zn)
+                    p[2] += clipShift / kP23;
+                    p[3] -= kP22 * clipShift / kP23;
+                    COUNT("draw: user clip plane SHIFTED (CW_VK_CLIP_SHIFT)");
+                }
+                switch (i)
+                {
+                    case 0: COUNT("draw: user clip plane 0 published"); break;
+                    case 1: COUNT("draw: user clip plane 1 published"); break;
+                    case 2: COUNT("draw: user clip plane 2 published"); break;
+                    case 3: COUNT("draw: user clip plane 3 published"); break;
+                    case 4: COUNT("draw: user clip plane 4 published"); break;
+                    default: COUNT("draw: user clip plane 5 published"); break;
+                }
+            }
+        }
+    }
 
     // The bool and loop constant files, verbatim. The shaders index them themselves.
     for (uint32_t i = 0; i < 8; i++)
@@ -9792,13 +10987,26 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     // `posScale` shares with them must stay resolution-independent or the geometry would
     // land in a corner of the enlarged target. One multiply, at the boundary.
     // A negative height (the Y flip above) keeps its sign through it.
-    if (ResScale() != 1)
+    // The SHADOW pass renders at its own tier resolution instead of the scene's
+    // (part 60); the resolve that copies the cascade out uses the same predicate on
+    // the same register, which is what keeps the two sides of the surface
+    // consistent. X and Y scale separately (rational, W/1280 and H/720) since the
+    // internal resolution stopped being a multiple of the title's frame.
+    uint32_t passW, passH;
+    if (IsShadowSurface(regs))
+        ShadowRes(passW, passH);
+    else
+        InternalRes(passW, passH);
+    if (passH != InternalH())
+        Count("draw: shadow-pass draw at a reduced shadow tier");
+    if (passW != 1280 || passH != 720)
     {
-        const float rs = float(ResScale());
-        viewport.x *= rs;
-        viewport.y *= rs;
-        viewport.width *= rs;
-        viewport.height *= rs;
+        const float rsx = float(passW) / 1280.0f;
+        const float rsy = float(passH) / 720.0f;
+        viewport.x *= rsx;
+        viewport.y *= rsy;
+        viewport.width *= rsx;
+        viewport.height *= rsy;
     }
     // Height may legitimately be NEGATIVE now (the Y flip above), so the check is on
     // magnitude. Testing `height <= 0` here would silently drop every single draw.
@@ -9833,9 +11041,14 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     // resolution scale existed. Identical at scale 1.
     if (winX1 > winX && winY1 > winY && winX < R->edramWidth && winY < R->edramHeight)
     {
-        scissor.offset = { RSi(int32_t(winX)), RSi(int32_t(winY)) };
-        scissor.extent = { RS(std::min(winX1, R->edramWidth) - winX),
-                           RS(std::min(winY1, R->edramHeight) - winY) };
+        // The PASS's own resolution, not the scene's: a shadow-pass scissor must
+        // clip at the tier's own size or the strip clears inside the pass would
+        // paint OUTSIDE the reduced cascade. Truncating rational conversion keeps
+        // the tile scissors exact for any even width (640*W/1280 = W/2).
+        scissor.offset = { PassXi(int32_t(winX), passW),
+                          PassYi(int32_t(winY), passH) };
+        scissor.extent = { PassX(std::min(winX1, R->edramWidth) - winX, passW),
+                           PassY(std::min(winY1, R->edramHeight) - winY, passH) };
     }
 
     // CW_VK_VIEWPORT_TRACE=1 — every DISTINCT viewport setup, once each. A per-draw
@@ -9888,6 +11101,15 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     if (noStateCache || pipeline != R->bound.pipeline)
     {
         vkCmdBindPipeline(R->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        // BINDING A PIPELINE THAT SPECIFIES STATE STATICALLY MAKES THE CORRESPONDING
+        // DYNAMIC STATE UNDEFINED, so the skip-if-unchanged cache below cannot survive a
+        // bind. The stencil states are declared dynamic only on stencil-enabled pipelines
+        // (see the dynamic-state array), which means every non-stencil draw in between
+        // invalidates them — and the symptom is not a wrong picture but 60
+        // `VUID-vkCmdDrawIndexed-None-0783{7,8,9}`, i.e. a draw reading undefined stencil
+        // state. The viewport, scissor and blend constants above are dynamic on EVERY
+        // pipeline, so they are unaffected and keep their cache.
+        R->bound.haveStencil = false;
         R->bound.pipeline = pipeline;
     }
     else
@@ -9919,6 +11141,51 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     }
     else
         ++R->skips.blend;
+
+    // The polygon offset lives in the PIPELINE now, not here — see PipelineKey. The
+    // counter stays, because an arm with no counter cannot be shown to have engaged.
+    if (!EnvOn("CW_VK_NO_POLY_OFFSET") &&
+        (regs[xenos::kPaSuPolyOffsetFrontScale] || regs[xenos::kPaSuPolyOffsetFrontOffset]))
+        ++g_polyOffsetDraws;
+
+    // ---- THE STENCIL REFERENCE AND MASKS (part 56) -------------------------------
+    //
+    // RB_STENCILREFMASK, layout ref:8 / mask:8 @8 / writemask:8 @16 — confirmed the same
+    // way the ops were, by whether the values come out sensible rather than from a
+    // header. They do: the draws that carry `ALWAYS / REPLACE` read `sr=00FFFFFE`, i.e.
+    // write reference **254** through full masks, and a matching draw tests `EQUAL`
+    // against it. Dynamic state, so none of this enters the pipeline key.
+    {
+        static const bool noStencil = EnvOn("CW_VK_NO_STENCIL");
+        const uint32_t sr = regs[xenos::kRbStencilRefMask];
+        const uint32_t ref = sr & 0xFF;
+        const uint32_t mask = (sr >> 8) & 0xFF;
+        const uint32_t wmask = (sr >> 16) & 0xFF;
+        const bool stencilOn = !noStencil && (regs[xenos::kRbDepthControl] & 1);
+        if (stencilOn)
+            ++g_stencilDraws;
+        // ONLY WHEN THE BOUND PIPELINE DECLARES THEM DYNAMIC, which is exactly when the
+        // stencil test is on. Calling a dynamic-state setter for state a pipeline
+        // specifies STATICALLY is illegal in the other direction — `VUID-vkCmdDraw-None-
+        // 08608`, 40 of them, and the message says so plainly once read rather than
+        // guessed at: "doesn't set up VK_DYNAMIC_STATE_STENCIL_*, but since the
+        // vkCmdBindPipeline, the related dynamic state commands have been called".
+        if (stencilOn &&
+            (noStateCache || !R->bound.haveStencil || R->bound.stencilRef != ref ||
+             R->bound.stencilMask != mask || R->bound.stencilWriteMask != wmask))
+        {
+            vkCmdSetStencilReference(R->cmd, VK_STENCIL_FACE_FRONT_AND_BACK, ref);
+            vkCmdSetStencilCompareMask(R->cmd, VK_STENCIL_FACE_FRONT_AND_BACK, mask);
+            vkCmdSetStencilWriteMask(R->cmd, VK_STENCIL_FACE_FRONT_AND_BACK, wmask);
+            R->bound.stencilRef = ref;
+            R->bound.stencilMask = mask;
+            R->bound.stencilWriteMask = wmask;
+            R->bound.haveStencil = true;
+        }
+        else if (stencilOn)
+            ++R->skips.stencil;
+    }
+
     // The five bindless heaps never change address, so this is once per command
     // buffer rather than once per draw — and it is the most expensive of the five.
     if (noStateCache || !R->bound.setsBound)
@@ -10824,6 +12091,21 @@ void DoResolve(uint8_t* base, const uint32_t* regs)
     static const bool noDepthResolve = EnvOn("CW_VK_NO_DEPTH_RESOLVE");
     const uint32_t srcSelect = control & 7;
     const bool fromDepth = srcSelect == 4 && !noDepthResolve;
+    // The shadow tier (part 60): this resolve copies at the resolution the pass
+    // RENDERED at, decided by the same surface-pitch predicate DoDraw used for its
+    // draws — same register, same frame, so the two cannot disagree. Everything
+    // below that converts a guest extent to host pixels goes through these.
+    uint32_t passW, passH;
+    if (IsShadowSurface(regs))
+        ShadowRes(passW, passH);
+    else
+        InternalRes(passW, passH);
+    auto RZ = [passH](uint32_t v) { return PassY(v, passH); };
+    auto RZx = [passW](uint32_t v) { return PassX(v, passW); };
+    auto RZxi = [passW](int32_t v) { return PassXi(v, passW); };
+    auto RZyi = [passH](int32_t v) { return PassYi(v, passH); };
+    if (passH != InternalH())
+        Count("resolve: shadow surface resolved at a reduced shadow tier");
     if (srcSelect == 4)
         Count("resolve: source is the DEPTH buffer");
     else if (srcSelect != 0)
@@ -11093,22 +12375,20 @@ void DoResolve(uint8_t* base, const uint32_t* regs)
         // partial overwrite leaves the previous surface's pixels around the edge of
         // the new one, which reads as a ghosting artefact with no obvious source.
         if (it != R->snapshots.end() &&
-            (it->second.guestW != w || it->second.guestH != h))
+            (it->second.guestW != w || it->second.guestH != h ||
+             it->second.builtW != passW || it->second.builtH != passH))
         {
-            vkDeviceWaitIdle(R->device);
-            vkDestroyImageView(R->device, it->second.image.view, nullptr);
-            vkDestroyImage(R->device, it->second.image.image, nullptr);
-            vkFreeMemory(R->device, it->second.image.memory, nullptr);
-            // The views go with it: they are copies of an image that no longer exists,
-            // and a surface whose extent changed is a different surface. Their bindless
-            // slots are NOT recycled, for the same reason the snapshot's is not — slot
-            // recycling is open-items 3b and needs deferred destruction to be safe.
+            // RETIRED, not destroyed — and NO wait-idle. Draws recorded earlier in
+            // THIS frame may sample the old image (their descriptors stay valid
+            // because the image stays alive), and a wait-idle here could not have
+            // protected them anyway: it only covers submitted work, which is the
+            // whole shadow-tier freeze (see RetiredImage). The old bindless slots
+            // are still not recycled (open-items 3b).
+            RetireImage(it->second.image);
             for (auto& [size, view] : it->second.views)
             {
                 (void)size;
-                vkDestroyImageView(R->device, view.image.view, nullptr);
-                vkDestroyImage(R->device, view.image.image, nullptr);
-                vkFreeMemory(R->device, view.image.memory, nullptr);
+                RetireImage(view.image);
             }
             R->snapshots.erase(it);
             it = R->snapshots.end();
@@ -11121,6 +12401,8 @@ void DoResolve(uint8_t* base, const uint32_t* regs)
             s.fromDepth = fromDepth;
             s.guestW = w;
             s.guestH = h;
+            s.builtW = passW;
+            s.builtH = passH;
             // A depth snapshot keeps the EDRAM depth buffer's own format, because
             // vkCmdCopyImage is only defined between identical depth formats — there
             // is no copy from a depth image into a colour one. It is viewed through
@@ -11132,7 +12414,7 @@ void DoResolve(uint8_t* base, const uint32_t* regs)
                 VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
                 VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_ONE
             };
-            if (CreateImage(s.image, RS(w), RS(h),
+            if (CreateImage(s.image, RZx(w), RZ(h),
                             fromDepth ? R->depth.format : VK_FORMAT_R8G8B8A8_UNORM,
                             VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
@@ -11177,6 +12459,15 @@ void DoResolve(uint8_t* base, const uint32_t* regs)
                 vkUpdateDescriptorSets(R->device, 1, &wr, 0, nullptr);
                 NameImage(s.image, "resolve snapshot %08X %ux%u%s slot %u", baseKey, w, h,
                           fromDepth ? " DEPTH" : "", s.slot);
+                // The tier-engagement line the overnight gate greps for: HOST extents,
+                // the tier scale and the scene scale, on the one surface the tier
+                // governs. One line per (re)creation, not per frame.
+                if (passH != InternalH())
+                    fprintf(stderr,
+                            "[vk] shadow-tier snapshot %08X: %ux%u host (guest %ux%u, "
+                            "shadow pass %ux%u, scene %ux%u)\n",
+                            baseKey, RZx(w), RZ(h), w, h, passW, passH, InternalW(),
+                            InternalH());
                 it = R->snapshots.emplace(key, std::move(s)).first;
                 Count("resolve: snapshot created");
             }
@@ -11212,10 +12503,10 @@ void DoResolve(uint8_t* base, const uint32_t* regs)
             // surface, which is what `dstX`/`dstY` carry.
             VkImageCopy copy{};
             copy.srcSubresource = { aspect, 0, 0, 1 };
-            copy.srcOffset = { RSi(int32_t(copyX)), RSi(int32_t(copyY)), 0 };
+            copy.srcOffset = { RZxi(int32_t(copyX)), RZyi(int32_t(copyY)), 0 };
             copy.dstSubresource = { aspect, 0, 0, 1 };
-            copy.dstOffset = { RSi(int32_t(dstX)), RSi(int32_t(dstY)), 0 };
-            copy.extent = { RS(copyW), RS(copyH), 1 };
+            copy.dstOffset = { RZxi(int32_t(dstX)), RZyi(int32_t(dstY)), 0 };
+            copy.extent = { RZx(copyW), RZ(copyH), 1 };
             vkCmdCopyImage(R->cmd, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            it->second.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                            1, &copy);
@@ -11250,7 +12541,7 @@ void DoResolve(uint8_t* base, const uint32_t* regs)
                     auto cube = R->cubeSnapshots.find(owner->second.first);
                     if (cube != R->cubeSnapshots.end())
                     {
-                        CopyFaceIntoCube(R->cmd, it->second.image, cube->second,
+                        CopyFaceIntoCube(R->cmd, it->second, cube->second,
                                          owner->second.second);
                         cube->second.frameSeen = R->frame;
                         Count("resolve: refreshed a face of a rendered CUBE MAP");
@@ -11377,8 +12668,8 @@ void DoResolve(uint8_t* base, const uint32_t* regs)
         if (scopedClear && copyW && copyH)
         {
             VkClearRect rect{};
-            rect.rect.offset = { RSi(int32_t(copyX)), RSi(int32_t(copyY)) };
-            rect.rect.extent = { RS(copyW), RS(copyH) };
+            rect.rect.offset = { RZxi(int32_t(copyX)), RZyi(int32_t(copyY)) };
+            rect.rect.extent = { RZx(copyW), RZ(copyH) };
             rect.baseArrayLayer = 0;
             rect.layerCount = 1;
             // vkCmdClearAttachments needs a render pass; outside one the region form is
@@ -11395,8 +12686,8 @@ void DoResolve(uint8_t* base, const uint32_t* regs)
             Barrier(R->cmd, R->depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                     VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
             VkRenderingInfo ri{ VK_STRUCTURE_TYPE_RENDERING_INFO };
-            ri.renderArea = { { RSi(int32_t(copyX)), RSi(int32_t(copyY)) },
-                              { RS(copyW), RS(copyH) } };
+            ri.renderArea = { { RZxi(int32_t(copyX)), RZyi(int32_t(copyY)) },
+                              { RZx(copyW), RZ(copyH) } };
             ri.layerCount = 1;
             ri.pDepthAttachment = &depthAtt;
             ri.pStencilAttachment = &depthAtt;
@@ -11451,7 +12742,7 @@ bool InitCommon()
     R->edramWidth = R->targetWidth;
     R->edramHeight = edramH;
     // THE HOST EXTENT IS SCALED; `edramWidth`/`edramHeight` below stay in guest pixels.
-    if (!CreateImage(R->color, RS(R->targetWidth), RS(edramH),
+    if (!CreateImage(R->color, RSX(R->targetWidth), RS(edramH),
                      VK_FORMAT_R8G8B8A8_UNORM,
                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                          VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
@@ -11459,7 +12750,7 @@ bool InitCommon()
         // TRANSFER_SRC because 18.4% of this title's resolves copy out of the DEPTH
         // buffer rather than the colour one (its shadow cascades and the scene depth
         // its depth-of-field pass reads back) — see DoResolve.
-        !CreateImage(R->depth, RS(R->targetWidth), RS(edramH),
+        !CreateImage(R->depth, RSX(R->targetWidth), RS(edramH),
                      VK_FORMAT_D24_UNORM_S8_UINT,
                      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
                          VK_IMAGE_USAGE_TRANSFER_DST_BIT |
@@ -11469,8 +12760,8 @@ bool InitCommon()
         fprintf(stderr, "[vk] render target creation FAILED\n");
         return false;
     }
-    NameImage(R->color, "EDRAM colour %ux%u", RS(R->targetWidth), RS(edramH));
-    NameImage(R->depth, "EDRAM depth %ux%u", RS(R->targetWidth), RS(edramH));
+    NameImage(R->color, "EDRAM colour %ux%u", RSX(R->targetWidth), RS(edramH));
+    NameImage(R->depth, "EDRAM depth %ux%u", RSX(R->targetWidth), RS(edramH));
 
     // A depth snapshot is sampled through the same bindless heap and the same single
     // linear sampler as every other texture, so the device has to be able to filter
@@ -11610,8 +12901,8 @@ bool InitCommon()
                       // is 4096x1024, and the dump SKIPS anything that does not fit,
                       // which would have made the one surface under investigation the
                       // one surface absent from the directory.
-                      std::max(uint64_t(RS(R->targetWidth)) * RS(R->targetHeight),
-                               uint64_t(RS(4096)) * RS(1024)) * 4,
+                      std::max(uint64_t(RSX(R->targetWidth)) * RS(R->targetHeight),
+                               uint64_t(RSX(4096)) * RS(1024)) * 4,
                       VK_BUFFER_USAGE_TRANSFER_DST_BIT, ReadbackMemoryProps(), false))
     {
         fprintf(stderr, "[vk] buffer allocation FAILED\n");
@@ -11627,8 +12918,8 @@ bool InitCommon()
     for (uint32_t i = 0; i < R->framesInFlight; ++i)
     {
         if (!CreateBuffer(R->frames[i].present,
-                          std::max(uint64_t(RS(R->targetWidth)) * RS(R->targetHeight),
-                                   uint64_t(RS(4096)) * RS(1024)) * 4,
+                          std::max(uint64_t(RSX(R->targetWidth)) * RS(R->targetHeight),
+                                   uint64_t(RSX(4096)) * RS(1024)) * 4,
                           VK_BUFFER_USAGE_TRANSFER_DST_BIT, ReadbackMemoryProps(), false))
         {
             fprintf(stderr, "[vk] present readback buffer %u allocation FAILED\n", i);
@@ -11808,7 +13099,7 @@ bool InitCommon()
     if (!LoadShaders())
         return false;
 
-    R->presentPixels.resize(size_t(RS(R->targetWidth)) * RS(R->targetHeight) * 4);
+    R->presentPixels.resize(size_t(RSX(R->targetWidth)) * RS(R->targetHeight) * 4);
     g_texCensus = EnvOn("CW_VK_TEX_CENSUS");
     g_dimCensus = EnvOn("CW_VK_DIM_CENSUS");
     // The three readers of the per-pass snapshot-input list, asked once. See the
@@ -11933,9 +13224,9 @@ bool InitCommon()
                 "guest's geometry is unchanged and the rasterisation target is not. The "
                 "present readback is %ux the bytes — %.1f MB/frame — so read `readback` "
                 "in CW_VK_PROFILE before quoting a frame time.\n",
-                RS(R->targetWidth), RS(R->targetHeight), ResScale(),
+                RSX(R->targetWidth), RS(R->targetHeight), ResScale(),
                 ResScale() * ResScale(),
-                double(RS(R->targetWidth)) * RS(R->targetHeight) * 4.0 / 1048576.0);
+                double(RSX(R->targetWidth)) * RS(R->targetHeight) * 4.0 / 1048576.0);
     if (g_profileOn)
         fprintf(stderr, "[vkprof] frame CPU profile ON\n");
     return true;
@@ -12160,7 +13451,7 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
     // In HOST pixels: `frontWidth`/`frontHeight` are what the guest resolved and
     // `targetWidth`/`targetHeight` are what it thinks the screen is, and the image in
     // front of us is neither if a resolution scale is in force.
-    const uint32_t width0 = RS(R->haveFrontSnapshot ? R->frontWidth : R->targetWidth);
+    const uint32_t width0 = RSX(R->haveFrontSnapshot ? R->frontWidth : R->targetWidth);
     const uint32_t height0 = RS(R->haveFrontSnapshot ? R->frontHeight : R->targetHeight);
     Count(R->haveFrontSnapshot ? "swap: presented the front-buffer resolve"
                                : "swap: presented raw EDRAM (no resolve matched)");
@@ -12184,7 +13475,7 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
     static const bool wantCachedPixels =
         Env("CW_VK_FRAME_STATS") || Env("CW_VK_FRAME_DUMP") || Env("CW_VK_SNAP_DUMP") ||
         Env("CW_VK_SNAP_ON_BLACK") || Env("CW_VK_SNAP_ON_DARK") || Env("CW_CAPTURE_KEY") ||
-        Env("CW_VK_SNAP_FRAME");
+        Env("CW_VK_SNAP_FRAME") || Env("CW_BURST_DUMP");
     const bool doReadback = !R->wantSwapchain || wantCachedPixels;
     static bool saidWhy = false;
     if (R->wantSwapchain && wantCachedPixels && !saidWhy)
@@ -12491,6 +13782,168 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
     // THROUGH rather than parks on can be shorter than 64 frames, and one dump of it is
     // one sample of a transition — the save-slot panel below appeared in exactly one
     // frame of a 180 s boot.
+    // ---- F8: THE BURST ----------------------------------------------------------
+    //
+    // WHY THIS EXISTS. The operator described a defect no single frame can show: *"The
+    // decals how it looks like is pretty much normal but it appears and disappear like
+    // flicker make it so when I press f8 it records all frame for a second so you can see
+    // it."* A screenshot of a flicker is a screenshot of one PHASE of it, and which phase
+    // you get is luck (gotcha 133). F9 answers "what does it look like"; F8 answers "what
+    // does it do over time".
+    //
+    // AND IT IS BUILT TO DISCRIMINATE, not just to illustrate. Two mechanisms produce an
+    // identical still image and need opposite fixes:
+    //
+    //   * the draw is ISSUED every frame and loses a depth fight — z-fighting, which is
+    //     what a decal does when the guest's polygon offset is not honoured, and the
+    //     leading hypothesis here because this renderer sets no `depthBiasEnable` at all;
+    //   * the draw is DROPPED on some frames — by the guest, by predication, by a bin
+    //     mask, or by one of our own declines.
+    //
+    // Under the first, the draw count and `drawFingerprint` are IDENTICAL frame to frame
+    // while the pixels change. Under the second they move. So the manifest carries both
+    // per frame, and the burst answers the question rather than merely showing it.
+    //
+    // `CW_BURST_DUMP=<dir>` arms it; F8 fires it; `CW_BURST_DUMP_MS` (default 1000) is the
+    // window and `CW_BURST_DUMP_MAX` (default 300) bounds the disk — at 95 fps and 720p a
+    // second is ~260 MB, which is fine on a disk and would be a disaster in /tmp, so the
+    // directory is the operator's to choose and the default is under their troubleshooting
+    // tree rather than a tmpfs.
+    if (Env("CW_BURST_DUMP") && Host_ConsumeBurstDumpPressed())
+    {
+        if (R->burstActive)
+        {
+            // A second press during a burst ENDS it rather than restarting it, so the
+            // operator can bound a recording they have already seen enough of.
+            fprintf(stderr, "[vk] burst #%u: stopped early by a second F8 (%u frames)\n",
+                    R->burstSeq, R->burstFrames);
+            R->burstEndNs = 0;
+        }
+        else
+        {
+            static uint32_t seq = 0;
+            R->burstSeq = ++seq;
+            R->burstActive = true;
+            R->burstFrames = 0;
+            uint64_t ms = 1000;
+            if (const char* m = Env("CW_BURST_DUMP_MS"))
+                ms = strtoull(m, nullptr, 10);
+            R->burstEndNs = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count()) +
+                            ms * 1000000ull;
+            char path[512];
+            snprintf(path, sizeof path, "%s/burst%02u_manifest.txt", Env("CW_BURST_DUMP"),
+                     R->burstSeq);
+            R->burstManifest = fopen(path, "w");
+            if (R->burstManifest)
+                fprintf(R->burstManifest,
+                        "# file frame draws vertices drawFingerprint cameraFingerprint "
+                        "meanLuma distinctColours pixelHash\n");
+            // The per-draw census, default-on. Its absence is what stopped part 56's
+            // decal analysis: the burst could show a decal blinking but could not say
+            // whether its draw was issued on the dark frames. Read it with
+            // tools/burst_read.py, which aligns it with the PPMs by frame number.
+            const char* censusWant = Env("CW_BURST_CENSUS");
+            if (!censusWant || strcmp(censusWant, "0") != 0)
+            {
+                snprintf(path, sizeof path, "%s/burst%02u_census.txt",
+                         Env("CW_BURST_DUMP"), R->burstSeq);
+                R->burstCensusFile = fopen(path, "w");
+                if (R->burstCensusFile)
+                    fprintf(R->burstCensusFile,
+                            "# every draw of every burst frame, fN <census line>. Same "
+                            "fields as a capture census; v0= is the first vertex's "
+                            "first three dwords, the identity that survives a camera "
+                            "move.\n");
+                else
+                    fprintf(stderr, "[vk] burst #%u: cannot open its census file — the "
+                                    "issued-or-discarded half of the answer will be "
+                                    "missing\n", R->burstSeq);
+                R->burstCensusLines = 0;
+            }
+            fprintf(stderr,
+                    "[vk] burst #%u ARMED: every presented frame for %llu ms into %s%s\n",
+                    R->burstSeq, (unsigned long long)ms, Env("CW_BURST_DUMP"),
+                    R->burstManifest ? "" : "  — !! the manifest could not be opened, so "
+                                            "the frames will have no draw data beside them");
+        }
+    }
+    if (R->burstActive)
+    {
+        uint32_t maxFrames = 300;
+        if (const char* m = Env("CW_BURST_DUMP_MAX"))
+            maxFrames = uint32_t(strtoul(m, nullptr, 10));
+        const uint64_t nowNs =
+            uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count());
+        if (!px)
+        {
+            // Armed with no pixels. Say so by name rather than recording nothing, which
+            // would read as "the defect did not happen" (gotcha 151).
+            fprintf(stderr, "[vk] burst #%u: no readback pixels this frame — nothing "
+                            "written\n", R->burstSeq);
+        }
+        else
+        {
+            char path[512];
+            snprintf(path, sizeof path, "%s/burst%02u_%04u_f%06llu.ppm",
+                     Env("CW_BURST_DUMP"), R->burstSeq, R->burstFrames,
+                     (unsigned long long)pres.frame);
+            if (FILE* f = fopen(path, "wb"))
+            {
+                fprintf(f, "P6\n%u %u\n255\n", width1, height1);
+                for (size_t i = 0; i < bytes; i += 4)
+                    fwrite(&px[i], 1, 3, f);
+                fclose(f);
+                if (R->burstManifest)
+                    fprintf(R->burstManifest,
+                            "%s %llu %llu %llu %016llx %016llx\n",
+                            strrchr(path, '/') ? strrchr(path, '/') + 1 : path,
+                            (unsigned long long)pres.frame,
+                            (unsigned long long)pres.draws,
+                            (unsigned long long)pres.vertices,
+                            (unsigned long long)pres.drawFingerprint,
+                            (unsigned long long)pres.cameraFingerprint);
+                ++R->burstFrames;
+            }
+        }
+        if (nowNs >= R->burstEndNs || R->burstFrames >= maxFrames)
+        {
+            R->burstActive = false;
+            if (R->burstManifest)
+            {
+                fclose(R->burstManifest);
+                R->burstManifest = nullptr;
+            }
+            if (R->burstCensusFile)
+            {
+                fclose(R->burstCensusFile);
+                R->burstCensusFile = nullptr;
+                fprintf(stderr, "[vk] burst #%u census: %llu draw lines\n", R->burstSeq,
+                        (unsigned long long)R->burstCensusLines);
+            }
+            fprintf(stderr,
+                    "[vk] burst #%u DONE: %u frames into %s — read it with "
+                    "tools/burst_read.py\n",
+                    R->burstSeq, R->burstFrames, Env("CW_BURST_DUMP"));
+        }
+    }
+    // Decide ONCE, at the frame boundary, whether the NEXT frame's draws go into the
+    // burst census — the draw path must not read burst timing state mid-frame, or the
+    // census could hold part of a frame and read as a draw-count change (gotcha 109's
+    // shape: a partial list is not a count). CW_BURST_CENSUS_EVERY=N thins to every Nth
+    // burst frame for long bursts; the default is every frame, because "issued or not"
+    // is a per-frame question.
+    {
+        uint32_t every = 1;
+        if (const char* e = Env("CW_BURST_CENSUS_EVERY"))
+            every = std::max(1u, uint32_t(strtoul(e, nullptr, 10)));
+        R->burstCensusThisFrame = R->burstActive && R->burstCensusFile &&
+                                  (R->burstFrames % every) == 0;
+    }
+
     // The CW_CAPTURE_KEY picture, written from the same readback the periodic dump uses.
     // Separate from the loop below rather than folded into its interval test, because
     // this one has to fire on EXACTLY the armed frame — the interval test would either
@@ -14020,11 +15473,147 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
 
 } // namespace
 
+// See vk_renderer.h — the settings panel's resolution row (part 60).
+void VkRenderer_RequestRenderScale(uint32_t scale)
+{
+    if (scale >= 1 && scale <= 4)
+        g_resScalePending.store(scale, std::memory_order_release);
+}
+
+namespace
+{
+
+// Apply a pending live resolution change, BETWEEN frames on the pump thread — the
+// only moment the scale may move, because every extent inside a frame assumes it
+// is constant. The EDRAM pair is rebuilt here; every resolve snapshot and the
+// rendered cube map carry the scale they were built at and rebuild themselves
+// lazily through their existing resize paths; the readback buffers grow if the
+// new frame no longer fits (they never shrink — memory is cheaper than another
+// resize path).
+void ApplyPendingRenderScale()
+{
+    const uint32_t want = g_resScalePending.exchange(0, std::memory_order_acq_rel);
+    if (!want || !R || want == ResScale())
+        return;
+    if (g_resScaleLocked)
+    {
+        fprintf(stderr, "[vk] render-scale change to %ux REFUSED: CW_VK_RES/"
+                        "CW_VK_RES_SCALE pin the scale for this run (the "
+                        "measurement arm wins over the menu)\n", want);
+        return;
+    }
+    vkDeviceWaitIdle(R->device);
+
+    auto destroyImage = [&](Image& im) {
+        if (im.view)
+            vkDestroyImageView(R->device, im.view, nullptr);
+        if (im.image)
+            vkDestroyImage(R->device, im.image, nullptr);
+        if (im.memory)
+            vkFreeMemory(R->device, im.memory, nullptr);
+        im = Image{};
+    };
+    const uint32_t before = ResScale();
+    destroyImage(R->color);
+    destroyImage(R->depth);
+    // The parked live path speaks integer scales; preserve the current aspect.
+    {
+        uint32_t w, h;
+        InternalRes(w, h);
+        const uint32_t nh = 720 * want;
+        const uint32_t nw = (uint32_t(uint64_t(w) * nh / h)) & ~1u;
+        g_internalW.store(nw, std::memory_order_relaxed);
+        g_internalH.store(nh, std::memory_order_relaxed);
+    }
+
+    const uint32_t edramH = R->edramHeight;   // guest rows, decided at bring-up
+    if (!CreateImage(R->color, RSX(R->targetWidth), RS(edramH),
+                     VK_FORMAT_R8G8B8A8_UNORM,
+                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                     VK_IMAGE_ASPECT_COLOR_BIT) ||
+        !CreateImage(R->depth, RSX(R->targetWidth), RS(edramH),
+                     VK_FORMAT_D24_UNORM_S8_UINT,
+                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                         VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                     VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
+    {
+        // A renderer with no EDRAM stand-in cannot draw at all — say so and stop
+        // feeding it rather than crash on the first pass.
+        fprintf(stderr, "[vk] LIVE RESCALE FAILED at %ux — renderer disabled\n", want);
+        g_active = false;
+        return;
+    }
+    NameImage(R->color, "EDRAM colour %ux%u", RSX(R->targetWidth), RS(edramH));
+    NameImage(R->depth, "EDRAM depth %ux%u", RSX(R->targetWidth), RS(edramH));
+
+    // Flush EVERY snapshot and rendered cube NOW, inside the one device idle this
+    // switch already paid for. The first version left them to the lazy per-entry
+    // rebuild path — which calls vkDeviceWaitIdle PER SNAPSHOT, and a street frame
+    // holds dozens of live snapshots, so the seconds after a resolution change
+    // were a stutter festival the operator read as a freeze. Erased entries
+    // recreate fresh on their next resolve with no further stalls.
+    size_t flushed = 0;
+    for (auto& [key, snap] : R->snapshots)
+    {
+        vkDestroyImageView(R->device, snap.image.view, nullptr);
+        vkDestroyImage(R->device, snap.image.image, nullptr);
+        vkFreeMemory(R->device, snap.image.memory, nullptr);
+        for (auto& [size, view] : snap.views)
+        {
+            (void)size;
+            vkDestroyImageView(R->device, view.image.view, nullptr);
+            vkDestroyImage(R->device, view.image.image, nullptr);
+            vkFreeMemory(R->device, view.image.memory, nullptr);
+        }
+        ++flushed;
+    }
+    R->snapshots.clear();
+    for (auto& [key, cube] : R->cubeSnapshots)
+    {
+        vkDestroyImageView(R->device, cube.image.view, nullptr);
+        vkDestroyImage(R->device, cube.image.image, nullptr);
+        vkFreeMemory(R->device, cube.image.memory, nullptr);
+        ++flushed;
+    }
+    R->cubeSnapshots.clear();
+    if (flushed)
+        fprintf(stderr, "[vk] live rescale flushed %zu snapshot surfaces in one "
+                        "stall\n", flushed);
+
+    const uint64_t need =
+        std::max(uint64_t(RSX(R->targetWidth)) * RS(R->targetHeight),
+                 uint64_t(RSX(4096)) * RS(1024)) * 4;
+    auto growBuffer = [&](Buffer& b, const char* what) {
+        if (b.size >= need)
+            return;
+        vkDestroyBuffer(R->device, b.buffer, nullptr);
+        vkFreeMemory(R->device, b.memory, nullptr);
+        b = Buffer{};
+        if (!CreateBuffer(b, need, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                          ReadbackMemoryProps(), false))
+            fprintf(stderr, "[vk] LIVE RESCALE: %s regrow FAILED — readback-side "
+                            "features will truncate at this scale\n", what);
+    };
+    growBuffer(R->readback, "snapshot readback");
+    for (uint32_t i = 0; i < R->framesInFlight; ++i)
+        growBuffer(R->frames[i].present, "present readback");
+    R->presentPixels.resize(size_t(RSX(R->targetWidth)) * RS(R->targetHeight) * 4);
+
+    fprintf(stderr, "[vk] render scale %ux -> %ux LIVE (%ux%u); snapshots and the "
+                    "cube map rebuild lazily over the next frames\n",
+            before, want, RSX(R->targetWidth), RS(R->targetHeight));
+}
+
+} // namespace
+
 void VkRenderer_OnSwap(uint8_t* base, uint32_t frontBuffer, uint32_t width,
                        uint32_t height)
 {
     if (!g_active || g_d3dMode)
         return;
+    ApplyPendingRenderScale();
     DoSwapImpl(base, frontBuffer, width, height);
 }
 
@@ -14074,6 +15663,12 @@ void VkRenderer_D3DSwap(uint8_t* base)
     DoSwapImpl(base, R->lastResolveDest, R->targetWidth, R->targetHeight);
 }
 
+// See vk_renderer.h — the live-VSync seam (part 60).
+void VkRenderer_RequestSwapchainRebuild()
+{
+    g_swapRebuildRequest.store(true, std::memory_order_release);
+}
+
 void VkRenderer_DumpStats()
 {
     if (!g_active)
@@ -14096,6 +15691,16 @@ void VkRenderer_DumpStats()
                     double(g_constMemoRunHits) * 4096.0 / 1073741824.0,
                     g_constMemoOff ? " [CW_VK_NO_CONST_MEMO: the copy ran every draw]" : "");
     }
+
+    // The polygon offset, printed on every run: an arm with no counter cannot be shown to
+    // have engaged (gotcha 151), and this one's effect is a judgement about a picture.
+    fprintf(stderr, "[vk]   stencil test: %llu draws enabled it%s\n",
+            (unsigned long long)g_stencilDraws,
+            EnvOn("CW_VK_NO_STENCIL") ? "  [CW_VK_NO_STENCIL: none were honoured]" : "");
+    fprintf(stderr, "[vk]   polygon offset: %llu draws asked for one%s\n",
+            (unsigned long long)g_polyOffsetDraws,
+            EnvOn("CW_VK_NO_POLY_OFFSET") ? "  [CW_VK_NO_POLY_OFFSET: none were applied]"
+                                          : "");
 
     // The flat tables' grow bill, printed on EVERY run rather than only under the
     // profiler — a play session the operator drives has no profiler, and it is exactly
