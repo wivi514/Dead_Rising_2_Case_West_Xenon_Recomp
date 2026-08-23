@@ -2915,3 +2915,72 @@ to rates, and the first chain stage that is active at the title and flat in-game
 the gate that stops the widget draws. (Note the title batches' high-water reading 0
 while bit draws demonstrably fire — read that counter's meaning before trusting it,
 gotcha 30.)
+
+## 60. **THE PROGRESS-WIDGET DEFECT IS CLOSED — small packed textures, named by A/B** — part 5, 2026-08-23
+
+**The port's one open defect of its own is fixed**, by importing Case Zero's non-RT
+block (`444631f..5b9fbba`, commit `04f42e3`). The operator reported it had been fixed
+accidentally in the sibling while fixing something else; they were right.
+
+### The mechanism, named by measurement rather than inference
+
+`cf62229` — **small packed textures**. A texture whose SHORTER dimension is ≤ 16 texels
+packs its whole mip chain, level 0 included, into one 32x32-block tile with
+`mipAddr = 0`. The renderer read level 0 at the tile ORIGIN — the scrap region — and
+skipped the chain upload entirely. **The bar strips are 32x1**, so every one of them
+sampled the wrong texels.
+
+**The A/B, same binary, same DebugJump destination, same frame:**
+
+```
+default                        PP bar RENDERS, mission progress bar RENDERS
+CW_VK_NO_PACKED_SMALL=1        both VANISH — the pre-import picture exactly
+```
+
+That is the whole finding: one arm, one flip, both bars. Before/after crops of the HUD
+region are in `runtime/build/hud_compare.png` and `mission_compare.png`.
+
+### RETRACTION — finding 59's ATTRIBUTION was wrong (its measurement was not)
+
+Finding 59 identified `vs_667b04293a65b5ca` as "the widget geometry" and concluded the
+guest stops emitting it in-game. **The counts were right and the story attached to them
+was wrong** — this port's characteristic error, and the fourth time (gotcha 322).
+`vs_667b` is still **zero** in our in-game censuses *while the bars render correctly*,
+so it was never the class that draws them. Hardware's HUD frame does carry that class;
+what it draws there remains unidentified, and it is no longer interesting.
+
+The lesson is the one this project keeps paying for: a draw class that is present on
+hardware and absent here is a **difference**, not a **cause**, until something ties it
+to the pixels. What tied this defect to its cause was an arm that could turn it back on.
+
+Finding 58's mechanism (the widgets are render-to-texture via convert-resolves) still
+stands and is what made the small-texture path the load-bearing one.
+
+## 61. **THE VISUALS MENU — the title's own options row opens a host panel** — part 5, 2026-08-23
+
+Imported from Case Zero part 60, **default path only**. Selecting **Visuals** in the
+title's own Options hub is intercepted at the frontend transition (`sub_82812410`, the
+hook the DebugJump port already owns), the transition is SWALLOWED, and a host-drawn
+panel opens with the hub alive underneath as its backdrop.
+
+Six rows: RESOLUTION / DISPLAY MODE / VSYNC / **SHADOW QUALITY (LOW, MEDIUM, HIGH)** /
+FRAME CAP / FIELD OF VIEW. **No ray-tracing entries** — operator's instruction, and by
+construction rather than by editing: the import boundary stops before Case Zero's first
+RT commit, so no RT code was ever brought across to remove.
+
+**Nothing is transcribed from the sibling.** Case Zero compares against two interned
+name-hash globals it located by hand; we instead hash our own image's `"OptionsVisual"`
+string (0x8206D900) with **the title's own hash function** `sub_827815D0` and compare
+that. Derived, not inherited — and it cannot rot if a rebuild moves the interned table.
+The computed hash is `21C38544`.
+
+Verified end to end on 2026-08-23: main menu → HELP & OPTIONS → Visuals opens the panel,
+and a further press stepped RESOLUTION to 1368x768 (`[pcopt]` log lines, screenshot).
+`CW_NO_PC_OPTIONS=1` restores the shipped screen; `CW_TEST_PANEL=1` opens the panel at
+boot for display-only questions.
+
+**Not ported:** `cpu/camera_fov.cpp` (the game-side FOV substitution is entirely Case
+Zero addresses, including a link-register value naming one call site) and
+`gen_pc_options.py` (the native-screen arm's repacked asset). The FOV row stores its
+value and the renderer's own projection patch applies it; re-deriving the game-side half
+needs this title's own camera census, and the sibling's file header carries the recipe.

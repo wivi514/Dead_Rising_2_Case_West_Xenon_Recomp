@@ -32,16 +32,20 @@ low-risk — the import table says so.
 > problem statement was false and part 2 refuted it with the measurement that section
 > itself asked for.
 
-## Status: part 3 complete (2026-08-16) — one open defect, and it is ours
+## Status: THE PROGRESS-WIDGET DEFECT IS CLOSED (2026-08-23, part 5)
 
-**The active task is the PROGRESS-WIDGET defect** — the PP bar, the LIFE meter's empty
-squares, the mission timer bar and the loading pop-up's segmented bar do not render. Findings
-**35-47**; the live hand-off `docs/part4-kickoff.md` names the next measurement.
+**Findings 35-59 close with finding 60.** The PP bar and the mission progress bar render;
+the mechanism is Case Zero's **small-packed-texture** fix (a 32x1 strip packs its whole
+mip chain into one tile with `mipAddr=0`, and level 0 was read at the tile origin), named
+here by A/B — `CW_VK_NO_PACKED_SMALL=1` makes both bars vanish again. **Finding 59's
+attribution is RETRACTED in place**: `vs_667b04293a65b5ca` is still zero in our in-game
+censuses *while the bars render*, so it was never the class that drew them. Correct
+counters, wrong story, fourth time (gotcha 322).
 
-The meter is **created, linked, walked 183,190 times, updated and laid out** — and never
-becomes geometry. Every GPU-side explanation is eliminated by measurement, and so is every
-guest-side lifecycle stage. What has not been found is the call that turns a laid-out meter
-into draws.
+**The Visuals menu is in** (finding 61): the title's own Options → Visuals row opens a
+host-drawn panel — RESOLUTION / DISPLAY MODE / VSYNC / SHADOW QUALITY (LOW/MEDIUM/HIGH) /
+FRAME CAP / FIELD OF VIEW. **No ray tracing**, by operator instruction and by construction:
+the import boundary stops before Case Zero's first RT commit.
 
 **Part 3's expensive lesson: four readings in a row had correct counters and a wrong story
 attached** (findings 43, 44, 46, 47). What worked every time was identifying things by what
@@ -102,6 +106,8 @@ inferences from a **count** or a **truncated listing**.
 | **Intro → safehouse** | ✅ **playable, with zombie combat**, and "pretty much exactly like Xenia" — **and better in one place: a cutscene Xenia truncates plays through here** (operator, finding 29, gotcha 320) |
 | **CASE 1-3 COMPLETE** | ✅ **new areas, no crash, no hang, "didn't have any issue except" two INHERITED defects** — and this is **FURTHER THAN THE OPERATOR EVER DROVE XENIA**, so past here the port has **no capture ground truth at all** (finding 33) |
 | Decals | ⏳ minor visual defect — **Case Zero's open item 00m, NOT investigated there or here.** Import when it closes; `docs/imported-fixes.md` |
+| Progress widgets | ✅ **FIXED 2026-08-23** — imported with Case Zero's non-RT block; mechanism named by A/B (`CW_VK_NO_PACKED_SMALL=1` brings the defect back). Findings 60-61, `docs/imported-fixes.md` §3 |
+| Visuals menu | ✅ **IN 2026-08-23** — the title's own Options → Visuals opens a host panel (6 rows, no ray tracing). `CW_NO_PC_OPTIONS=1` restores the shipped screen |
 | Performance | ✅ **IMPORTED 2026-08-18** — Case Zero's whole parts 47-55 campaign (`82d181f..444631f`), confirmed in play by the operator: **16-24 fps at 720p before → 68-120 fps at 2560x1440 internal after, no visible regression**. Swapchain present + 60 fps pacing are now the DEFAULTS. `docs/imported-fixes.md` §2 |
 | Save/load | ✅ **behaviourally confirmed** — saved and loaded inside a real session (finding 29). Part 1's confirmation was static only |
 | HUD/menu text | ✅ **FIXED** — imported 2026-08-16 from Case Zero `82d181f` (part 46), **confirmed in play by the operator** ("Ui seems to work really well this time"). Costs ~12 MB/frame of extra hashing in gameplay. `docs/imported-fixes.md` |

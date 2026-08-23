@@ -182,6 +182,60 @@ regression ever points at it).
 
 ---
 
+## 3. The non-RT block — parts 56-61, and the progress-widget fix
+
+| | |
+|---|---|
+| **Imported** | 2026-08-23 (part 5), commit `04f42e3` |
+| **Source** | Case Zero `444631f..5b9fbba` — every non-RT commit of parts 56-61 |
+| **Method** | per-file `git diff` patches with the `CZ_` -> `CW_` rename applied to the PATCH TEXT (so string-literal arms survive); one include conflict, resolved by keeping both sides |
+| **Why that boundary** | **every non-RT commit precedes the first ray-tracing commit** (`4cc4f4a`), so a single cut takes all the fixes and no RT. The operator ruled RT out (2026-08-23); there was no RT code to strip because none was ever brought across |
+| **Re-measured here?** | **YES — the progress-widget defect is CLOSED and the mechanism named by A/B.** See finding 60 |
+
+### What it fixed, and the arm that proves it
+
+**The PP bar and the mission progress bar render.** The mechanism is `cf62229`, the
+small-packed-texture read: a texture whose shorter dimension is <= 16 texels packs its
+whole chain into one tile with `mipAddr = 0`, and level 0 was being read at the tile
+origin instead of its packed offset. The bar strips are 32x1.
+
+```
+default                   both bars RENDER
+CW_VK_NO_PACKED_SMALL=1   both VANISH (the pre-import picture)
+```
+
+Also in this block: the **stencil test** (never honoured before — ~18% of a gameplay
+frame enables it), **front face = CW** as the default, guest **polygon offset**, **user
+clip planes**, **aspect-correct presentation** (black bars instead of stretch),
+**deferred image retirement**, and the F8 burst instrument.
+
+### The Visuals menu
+
+`host/settings.{h,cpp}` and the panel layout in `host/window.cpp` came across unmodified.
+Case Zero's guest-side half (`cpu/pc_options.cpp`, 959 lines) did **not**: this port
+writes its own `cpu/pc_options_cw.cpp` carrying only the default path (~120 lines of it),
+because the other ~840 are the native-screen experiment and hold nearly all of that
+file's guest exposure — five hooked functions, three data addresses, and **a hardcoded
+`.text` bound that is wrong for this title in the safe direction** (gotcha 3).
+
+The one thing it needs is derived rather than transcribed: the `"OptionsVisual"` name
+hash, computed by calling **the title's own** `sub_827815D0` on our own image's string.
+
+**Deliberately not ported:** `cpu/camera_fov.cpp` (100% sibling addresses, including a
+link-register value identifying one call site) and `tools/gen_pc_options.py` (the
+native-screen arm's repacked asset, which also carries Case Zero's string-id and `.big`
+layout assumptions).
+
+### Not imported from this range at all
+
+Everything from `4cc4f4a` onward — Case Zero's parts 62-71 ray-tracing work (RT shadow
+route (a) and (b), BLAS/TLAS plumbing, the factor pass, the sun oracle, the occluder
+census) and the two settings commits that add RT rungs to the shadow row (`403f6c8`,
+`f622955`). Operator's instruction: it does not work there yet. Watch those parts and
+import if it closes.
+
+---
+
 ## PENDING — defects known to be Case Zero's, waiting on a fix there
 
 **These are NOT to be investigated in this port.** They were reported here by the operator
