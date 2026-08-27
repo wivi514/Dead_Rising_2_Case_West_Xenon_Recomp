@@ -1,6 +1,6 @@
 # Part 6 kickoff — the live hand-off
 
-**Written at the end of part 5 (2026-08-23). THIS IS THE LIVE ONE.**
+**Written at the end of part 5, extended 2026-08-27. THIS IS THE LIVE ONE.**
 `part4-kickoff.md` is superseded (its one active task is closed — see §1);
 `part3-kickoff.md` before it likewise; `part2-kickoff.md` is kept only as the cautionary
 example, because its problem statement was false and part 2 refuted it with the very
@@ -10,8 +10,9 @@ Read this, then `docs/xenia-capture-analysis.md` — the numbered findings ledge
 authority on any measured number. `docs/imported-fixes.md` tracks everything taken from
 Case Zero, with the source commit and date for each.
 
-**Parts 4 and 5 ran in one conversation.** Part 4 was the meter investigation and the
-performance import; part 5 was the non-RT import that closed the defect.
+**Parts 4 and 5 ran in one conversation.** Part 4 was the meter investigation and the first
+performance import; part 5 closed the widget defect, landed the Visuals menu, and then took
+the sibling's newer performance work as well.
 
 ---
 
@@ -34,10 +35,18 @@ verified at the date given.
 ```
 Case 1-3 complete, new areas, zombie combat, cinematics, save/load   (finding 33, part 2)
 16-24 fps @720p  ->  68-120 fps @2560x1440 internal, no regression   (part 4, f1fdeaa)
+then 215-252 fps at ~1,350 draws WITH the profiler on                (part 5, 03dc55e)
 ```
 
-Case Zero's **entire performance campaign** (their parts 47-55) is imported. Defaults that
-changed with it, each with its control arm:
+**Two** of the sibling's performance campaigns are imported: their parts 47-55 (part 4) and
+their parts 72-81 (part 5). The second brought a persisted `VkPipelineCache`, texture image
+suballocation (one `vkAllocateMemory` per texture had been 71% of the decode), batched
+texture-upload submits, image-barrier masks derived from layouts, a stream store that starts
+at its ceiling so growth cannot hitch, a GPU-side pass breakdown, and **per-entry durations
+in the synthetic input sequence** (`NAME@MS` — `A@300`, `NONE@2000`), which finally makes a
+recipe able to reproduce a human rather than a metronome.
+
+Defaults that changed, each with its control arm:
 
 | default now | control arm |
 |---|---|
@@ -67,7 +76,7 @@ underneath and gets its input back on close (B).
 
 ```
 RESOLUTION · DISPLAY MODE · VSYNC · SHADOW QUALITY · FRAME CAP · FIELD OF VIEW
-SHADOW QUALITY = LOW / MEDIUM / HIGH.  There is NO ray tracing anywhere in this build.
+SHADOW QUALITY = LOW / MEDIUM / HIGH
 ```
 
 - `runtime/host/settings.{h,cpp}` — the persistent store, imported unmodified.
@@ -93,7 +102,7 @@ performance import; the current ones are in `tools/cw_hud_capture.sh`** — use 
 rather than retyping a press sequence, so two arms differ only by environment and never by
 scene.
 
-### Standing gates — state as of 2026-08-23
+### Standing gates — state as of 2026-08-27
 
 | gate | state |
 |---|---|
@@ -104,19 +113,34 @@ scene.
 
 ---
 
-## 3. THE RULE ON RAY TRACING
+## 3. IMPORTING FROM CASE ZERO — the method, because it changed
 
-**Do not import it.** Operator's instruction, 2026-08-23: it does not work in Case Zero yet.
+Three imports have landed and the fourth needed a different technique; `docs/imported-fixes.md`
+has a row per import with its source commit.
 
-This is enforced by construction rather than by vigilance: **every non-RT commit in Case
-Zero's range precedes their first RT commit (`4cc4f4a`)**, so the part-5 import boundary
-(`444631f..5b9fbba`) took all the fixes and none of the ray tracing. There is no RT code in
-this tree to strip, and the shadow row has three rungs because it was built before the RT
-rungs existed there.
+**The rename goes on the PATCH TEXT, not the tree** — `sed 's/CZ_/CW_/g'` over the diff, so
+string-literal arms (`getenv("CW_...")`) come across as arms and not as dead names.
 
-Their parts 62-71 are **all** ray tracing. Watch them; import only if it starts working.
+**Up to part 5 a range cut was enough.** Their commits happened to be ordered so a single
+`git diff A..B` took everything wanted and nothing else.
 
----
+**From part 6 that stops working, and the answer is a three-way merge.** Their newer work is
+written on top of subsystems this port does not carry, and calls into them from dozens of
+scattered sites, so neither sequential cherry-picking (fails at the first commit) nor one
+flattened diff (73 conflicts) survives contact. What does work:
+
+```
+base   = the sibling file at OUR last import point, renamed
+theirs = the sibling file at HEAD, renamed, with the unported subsystem replaced by a stub
+ours   = our current file
+git merge-file ours base theirs
+```
+
+That produced **one conflict in ~26,000 lines**, and it was additive. **Keep the seam, drop
+the feature**: an unported subsystem stays as a namespace of inert stubs — hard-false gates,
+no-op collectors, census globals at zero, and a print that says out loud that nothing was
+collected. Deleting its call sites instead would fork this file from the sibling permanently
+and make every future import a hand-merge.
 
 ## 4. THE BACKLOG, roughly by value
 

@@ -46,8 +46,16 @@ counters, wrong story, fourth time (gotcha 322).
 
 **The Visuals menu is in** (finding 61): the title's own Options → Visuals row opens a
 host-drawn panel — RESOLUTION / DISPLAY MODE / VSYNC / SHADOW QUALITY (LOW/MEDIUM/HIGH) /
-FRAME CAP / FIELD OF VIEW. **No ray tracing**, by operator instruction and by construction:
-the import boundary stops before Case Zero's first RT commit.
+FRAME CAP / FIELD OF VIEW.
+
+**SCOPE: ray tracing is OUT** (operator, 2026-08-23, restated 2026-08-27 — it does not
+produce a correct picture in Case Zero either, and their own part 71 parked it). Their
+newer performance work is written on top of it, so `gpu/vk_renderer.cpp` carries
+`namespace rtshadow` and `namespace rtfactor` as **inert stubs** — hard-false gates, no-op
+collectors, zeroed census, and `R->rtEnabled` hard false so the device never asks for
+ray-query extensions. **Keep the seam, not the feature**: it is what makes the next import
+a three-way merge instead of 57 hand edits. Each stub's own header says what un-parking
+would require.
 
 **Part 3's expensive lesson: four readings in a row had correct counters and a wrong story
 attached** (findings 43, 44, 46, 47). What worked every time was identifying things by what
@@ -110,7 +118,7 @@ inferences from a **count** or a **truncated listing**.
 | Decals | ⏳ minor visual defect — **Case Zero's open item 00m, NOT investigated there or here.** Import when it closes; `docs/imported-fixes.md` |
 | Progress widgets | ✅ **FIXED 2026-08-23** — imported with Case Zero's non-RT block; mechanism named by A/B (`CW_VK_NO_PACKED_SMALL=1` brings the defect back). Findings 60-61, `docs/imported-fixes.md` §3 |
 | Visuals menu | ✅ **IN 2026-08-23** — the title's own Options → Visuals opens a host panel (6 rows, no ray tracing). `CW_NO_PC_OPTIONS=1` restores the shipped screen |
-| Performance | ✅ **IMPORTED 2026-08-18** — Case Zero's whole parts 47-55 campaign (`82d181f..444631f`), confirmed in play by the operator: **16-24 fps at 720p before → 68-120 fps at 2560x1440 internal after, no visible regression**. Swapchain present + 60 fps pacing are now the DEFAULTS. `docs/imported-fixes.md` §2 |
+| Performance | ✅ **IMPORTED TWICE** — their parts 47-55 (2026-08-18) and parts 72-81 (2026-08-27, `03dc55e`): 215-252 fps at ~1,350 draws with the profiler on. Earlier row: — Case Zero's whole parts 47-55 campaign (`82d181f..444631f`), confirmed in play by the operator: **16-24 fps at 720p before → 68-120 fps at 2560x1440 internal after, no visible regression**. Swapchain present + 60 fps pacing are now the DEFAULTS. `docs/imported-fixes.md` §2 |
 | Save/load | ✅ **behaviourally confirmed** — saved and loaded inside a real session (finding 29). Part 1's confirmation was static only |
 | HUD/menu text | ✅ **FIXED** — imported 2026-08-16 from Case Zero `82d181f` (part 46), **confirmed in play by the operator** ("Ui seems to work really well this time"). Costs ~12 MB/frame of extra hashing in gameplay. `docs/imported-fixes.md` |
 

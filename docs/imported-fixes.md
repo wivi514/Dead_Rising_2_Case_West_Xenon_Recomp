@@ -236,6 +236,71 @@ import if it closes.
 
 ---
 
+## 4. The post-RT performance work — parts 72-81, with ray tracing stubbed inert
+
+| | |
+|---|---|
+| **Imported** | 2026-08-27 (part 5), commit `03dc55e` |
+| **Source** | Case Zero `ef52c7b..HEAD` — 56 runtime commits, everything after their *"PARK the RT shadow rows, and repoint the project at performance"* |
+| **Re-measured here?** | **YES** — 215-252 fps at ~1,350 draws/frame **with the profiler running**, `rt 0.0%`, HUD and progress bars unchanged, smoke gate passes |
+
+### Why this one needed a different technique
+
+Parts 1-3 of this table were range cuts: `git diff A..B`, rename the patch text, apply.
+**That stopped working here.** This work is written on top of the ray tracing of their parts
+62-71, which this port deliberately does not carry, and it calls into it from ~57 sites
+across the draw path, the frame roll and the exit census.
+
+```
+sequential cherry-pick   FAILS AT COMMIT 1 (it folds the RT-era per-draw hooks)
+one flattened diff       73 conflicts
+three-way merge          1 conflict in ~26,000 lines, and it was additive
+```
+
+The merge that works:
+
+```
+base   = sibling@<our last import point>, renamed CZ_ -> CW_
+theirs = sibling@HEAD,  renamed, with the unported namespaces replaced by stubs
+ours   = our current file
+git merge-file ours base theirs
+```
+
+### The stubs — keep the seam, drop the feature
+
+```
+namespace rtshadow   3,396 lines -> 156      namespace rtfactor   953 lines -> 21
+```
+
+Hard-false gates (`Active`, `RouteB`, `MenuOffersRt`), `TierThisFrame()` = 0, no-op
+collectors, census globals left at zero so the exit report prints honest zeros, and
+`PrintCollectorCensus` says out loud that nothing was collected — a silent census and a
+census that found zero are different claims (gotcha 25). `R->rtEnabled` is hard false, so
+the device stops requesting ray-query extensions no code uses; the capability **probe**
+still runs and still reports.
+
+**Deleting the call sites instead would fork this file from the sibling permanently** and
+make every future import a hand-merge. The stubs' headers say exactly what un-parking needs.
+
+### What came with it
+
+A persisted `VkPipelineCache` (this renderer never had one); **texture image
+suballocation** — one `vkAllocateMemory` per texture was **71%** of the texture decode;
+batched texture-upload submits (2,432 submit-and-waits became one per burst); image-barrier
+masks derived from their layouts (−11.9% at crowd load in the sibling); the stream store
+starting **at its ceiling** so growth cannot hitch; a first GPU-side pass breakdown
+(`CW_VK_GPU_PASSES`); a per-frame CPU/GPU profiler; and **per-entry durations in the
+synthetic input sequence** (`NAME@MS`, e.g. `A@300`, `NONE@2000`) — which is what lets a
+recipe reproduce a human instead of a metronome.
+
+### The Visuals panel's shadow row
+
+The merge pulled in their six-rung version (our base predates it, so it read as an
+addition). **Cut back to LOW / MEDIUM / HIGH**, with the three RT footer reasons dropped —
+operator's instruction, and the configuration Case Zero itself ships since their part 71.
+
+---
+
 ## PENDING — defects known to be Case Zero's, waiting on a fix there
 
 **These are NOT to be investigated in this port.** They were reported here by the operator
