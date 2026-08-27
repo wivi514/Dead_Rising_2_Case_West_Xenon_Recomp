@@ -1,4 +1,5 @@
 #include "window.h"
+#include "../gpu/vk_renderer.h"
 
 #include <atomic>
 #include <cstdio>
@@ -58,6 +59,26 @@ void Host_RequestDebugEnter() { g_debugEnterPressed.store(true, std::memory_orde
 void Host_RequestDebugMenu() { g_debugMenuPressed.store(true, std::memory_order_release); }
 void Host_RequestSnapDump() { g_snapDumpPressed.store(true, std::memory_order_release); }
 void Host_RequestBurstDump() { g_burstDumpPressed.store(true, std::memory_order_release); }
+
+// F7 — MARK THE FRAME TRACE. The operator plays, feels a stutter, and presses this; the
+// renderer stamps the current frame number into the trace and the log.
+//
+// WHY IT EXISTS. Correlating "it stuttered just now" with a frame number is otherwise
+// guesswork: a play session is tens of thousands of frames and the worst-frame table keeps
+// twelve. Without a marker their report can only be matched to the trace by wall-clock
+// eyeballing, which is exactly the kind of loose join that has produced wrong conclusions
+// in this project before. A keypress is an EVENT, and the frame it lands on is a fact.
+//
+// Reaction time is a known and stated limitation: a human presses ~200-500 ms after the
+// thing they felt, so the marker names a NEIGHBOURHOOD, not the frame. The reader looks
+// backwards from the marker for the worst frame in the preceding second — which is why the
+// trace carries every frame rather than only the extremes.
+std::atomic<bool> g_markPressed{ false };
+void Host_RequestMark() { g_markPressed.store(true, std::memory_order_release); }
+bool Host_ConsumeMarkPressed()
+{
+    return g_markPressed.exchange(false, std::memory_order_acq_rel);
+}
 
 bool Host_ConsumeSnapDumpPressed()
 {
@@ -318,6 +339,65 @@ SDL_GameController* g_controller = nullptr;
 SDL_JoystickID      g_controllerId = -1;
 bool g_inputTrace = false;
 
+// THE INPUT TRACE'S CLOCK, AND WHY THE TRACE WAS USELESS WITHOUT IT.
+//
+// `CW_INPUT_TRACE=1` has printed one line per pad state change since phase 3, and every
+// line said WHAT was pressed and nothing about WHEN. That is enough to answer "does the
+// pad work" and it is not enough for the thing the operator asked for in part 80:
+// *"look at the input I do and at what time they happen according to time not frame per
+// second so you can reproduce it"*. They had just found DebugJump entries that spawn into
+// an 8,500-8,900-draw crowd — the load `part80-kickoff.md` §1 says a CPU item must be
+// measured at or not at all — and the only way that route becomes MINE to run is if their
+// keystrokes can be transcribed into a `CW_FAKE_PRESS_SEQ` recipe.
+//
+// So the line carries milliseconds since process start, on the same epoch as
+// `debug_tunables.cpp`'s `[debug] ... at Ns` lines (both are static initialisers, so they
+// agree to a few milliseconds). That matters more than the absolute value: the DebugJump
+// screen lands anywhere from 24 s to 131 s after boot (gotcha 75), so a recipe anchored on
+// process start is a fit to one afternoon and a recipe anchored on the SCREEN LANDING is a
+// statement about the game. Having both clocks in one file is what makes the second
+// computable from the log after the fact.
+//
+// It also DECODES, into exactly the vocabulary `CW_FAKE_PRESS_SEQ` accepts (A, START,
+// DOWN, LSUP, RSRIGHT...). A hex button mask is transcribable in principle and nobody does
+// it correctly at 40 lines a minute; printing the name the replay side already parses
+// makes the transcription mechanical instead of a second place to make a mistake.
+static const auto g_inputEpoch = std::chrono::steady_clock::now();
+
+static long long InputElapsedMs()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - g_inputEpoch)
+        .count();
+}
+
+// The button bits, named as the press-sequence names them. Kept here rather than shared
+// with `imports.cpp`'s `kButtons` on purpose: that table is the REPLAY side's vocabulary
+// and this is the RECORD side's, and if the two ever disagree the trace should say so by
+// printing a name the replay rejects — not by silently agreeing because they are the same
+// array. The masks are XInput's and are fixed by the contract, not by either table.
+struct TracedButton { uint16_t mask; const char* name; };
+static constexpr TracedButton kTracedButtons[] = {
+    { 0x1000, "A" },     { 0x2000, "B" },      { 0x4000, "X" },     { 0x8000, "Y" },
+    { 0x0010, "START" }, { 0x0020, "BACK" },   { 0x0001, "UP" },    { 0x0002, "DOWN" },
+    { 0x0004, "LEFT" },  { 0x0008, "RIGHT" },  { 0x0040, "LTHUMB" },{ 0x0080, "RTHUMB" },
+    { 0x0100, "LB" },    { 0x0200, "RB" },
+};
+
+// A stick axis as a sequence entry name, or nothing when it is inside the deflection
+// this printer treats as centred. HALF deflection is the threshold rather than any
+// deflection at all: an analog stick at rest reads a few hundred counts of noise, and a
+// trace that reported LSUP for noise would put a walk entry into every transcription.
+// The replay side only has full deflection, so half is also the point past which the two
+// stop being comparable — say the axis is deflected when the recipe could reproduce it.
+static void AppendStick(char* out, size_t n, const char* neg, const char* pos, int v)
+{
+    if (v > 16383)
+        snprintf(out + strlen(out), n - strlen(out), ",%s", pos);
+    else if (v < -16383)
+        snprintf(out + strlen(out), n - strlen(out), ",%s", neg);
+}
+
 // The pad snapshot. Written by the event loop, read by whichever guest thread is
 // inside XamInputGetState. A mutex rather than an atomic struct because the state is
 // 16 bytes (never lock-free) and because the read rate is not a hot path: A5 shows
@@ -450,7 +530,8 @@ const char* Glyph(char c)
 template <typename Rect>
 void EmitSettingsOverlay(int w, int h, Rect&& rect)
 {
-    const int panelW = 640, panelH = 380;   // 380: six rows since part 61 (FOV)
+    const int panelW = 640, panelH = 380;   // 380: six rows — part 64 merged the RT
+                                            // tiers INTO the shadow row
     const int panelX = (w - panelW) / 2, panelY = (h - panelH) / 2 - 30;
     if (panelW <= 0 || panelH <= 0)
         return;
@@ -501,11 +582,28 @@ void EmitSettingsOverlay(int w, int h, Rect&& rect)
     char fovName[8] = "OG";
     if (const int fov = Settings_Fov(); fov != 0)
         snprintf(fovName, sizeof fovName, "%+d", fov);
+    // ONE SHADOW ROW (part 64, operator's revision): the raster tiers and the RT
+    // tiers are values of the SAME setting, because selecting an RT value REPLACES
+    // the normal shadow rather than adding to it — "normal shadow would be removed
+    // to be replaced by the RT shadow if a rt settings is selected". Two rows
+    // implied you could have both, which is what the first build actually did.
+    //
+    // On a device without ray query the RT values are not offered at all: the row
+    // stops at HIGH and the footer says why. Better than showing values that
+    // refuse to move (the gamma-slider rule) when the whole class is unavailable.
+    // SHADOW QUALITY IS THREE RUNGS HERE. Case Zero's row grows three more (RT LOW /
+    // MEDIUM / HIGH) for its ray-traced cascade; none of that is ported — operator's
+    // instruction, because it does not produce a correct picture there yet, and their
+    // own part 71 parked those rungs for the same reason. With no RT there is no
+    // availability predicate to consult and no stored RT tier to step past, so the row
+    // reads the raster tier directly and cannot land on a value that does not exist.
+    static const char* kShadowRow[] = { "LOW", "MEDIUM", "HIGH" };
+    const int shadowRow = Settings_ShadowTier();
     const char* rows[6][2] = {
         { "RESOLUTION", resName },
         { "DISPLAY MODE", kModeNames[int(Settings_DisplayMode()) % 3] },
         { "VSYNC", kOnOff[Settings_VSync() ? 1 : 0] },
-        { "SHADOW QUALITY", kTiers[Settings_ShadowTier() % 3] },
+        { "SHADOW QUALITY", kShadowRow[shadowRow % 3] },
         { "FRAME CAP", capName },
         { "FIELD OF VIEW", fovName },
     };
@@ -525,6 +623,13 @@ void EmitSettingsOverlay(int w, int h, Rect&& rect)
     // frame), but the tier scales are floored at the title's own 1280x720 base — so
     // at render scale 1 every tier is 1x and the row is honestly inert, which the
     // footer says rather than letting a dead row pretend (the gamma-slider rule).
+    // A dead rung must say WHY it is dead, and the two reasons need different words:
+    // a device without ray query cannot be fixed by the user, a missing shader variant
+    // cache is one build command away (tools/patch_rt_shadow_hlsl.py).
+    // The Shadow row is LIVE (the renderer re-reads the tier each frame), but the tier
+    // scales are floored at the title's own 1280x720 base — so at render scale 1 every
+    // tier is 1x and the row is honestly inert, which the footer says rather than
+    // letting a dead row pretend (the gamma-slider rule).
     text(panelX + 20, panelY + panelH - 30,
          scale > 1 ? "RESOLUTION: NEXT LAUNCH - SHADOW: LIVE"
                    : "RESOLUTION: NEXT LAUNCH - SHADOW INERT AT 720P",
@@ -734,6 +839,7 @@ HostPadState ReadKeyboard()
     static bool f2WasDown = false;
     static bool f3WasDown = false;
     static bool f4WasDown = false;
+    static bool f7WasDown = false;
     static bool f8WasDown = false;
     static bool f9WasDown = false;
     if (g_keyboardFocus)
@@ -742,6 +848,10 @@ HostPadState ReadKeyboard()
         const bool f2Down = keys[SDL_SCANCODE_F2] != 0;
         const bool f3Down = keys[SDL_SCANCODE_F3] != 0;
         const bool f4Down = keys[SDL_SCANCODE_F4] != 0;
+        const bool f7Down = keys[SDL_SCANCODE_F7] != 0;
+        if (f7Down && !f7WasDown)
+            g_markPressed.store(true, std::memory_order_release);
+        f7WasDown = f7Down;
         const bool f8Down = keys[SDL_SCANCODE_F8] != 0;
         if (f8Down && !f8WasDown)
             g_burstDumpPressed.store(true, std::memory_order_release);
@@ -833,10 +943,32 @@ void PublishPad(uint32_t userIndex, const HostPadState& fresh)
     pad = fresh;
     pad.packet = packet;
     if (g_inputTrace)
+    {
+        // The decoded form, built first so the raw fields can still be printed beside it.
+        // BOTH are on the line deliberately: the names are what a recipe is written from,
+        // and the raw mask is what says the decoder missed a bit rather than the pad being
+        // idle — a decoder with no raw column next to it cannot be shown to be complete.
+        char names[192] = "";
+        for (const TracedButton& b : kTracedButtons)
+            if (fresh.buttons & b.mask)
+                snprintf(names + strlen(names), sizeof names - strlen(names), ",%s", b.name);
+        AppendStick(names, sizeof names, "LSLEFT", "LSRIGHT", fresh.thumbLX);
+        AppendStick(names, sizeof names, "LSDOWN", "LSUP", fresh.thumbLY);
+        AppendStick(names, sizeof names, "RSLEFT", "RSRIGHT", fresh.thumbRX);
+        AppendStick(names, sizeof names, "RSDOWN", "RSUP", fresh.thumbRY);
+        if (fresh.leftTrigger > 127)
+            snprintf(names + strlen(names), sizeof names - strlen(names), ",LT");
+        if (fresh.rightTrigger > 127)
+            snprintf(names + strlen(names), sizeof names - strlen(names), ",RT");
+        const long long ms = InputElapsedMs();
         fprintf(stderr,
-                "[host] pad %u packet %u: buttons=%04X triggers=%u/%u L=(%d,%d) R=(%d,%d)\n",
-                userIndex, packet, fresh.buttons, fresh.leftTrigger, fresh.rightTrigger,
-                fresh.thumbLX, fresh.thumbLY, fresh.thumbRX, fresh.thumbRY);
+                "[input] t=%lld.%03llds pad %u packet %u  %-24s | "
+                "buttons=%04X triggers=%u/%u L=(%d,%d) R=(%d,%d)\n",
+                ms / 1000, ms % 1000, userIndex, packet,
+                names[0] ? names + 1 : "NONE (released)", fresh.buttons,
+                fresh.leftTrigger, fresh.rightTrigger, fresh.thumbLX, fresh.thumbLY,
+                fresh.thumbRX, fresh.thumbRY);
+    }
 }
 
 void Shutdown(const char* why)
@@ -854,6 +986,10 @@ void Shutdown(const char* why)
     // ends here rather than through main.
     ::GapProbe_Report();
     ::FeProbe_Report();
+    // PART 71: and write the pipeline cache back, HERE rather than inside DumpStats —
+    // see the header comment on why. This is the normal quit path, so it is the one that
+    // actually has to fire for the next launch to be warm.
+    ::VkRenderer_SavePipelineCache();
     fflush(nullptr);
     // _Exit, not exit: guest threads are still running recompiled code against guest
     // memory, and running static destructors underneath them would turn an ordinary

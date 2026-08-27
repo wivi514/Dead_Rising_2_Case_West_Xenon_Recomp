@@ -3841,6 +3841,40 @@ static uint32_t XamInputGetCapabilities_x(uint32_t userIndex, uint32_t flags,
     return 0;
 }
 
+// ONE STICK CLAUSE — `LS<x>/<y>` or `RS<x>/<y>` — decoded into the four-axis array
+// {lx, ly, rx, ry}. Returns false and touches nothing on any malformed input.
+//
+// The numeric test is written out rather than handed to `strtol`'s error reporting,
+// because `strtol` returns 0 for "" and for "Q" — and 0 is a perfectly legal axis
+// value, so a silent parse failure would spell itself as a CENTRED STICK. A recipe
+// that quietly centres a stick is a recipe that walks somewhere else, which is the
+// exact failure this whole parser is loud about.
+//
+// Out of range is REJECTED rather than clamped, for the same reason: a clamp turns a
+// mistyped 327670 into full deflection and the recipe looks like it worked.
+static bool ParseStickClause(const std::string& c, int16_t (&axes)[4])
+{
+    const size_t slash = c.find('/');
+    if (slash == std::string::npos || slash < 3)
+        return false;
+    const std::string xs = c.substr(2, slash - 2), ys = c.substr(slash + 1);
+    auto numeric = [](const std::string& v) {
+        const size_t first = (!v.empty() && v[0] == '-') ? 1 : 0;
+        return v.size() > first &&
+               v.find_first_not_of("0123456789", first) == std::string::npos;
+    };
+    if (!numeric(xs) || !numeric(ys))
+        return false;
+    const long xv = strtol(xs.c_str(), nullptr, 10);
+    const long yv = strtol(ys.c_str(), nullptr, 10);
+    if (xv < -32768 || xv > 32767 || yv < -32768 || yv > 32767)
+        return false;
+    const int base = c[0] == 'L' ? 0 : 2;
+    axes[base] = int16_t(xv);
+    axes[base + 1] = int16_t(yv);
+    return true;
+}
+
 constexpr uint16_t XINPUT_GAMEPAD_START = 0x0010;
 
 // CW_FAKE_START_MS=N — a synthetic START press every N milliseconds, held for 150 ms.
@@ -3878,6 +3912,17 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
     if (userIndex >= kLocalPadCount)
         return ERROR_DEVICE_NOT_CONNECTED;
 
+    // CW_FAKE_PRESS_MS — the interval BETWEEN entries, separated from the boot delay in
+    // part 74 on the operator's request ("go faster when you are in debug jump instead of
+    // waiting for a while"). These were one knob, so shortening the menu navigation also
+    // shortened the wait for the title screen to exist, and the first press would land
+    // before there was anything to press. They are different quantities: the boot delay is
+    // a property of the GAME's load time and the interval is a property of how long a menu
+    // transition takes. Defaults to the boot delay, so every existing recipe is unchanged.
+    //
+    // The 150 ms tap window is NOT scaled with it: a tap is a tap, and part 54 had to fix a
+    // race where the DebugJump edge was missed inside exactly this window. Shortening the
+    // interval leaves the tap the same length and only reduces the idle time after it.
     static const int fakeStartMs = []() {
         const char* e = getenv("CW_FAKE_START_MS");
         const int ms = e ? atoi(e) : 0;
@@ -3886,6 +3931,15 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
                  "not evidence about any import; do not gate on it.\n",
                  ms);
         return ms;
+    }();
+    // Resolved AFTER the boot delay, because its default IS the boot delay.
+    static const int fakePressMs = []() {
+        const char* e = getenv("CW_FAKE_PRESS_MS");
+        const int v = e ? atoi(e) : 0;
+        if (v > 0)
+            KLOG("CW_FAKE_PRESS_MS=%d — entries advance every %d ms; the boot delay stays "
+                 "CW_FAKE_START_MS. The 150 ms tap window is unchanged.\n", v, v);
+        return v > 0 ? v : (fakeStartMs > 0 ? fakeStartMs : 1);
     }();
 
     // The real device, and it takes precedence over nothing: the synthetic arm below
@@ -3971,12 +4025,31 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
         uint16_t mask;
         int16_t lx, ly, rx, ry;
         bool hold;              // stick entries deflect for the whole interval
-        int hostKey = 0;        // 2/3/4 = the F2/F3/F4 debug edges, 8 = F8's burst, 9 = F9
+        int hostKey = 0;        // 2/3/4 = F2/F3/F4 debug edges, 7 = F7's mark, 8 = F8 burst, 9 = F9
                                 // dump/census, all of them pulses with no pad state
         bool barrier = false;   // WAITJUMP: park here until the screen request lands
         uint8_t lt = 0, rt = 0; // trigger entries HOLD like sticks; LT re-shows the
                                 // auto-hidden HUD (operator, 2026-08-17), which is what
                                 // makes a census frame with the PP bar reachable
+        // PER-ENTRY DURATION, in milliseconds. 0 means "use CW_FAKE_PRESS_MS", which is
+        // what every recipe written before part 80 means and still gets.
+        //
+        // WHY IT EXISTS. Until now the sequence was a metronome: every entry occupied
+        // exactly one interval, so the only recipes expressible were ones where each step
+        // takes the same time. That is fine for walking a menu and it CANNOT REPRODUCE A
+        // HUMAN. The operator's request opening part 80 was exactly that — they had found
+        // DebugJump entries spawning into an 8,500-8,900-draw crowd, which is the load
+        // `part80-kickoff.md` §1 requires for a CPU item, and asked me to *"look at the
+        // input I do and at what time they happen ... so you can reproduce it"*. Their
+        // route is a 300 ms tap, a two-second wait, a four-second walk; a metronome can
+        // only approximate it by choosing an interval short enough for the shortest step,
+        // which then makes the long steps dozens of near-duplicate entries and the recipe
+        // unreadable.
+        //
+        // The spelling is `NAME@MS` — `A@300`, `LSUP@4000`, `NONE@2000`. It composes with
+        // WAITJUMP unchanged, because the barrier works on the sequence CLOCK and this
+        // changes only how that clock is partitioned.
+        unsigned durMs = 0;
     };
     // Full deflection is 32767 and the Y axis is positive UP (gotcha 102 — the
     // conversion the real pad path also makes). No deadzone is applied anywhere,
@@ -4017,6 +4090,10 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
         // errand, and this one has to be checkable because a burst that silently records
         // nothing looks exactly like a defect that did not happen (gotchas 30, 151, 190).
         { "F8", 0, 0,0,0,0, false, 8 },
+        // F7 — the operator's stutter MARKER. Synthesizable so the marker path can be
+        // tested without a human at the keyboard: an instrument nobody has seen fire is
+        // not an instrument (gotcha 30), and this one is handed to the operator to use.
+        { "F7", 0, 0,0,0,0, false, 7 },
         // WAITJUMP — a BARRIER, and the thing that makes an F2 recipe reproducible.
         //
         // Every entry before this one is placed at a fixed wall-clock offset, which is
@@ -4044,11 +4121,118 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
         {
             if (i == all.size() || all[i] == ',')
             {
+                // `NAME@MS` — split the duration off before the name is matched. An
+                // entry with no `@` keeps durMs 0 and therefore CW_FAKE_PRESS_MS, so
+                // every recipe written before part 80 means exactly what it meant.
+                std::string nm = one;
+                unsigned dur = 0;
+                const size_t at = one.find('@');
+                if (at != std::string::npos)
+                {
+                    nm = one.substr(0, at);
+                    // A malformed duration must not become "0", because 0 means "use the
+                    // default interval" and the recipe would then run at a cadence nobody
+                    // asked for while looking correct. Reject it by name, the same way a
+                    // misspelled button is rejected — the failure mode this whole block
+                    // exists to prevent is a sequence that silently walks the wrong menu.
+                    const std::string ds = one.substr(at + 1);
+                    const bool digits =
+                        !ds.empty() &&
+                        ds.find_first_not_of("0123456789") == std::string::npos;
+                    if (!digits || strtoul(ds.c_str(), nullptr, 10) == 0)
+                    {
+                        unknown++;
+                        KLOG("CW_FAKE_PRESS_SEQ: BAD DURATION in \"%s\" — expected "
+                             "NAME@MILLISECONDS with a non-zero count. ENTRY IGNORED; "
+                             "the rest of the sequence is now early.\n", one.c_str());
+                        one.clear();
+                        continue;
+                    }
+                    dur = unsigned(strtoul(ds.c_str(), nullptr, 10));
+                }
                 bool found = false;
+                // ANALOG STICK ENTRIES — `LS<x>/<y>` and `RS<x>/<y>`, e.g. `LS-4849/32767`.
+                //
+                // WHY THE EIGHT CARDINAL NAMES ARE NOT ENOUGH, measured rather than argued.
+                // Part 80 transcribed the operator's own route into a 9,300-draw crowd from
+                // an input trace, emitted `LSUP` for the walk, and they watched the replay
+                // and said: *"the character goes forward the whole time while I was often
+                // slightly to the left so it runs into the sheriff office building instead
+                // of middle of street."* The trace says exactly that — over the 14.5-second
+                // walk the Y axis is pinned at 32767 and **X drifts between -5,467 and
+                // +3,993**, a 17% deflection that is steering. `LSUP` is (0, 32767), so the
+                // replay walks dead straight into a wall.
+                //
+                // A cardinal vocabulary can only express eight directions at full
+                // deflection, and a human uses neither: they use small corrections at
+                // partial deflection, continuously. Rounding those to the nearest of eight
+                // does not approximate the route, it produces a DIFFERENT route that
+                // happens to start in the same place — and the failure is silent, because
+                // the run still reaches somewhere and still reports a draw count.
+                //
+                // These entries HOLD for their whole window, like the cardinal stick names
+                // and for the same reason: a stick that tapped for 150 ms would move Chuck
+                // a few centimetres and look exactly like a stick that does not work.
+                //
+                // BOTH STICKS AT ONCE — `LS<x>/<y>+RS<x>/<y>`. The operator turns the
+                // camera WHILE walking, continuously, and an entry that could carry only
+                // one stick would have to drop the other: transcribing their route dropped
+                // a right-stick deflection of -12,000 that was live throughout the walk,
+                // so Chuck took the same path facing the wrong way. For a PERFORMANCE route
+                // the facing is not cosmetic — it decides the draw set, which is the thing
+                // being measured.
+                if (!found && nm.find('/') != std::string::npos &&
+                    (nm.compare(0, 2, "LS") == 0 || nm.compare(0, 2, "RS") == 0))
+                {
+                    // Split on '+' into at most two stick clauses, each `LSx/y` or `RSx/y`.
+                    std::vector<std::string> clauses;
+                    for (size_t b = 0, e; b <= nm.size(); b = e + 1)
+                    {
+                        e = nm.find('+', b);
+                        if (e == std::string::npos)
+                            e = nm.size();
+                        clauses.push_back(nm.substr(b, e - b));
+                        if (e == nm.size())
+                            break;
+                    }
+                    bool ok = !clauses.empty();
+                    int16_t axes[4] = { 0, 0, 0, 0 };   // lx, ly, rx, ry
+                    for (const std::string& c : clauses)
+                    {
+                        if (c.size() < 4 || (c.compare(0, 2, "LS") != 0 &&
+                                             c.compare(0, 2, "RS") != 0) ||
+                            c.find('/') == std::string::npos)
+                        {
+                            ok = false;
+                            break;
+                        }
+                        ok = ok && ParseStickClause(c, axes);
+                    }
+                    if (ok)
+                    {
+                        static std::deque<std::string> analogNames;
+                        analogNames.push_back(nm);
+                        NamedButton ab{ analogNames.back().c_str(), 0,
+                                        axes[0], axes[1], axes[2], axes[3], true };
+                        ab.durMs = dur;
+                        seq.push_back(ab);
+                        found = true;
+                    }
+                    else
+                    {
+                        unknown++;
+                        KLOG("CW_FAKE_PRESS_SEQ: BAD STICK entry \"%s\" — expected "
+                             "LS<x>/<y>, RS<x>/<y> or the two joined by '+', axes in "
+                             "-32768..32767. ENTRY IGNORED.\n", one.c_str());
+                        one.clear();
+                        continue;
+                    }
+                }
                 for (const auto& b : kButtons)
-                    if (one == b.name)
+                    if (!found && nm == b.name)
                     {
                         seq.push_back(b);
+                        seq.back().durMs = dur;
                         found = true;
                     }
                 // A misspelled name used to vanish silently, which shifts every later
@@ -4118,17 +4302,82 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
         elapsedMs - parkedTotalMs.load(std::memory_order_relaxed) -
         (parkedNow >= 0 ? elapsedMs - parkedNow : 0);
 
+    // THE ENTRY TIMELINE. Each entry's start offset on the sequence clock, cumulated
+    // from the per-entry durations — so a recipe of plain names is still a metronome at
+    // CW_FAKE_PRESS_MS, and one carrying `NAME@MS` is whatever a human actually did.
+    //
+    // Built once, next to the sequence it describes, because the alternative (dividing by
+    // a constant, as this did before) is only correct while every entry is the same
+    // length and would go silently wrong the first time one was not.
+    struct Timeline
+    {
+        std::vector<long long> start;   // start[i] = offset of entry i, from fakeStartMs
+        long long total = 0;
+    };
+    static const Timeline timeline = [] {
+        Timeline t;
+        long long acc = 0;
+        for (const auto& b : sequence)
+        {
+            t.start.push_back(acc);
+            acc += b.durMs ? static_cast<long long>(b.durMs) : static_cast<long long>(fakePressMs);
+        }
+        t.total = acc;
+        // Print the schedule when — and only when — the recipe actually uses per-entry
+        // durations. A metronome recipe's schedule is its own definition and printing it
+        // would be noise in every existing run's log; a hand-timed one is a transcription
+        // of something a human did, and the single most likely mistake in it is a typo in
+        // a duration that shifts everything after it. Printing what the runtime BELIEVES
+        // the schedule to be is how that typo is caught by reading rather than by a run
+        // that walks the wrong menu and reports it as the game (gotcha 78's neighbour).
+        bool timed = false;
+        for (const auto& b : sequence)
+            timed = timed || b.durMs != 0;
+        if (timed)
+        {
+            KLOG("CW_FAKE_PRESS_SEQ: hand-timed schedule, %.1f s total (offsets are from "
+                 "the CW_FAKE_START_MS delay, and from the WAITJUMP release if there is "
+                 "one):\n", double(acc) / 1000.0);
+            for (size_t i = 0; i < sequence.size(); ++i)
+                KLOG("    %7.3fs  %-10s %5lld ms\n", double(t.start[i]) / 1000.0,
+                     sequence[i].name,
+                     sequence[i].durMs ? static_cast<long long>(sequence[i].durMs)
+                                       : static_cast<long long>(fakePressMs));
+        }
+        return t;
+    }();
+
     const bool started = effectiveMs > fakeStartMs;
     NamedButton entry{ "START", XINPUT_GAMEPAD_START, 0, 0, 0, 0, false };
     size_t idx = 0;
+    // The offset of the selected entry on the sequence clock, so the tap window below is
+    // measured from when THIS entry began rather than from a fixed grid.
+    long long entryStartMs = 0;
+    long long entryDurMs = static_cast<long long>(fakePressMs);
     if (!sequence.empty())
     {
         // Only meaningful once the first interval has elapsed: before that the
         // subtraction below would wrap and select the LAST entry, which is harmless
         // while nothing is emitted and is a spurious transition once it is.
         if (started)
-            idx = std::min(size_t(effectiveMs / fakeStartMs) - 1, sequence.size() - 1);
+        {
+            const long long t = effectiveMs - fakeStartMs;
+            // Linear rather than a binary search on purpose: a recipe is tens of entries,
+            // this is called about once a frame per user, and a scan that reads in source
+            // order is the one whose off-by-one is visible.
+            idx = sequence.size() - 1;
+            for (size_t i = 0; i < sequence.size(); ++i)
+                if (t < timeline.start[i] + (sequence[i].durMs
+                                                 ? static_cast<long long>(sequence[i].durMs)
+                                                 : static_cast<long long>(fakePressMs)))
+                {
+                    idx = i;
+                    break;
+                }
+        }
         entry = sequence[idx];
+        entryStartMs = timeline.start[idx];
+        entryDurMs = entry.durMs ? static_cast<long long>(entry.durMs) : static_cast<long long>(fakePressMs);
     }
 
     // The barrier itself. Parking is a property of the ENTRY, so it re-evaluates on every
@@ -4183,10 +4432,23 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
     // BARRIER-CORRECTED clock, or a recipe would resume mid-tap after a long park.
     // While parked the sequence clock is frozen, so the tap phase has to come from the
     // REAL clock or the repeat would be stuck permanently on or permanently off.
-    const long long phaseMs = parked ? elapsedMs : effectiveMs;
-    const bool active =
-        (started || parked) && !entry.barrier &&
-        (entry.hold || (phaseMs % fakeStartMs) < 150);
+    //
+    // PAST THE END OF THE TIMELINE the last entry still re-taps at CW_FAKE_PRESS_MS, which
+    // is what it did before and what every recipe ending in NONE relies on. Expressed as
+    // "if the clock has run off the end, fold it back into the last entry's window" rather
+    // than as a special case, so the two paths cannot drift.
+    long long phaseInEntry;
+    if (parked)
+        phaseInEntry = elapsedMs % static_cast<long long>(fakePressMs);
+    else
+    {
+        const long long t = effectiveMs - fakeStartMs;
+        phaseInEntry = t >= timeline.total && entryDurMs > 0
+                           ? (t - entryStartMs) % entryDurMs
+                           : t - entryStartMs;
+    }
+    const bool active = (started || parked) && !entry.barrier &&
+                        (entry.hold || phaseInEntry < 150);
 
     // A HOST DEBUG EDGE FIRES ONCE PER INTERVAL, keyed on the interval INDEX.
     //
@@ -4251,6 +4513,7 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
                 case 2: Host_RequestDebugJump(); break;
                 case 3: Host_RequestDebugEnter(); break;
                 case 4: Host_RequestDebugMenu(); break;
+                case 7: Host_RequestMark(); break;
                 case 8: Host_RequestBurstDump(); break;
                 case 9: Host_RequestSnapDump(); break;
             }

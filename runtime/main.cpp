@@ -192,6 +192,7 @@ int main(int argc, char** argv)
             ::VkRenderer_DumpStats();
             ::GapProbe_Report();
             ::FeProbe_Report();
+            ::VkRenderer_SavePipelineCache();
             fflush(nullptr);
             std::_Exit(128 + s);
         });
