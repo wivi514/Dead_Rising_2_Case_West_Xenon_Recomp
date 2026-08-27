@@ -1,4 +1,12 @@
-# Part 4 kickoff — the live hand-off
+# Part 4 kickoff — SUPERSEDED
+
+> **SUPERSEDED 2026-08-23 by `docs/part6-kickoff.md`.** Parts 4 and 5 both ran; §1's one
+> active task — the progress-widget defect — is **CLOSED** (finding 60). Its mechanism was
+> not any of the ones this document reasons about: it was the small-packed-texture read,
+> and `CW_VK_NO_PACKED_SMALL=1` is the arm that proves it. **Finding 59, written during
+> part 4, is retracted in place.** Read this file for what was measured, not for what it
+> says is broken.
+
 
 **Written at the end of part 3 (2026-08-16). This is the live one.** `part3-kickoff.md` is
 superseded; `part2-kickoff.md` before it is kept only as a cautionary example (its problem

@@ -24,11 +24,13 @@ low-risk — the import table says so.
 
 ## Status — and where a new conversation starts
 
-> **THE LIVE HAND-OFF IS `docs/part4-kickoff.md`.** Read it first in a new conversation:
+> **THE LIVE HAND-OFF IS `docs/part6-kickoff.md`.** Read it first in a new conversation:
 > it says what already exists (so it is not rebuilt), names where to start, and lists the
 > gates that are run and owed. When a part ends, write the next `part<N>-kickoff.md`,
 > demote this pointer to it, and refresh the memory directory.
-> `docs/part3-kickoff.md` is superseded too. **`docs/part2-kickoff.md` is superseded** and is kept as the cautionary example: its
+> `docs/part4-kickoff.md` is superseded — **its one active task, the progress-widget
+> defect, is CLOSED** (finding 60). `part3-kickoff.md` likewise.
+> **`docs/part2-kickoff.md` is superseded** and is kept as the cautionary example: its
 > problem statement was false and part 2 refuted it with the measurement that section
 > itself asked for.
 
