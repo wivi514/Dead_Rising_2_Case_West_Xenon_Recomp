@@ -3206,3 +3206,30 @@ address is the recompiled weak alias, i.e. the hook did not land. Run it for
 every new hook before believing any zero from it. This is gotcha 30 ("an
 instrument that has never failed has not been shown capable of failing") wearing
 C++ linkage as a costume; the counters were never wrong, they were never wired.
+
+## 324. A SHADER-CACHE MISS IS SILENT, AND "it looks fine" CANNOT DETECT ONE
+
+Arm the microcode dump on **every** operator session, not just on sessions that were
+asked for a capture. Two long Case West sessions (2026-08-27/28) added **37 shaders**
+the bank did not have, and **34 of them reached a draw and were skipped** — while the
+operator, playing the whole time, reported *"everything looks good"*.
+
+That is not a failure of attention. A missing shader does not stripe, flicker or fault:
+the draw is declined, and what you see is a world with something quietly absent from it
+that you have no reference for. Past the point where captures exist there is no oracle
+to notice it either, so the ONLY instrument that catches it is the dump plus the
+renderer's own `no translated shader` line.
+
+**The rule:** `CW_SHADER_DUMP=<dir>` on every session with a human at the controls, into
+a session-specific directory outside `/tmp` (gotcha: tmpfs eats dumps), then diff against
+the bank and rebuild. The cost is a few MB and one `cp`; the alternative is shipping a
+port whose picture is wrong in places nobody will ever be able to name.
+
+**And the growth curve is itself the measurement.** 443 → 461 → 480 across two sessions,
+~18 per session, is a bank still tracking new material. A session that returns **zero**
+new shaders over ground already covered is the first evidence the cache is COMPLETE
+rather than merely larger — which is a different claim, and only a repeat run can make it.
+
+**How this was nearly missed:** the operator asked *"did you put the thing to catch
+shader in before you launched it?"* — and the answer was no. The launch that preceded
+that question had the dump off, and would have thrown away everything it saw.

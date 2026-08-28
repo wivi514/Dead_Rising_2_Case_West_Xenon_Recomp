@@ -2984,3 +2984,51 @@ Zero addresses, including a link-register value naming one call site) and
 `gen_pc_options.py` (the native-screen arm's repacked asset). The FOV row stores its
 value and the renderer's own projection patch applies it; re-deriving the game-side half
 needs this title's own camera census, and the sibling's file header carries the recipe.
+
+## 62. **A NEAR-COMPLETE PLAYTHROUGH, ZERO FAULTS — and 37 shaders the bank did not have** — part 5, 2026-08-27/28
+
+Two long operator sessions on the post-import build (`03dc55e`), both with
+`CW_SHADER_DUMP` armed. The second was an attempt to finish the game and got, in the
+operator's words, *"almost"* there — **further into Case West than this port or Xenia
+has ever been driven.**
+
+### The run itself is the headline
+
+```
+~1,454,000 vblanks in one session   (the longest run this port has taken)
+crashes / SIGSEGV / SIGBUS      0
+unsupported packet / format / import  0     (all three fail LOUDLY by design)
+truncated index buffers         0
+dispatch table                  58,695 entries, 0 refused
+```
+
+Nothing in the runtime complained, at a depth where there is **no capture ground truth
+at all** (finding 33). Combined with 2560x1440 internal and the two imported performance
+campaigns, the port now sustains a multi-hour session at high resolution without a fault.
+
+### The shader bank grew, and every miss was invisible
+
+```
+session 1 (2026-08-27)   +18 new   15 reached a draw and were SKIPPED
+session 2 (2026-08-28)   +19 new   19 reached a draw and were SKIPPED
+bank: 443 -> 461 -> 480, all translated, dim census 0 disagreements
+```
+
+**The operator reported "everything looks good" during the session in which 15 draw
+classes were being declined.** That is the finding, and it is now **gotcha 324**: a
+shader-cache miss is silent — the draw is declined, and the result is a world with
+something quietly absent that a player has no reference for. Past the captures there is
+no oracle either, so the dump plus the renderer's own `no translated shader` line is the
+only instrument that can catch it.
+
+**The growth curve is itself a measurement.** ~18 new per session is a bank still
+tracking new material. **A repeat run over covered ground returning ZERO new shaders is
+what would establish the cache is complete** rather than merely larger — that run is
+owed and has not been done.
+
+### How it was nearly not measured at all
+
+The first launch of 2026-08-27 went out with the dump OFF. It was caught by the operator
+asking whether it had been armed, two minutes in, and relaunched before anything was
+lost. Everything above exists because they asked. **Arm it on every session with a human
+at the controls, whatever the session was for.**
