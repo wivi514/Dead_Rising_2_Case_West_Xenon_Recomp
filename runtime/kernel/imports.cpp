@@ -4060,6 +4060,13 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
         // WAITJUMP unchanged, because the barrier works on the sequence CLOCK and this
         // changes only how that clock is partitioned.
         unsigned durMs = 0;
+        // TRANSCRIBED ANALOG entries interpolate their axes toward the next lerp entry
+        // over their duration (2026-08-29). A recorded thumb moves CONTINUOUSLY; held
+        // stair-steps integrate to a different path, and the operator watched the
+        // difference walk Chuck into the bathroom wall beside the door. Only entries
+        // from the analog/compound parser lerp — the cardinal names (LSUP, RSRIGHT...)
+        // keep their hard edges so every hand-written recipe means what it meant.
+        bool lerp = false;
     };
     // Full deflection is 32767 and the Y axis is positive UP (gotcha 102 — the
     // conversion the real pad path also makes). No deadzone is applied anywhere,
@@ -4263,6 +4270,7 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
                         ab.lt = clt;
                         ab.rt = crt;
                         ab.durMs = dur;
+                        ab.lerp = true;
                         seq.push_back(ab);
                         found = true;
                     }
@@ -4590,12 +4598,36 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
     const uint16_t autoClose =
         DebugTunables_WantAutoBack() ? uint16_t(0x2000) : uint16_t(0);
     const uint16_t outButtons = uint16_t((active ? entry.mask : uint16_t(0)) | autoClose);
-    const int16_t outLX = active ? entry.lx : int16_t(0);
-    const int16_t outLY = active ? entry.ly : int16_t(0);
-    const int16_t outRX = active ? entry.rx : int16_t(0);
-    const int16_t outRY = active ? entry.ry : int16_t(0);
+    int16_t outLX = active ? entry.lx : int16_t(0);
+    int16_t outLY = active ? entry.ly : int16_t(0);
+    int16_t outRX = active ? entry.rx : int16_t(0);
+    int16_t outRY = active ? entry.ry : int16_t(0);
     const uint8_t outLT = active ? entry.lt : uint8_t(0);
     const uint8_t outRT = active ? entry.rt : uint8_t(0);
+    // THE ANALOG LERP (see NamedButton::lerp). Two adjacent transcribed entries are two
+    // knots of the recorded thumb path; the value between them is the line, not the
+    // stair. Never across a park (the frozen clock makes the fraction a lie) and never
+    // into or out of a non-lerp entry (NONE and the cardinal names keep hard edges).
+    bool lerping = false;
+    if (active && !parked && entry.lerp && !sequence.empty() &&
+        idx + 1 < sequence.size() && sequence[idx + 1].lerp && entryDurMs > 0)
+    {
+        long long in = (effectiveMs - fakeStartMs) - entryStartMs;
+        if (in > 0)
+        {
+            lerping = true;
+            if (in > entryDurMs)
+                in = entryDurMs;
+            const NamedButton& nx = sequence[idx + 1];
+            auto mix = [&](int16_t from, int16_t to) {
+                return int16_t(from + (int(to) - int(from)) * in / entryDurMs);
+            };
+            outLX = mix(entry.lx, nx.lx);
+            outLY = mix(entry.ly, nx.ly);
+            outRX = mix(entry.rx, nx.rx);
+            outRY = mix(entry.ry, nx.ry);
+        }
+    }
 
     const uint64_t stateKey =
         stateHash(outButtons, outLX, outLY, outRX,
@@ -4604,7 +4636,13 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
     if (stateKey != lastState.exchange(stateKey))
     {
         const uint32_t n = packet.fetch_add(1) + 1;
-        if (entry.hold)
+        // A lerped entry changes state on nearly every poll BY DESIGN — the packet
+        // number must tick (that is XInput's contract) but a log line per poll would
+        // be a hundred lines a second of a working feature. One line per ENTRY.
+        static std::atomic<size_t> lastLoggedIdx{ SIZE_MAX };
+        if (lerping && lastLoggedIdx.exchange(idx) == idx)
+            ;   // same lerped entry, already announced
+        else if (entry.hold)
             KLOG("CW_FAKE_START_MS: synthetic %s %s at %llds (stick %d,%d / %d,%d, "
                  "packet %u)\n", entry.name, active ? "HELD" : "released",
                  static_cast<long long>(elapsedMs / 1000), entry.lx, entry.ly,

@@ -68,19 +68,19 @@ ap.add_argument("--deadzone", type=int, default=2000,
                      "(a few hundred counts). Case West 2026-08-29: dropped from the "
                      "sibling's 6000 — that value ate the operator's gentle steering, "
                      "which is exactly the input a faithful walk needs.")
-ap.add_argument("--quantise", type=int, default=500,
+ap.add_argument("--quantise", type=int, default=250,
                 help="axis quantisation. Case West 2026-08-29: dropped from the "
                      "sibling's 4000 (8 steps per axis) to 500 (~1.5%% of deflection) — "
                      "the operator watched a replay miss a doorway on the coarse grid, "
                      "and the replay side holds exact per-entry values anyway.")
 ap.add_argument("--from", dest="start", type=float, default=0.0,
                 help="ignore everything before this many seconds")
-ap.add_argument("--resample-ms", type=int, default=80,
+ap.add_argument("--resample-ms", type=int, default=40,
                 help="analog inputs are resampled to this granularity: the MEAN deflection "
                      "over each bucket becomes one entry. Case West 2026-08-29: dropped "
                      "from the sibling's 400 — a 400 ms mean smears every quick steering "
                      "correction into the straight-line average that misses the door.")
-ap.add_argument("--merge-ms", type=int, default=60,
+ap.add_argument("--merge-ms", type=int, default=30,
                 help="two identical states separated by less than this are one input; "
                      "an analog stick crosses the threshold and falls back repeatedly "
                      "while being held, and each crossing would otherwise be a new entry")
