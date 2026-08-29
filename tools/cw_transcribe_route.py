@@ -62,22 +62,25 @@ ap.add_argument("log")
 ap.add_argument("--half", type=int, default=16383,
                 help="unused since the analog path landed; kept so older invocations "
                      "do not fail. See --deadzone.")
-ap.add_argument("--deadzone", type=int, default=6000,
+ap.add_argument("--deadzone", type=int, default=2000,
                 help="axis magnitude above which a stick counts as being USED (not as "
-                     "being at full deflection). Must clear this pad's resting jitter, "
-                     "which is a few thousand counts.")
-ap.add_argument("--quantise", type=int, default=4000,
-                help="axis quantisation. Coarser means fewer, more readable entries and a "
-                     "less faithful path; 4000 is about 12%% of full deflection, which is "
-                     "finer than the steering being reproduced.")
+                     "being at full deflection). Must clear this pad's resting jitter "
+                     "(a few hundred counts). Case West 2026-08-29: dropped from the "
+                     "sibling's 6000 — that value ate the operator's gentle steering, "
+                     "which is exactly the input a faithful walk needs.")
+ap.add_argument("--quantise", type=int, default=500,
+                help="axis quantisation. Case West 2026-08-29: dropped from the "
+                     "sibling's 4000 (8 steps per axis) to 500 (~1.5%% of deflection) — "
+                     "the operator watched a replay miss a doorway on the coarse grid, "
+                     "and the replay side holds exact per-entry values anyway.")
 ap.add_argument("--from", dest="start", type=float, default=0.0,
                 help="ignore everything before this many seconds")
-ap.add_argument("--resample-ms", type=int, default=400,
+ap.add_argument("--resample-ms", type=int, default=80,
                 help="analog inputs are resampled to this granularity: the MEAN deflection "
-                     "over each bucket becomes one entry. Without it a drifting stick "
-                     "produces one entry per poll and the recipe is thousands of entries "
-                     "long.")
-ap.add_argument("--merge-ms", type=int, default=120,
+                     "over each bucket becomes one entry. Case West 2026-08-29: dropped "
+                     "from the sibling's 400 — a 400 ms mean smears every quick steering "
+                     "correction into the straight-line average that misses the door.")
+ap.add_argument("--merge-ms", type=int, default=60,
                 help="two identical states separated by less than this are one input; "
                      "an analog stick crosses the threshold and falls back repeatedly "
                      "while being held, and each crossing would otherwise be a new entry")
@@ -330,4 +333,11 @@ print("# distribution, not a constant -- 24 s to 131 s on measured runs (gotcha 
 print("# leading NONE is the one number in this recipe that is a fit to one afternoon, and")
 print("# it is the one to check with the draw gate before trusting anything measured on it.")
 print("#")
-print("CW_FAKE_PRESS_SEQ=" + ",".join(f"{n}@{d}" for n, d in collapsed) + ",NONE")
+line = "CW_FAKE_PRESS_SEQ=" + ",".join(f"{n}@{d}" for n, d in collapsed) + ",NONE"
+# One environment string is capped at 128 KB by the kernel (MAX_ARG_STRLEN). A recipe
+# over that limit does not truncate — execve refuses and the run never starts, which
+# would read as "the game did not boot". Say it here, where the number is chosen.
+if len(line) > 110_000:
+    print(f"# WARNING: recipe is {len(line)} bytes — near the 128 KB per-env-string "
+          f"kernel cap. Raise --resample-ms or --quantise.", file=sys.stderr)
+print(line)
