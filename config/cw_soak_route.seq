@@ -1,0 +1,82 @@
+# transcribed from /home/wivi514/DR2CW-troubleshooting/part80-route/rt_0829_185818_soakroute.log
+# 446 pad samples -> 67 distinct inputs (half-deflection 16383, merge 60 ms)
+#
+# t (s)   duration   input
+#   22.228     160 ms  START
+#   26.989     144 ms  DOWN
+#   27.677     136 ms  A
+#   28.981     144 ms  A
+#   47.535      68 ms  RS-9500/-1500
+#   47.603      84 ms  LS-11500/-3500+RS-32000/-6000
+#   47.687      80 ms  LS-30000/-2500+RS-32500/-4500
+#   47.767      76 ms  LS-32768/-5000+RS-32500/0
+#   47.843      80 ms  LS-32768/-6000+RS-32500/2000
+#   47.923      81 ms  LS-32768/-4000+RS-32500/2500
+#   48.004      79 ms  LS-32768/3000+RS-32500/2500
+#   48.083      81 ms  LS-32768/13500+RS-32500/2500
+#   48.164      79 ms  LS-31000/21500+RS-32500/2500
+#   48.243      84 ms  LS-23500/26000+RS-32500/2000
+#   48.327      80 ms  LS-21500/28000+RS-32500/-500
+#   48.407      80 ms  LS-21000/28500+RS-31500/-7500
+#   48.487      80 ms  LS-18500/28500+RS-11500/-6000
+#   48.567      73 ms  LS-15000/28500
+#   48.640      87 ms  LS-10500/28500
+#   48.727      76 ms  LS-7500/28500+RS8500/-2000
+#   48.803      84 ms  LS-5500/28500+RS22000/-3000
+#   48.887      80 ms  LS-5000/28500+RS23000/-3000
+#   48.967      80 ms  LS-5000/28500+RS12500/-2500
+#   49.047      80 ms  LS-5000/28500
+#   49.127      80 ms  LS-5500/28500
+#   49.207      76 ms  LS-6000/28500
+#   49.283     344 ms  LS-6500/28500
+#   49.627      57 ms  LS-7500/27500
+#   49.684      67 ms  LS-7500/4000
+#   49.751      37 ms  B+LS-7500/4000
+#   49.788      83 ms  B+LS-7500/-2000
+#   49.871      44 ms  B+LS-7000/-2000
+#   49.915     456 ms  LS-7000/-2000
+#   50.371     441 ms  LS-7500/-2000
+#   50.812      79 ms  LS-7500/0
+#   50.891      77 ms  LS-7000/5500
+#   50.968     132 ms  LS-4500/23500
+#   51.100     432 ms  LS-3000/28500
+#   51.532      76 ms  LS-2500/28500
+#   51.608      84 ms  LS-1500/28500
+#   51.692      71 ms  LS-500/28500
+#   51.763      81 ms  LS500/28500
+#   51.844     724 ms  LS1000/28500
+#   52.568     156 ms  LS0/28500
+#   52.724      79 ms  LS-500/28500
+#   52.803      77 ms  LS-3500/28500
+#   52.880      80 ms  LS-7000/28500
+#   52.960     164 ms  LS-9500/28500
+#   53.124      80 ms  LS-6500/28500
+#   53.204      76 ms  LS-2500/28500
+#   53.280      88 ms  LS-1000/28500
+#   53.368     120 ms  LS-500/28500
+#   53.488      36 ms  LS-1000/28500
+#   53.524      80 ms  LS-2500/28500
+#   53.604     376 ms  LS-4000/28500
+#   53.980     696 ms  LS-3500/28500
+#   54.676      48 ms  LS-2500/28500
+#   54.724    1696 ms  LS-2000/28500
+#   56.420     869 ms  LS-2500/28500
+#   57.289     267 ms  LS-2000/28500
+#   57.556      44 ms  LS-2000/21000
+#   57.600      33 ms  LS-4000/-2500
+#          ** DOWN was 144 ms -- floored to 160 ms, borrowed from the following wait (route timing unchanged)
+#          ** A was 136 ms -- floored to 160 ms, borrowed from the following wait (route timing unchanged)
+#          ** A was 144 ms -- floored to 160 ms, borrowed from the following wait (route timing unchanged)
+#          ** B+LS-7500/4000 was 37 ms -- floored to 160 ms; NO following wait to borrow from, so everything after it shifts 123 ms LATER
+#          ** B+LS-7500/-2000 was 83 ms -- floored to 160 ms; NO following wait to borrow from, so everything after it shifts 77 ms LATER
+#          ** B+LS-7000/-2000 was 44 ms -- floored to 160 ms; NO following wait to borrow from, so everything after it shifts 116 ms LATER
+#
+# THE ANCHOR PROBLEM, stated because the recipe cannot state it itself. The times
+# above are from PROCESS START; the replay's clock starts at the title's FIRST INPUT
+# POLL, which is a different and better zero (it is the frontend coming up, not the
+# process). They differ by however long this boot took, and boot depth here is a
+# distribution, not a constant -- 24 s to 131 s on measured runs (gotcha 75). So the
+# leading NONE is the one number in this recipe that is a fit to one afternoon, and
+# it is the one to check with the draw gate before trusting anything measured on it.
+#
+CW_FAKE_PRESS_SEQ=NONE@21737,START@160,NONE@4601,DOWN@160,NONE@528,A@160,NONE@1144,A@160,NONE@18394,RS-9500/-1500@68,LS-11500/-3500+RS-32000/-6000@84,LS-30000/-2500+RS-32500/-4500@80,LS-32768/-5000+RS-32500/0@76,LS-32768/-6000+RS-32500/2000@80,LS-32768/-4000+RS-32500/2500@81,LS-32768/3000+RS-32500/2500@79,LS-32768/13500+RS-32500/2500@81,LS-31000/21500+RS-32500/2500@79,LS-23500/26000+RS-32500/2000@84,LS-21500/28000+RS-32500/-500@80,LS-21000/28500+RS-31500/-7500@80,LS-18500/28500+RS-11500/-6000@80,LS-15000/28500@73,LS-10500/28500@87,LS-7500/28500+RS8500/-2000@76,LS-5500/28500+RS22000/-3000@84,LS-5000/28500+RS23000/-3000@80,LS-5000/28500+RS12500/-2500@80,LS-5000/28500@80,LS-5500/28500@80,LS-6000/28500@76,LS-6500/28500@344,LS-7500/27500@57,LS-7500/4000@67,B+LS-7500/4000@160,B+LS-7500/-2000@160,B+LS-7000/-2000@160,LS-7000/-2000@456,LS-7500/-2000@441,LS-7500/0@79,LS-7000/5500@77,LS-4500/23500@132,LS-3000/28500@432,LS-2500/28500@76,LS-1500/28500@84,LS-500/28500@71,LS500/28500@81,LS1000/28500@724,LS0/28500@156,LS-500/28500@79,LS-3500/28500@77,LS-7000/28500@80,LS-9500/28500@164,LS-6500/28500@80,LS-2500/28500@76,LS-1000/28500@88,LS-500/28500@120,LS-1000/28500@36,LS-2500/28500@80,LS-4000/28500@376,LS-3500/28500@696,LS-2500/28500@48,LS-2000/28500@1696,LS-2500/28500@869,LS-2000/28500@267,LS-2000/21000@44,LS-4000/-2500@33,NONE

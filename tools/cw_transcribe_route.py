@@ -44,7 +44,7 @@ needs an `F2` and a `WAITJUMP` inserted by hand — the log's own
 Usage:
     tools/part80_transcribe_route.py <recorded.log> [--hold-ms N] [--from T]
 """
-import sys, re, argparse
+import sys, re, argparse, statistics
 
 LINE = re.compile(
     r"^\[input\] t=(\d+)\.(\d+)s pad (\d+) packet \d+\s+(\S.*?)\s+\| buttons=([0-9A-Fa-f]{4})"
@@ -138,6 +138,29 @@ for line in open(a.log, errors="replace"):
         continue
     raw.append((ms, int(m.group(5), 16), int(m.group(8)), int(m.group(9)),
                 int(m.group(10)), int(m.group(11)), int(m.group(6)), int(m.group(7))))
+
+# CALIBRATE OUT THE RESTING BIAS, before anything else reads an axis. The operator's
+# pad rests at L=(4461,4080) — a worn stick, not a touch — which is ABOVE any deadzone
+# gentle steering can coexist with, so raising the deadzone cannot fix it (2026-08-29:
+# the 6000 deadzone hid it and ate the steering; the 2000 one showed it and drowned the
+# recipe in phantom holds). The bias is the per-axis median over the idle samples before
+# the first button press; subtracting it is what the game's own deadzone effectively
+# does, and what makes the recorded deflections mean displacement-from-rest on replay.
+# Only samples BEFORE the first button press: "buttons == 0 anywhere" also matches
+# every sample of the walk itself, and a bias computed over the walk subtracts the
+# route (the first version reported L=(-15730,23194) — the walk's own median).
+first_press = next((i for i, r in enumerate(raw) if r[1] != 0), len(raw))
+idle = raw[:first_press][:200]
+bias = (0, 0, 0, 0)
+if len(idle) >= 3:
+    bias = tuple(int(statistics.median(r[2 + i] for r in idle)) for i in range(4))
+if any(abs(b) > 400 for b in bias):
+    print(f"# resting-stick bias L=({bias[0]},{bias[1]}) R=({bias[2]},{bias[3]}) "
+          f"subtracted from every sample (pad calibration)", file=sys.stderr)
+clamp = lambda v: max(-32768, min(32767, v))
+raw = [(ms, b, clamp(lx - bias[0]), clamp(ly - bias[1]),
+        clamp(rx - bias[2]), clamp(ry - bias[3]), lt, rt)
+       for ms, b, lx, ly, rx, ry, lt, rt in raw]
 
 # RESAMPLE THE ANALOG AXES ONTO A FIXED GRID, and do it before anything else looks at them.
 #
@@ -243,21 +266,14 @@ for i, (t0, t1, st) in enumerate(final):
     # and the camera decides the draw set, which is the quantity being measured. An earlier
     # version emitted the left stick and dropped a live right-stick deflection of -12,000,
     # so the replay took the same path facing the wrong way.
-    sticks = [n for n in st if n[:2] in ("LS", "RS")]
+    # FULL COMPOUNDS (2026-08-29): the replay grammar now composes buttons with sticks
+    # ('+'-joined), so nothing is chosen and nothing is dropped. This closed a real
+    # desync: the operator's pad rests slightly deflected, so their START at the title
+    # screen rode on a stick clause — and the old "emit st[0]" dropped the START, which
+    # parked every replay at the main menu forever.
+    sticks = sorted(n for n in st if n[:2] in ("LS", "RS"))   # LS before RS
     others = [n for n in st if n not in sticks]
-    if len(sticks) == 2 and not others:
-        name = "+".join(sorted(sticks))          # LS before RS
-    elif st:
-        name = st[0]
-    else:
-        name = "NONE"
-    dropped = [n for n in st if n not in name.split("+")]
-    if dropped:
-        # REPORTED, not silently dropped. A button plus a stick is still inexpressible as
-        # one entry, and a compound that quietly became one of its halves is a recipe that
-        # means something different from what was played.
-        print(f"#          ** COMPOUND {'+'.join(st)} -> emitting {name}, DROPPING "
-              f"{'+'.join(dropped)}")
+    name = "+".join(others + sticks) if st else "NONE"
     if st:
         print(f"# {t0/1000:8.3f}  {dur:6d} ms  {'+'.join(st)}")
     seq.append((name, dur))

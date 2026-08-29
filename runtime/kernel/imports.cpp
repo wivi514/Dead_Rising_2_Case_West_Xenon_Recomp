@@ -4191,10 +4191,21 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
                 // so Chuck took the same path facing the wrong way. For a PERFORMANCE route
                 // the facing is not cosmetic — it decides the draw set, which is the thing
                 // being measured.
-                if (!found && nm.find('/') != std::string::npos &&
-                    (nm.compare(0, 2, "LS") == 0 || nm.compare(0, 2, "RS") == 0))
+                // ...AND BUTTONS TOO (2026-08-29). The transcriber found a state this
+                // grammar could not express: the operator's pad rests slightly deflected
+                // (L=(4461,4080), a worn stick), so with honest calibration every button
+                // press RIDES ON a stick clause — and the emitter, forced to choose,
+                // dropped a START that was the press that leaves the title screen. The
+                // recipe then parked at the main menu forever. A clause list that mixes
+                // buttons with sticks is exactly what a human's compound input is; the
+                // buttons OR into the mask, the sticks and triggers hold, and nothing is
+                // dropped. Host debug edges (F2..F9) and WAITJUMP stay non-composable —
+                // they are pulses and barriers, not pad state.
+                if (!found && (nm.find('+') != std::string::npos ||
+                               ((nm.compare(0, 2, "LS") == 0 ||
+                                 nm.compare(0, 2, "RS") == 0) &&
+                                nm.find('/') != std::string::npos)))
                 {
-                    // Split on '+' into at most two stick clauses, each `LSx/y` or `RSx/y`.
                     std::vector<std::string> clauses;
                     for (size_t b = 0, e; b <= nm.size(); b = e + 1)
                     {
@@ -4206,24 +4217,51 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
                             break;
                     }
                     bool ok = !clauses.empty();
+                    uint16_t mask = 0;
                     int16_t axes[4] = { 0, 0, 0, 0 };   // lx, ly, rx, ry
+                    uint8_t clt = 0, crt = 0;
                     for (const std::string& c : clauses)
                     {
-                        if (c.size() < 4 || (c.compare(0, 2, "LS") != 0 &&
-                                             c.compare(0, 2, "RS") != 0) ||
-                            c.find('/') == std::string::npos)
+                        if (c.find('/') != std::string::npos &&
+                            (c.compare(0, 2, "LS") == 0 || c.compare(0, 2, "RS") == 0))
+                        {
+                            if (!ParseStickClause(c, axes))
+                            {
+                                ok = false;
+                                break;
+                            }
+                            continue;
+                        }
+                        // A named clause: any pad-state entry — plain buttons, the
+                        // cardinal stick names, LT/RT — but never a pulse or a barrier.
+                        bool clauseFound = false;
+                        for (const auto& b : kButtons)
+                            if (c == b.name && b.hostKey == 0 && !b.barrier)
+                            {
+                                mask |= b.mask;
+                                if (b.lx) axes[0] = b.lx;
+                                if (b.ly) axes[1] = b.ly;
+                                if (b.rx) axes[2] = b.rx;
+                                if (b.ry) axes[3] = b.ry;
+                                if (b.lt) clt = b.lt;
+                                if (b.rt) crt = b.rt;
+                                clauseFound = true;
+                                break;
+                            }
+                        if (!clauseFound)
                         {
                             ok = false;
                             break;
                         }
-                        ok = ok && ParseStickClause(c, axes);
                     }
                     if (ok)
                     {
                         static std::deque<std::string> analogNames;
                         analogNames.push_back(nm);
-                        NamedButton ab{ analogNames.back().c_str(), 0,
+                        NamedButton ab{ analogNames.back().c_str(), mask,
                                         axes[0], axes[1], axes[2], axes[3], true };
+                        ab.lt = clt;
+                        ab.rt = crt;
                         ab.durMs = dur;
                         seq.push_back(ab);
                         found = true;
@@ -4231,9 +4269,11 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
                     else
                     {
                         unknown++;
-                        KLOG("CW_FAKE_PRESS_SEQ: BAD STICK entry \"%s\" — expected "
-                             "LS<x>/<y>, RS<x>/<y> or the two joined by '+', axes in "
-                             "-32768..32767. ENTRY IGNORED.\n", one.c_str());
+                        KLOG("CW_FAKE_PRESS_SEQ: BAD COMPOUND entry \"%s\" — expected "
+                             "clauses joined by '+', each LS<x>/<y>, RS<x>/<y> (axes in "
+                             "-32768..32767) or a pad-state name (A, START, LSUP, LT, "
+                             "...; F-keys and WAITJUMP do not compose). ENTRY "
+                             "IGNORED.\n", one.c_str());
                         one.clear();
                         continue;
                     }
