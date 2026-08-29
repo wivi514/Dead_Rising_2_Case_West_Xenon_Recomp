@@ -66,7 +66,7 @@ int           Settings_Aspect();        // LEGACY: 1 when the internal res is wi
 // H/720 is "nice" — 900 works as well as 1080), width even, at least 16:9 for the
 // height (narrower would need a sub-1 X factor and a fov CROP, which this port
 // refuses rather than ships), and at most 6880 wide. Legacy render_scale/aspect keys still load and are
-// converted, so an existing cz_settings.txt keeps its meaning.
+// converted, so an existing settings file keeps its meaning.
 bool Settings_ValidInternalRes(uint32_t w, uint32_t h);
 void Settings_InternalRes(uint32_t& w, uint32_t& h);
 void Settings_SetInternalRes(uint32_t w, uint32_t h);

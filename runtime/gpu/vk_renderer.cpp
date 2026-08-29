@@ -1307,7 +1307,7 @@ void InternalRes(uint32_t& w, uint32_t& h)
             // could not have matched anything (gotcha 408, found by writing the gate
             // first). The settings path a few lines below has always announced itself.
             fprintf(stderr, "[vk] internal resolution %ux%u from CW_VK_RES (env wins over "
-                            "cz_settings.txt)\n", bw, bh);
+                            "cw_settings.txt)\n", bw, bh);
         }
         else
             fprintf(stderr, "[vk] CW_VK_RES=%s is not a resolution this renderer can "
@@ -1339,13 +1339,13 @@ void InternalRes(uint32_t& w, uint32_t& h)
         uint32_t dw = 0, dh = 0;
         if (Host_DisplaySize(&dw, &dh) && (bw > dw || bh > dh))
         {
-            fprintf(stderr, "[vk] %ux%u from cz_settings.txt is larger than the "
+            fprintf(stderr, "[vk] %ux%u from cw_settings.txt is larger than the "
                             "%ux%u display — clamped to 1280x720\n", bw, bh, dw, dh);
             bw = 1280;
             bh = 720;
         }
         if (bw != 1280 || bh != 720)
-            fprintf(stderr, "[vk] internal resolution %ux%u from cz_settings.txt\n",
+            fprintf(stderr, "[vk] internal resolution %ux%u from cw_settings.txt\n",
                     bw, bh);
     }
     // The legacy wide arms, applied ON TOP so their headless A/B recipes survive:
