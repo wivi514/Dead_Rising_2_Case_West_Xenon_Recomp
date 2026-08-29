@@ -27,6 +27,10 @@ shift 2
 [ $# -gt 0 ] && case "$1" in *=*) ;; *) shift ;; esac
 
 NAV="NONE@21000,START,NONE@5000,F2,NONE@1500"
+# [Y] IGNORE HUMANS — the image's own debug toggle (string at 49492,
+# zombies_ignore_all_humans at 436992). Pressed on every jump so an unattended soak
+# does not end with Chuck eaten mid-measurement (operator's advice, 2026-08-29).
+NAV="$NAV,Y@200,NONE@600"
 for ((i=0; i<RIGHTS; i++)); do NAV="$NAV,RIGHT@300,NONE@500"; done
 for ((i=0; i<DOWNS; i++)); do NAV="$NAV,DOWN@300,NONE@500"; done
 NAV="$NAV,A"
