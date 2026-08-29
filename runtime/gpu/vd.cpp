@@ -250,6 +250,17 @@ std::atomic<uint64_t> g_pumpSleepBeforeProgressNs{ 0 };
 // two counters above bound, converted from a bound into a removal. The counter is the
 // engagement gate for CW_PM4_NO_EAGER_TICK's arm (gotcha 151).
 std::atomic<uint64_t> g_pumpEagerTicks{ 0 };
+// THE FAST-RETRY BACKOFF (2026-08-29, the crowd-band item). The operator's crowd soak
+// decomposed a 9.55 ms crowd frame as walk 8.20 + SLEEP 1.25 — about twelve 100 us
+// naps per frame. They are NOT WAIT_REG_MEM holds (the whole soak had exactly 4 of
+// those): they are DRAINED-RING idles — the pump empties the ring mid-frame, naps a
+// full 100 us, and the guest's next kick sits unnoticed for up to the whole nap. So
+// after any tick whose walk made no progress the nap now starts at 5 us and doubles
+// (5,10,20,40,80, then the 100 us floor): a mid-frame kick is seen in microseconds,
+// and a genuinely idle pump converges to the old cadence within six ticks. A
+// progressing walk resets the ladder (and the eager tick skips its nap entirely).
+// CW_PM4_NO_FAST_HELD=1 restores the flat tick; the counter is the engagement gate.
+std::atomic<uint64_t> g_pumpHeldFastTicks{ 0 };
 
 inline uint64_t NowNs()
 {
@@ -509,7 +520,14 @@ void GraphicsInterruptPump()
          eagerTick ? "ON (a walk that made progress skips the next sleep; "
                      "CW_PM4_NO_EAGER_TICK=1 restores the unconditional sleep)"
                    : "OFF (unconditional sleep before every walk)");
+    const bool fastRetry = getenv("CW_PM4_NO_FAST_HELD") == nullptr;
+    KLOG("fast-retry backoff %s\n",
+         fastRetry ? "ON (after an unproductive walk the nap starts at 5 us and "
+                     "doubles to the tick floor; CW_PM4_NO_FAST_HELD=1 restores the "
+                     "flat tick)"
+                   : "OFF (flat tick sleep after every walk)");
     bool skipSleep = false;
+    int napBackoffUs = tickUs;   // the fast-retry ladder; reset by a progressing walk
     for (;;)
     {
         // Timed, because this sleep is the single largest term in a gameplay frame and
@@ -521,7 +539,15 @@ void GraphicsInterruptPump()
             g_pumpEagerTicks.fetch_add(1, std::memory_order_relaxed);
         }
         else
-            std::this_thread::sleep_for(std::chrono::microseconds(tickUs));
+        {
+            const int napUs = fastRetry ? napBackoffUs : tickUs;
+            if (napUs < tickUs)
+            {
+                g_pumpHeldFastTicks.fetch_add(1, std::memory_order_relaxed);
+                napBackoffUs = napBackoffUs * 2 > tickUs ? tickUs : napBackoffUs * 2;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(napUs));
+        }
         skipSleep = false;
         const uint64_t sleptNs = NowNs() - tSleep;
         g_pumpSleepNs.fetch_add(sleptNs, std::memory_order_relaxed);
@@ -623,6 +649,7 @@ void GraphicsInterruptPump()
                 g_pumpProgressTicks.fetch_add(1, std::memory_order_relaxed);
                 g_pumpSleepBeforeProgressNs.fetch_add(sleptNs, std::memory_order_relaxed);
                 skipSleep = eagerTick; // go straight back to a ring that is moving
+                napBackoffUs = 5;      // ...and re-arm the fast-retry ladder
             }
         }
 
@@ -1074,7 +1101,8 @@ PumpStats PumpStats_Read()
                       g_pumpProgressTicks.load(std::memory_order_relaxed),
                       g_pumpSleepBeforeProgressNs.load(std::memory_order_relaxed),
                       g_pumpWalkStartNs.load(std::memory_order_relaxed),
-                      g_pumpEagerTicks.load(std::memory_order_relaxed) };
+                      g_pumpEagerTicks.load(std::memory_order_relaxed),
+                      g_pumpHeldFastTicks.load(std::memory_order_relaxed) };
 }
 
 // ---------------------------------------------------------------------------

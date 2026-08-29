@@ -68,6 +68,10 @@ struct PumpStats
     // progress (the eager tick, 2026-08-29). The share eager/ticks is the engagement
     // gate for CW_PM4_NO_EAGER_TICK's arm.
     uint64_t eagerTicks;
+    // Ticks whose sleep was shortened below the tick period because the ring was HELD
+    // at a WAIT_REG_MEM (the held-wait fast retry, 2026-08-29). The engagement gate
+    // for CW_PM4_NO_FAST_HELD's arm.
+    uint64_t heldFastTicks;
 };
 
 // A snapshot. Like ChainStats_Read these are independent relaxed counters, so the fields
