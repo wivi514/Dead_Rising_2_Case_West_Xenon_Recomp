@@ -96,6 +96,19 @@ target_compile_options(ppc_image PRIVATE
 set_source_files_properties(${PPC_SOURCES} PROPERTIES COMPILE_OPTIONS
     "-include;${CMAKE_CURRENT_SOURCE_DIR}/cpu/timebase.h")
 
+# CW_PPC_O3 — build the RECOMPILED IMAGE at -O3; the runtime's own sources keep the
+# build type's -O2. Exists because the 2026-08-28 uninstrumented perf profile showed the
+# guest render thread SATURATED while the pump idled 23% at the HUD scene — i.e. on this
+# title the recompiled code, not the renderer, can be the frame's pacing thread, which is
+# the opposite of Case Zero's regime (their phase5-notes §6dm). GCC's last -O wins, so
+# this appends cleanly after the build type's -O2; CW_DEBUG_TUS still wins over both
+# because source-file properties are appended after target options.
+option(CW_PPC_O3 "Build the recompiled guest image at -O3" OFF)
+if(CW_PPC_O3)
+    target_compile_options(ppc_image PRIVATE -O3)
+    message(STATUS "CW_PPC_O3: recompiled image at -O3")
+endif()
+
 # CW_DEBUG_TUS — build named recompiled TUs at -O0 -fno-inline so a fault inside one
 # resolves to an exact line, and every line in those files carries its original PPC
 # mnemonic as a comment. Asura's Wrath established that host backtraces through
