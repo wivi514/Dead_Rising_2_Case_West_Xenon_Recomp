@@ -1,0 +1,8 @@
+# The MIRROR soak (route v4, 2026-08-29) — the operator's insight made the
+# doorway problem evaporate: the bathroom mirror is a planar reflection that
+# re-renders the scene, so PANNING AT THE SPAWN reaches 6,800-draw frames with
+# ZERO navigation. Valid for pump-side CPU A/Bs (a draw is a draw to the
+# command processor); NOT a substitute for the real crowd on guest-side or
+# whole-frame claims — the operator's manual crowd soak remains that oracle.
+# Load save -> WAITWORLD -> 8 s settle; the harness's pans do the rest.
+CW_FAKE_PRESS_SEQ=NONE@16357,RS2000/-3500@64,RS2000/-4250@16,RS2000/-4750@40,NONE@11874,START@160,NONE@6136,DOWN@160,NONE@553,A@160,NONE@3884,A@160,WAITWORLD,NONE@8000,NONE
