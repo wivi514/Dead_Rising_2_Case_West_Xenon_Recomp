@@ -64,3 +64,18 @@ ordered by what it established.
 * AutoChuck degenerates: every soak self-gates (GATE_DRAWS/GATE_FRAMES, `.rejected`).
 * The heavy CROWD load comes from the operator's recorded route, not from any debug
   level found so far.
+
+## 5. Operator-soak session notes (2026-08-29)
+
+* `force_survivors_idle` (0x82A7459D) is the pacify-humans flag for future soaks —
+  NOT armed in the O2/O3 pair, which must differ only by binary. God mode already
+  makes human attacks harmless in both arms.
+* The route replay drifts: the save-load duration shifts every subsequent input, so
+  Chuck misses doors and later presses land in wrong contexts (operator watched it
+  pick up a fire extinguisher and scroll the pause menu). Autonomy needs a
+  post-load anchor (a WAITWORLD-style barrier on in-game state) before the recorded
+  route is replayable. The operator-driven chained soak is the measurement path
+  meanwhile.
+* The one-pad fix (imports.cpp): synthetic input served every user index, so pads
+  0+1 both pressed START and the title could bind the unsigned pad-1 user — Load
+  Game refused the save. Synthetic input is one pad now.

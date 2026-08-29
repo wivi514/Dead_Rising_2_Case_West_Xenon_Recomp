@@ -73,7 +73,8 @@ EOF
 # extracted table's own snake_case names (debug_tunables_table.inc), and the
 # shader-cache / A2M arms are Case Zero paths that do not exist here — defaults
 # are already correct.
-( cd "$ROOT/runtime/build" && env \
+# BIN_DIR=build-o3 runs the -O3 guest-image arm; default is the ordinary build.
+( cd "$ROOT/runtime/${BIN_DIR:-build}" && env \
     CW_VKDRAW=1 CW_FPS_CAP=500 CW_FPS_LOG=3 \
     CW_DEBUG_MENU=1 CW_INPUT_TRACE=1 \
     "CW_DEBUG_TUNABLES=chuck_in_god_mode,disable_death_sequence,zombies_ignore_all_humans" \
