@@ -40,10 +40,19 @@ REC_LEADIN="$(printf '%s' "$BASE_SEQ" | sed -n 's/^NONE@\([0-9]*\),.*/\1/p')"
 LEADIN="${LEADIN:-$REC_LEADIN}"
 SEQ="$(printf '%s' "$BASE_SEQ" | sed "s/^NONE@${REC_LEADIN},/NONE@${LEADIN},/")"
 
-# SOAK — extra seconds standing still at the end, in the crowd, where the frame time
-# is actually measured (a turning camera changes the draw set every frame).
+# SOAK — extra seconds at the end, in the crowd, where the frame time is actually
+# measured. SLOW ALTERNATING CAMERA PANS rather than stillness (2026-08-29): the
+# replay lands within a metre of the operator's spot but its final FACING drifts,
+# and a soak staring at the wrong wall reads 1,700 draws where the crowd view reads
+# 5,900. A pan at ~30% deflection crosses the crowd every cycle, so the band is
+# sampled whatever the terminal heading — the same rescue the first AutoChuck probe
+# demonstrated. The pans are in the harness, not the route, so every route gets them.
 SOAK="${SOAK:-60}"
-SEQ="$SEQ,NONE@$((SOAK * 1000)),NONE"
+PANS=""
+for ((i=0; i<SOAK/12; i++)); do
+    PANS="$PANS,RS10000/0@3000,NONE@3000,RS-10000/0@3000,NONE@3000"
+done
+SEQ="$SEQ${PANS},NONE@2000,NONE"
 
 FPSLOG="${FPSLOG:-3}"
 RES="${RES:-2560x1440}"   # PINNED — never take it from the desktop or the settings file.
