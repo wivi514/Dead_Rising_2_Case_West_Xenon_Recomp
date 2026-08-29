@@ -3901,6 +3901,9 @@ constexpr uint16_t XINPUT_GAMEPAD_START = 0x0010;
 // this is the one of them the SYNTHETIC INPUT arm reads and it is used above them.
 uint32_t DebugTunables_ScreenRequestsServiced();
 bool DebugTunables_WantAutoBack();
+// WAITWORLD's predicate: the draw count of the last presented frame, from the
+// renderer. 0 before the renderer exists, which correctly keeps the barrier parked.
+extern "C" uint32_t VkRenderer_LastFrameDraws();
 
 static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
                                    GuestInputState* state)
@@ -4037,7 +4040,15 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
         bool hold;              // stick entries deflect for the whole interval
         int hostKey = 0;        // 2/3/4 = F2/F3/F4 debug edges, 7 = F7's mark, 8 = F8 burst, 9 = F9
                                 // dump/census, all of them pulses with no pad state
-        bool barrier = false;   // WAITJUMP: park here until the screen request lands
+        int barrier = 0;        // 1 = WAITJUMP: park (repeating the preceding entry)
+                                //     until a screen request lands
+                                // 2 = WAITWORLD (2026-08-29): park EMITTING NOTHING
+                                //     until the renderer reports a world-sized frame.
+                                //     The anchor a save-load route needs: the load's
+                                //     duration varies by seconds run to run, and a
+                                //     walk timed from the menu presses fires into the
+                                //     loading screen — the operator watched a replay
+                                //     stand at spawn for exactly this reason.
         uint8_t lt = 0, rt = 0; // trigger entries HOLD like sticks; LT re-shows the
                                 // auto-hidden HUD (operator, 2026-08-17), which is what
                                 // makes a census frame with the PP bar reachable
@@ -4125,7 +4136,12 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
         // do the remaining entries start their intervals. So DOWN is "one interval after
         // the screen opens" rather than "at 136 seconds", which is a statement about the
         // GAME and not about this afternoon.
-        { "WAITJUMP", 0, 0,0,0,0, false, 0, true },
+        { "WAITJUMP", 0, 0,0,0,0, false, 0, 1 },
+        // WAITWORLD — the save-load anchor; see the barrier field. Parks on NOTHING
+        // (a loading screen must not be poked; WAITJUMP's repeat-preceding would
+        // re-press the load-confirm A), releases after the renderer has drawn a
+        // world-sized frame for 30 consecutive polls.
+        { "WAITWORLD", 0, 0,0,0,0, false, 0, 2 },
     };
     static const std::vector<NamedButton> sequence = [] {
         std::vector<NamedButton> seq;
@@ -4455,34 +4471,58 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
     bool parked = false;
     if (entry.barrier)
     {
-        if (DebugTunables_ScreenRequestsServiced() == 0)
+        bool blocked;
+        if (entry.barrier == 2)
+        {
+            // WAITWORLD: the world is up when the renderer has drawn a crowd-of-
+            // geometry frame for 30 consecutive polls. Menus and the CASE FILE sit
+            // at 750-1,500 draws, loading screens at ~64, the save's spawn at 5,000+,
+            // so 2,000 separates them with margin on both sides; the streak filters
+            // a transition spike from a world.
+            static int worldStreak = 0;
+            if (VkRenderer_LastFrameDraws() >= 2000)
+                worldStreak++;
+            else
+                worldStreak = 0;
+            blocked = worldStreak < 30;
+        }
+        else
+            blocked = DebugTunables_ScreenRequestsServiced() == 0;
+        if (blocked)
         {
             parked = true;
             if (parkedNow < 0)
             {
                 parkedSinceMs.store(elapsedMs, std::memory_order_relaxed);
-                KLOG("CW_FAKE_PRESS_SEQ: WAITJUMP parked at %llds — repeating the "
-                     "preceding entry until a screen request reaches the frontend.\n",
-                     static_cast<long long>(elapsedMs / 1000));
+                KLOG("CW_FAKE_PRESS_SEQ: %s parked at %llds — %s.\n",
+                     entry.barrier == 2 ? "WAITWORLD" : "WAITJUMP",
+                     static_cast<long long>(elapsedMs / 1000),
+                     entry.barrier == 2
+                         ? "emitting nothing until the renderer draws a world-sized "
+                           "frame (a loading screen must not be poked)"
+                         : "repeating the preceding entry until a screen request "
+                           "reaches the frontend");
             }
-            // The preceding real entry, which is what gets repeated. A barrier first in
-            // the sequence has nothing to repeat and simply waits — counted as the
-            // degenerate case rather than silently doing something else.
-            for (size_t back = idx; back-- > 0;)
-                if (!sequence[back].barrier)
-                {
-                    entry = sequence[back];
-                    entry.hostKey = 0;   // never re-pulse a debug edge while waiting
-                    break;
-                }
+            // WAITJUMP repeats the preceding real entry (the press that causes the
+            // screen it waits for); WAITWORLD emits nothing — its own empty pad state.
+            if (entry.barrier != 2)
+                for (size_t back = idx; back-- > 0;)
+                    if (!sequence[back].barrier)
+                    {
+                        entry = sequence[back];
+                        entry.hostKey = 0;  // never re-pulse a debug edge while waiting
+                        break;
+                    }
         }
         else if (parkedNow >= 0)
         {
             parkedTotalMs.fetch_add(elapsedMs - parkedNow, std::memory_order_relaxed);
             parkedSinceMs.store(-1, std::memory_order_relaxed);
-            KLOG("CW_FAKE_PRESS_SEQ: WAITJUMP released at %llds — the screen landed; the "
-                 "rest of the sequence now starts its intervals from here.\n",
-                 static_cast<long long>(elapsedMs / 1000));
+            KLOG("CW_FAKE_PRESS_SEQ: %s released at %llds — %s; the rest of the "
+                 "sequence now starts its intervals from here.\n",
+                 entry.barrier == 2 ? "WAITWORLD" : "WAITJUMP",
+                 static_cast<long long>(elapsedMs / 1000),
+                 entry.barrier == 2 ? "the world is rendering" : "the screen landed");
         }
     }
 

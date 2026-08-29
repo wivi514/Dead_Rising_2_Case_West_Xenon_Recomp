@@ -21740,6 +21740,15 @@ void VkRenderer_SavePipelineCache()
     SavePipelineCache();
 }
 
+// The WAITWORLD barrier's predicate (kernel/imports.cpp): the last presented frame's
+// draw count, racily read from another thread — a barrier threshold, not arithmetic,
+// so a torn read costs at most one extra poll of parking. 0 before the renderer
+// exists, which correctly keeps the barrier parked.
+extern "C" uint32_t VkRenderer_LastFrameDraws()
+{
+    return R ? uint32_t(R->lastFrameDraws) : 0;
+}
+
 void VkRenderer_DumpStats()
 {
     if (!g_active)
