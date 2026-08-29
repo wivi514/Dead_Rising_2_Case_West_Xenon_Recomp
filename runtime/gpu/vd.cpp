@@ -245,6 +245,11 @@ std::atomic<uint64_t> g_pumpIsrNs{ 0 };
 // Part 51: was that sleep on the critical path? gpu/pump_stats.h has the argument.
 std::atomic<uint64_t> g_pumpProgressTicks{ 0 };
 std::atomic<uint64_t> g_pumpSleepBeforeProgressNs{ 0 };
+// THE EAGER TICK (2026-08-29): ticks that skipped the 100 us sleep because the walk
+// immediately before them made ring progress — the "sleep before progress" latency the
+// two counters above bound, converted from a bound into a removal. The counter is the
+// engagement gate for CW_PM4_NO_EAGER_TICK's arm (gotcha 151).
+std::atomic<uint64_t> g_pumpEagerTicks{ 0 };
 
 inline uint64_t NowNs()
 {
@@ -484,12 +489,40 @@ void GraphicsInterruptPump()
     uint64_t ticks = 0;   // VBLANKS delivered — every `ticks %` below means vblanks
     int sinceVblankUs = 0; // us of ring ticks accumulated toward the next vblank
     auto nextVblankAt = std::chrono::steady_clock::now(); // ...or the deadline, below
+
+    // THE EAGER TICK. Part 51 measured the unconditional sleep as ~0.47 ms/frame of
+    // ring-progress latency at the HUD scene (an upper bound, pump_stats.h says how),
+    // and the guest's Draw Thread eats every microsecond of it as a ring-space spin
+    // (finding 38's shape; here sub_825B7668/sub_825B5FB8, the two largest symbols in
+    // the process). A walk that just advanced the cursor is strong evidence the guest
+    // is still producing, so the next iteration goes straight back to the ring after a
+    // yield; only a walk that found nothing pays the 100 us sleep. Idle scenes
+    // therefore behave exactly as before, and busy ones stop billing the guest a sleep
+    // per hand-off.
+    //
+    // CW_PM4_NO_EAGER_TICK=1 restores the unconditional sleep (the control arm).
+    // Forced off under CW_VBLANK_TICKCOUNT, whose legacy accounting defines a tick AS
+    // one tickUs sleep — eager ticks would advance its vblank clock at yield speed.
+    const bool eagerTick = getenv("CW_PM4_NO_EAGER_TICK") == nullptr &&
+                           getenv("CW_VBLANK_TICKCOUNT") == nullptr;
+    KLOG("eager tick %s\n",
+         eagerTick ? "ON (a walk that made progress skips the next sleep; "
+                     "CW_PM4_NO_EAGER_TICK=1 restores the unconditional sleep)"
+                   : "OFF (unconditional sleep before every walk)");
+    bool skipSleep = false;
     for (;;)
     {
         // Timed, because this sleep is the single largest term in a gameplay frame and
         // no instrument in this port could see it (gpu/pump_stats.h).
         const uint64_t tSleep = NowNs();
-        std::this_thread::sleep_for(std::chrono::microseconds(tickUs));
+        if (skipSleep)
+        {
+            std::this_thread::yield();
+            g_pumpEagerTicks.fetch_add(1, std::memory_order_relaxed);
+        }
+        else
+            std::this_thread::sleep_for(std::chrono::microseconds(tickUs));
+        skipSleep = false;
         const uint64_t sleptNs = NowNs() - tSleep;
         g_pumpSleepNs.fetch_add(sleptNs, std::memory_order_relaxed);
         g_pumpTicks.fetch_add(1, std::memory_order_relaxed);
@@ -556,6 +589,19 @@ void GraphicsInterruptPump()
             // block, and pm4.cpp watching a stale address would make the fence
             // experiment arm silently watch nothing (gotcha 25's shape).
             Pm4_SetFenceWord(PPC_LOAD_U32(userData + kDeviceWritebackPtr));
+            // Mid-walk read-pointer publication (see pm4.cpp's g_rptrPublishSlot).
+            // CW_PM4_NO_MIDWALK_RPTR=1 is the control arm: the slot stays 0 and the
+            // guest sees consumption only at the end of each walk, the pre-2026-08-29
+            // behaviour. Announced once so a log can show which arm a run was.
+            static const bool noMidwalk = [] {
+                const bool off = getenv("CW_PM4_NO_MIDWALK_RPTR") != nullptr;
+                KLOG("mid-walk rptr publication %s\n",
+                     off ? "OFF (CW_PM4_NO_MIDWALK_RPTR — end-of-walk only)"
+                         : "ON (guest sees ring consumption per packet; "
+                           "CW_PM4_NO_MIDWALK_RPTR=1 restores end-of-walk only)");
+                return off;
+            }();
+            Pm4_SetRptrPublishSlot(noMidwalk ? 0 : g_rptrWriteback.load());
             const uint32_t kickedWptr = PPC_LOAD_U32(userData + kDeviceKickedWptr);
             const uint64_t tWalk = NowNs();
             g_pumpWalkStartNs.store(tWalk, std::memory_order_relaxed);
@@ -576,6 +622,7 @@ void GraphicsInterruptPump()
                 lastCursor = cursor;
                 g_pumpProgressTicks.fetch_add(1, std::memory_order_relaxed);
                 g_pumpSleepBeforeProgressNs.fetch_add(sleptNs, std::memory_order_relaxed);
+                skipSleep = eagerTick; // go straight back to a ring that is moving
             }
         }
 
@@ -1026,7 +1073,8 @@ PumpStats PumpStats_Read()
                       g_pumpIsrNs.load(std::memory_order_relaxed),
                       g_pumpProgressTicks.load(std::memory_order_relaxed),
                       g_pumpSleepBeforeProgressNs.load(std::memory_order_relaxed),
-                      g_pumpWalkStartNs.load(std::memory_order_relaxed) };
+                      g_pumpWalkStartNs.load(std::memory_order_relaxed),
+                      g_pumpEagerTicks.load(std::memory_order_relaxed) };
 }
 
 // ---------------------------------------------------------------------------
