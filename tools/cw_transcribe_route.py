@@ -146,14 +146,26 @@ for line in open(a.log, errors="replace"):
 # recipe in phantom holds). The bias is the per-axis median over the idle samples before
 # the first button press; subtracting it is what the game's own deadzone effectively
 # does, and what makes the recorded deflections mean displacement-from-rest on replay.
-# Only samples BEFORE the first button press: "buttons == 0 anywhere" also matches
-# every sample of the walk itself, and a bias computed over the walk subtracts the
-# route (the first version reported L=(-15730,23194) — the walk's own median).
-first_press = next((i for i, r in enumerate(raw) if r[1] != 0), len(raw))
-idle = raw[:first_press][:200]
+# Per-STICK median over every sample where that stick is below HALF deflection.
+# Two failed designs first, kept as the reasoning: "button-free samples anywhere"
+# is mostly the walk and subtracts the route from itself (bias L=(-15730,23194));
+# "samples before the first press" measured the operator's hand settling on the pad
+# during boot (v2: 18 s of L=(7750,-13000) before START). Rest dominates any real
+# session — menus, loads, standing — and rest lives below half deflection, where
+# walks and camera pans do not; the median there is the pad's true zero whatever
+# the session did.
 bias = (0, 0, 0, 0)
-if len(idle) >= 3:
-    bias = tuple(int(statistics.median(r[2 + i] for r in idle)) for i in range(4))
+if len(raw) >= 10:
+    def stick_bias(ix, iy):
+        pts = [(r[ix], r[iy]) for r in raw
+               if abs(r[ix]) < 16383 and abs(r[iy]) < 16383]
+        if len(pts) < 3:
+            return 0, 0
+        return (int(statistics.median(p[0] for p in pts)),
+                int(statistics.median(p[1] for p in pts)))
+    lb = stick_bias(2, 3)
+    rb = stick_bias(4, 5)
+    bias = (lb[0], lb[1], rb[0], rb[1])
 if any(abs(b) > 400 for b in bias):
     print(f"# resting-stick bias L=({bias[0]},{bias[1]}) R=({bias[2]},{bias[3]}) "
           f"subtracted from every sample (pad calibration)", file=sys.stderr)
