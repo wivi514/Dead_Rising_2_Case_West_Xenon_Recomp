@@ -3087,3 +3087,22 @@ Also learned: the four DebugJump left-column destinations all land at 1,350-1,53
 (`tools/cw_jump_probe.sh`) — none reaches the operator's heavy band, so a heavy
 autonomous route needs their played input trace (Case Zero part 80's transcription
 pipeline), which does not exist here yet.
+
+## 65. **THE HEAVY SCENE EXISTS AND IS AUTONOMOUS — X_AutoChuck, named by the operator** — part 6, 2026-08-29
+
+The operator, mid-session: RIGHT from the DebugJump case column reaches the survivor
+scoop, and further right the AutoChuck column — *"which can be really useful to test
+performance in a crowd of zombies."* Two corrections the tooling had to learn:
+
+* **The grid has two BLANK columns** between the survivors and X_AutoChuck, and a blank
+  column is selectable: RIGHT x2 + A jumps into a 64-draw void that an earlier probe
+  had scored as "destination is light". RIGHT x4 is the AutoChuck column. The photo
+  survey (F9 after each press) is what caught it — a draw count alone could not have.
+* **[Y] IGNORE HUMANS** is a real toggle on the jump screen (string at image+49492,
+  property `zombies_ignore_all_humans`); pressed before every unattended jump so the
+  soak cannot end with Chuck eaten.
+
+First soak band: **3,100-4,800 draws at 9-12 ms** in the heavy stretches, unattended,
+reproducible from a cold boot in ~75 s. `tools/cw_autochuck_soak.sh` +
+`tools/cw_trace_band.py` (Case Zero's banding reader, imported). Every heavy-band claim
+this port makes from here on has this scene as its floor.
