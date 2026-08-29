@@ -3942,6 +3942,16 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
         return v > 0 ? v : (fakeStartMs > 0 ? fakeStartMs : 1);
     }();
 
+    // SYNTHETIC INPUT IS ONE PAD. This function used to serve the sequence to EVERY
+    // polled user index, so at the title screen pads 0 and 1 pressed START on the same
+    // frame — and the title is entitled to bind whichever it processes first. The
+    // operator caught the consequence (2026-08-29): a route replay came up bound to
+    // the absent pad-1 user, not signed in, with Load Game refusing the save that the
+    // interactive recording had loaded fine. A single human has one controller; the
+    // synthetic arm now does too, and every other index is honestly disconnected.
+    if (fakeStartMs > 0 && userIndex != kLocalUserIndex)
+        return ERROR_DEVICE_NOT_CONNECTED;
+
     // The real device, and it takes precedence over nothing: the synthetic arm below
     // is checked FIRST only when it is switched on, so an ordinary run cannot have
     // its input quietly overridden by a leftover environment variable. When both are
