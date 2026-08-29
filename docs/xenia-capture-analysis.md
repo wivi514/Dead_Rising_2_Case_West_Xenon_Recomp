@@ -3032,3 +3032,58 @@ The first launch of 2026-08-27 went out with the dump OFF. It was caught by the 
 asking whether it had been armed, two minutes in, and relaunched before anything was
 lost. Everything above exists because they asked. **Arm it on every session with a human
 at the controls, whatever the session was for.**
+
+## 63. **THE FIRST UNINSTRUMENTED PROFILE — the guest render thread paces the frame, and the two biggest symbols are its ring-space spin** — part 6, 2026-08-28
+
+`tools/cw_perf_profile.sh` (new): the HUD-scene recipe with a 60 s in-game hold, sampled
+by `perf` (cycles:u) with NO ProfScope armed — the profiler's own bill is ~777 ns/draw at
+this scene, the same order as the per-draw costs it reports, so this run is the first
+per-symbol truth this port has. Operator config throughout (2560x1440 internal from
+cw_settings.txt, shadows HIGH, fps cap off). 165K samples over 25 s, ~3.3 cores busy.
+
+```
+thread                         share    what it is
+guest render thread            34.1%    SATURATED (~1.1 core-equivalents)
+the pump                       23.3%    77% duty — idles 23% of the frame
+3 guard prehash workers        16.4%    GuardFold, off the critical path
+second guest thread            15.9%    real sim work
+3 guest job threads             7.0%    sub_82741F98, real work
+```
+
+Top symbols: `GuardFold` 16.5% (nearly all on the workers), then **`sub_825B7668`
+(10.3%) and `sub_825B5FB8` (6.4%) — both on the guest render thread, and they are one
+mechanism**: 825B5FB8 compares the ring write offset against a POINTER to the read
+pointer (fields +0x2a90/+0x2a9c) and 825B7668 is its nop-backoff spin body with a
+5000-unit bound before falling back to a real wait. The busiest code in the process is
+the title's Draw Thread waiting to SEE our ring consumption — Case Zero's finding 38,
+re-derived here from this image's own bytes.
+
+**The regime differs from Case Zero's:** their pump owned the frame; here the pump idles
+23% while the guest render thread saturates. A pump-side per-draw saving therefore does
+not convert 1:1 at this scene — the guest side is live in this port in a way it never
+was there (their §6dm ruled it out for THEM, at their load, and says nothing about ours).
+
+## 64. **THE RING-LATENCY PAIR: engagement proven, latency bound moved as predicted, frame rate NULL** — part 6, 2026-08-29
+
+Two items built on finding 63, each with its control arm and engagement counter:
+mid-walk rptr publication (`CW_PM4_NO_MIDWALK_RPTR=1` restores end-of-walk-only) and
+the eager tick (`CW_PM4_NO_EAGER_TICK=1` restores the unconditional 100 us sleep).
+
+One run per arm, HUD scene, matched draws 1330-1470:
+
+```
+control   220.0/225.5/224.7 fps   sleep-before-progress <= 0.47 ms/frame   counters 0/0
+arm       225.5/224.9/223.4 fps   sleep-before-progress <= 0.31 ms/frame   eager 60%, 16 stores/frame
+```
+
+The pre-registered latency bound moved; the frame rate did not. **NULL at this scene** —
+the pump's tick latency is not on the frame's critical path here. Kept as defaults (cost
+nil, closer to hardware's continuous rptr update, scales with ring traffic), and the
+mid-walk census taught one structural fact: **the ring carries only ~16 top-level packets
+a frame** — the command mass is inside INDIRECT_BUFFERs, so ring-granularity items on
+this title have ~16 latency points a frame to work with, not thousands.
+
+Also learned: the four DebugJump left-column destinations all land at 1,350-1,530 draws
+(`tools/cw_jump_probe.sh`) — none reaches the operator's heavy band, so a heavy
+autonomous route needs their played input trace (Case Zero part 80's transcription
+pipeline), which does not exist here yet.
