@@ -15008,6 +15008,200 @@ void PrintStats(FILE* f)
 
 } // namespace rexec
 
+
+// ===================================================================================
+// CW_VK_REUSE_CENSUS — the ask-first census for cross-frame range reuse (part 8)
+// ===================================================================================
+//
+// The lead it prices: a range whose inputs are identical to last frame's could reuse
+// last frame's recorded secondary and skip capture+record. Case Zero built this
+// census first (CZ_VK_REUSE_CENSUS, their part 87) and REFUTED the lead at their
+// crowd: 1.2-2.1% reusable, because 93-94% of crowd draws differ ONLY in their ALU
+// constants — the guest rewrites the constant file for ~98% of draws every frame.
+// Same engine, so the expectation here is the same verdict — but a copied conclusion
+// is not a measurement (this port's own rule), so this is the ~equivalent census run
+// on OUR structures: the DrawTicket already IS "everything recorded commands depend
+// on", so the fingerprint is a fold over the ticket's input identity.
+//
+// FOUR CELLS, matching theirs: ordinal-matched (draw N vs draw N of the previous
+// frame) vs set-matched (draw appears anywhere in the previous frame), each with and
+// without the constants in the fingerprint. The constants term hashes ONLY the
+// registers this draw's shaders declare (aluConsts), falling back to the whole
+// window for dynamically-indexed shaders (bone palettes) — correctness over cost, and
+// this is a diagnostic arm whose frame times are not quotable (gotcha 7, announced).
+//
+// BUILT-IN POSITIVE CONTROL: Case Zero's menus read 69-77% reusable. Our light bucket
+// must read high or the census is broken — a zero in BOTH buckets is a defect of the
+// instrument, not a fact about the title (gotcha 25/30). Stream CONTENT is excluded
+// from the fingerprint on their evidence (0 draws failed on content alone) and that
+// exclusion is stated here rather than hidden.
+namespace reusec
+{
+
+bool On()
+{
+    static const bool on = [] {
+        const bool o = EnvOn("CW_VK_REUSE_CENSUS");
+        if (o)
+            fprintf(stderr,
+                    "[reuse] CW_VK_REUSE_CENSUS=1 — the cross-frame reuse census is "
+                    "ARMED (diagnostic: hashes each draw's declared constants; no "
+                    "frame time from this run is quotable)\n");
+        return o;
+    }();
+    return on;
+}
+
+uint64_t g_lastFrame = ~0ull;
+struct Fp { uint64_t full, noConst; };
+std::vector<Fp> g_prev, g_cur;
+std::unordered_map<uint64_t, uint32_t> g_prevFull, g_prevNoConst;
+
+struct Bucket
+{
+    uint64_t frames = 0, draws = 0;
+    uint64_t ordFull = 0, ordNoConst = 0, setFull = 0, setNoConst = 0;
+};
+Bucket g_light, g_crowd;   // split at 4,000 draws/frame — the soak gate's own line
+uint64_t g_constBytesHashed = 0;   // the liveness counter for the constants channel
+
+inline uint64_t Mix(uint64_t h, uint64_t v)
+{
+    h ^= v;
+    return h * 0x100000001B3ull;
+}
+
+void OnFrameBoundary(uint64_t frame, uint64_t drawsLastFrame)
+{
+    // Score the finished frame against the one before it, then rotate.
+    if (g_lastFrame != ~0ull && !g_prev.empty() && !g_cur.empty())
+    {
+        Bucket& b = drawsLastFrame >= 4000 ? g_crowd : g_light;
+        ++b.frames;
+        b.draws += g_cur.size();
+        auto pf = g_prevFull;       // copies: multiset semantics decrement on match
+        auto pn = g_prevNoConst;
+        const size_t n = g_cur.size();
+        for (size_t i = 0; i < n; ++i)
+        {
+            if (i < g_prev.size() && g_cur[i].full == g_prev[i].full)
+                ++b.ordFull;
+            if (i < g_prev.size() && g_cur[i].noConst == g_prev[i].noConst)
+                ++b.ordNoConst;
+            auto itf = pf.find(g_cur[i].full);
+            if (itf != pf.end() && itf->second)
+            {
+                --itf->second;
+                ++b.setFull;
+            }
+            auto itn = pn.find(g_cur[i].noConst);
+            if (itn != pn.end() && itn->second)
+            {
+                --itn->second;
+                ++b.setNoConst;
+            }
+        }
+    }
+    g_prev.swap(g_cur);
+    g_cur.clear();
+    g_prevFull.clear();
+    g_prevNoConst.clear();
+    for (const Fp& f : g_prev)
+    {
+        ++g_prevFull[f.full];
+        ++g_prevNoConst[f.noConst];
+    }
+    g_lastFrame = frame;
+}
+
+void OnDraw(const DrawTicket& t, const uint32_t* regs, uint32_t vsBase,
+            uint32_t psBase, uint64_t frame, uint64_t drawsLastFrame)
+{
+    if (!On())
+        return;
+    if (frame != g_lastFrame)
+        OnFrameBoundary(frame, drawsLastFrame);
+
+    uint64_t h = 0xCBF29CE484222325ull;
+    h = Mix(h, t.vsHash);
+    h = Mix(h, t.psHash);
+    h = Mix(h, uint64_t(uintptr_t(t.pipeline)));
+    h = Mix(h, (uint64_t(t.draw.primType) << 32) | t.draw.indexCount);
+    h = Mix(h, (uint64_t(t.draw.indexVa) << 16) | (t.draw.index32 ? 2 : 0) |
+                   (t.draw.indexed ? 1 : 0));
+    h = Mix(h, uint64_t(uint32_t(t.indxOffset)));
+    uint64_t vbits[3];   // VkViewport is 6 floats = 24 bytes = 3 words of hash input
+    memcpy(vbits, &t.viewport, sizeof(t.viewport));
+    for (int i = 0; i < 3; ++i)
+        h = Mix(h, vbits[i]);
+    h = Mix(h, (uint64_t(uint32_t(t.scissor.offset.x)) << 32) |
+                   uint32_t(t.scissor.offset.y));
+    h = Mix(h, (uint64_t(t.scissor.extent.width) << 32) | t.scissor.extent.height);
+    h = Mix(h, t.stencilRefMask | (t.stencilTest ? 1ull << 32 : 0));
+    for (uint32_t i = 0; i < t.nFetch; ++i)
+    {
+        const DrawTicket::AttrFetch& a = t.fetch[i];
+        h = Mix(h, (uint64_t(a.vf.address) << 8) | a.vf.endian);
+        h = Mix(h, (uint64_t(a.vf.sizeDwords) << 16) | (a.attr->format << 8) |
+                       a.attr->offsetDwords);
+        h = Mix(h, a.attr->strideDwords);
+    }
+    const uint64_t noConst = h;
+
+    // The constants term: only the registers the shaders declare, whole window when
+    // the shader indexes dynamically. Both halves of the guest's file, through the
+    // register file directly (capture side — regs is live here).
+    auto hashConsts = [&](const ShaderMeta* m, uint32_t base, uint32_t words) {
+        const uint32_t* win = regs + xenos::kAluConstantBase + base * 4;
+        if (!m || m->aluDynamic || m->aluConsts.empty())
+        {
+            for (uint32_t i = 0; i < words; ++i)
+                h = Mix(h, win[i]);
+            g_constBytesHashed += words * 4;
+            return;
+        }
+        for (uint32_t r : m->aluConsts)
+        {
+            if (r * 4 + 4 > words)
+                continue;
+            for (uint32_t k = 0; k < 4; ++k)
+                h = Mix(h, win[r * 4 + k]);
+            g_constBytesHashed += 16;
+        }
+    };
+    // The windows the draw ACTUALLY reads — the guest names them per draw.
+    hashConsts(t.vs, vsBase, 256 * 4);
+    hashConsts(t.ps, psBase, 224 * 4);
+    g_cur.push_back(Fp{ h, noConst });
+}
+
+void PrintStats(FILE* f)
+{
+    if (!On())
+        return;
+    auto line = [&](const char* name, const Bucket& b) {
+        if (!b.draws)
+            return;
+        fprintf(f,
+                "[reuse]   %s: %llu frames, %llu draws | ordinal full %.1f%% "
+                "no-const %.1f%% | set full %.1f%% no-const %.1f%%\n",
+                name, (unsigned long long)b.frames, (unsigned long long)b.draws,
+                100.0 * double(b.ordFull) / double(b.draws),
+                100.0 * double(b.ordNoConst) / double(b.draws),
+                100.0 * double(b.setFull) / double(b.draws),
+                100.0 * double(b.setNoConst) / double(b.draws));
+    };
+    line("light (<4,000 draws)", g_light);
+    line("CROWD (>=4,000 draws)", g_crowd);
+    if (g_light.draws || g_crowd.draws)
+        fprintf(f,
+                "[reuse]   constants channel: %.1f MB hashed (a zero here means the "
+                "constants term never ran and the full-fp columns are BLIND)\n",
+                double(g_constBytesHashed) / 1048576.0);
+}
+
+} // namespace reusec
+
 void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
             const Pm4ShaderBinding& vsBind, const Pm4ShaderBinding& psBind)
 {
@@ -18280,6 +18474,12 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     }
 
     _pIndex.Close();   // the capture-side index scope must not swallow the core call
+
+    // The reuse census reads the finished ticket plus the live registers — capture is
+    // the one place both exist (see namespace reusec for what it answers and why the
+    // sibling's verdict is not simply copied).
+    if (reusec::On())
+        reusec::OnDraw(t, regs, memoVsBase, memoPsBase, R->frame, R->lastFrameDraws);
 
     // THE CORE CALL (part 7 stage 2b). Inline by default: the ticket was built just
     // above from the same values the code that used to live here read in place, and
@@ -23272,6 +23472,7 @@ void VkRenderer_DumpStats()
     sec::PrintStats(stderr);
     defer::PrintStats(stderr);
     rexec::PrintStats(stderr);
+    reusec::PrintStats(stderr);
     // Part 72 item 1. Printed HERE as well as on the census's own cadence, so a soak
     // that ends off a 600-frame boundary still lands the number — the same defect the
     // stencil skip counter had for fifteen parts (collected since part 56, printed by
