@@ -54,7 +54,24 @@ proof scale.
 * The harness stamps every soak run's **binary sha256** (a mid-chain rebuild nearly
   relabelled an A/B arm — the rule is NO BUILDS WHILE A CHAIN MEASURES).
 
-## 2. WHERE PART 8 STARTS
+## 2. WHERE PART 8 STARTS (updated at the 2026-08-30 stop)
+
+**Two censuses are owed their local verdicts** (Case Zero measured both and refuted
+both AT THEIR CROWD — same engine, but a copied conclusion is not a measurement):
+
+1. `CW_VK_VCULL_CENSUS=1` at the crowd — is the frustum-cull pool real here? (Theirs:
+   0.1% off-screen; the engine culls before submitting. Caveat there: only ~36% of
+   crowd draws classifiable.) One diagnostic soak; the run was interrupted mid-chain
+   at the stop.
+2. `CW_VK_REUSE_CENSUS=1` at the crowd — the four-cell reuse census, WRITTEN AND
+   BUILT this session, NEVER RUN. (Theirs: crowd 1.2-2.1% reusable; 93-94% of draws
+   differ only in ALU constants. Our light bucket is the positive control — must read
+   high like their menus' 69-77%.)
+
+Then findings 72+ with the sibling cross-reference confirmed or diverged. Their ask
+back: our 2a/2b restructure is worth exporting to them once they re-price it.
+
+## 2b. THE OPERATOR'S PARKED LIST
 
 **The operator has a list of MINOR VISUAL ISSUES they observed and deliberately did
 not describe** — they said so explicitly, to prevent them being chased before the
