@@ -12325,29 +12325,46 @@ uint64_t g_bindBatchCalls = 0;     // vkCmdBindVertexBuffers the batched path is
 uint64_t g_bindBatchDraws = 0;
 uint64_t g_bindVerifyChecked = 0, g_bindVerifyBad = 0;
 
-VkBuffer g_pendBuf[kBindBatchMax]{};
-VkDeviceSize g_pendOff[kBindBatchMax]{};
-uint32_t g_pendMask = 0;
+// THE PER-CONTEXT RECORDING STATE (part 7, 2c prep). Everything a thread needs to
+// record draws — the command buffer, the bind-elision cache, the skip counters and the
+// bind batch — gathered behind one reference bundle. The pump's context aliases the
+// renderer's own members (so the secondaries' R->cmd swaps keep working unchanged);
+// a stage-2c worker brings its own. This refactor is PLUMBING ONLY: thread safety of
+// the arena, the stream store and the global counters is the next, separate step.
+struct BindBatch
+{
+    VkBuffer pendBuf[kBindBatchMax]{};
+    VkDeviceSize pendOff[kBindBatchMax]{};
+    uint32_t pendMask = 0;
+    uint32_t recBinding[kBindBatchMax]{};
+    VkBuffer recBuf[kBindBatchMax]{};
+    VkDeviceSize recOff[kBindBatchMax]{};
+    uint32_t recN = 0;
+};
+struct RecordCtx
+{
+    VkCommandBuffer& cmd;
+    Renderer::BoundState& bound;
+    Renderer::BindSkips& skips;
+    BindBatch& batch;
+};
+BindBatch g_pumpBindBatch;
 // The verifier's record of what the draw ASKED FOR, written at offer time in offer order.
 // Compared against an expansion of what the batched calls actually handed the driver.
-uint32_t g_recBinding[kBindBatchMax]{};
-VkBuffer g_recBuf[kBindBatchMax]{};
-VkDeviceSize g_recOff[kBindBatchMax]{};
-uint32_t g_recN = 0;
 
 // The draw failed after offering some binds. Drop them WITHOUT touching the cache.
-inline void BindBatchDiscard()
+inline void BindBatchDiscard(RecordCtx& ctx)
 {
-    g_pendMask = 0;
-    g_recN = 0;
+    ctx.batch.pendMask = 0;
+    ctx.batch.recN = 0;
 }
 
 // Issue the pending binds as contiguous runs, then — and only then — update the cache.
-void BindBatchFlush()
+void BindBatchFlush(RecordCtx& ctx)
 {
-    if (!g_pendMask)
+    if (!ctx.batch.pendMask)
     {
-        g_recN = 0;
+        ctx.batch.recN = 0;
         return;
     }
     // What the driver was actually handed, expanded back to one entry per binding. This
@@ -12362,20 +12379,20 @@ void BindBatchFlush()
     uint32_t isN = 0;
     for (uint32_t b = 0; b < kBindBatchMax;)
     {
-        if (!(g_pendMask & (1u << b)))
+        if (!(ctx.batch.pendMask & (1u << b)))
         {
             ++b;
             continue;
         }
         uint32_t e = b;
-        while (e + 1 < kBindBatchMax && (g_pendMask & (1u << (e + 1))))
+        while (e + 1 < kBindBatchMax && (ctx.batch.pendMask & (1u << (e + 1))))
             ++e;
         const uint32_t count = e - b + 1;
         VkBuffer bufs[kBindBatchMax];
         VkDeviceSize offs[kBindBatchMax];
         for (uint32_t i = 0; i < count; i++)
         {
-            bufs[i] = g_pendBuf[b + i];
+            bufs[i] = ctx.batch.pendBuf[b + i];
             // THE POISON, and it had to be one that fires on EVERY check rather than only
             // on multi-binding runs: 22% of runs are one binding long, so a poison that
             // needed count > 1 could not read 100% and would not have shown the checker
@@ -12383,12 +12400,12 @@ void BindBatchFlush()
             // stays inside the buffer in both directions and it renders garbage on
             // purpose — this is a diagnostic arm, never a configuration.
             offs[i] = g_verifyBindPoison
-                          ? (g_pendOff[b + i] >= 16 ? g_pendOff[b + i] - 16
-                                                    : g_pendOff[b + i] + 16)
-                          : g_pendOff[b + i];
+                          ? (ctx.batch.pendOff[b + i] >= 16 ? ctx.batch.pendOff[b + i] - 16
+                                                    : ctx.batch.pendOff[b + i] + 16)
+                          : ctx.batch.pendOff[b + i];
         }
         if (!NoDriverRecord())
-            vkCmdBindVertexBuffers(R->cmd, b, count, bufs, offs);
+            vkCmdBindVertexBuffers(ctx.cmd, b, count, bufs, offs);
         else
             ++g_noDriverRecordSkipped;
         ++g_bindBatchCalls;
@@ -12403,9 +12420,9 @@ void BindBatchFlush()
         // The cache records what was ISSUED, at the moment it was issued.
         for (uint32_t i = 0; i < count; i++)
         {
-            R->bound.haveVertex[b + i] = true;
-            R->bound.vertexBuffer[b + i] = g_pendBuf[b + i];
-            R->bound.vertexOffset[b + i] = g_pendOff[b + i];
+            ctx.bound.haveVertex[b + i] = true;
+            ctx.bound.vertexBuffer[b + i] = ctx.batch.pendBuf[b + i];
+            ctx.bound.vertexOffset[b + i] = ctx.batch.pendOff[b + i];
         }
         b = e + 1;
     }
@@ -12414,28 +12431,28 @@ void BindBatchFlush()
         // Both lists are ascending by binding — the offers because `binding` only ever
         // increments, the issues because the runs are walked in order — so a positional
         // compare is the right one and a length disagreement is itself a defect.
-        const uint32_t n = isN < g_recN ? isN : g_recN;
+        const uint32_t n = isN < ctx.batch.recN ? isN : ctx.batch.recN;
         for (uint32_t i = 0; i < n; i++)
         {
             ++g_bindVerifyChecked;
-            if (isB[i] != g_recBinding[i] || isBuf[i] != g_recBuf[i] ||
-                isOff[i] != g_recOff[i])
+            if (isB[i] != ctx.batch.recBinding[i] || isBuf[i] != ctx.batch.recBuf[i] ||
+                isOff[i] != ctx.batch.recOff[i])
                 ++g_bindVerifyBad;
         }
-        for (uint32_t i = n; i < (isN > g_recN ? isN : g_recN); i++)
+        for (uint32_t i = n; i < (isN > ctx.batch.recN ? isN : ctx.batch.recN); i++)
         {
             ++g_bindVerifyChecked;
             ++g_bindVerifyBad;
         }
     }
-    g_pendMask = 0;
-    g_recN = 0;
+    ctx.batch.pendMask = 0;
+    ctx.batch.recN = 0;
 }
 
-void BindVertexBufferCached(uint32_t binding, VkBuffer buffer, VkDeviceSize offset)
+void BindVertexBufferCached(RecordCtx& ctx, uint32_t binding, VkBuffer buffer, VkDeviceSize offset)
 {
     const bool noStateCache = NoBufferBindCache();
-    ++R->skips.vertexBinds;
+    ++ctx.skips.vertexBinds;
     // Above the tracked range the bind is always issued — untracked, never assumed
     // unchanged. 16 is above the highest binding this title has ever used.
     if (binding >= Renderer::BoundState::kMaxTrackedBindings)
@@ -12445,7 +12462,7 @@ void BindVertexBufferCached(uint32_t binding, VkBuffer buffer, VkDeviceSize offs
         // that `binding` increments monotonically so an untracked bind always follows
         // every tracked one, and the census measured 0.000 of them a draw.
         if (!g_noBindBatch)
-            BindBatchFlush();
+            BindBatchFlush(ctx);
         if (g_bindRunCensus)
         {
             ++g_brOffered;
@@ -12457,16 +12474,16 @@ void BindVertexBufferCached(uint32_t binding, VkBuffer buffer, VkDeviceSize offs
             g_brPrevChanged = -1;
         }
         if (!NoDriverRecord())
-            vkCmdBindVertexBuffers(R->cmd, binding, 1, &buffer, &offset);
+            vkCmdBindVertexBuffers(ctx.cmd, binding, 1, &buffer, &offset);
         else
             ++g_noDriverRecordSkipped;
         return;
     }
-    if (!noStateCache && R->bound.haveVertex[binding] &&
-        R->bound.vertexOffset[binding] == offset &&
-        R->bound.vertexBuffer[binding] == buffer)
+    if (!noStateCache && ctx.bound.haveVertex[binding] &&
+        ctx.bound.vertexOffset[binding] == offset &&
+        ctx.bound.vertexBuffer[binding] == buffer)
     {
-        ++R->skips.vertexBindRepeats;
+        ++ctx.skips.vertexBindRepeats;
         if (g_bindRunCensus)
         {
             ++g_brOffered;
@@ -12477,15 +12494,15 @@ void BindVertexBufferCached(uint32_t binding, VkBuffer buffer, VkDeviceSize offs
     if (!g_noBindBatch)
     {
         // Queue it. The call — and the cache update — happen at the flush before the draw.
-        g_pendBuf[binding] = buffer;
-        g_pendOff[binding] = offset;
-        g_pendMask |= (1u << binding);
-        if (g_verifyBindBatch && g_recN < kBindBatchMax)
+        ctx.batch.pendBuf[binding] = buffer;
+        ctx.batch.pendOff[binding] = offset;
+        ctx.batch.pendMask |= (1u << binding);
+        if (g_verifyBindBatch && ctx.batch.recN < kBindBatchMax)
         {
-            g_recBinding[g_recN] = binding;
-            g_recBuf[g_recN] = buffer;
-            g_recOff[g_recN] = offset;
-            ++g_recN;
+            ctx.batch.recBinding[ctx.batch.recN] = binding;
+            ctx.batch.recBuf[ctx.batch.recN] = buffer;
+            ctx.batch.recOff[ctx.batch.recN] = offset;
+            ++ctx.batch.recN;
         }
     }
     if (g_bindRunCensus)
@@ -12506,33 +12523,33 @@ void BindVertexBufferCached(uint32_t binding, VkBuffer buffer, VkDeviceSize offs
     if (g_noBindBatch)
     {
         if (!NoDriverRecord())
-            vkCmdBindVertexBuffers(R->cmd, binding, 1, &buffer, &offset);
+            vkCmdBindVertexBuffers(ctx.cmd, binding, 1, &buffer, &offset);
         else
             ++g_noDriverRecordSkipped;
-        R->bound.haveVertex[binding] = true;
-        R->bound.vertexOffset[binding] = offset;
-        R->bound.vertexBuffer[binding] = buffer;
+        ctx.bound.haveVertex[binding] = true;
+        ctx.bound.vertexOffset[binding] = offset;
+        ctx.bound.vertexBuffer[binding] = buffer;
     }
 }
 
-void BindIndexBufferCached(VkBuffer buffer, VkDeviceSize offset, VkIndexType type)
+void BindIndexBufferCached(RecordCtx& ctx, VkBuffer buffer, VkDeviceSize offset, VkIndexType type)
 {
     const bool noStateCache = NoBufferBindCache();
-    ++R->skips.indexBinds;
-    if (!noStateCache && R->bound.haveIndex && R->bound.indexOffset == offset &&
-        R->bound.indexType == type && R->bound.indexBuffer == buffer)
+    ++ctx.skips.indexBinds;
+    if (!noStateCache && ctx.bound.haveIndex && ctx.bound.indexOffset == offset &&
+        ctx.bound.indexType == type && ctx.bound.indexBuffer == buffer)
     {
-        ++R->skips.indexBindRepeats;
+        ++ctx.skips.indexBindRepeats;
         return;
     }
     if (!NoDriverRecord())
-        vkCmdBindIndexBuffer(R->cmd, buffer, offset, type);
+        vkCmdBindIndexBuffer(ctx.cmd, buffer, offset, type);
     else
         ++g_noDriverRecordSkipped;
-    R->bound.haveIndex = true;
-    R->bound.indexOffset = offset;
-    R->bound.indexType = type;
-    R->bound.indexBuffer = buffer;
+    ctx.bound.haveIndex = true;
+    ctx.bound.indexOffset = offset;
+    ctx.bound.indexType = type;
+    ctx.bound.indexBuffer = buffer;
 }
 
 // Part 41 item 1b: the sampler a fetch ASKS FOR, by descriptor index in set 3.
@@ -14285,7 +14302,8 @@ struct DrawTicket
 // Returns false when the draw was abandoned (a degenerate stream, an unreadable index
 // buffer) — exactly the early-outs the inline path always had, so the caller skips the
 // per-draw bookkeeping the same way falling through a `return` used to.
-bool RecordDrawCore(uint8_t* base, const DrawTicket& t, const uint32_t* liveRegs)
+bool RecordDrawCore(RecordCtx& ctx, uint8_t* base, const DrawTicket& t,
+                    const uint32_t* liveRegs)
 {
     ProfScope _pRecord(&g_prof.record);
     {
@@ -14294,12 +14312,12 @@ bool RecordDrawCore(uint8_t* base, const DrawTicket& t, const uint32_t* liveRegs
     // Renderer::BoundState for why that is sound; CW_VK_NO_STATE_CACHE=1 re-issues
     // everything every draw, which is the pre-part-18 renderer and the control arm.
     static const bool noStateCache = Env("CW_VK_NO_STATE_CACHE") != nullptr;
-    ++R->skips.draws;
+    ++ctx.skips.draws;
     const float blendConstants[4] = { t.blend[0], t.blend[1], t.blend[2], t.blend[3] };
-    if (noStateCache || t.pipeline != R->bound.pipeline)
+    if (noStateCache || t.pipeline != ctx.bound.pipeline)
     {
         if (!NoDriverRecord())
-            vkCmdBindPipeline(R->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, t.pipeline);
+            vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, t.pipeline);
         else
             ++g_noDriverRecordSkipped;
         // BINDING A PIPELINE THAT SPECIFIES STATE STATICALLY MAKES THE CORRESPONDING
@@ -14310,47 +14328,47 @@ bool RecordDrawCore(uint8_t* base, const DrawTicket& t, const uint32_t* liveRegs
         // `VUID-vkCmdDrawIndexed-None-0783{7,8,9}`, i.e. a draw reading undefined stencil
         // state. The t.viewport, t.scissor and blend constants above are dynamic on EVERY
         // t.pipeline, so they are unaffected and keep their cache.
-        R->bound.haveStencil = false;
-        R->bound.pipeline = t.pipeline;
+        ctx.bound.haveStencil = false;
+        ctx.bound.pipeline = t.pipeline;
     }
     else
-        ++R->skips.pipeline;
-    if (noStateCache || !R->bound.haveViewport ||
-        memcmp(&t.viewport, &R->bound.viewport, sizeof(t.viewport)) != 0)
+        ++ctx.skips.pipeline;
+    if (noStateCache || !ctx.bound.haveViewport ||
+        memcmp(&t.viewport, &ctx.bound.viewport, sizeof(t.viewport)) != 0)
     {
         if (!NoDriverRecord())
-            vkCmdSetViewport(R->cmd, 0, 1, &t.viewport);
+            vkCmdSetViewport(ctx.cmd, 0, 1, &t.viewport);
         else
             ++g_noDriverRecordSkipped;
-        R->bound.viewport = t.viewport;
-        R->bound.haveViewport = true;
+        ctx.bound.viewport = t.viewport;
+        ctx.bound.haveViewport = true;
     }
     else
-        ++R->skips.viewport;
-    if (noStateCache || !R->bound.haveScissor ||
-        memcmp(&t.scissor, &R->bound.scissor, sizeof(t.scissor)) != 0)
+        ++ctx.skips.viewport;
+    if (noStateCache || !ctx.bound.haveScissor ||
+        memcmp(&t.scissor, &ctx.bound.scissor, sizeof(t.scissor)) != 0)
     {
         if (!NoDriverRecord())
-            vkCmdSetScissor(R->cmd, 0, 1, &t.scissor);
+            vkCmdSetScissor(ctx.cmd, 0, 1, &t.scissor);
         else
             ++g_noDriverRecordSkipped;
-        R->bound.scissor = t.scissor;
-        R->bound.haveScissor = true;
+        ctx.bound.scissor = t.scissor;
+        ctx.bound.haveScissor = true;
     }
     else
-        ++R->skips.scissor;
-    if (noStateCache || !R->bound.haveBlend ||
-        memcmp(blendConstants, R->bound.blend, sizeof(blendConstants)) != 0)
+        ++ctx.skips.scissor;
+    if (noStateCache || !ctx.bound.haveBlend ||
+        memcmp(blendConstants, ctx.bound.blend, sizeof(blendConstants)) != 0)
     {
         if (!NoDriverRecord())
-            vkCmdSetBlendConstants(R->cmd, blendConstants);
+            vkCmdSetBlendConstants(ctx.cmd, blendConstants);
         else
             ++g_noDriverRecordSkipped;
-        memcpy(R->bound.blend, blendConstants, sizeof(blendConstants));
-        R->bound.haveBlend = true;
+        memcpy(ctx.bound.blend, blendConstants, sizeof(blendConstants));
+        ctx.bound.haveBlend = true;
     }
     else
-        ++R->skips.blend;
+        ++ctx.skips.blend;
 
     // ---- THE STENCIL REFERENCE AND MASKS (part 56) -------------------------------
     //
@@ -14375,39 +14393,39 @@ bool RecordDrawCore(uint8_t* base, const DrawTicket& t, const uint32_t* liveRegs
         // guessed at: "doesn't set up VK_DYNAMIC_STATE_STENCIL_*, but since the
         // vkCmdBindPipeline, the related dynamic state commands have been called".
         if (stencilOn &&
-            (noStateCache || !R->bound.haveStencil || R->bound.stencilRef != ref ||
-             R->bound.stencilMask != mask || R->bound.stencilWriteMask != wmask))
+            (noStateCache || !ctx.bound.haveStencil || ctx.bound.stencilRef != ref ||
+             ctx.bound.stencilMask != mask || ctx.bound.stencilWriteMask != wmask))
         {
             if (!NoDriverRecord())
             {
-                vkCmdSetStencilReference(R->cmd, VK_STENCIL_FACE_FRONT_AND_BACK, ref);
-                vkCmdSetStencilCompareMask(R->cmd, VK_STENCIL_FACE_FRONT_AND_BACK, mask);
-                vkCmdSetStencilWriteMask(R->cmd, VK_STENCIL_FACE_FRONT_AND_BACK, wmask);
+                vkCmdSetStencilReference(ctx.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, ref);
+                vkCmdSetStencilCompareMask(ctx.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, mask);
+                vkCmdSetStencilWriteMask(ctx.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, wmask);
             }
             else
                 g_noDriverRecordSkipped += 3;
-            R->bound.stencilRef = ref;
-            R->bound.stencilMask = mask;
-            R->bound.stencilWriteMask = wmask;
-            R->bound.haveStencil = true;
+            ctx.bound.stencilRef = ref;
+            ctx.bound.stencilMask = mask;
+            ctx.bound.stencilWriteMask = wmask;
+            ctx.bound.haveStencil = true;
         }
         else if (stencilOn)
-            ++R->skips.stencil;
+            ++ctx.skips.stencil;
     }
 
     // The five bindless heaps never change address, so this is once per command
     // buffer rather than once per draw — and it is the most expensive of the five.
-    if (noStateCache || !R->bound.setsBound)
+    if (noStateCache || !ctx.bound.setsBound)
     {
         if (!NoDriverRecord())
-            vkCmdBindDescriptorSets(R->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, R->pipeLayout,
+            vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, R->pipeLayout,
                                     0, 5, R->sets, 0, nullptr);
         else
             ++g_noDriverRecordSkipped;
-        R->bound.setsBound = true;
+        ctx.bound.setsBound = true;
     }
     else
-        ++R->skips.sets;
+        ++ctx.skips.sets;
 
     // The three constant-buffer addresses, then THE DRAW INDEX at offset 24 for the
     // draw-ID pass. The index is pushed on every draw, armed or not: it costs four bytes
@@ -14419,7 +14437,7 @@ bool RecordDrawCore(uint8_t* base, const DrawTicket& t, const uint32_t* liveRegs
         uint64_t(R->arena.address + t.sharedAt),
         t.drawIndex, 0 };
     if (!NoDriverRecord())
-        vkCmdPushConstants(R->cmd, R->pipeLayout,
+        vkCmdPushConstants(ctx.cmd, R->pipeLayout,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32,
                            &pushConstants);
     else
@@ -14610,7 +14628,7 @@ bool RecordDrawCore(uint8_t* base, const DrawTicket& t, const uint32_t* liveRegs
                 break;
             }
             const VkDeviceSize offset = four + uint64_t(a.offsetDwords) * 4;
-            BindVertexBufferCached(binding, R->arena.buffer, offset);
+            BindVertexBufferCached(ctx, binding, R->arena.buffer, offset);
             ++binding;
             continue;
         }
@@ -14624,19 +14642,19 @@ bool RecordDrawCore(uint8_t* base, const DrawTicket& t, const uint32_t* liveRegs
         if (rangeCensus && a.strideDwords && rangeAttrCount < 32)
             rangeAttrs[rangeAttrCount++] = { a.strideDwords, a.offsetDwords,
                                              uint32_t(a.format), bytes, loc.bytes() };
-        BindVertexBufferCached(binding, loc.handle(), offset);
+        BindVertexBufferCached(ctx, binding, loc.handle(), offset);
         ++binding;
     }
     if (!streamsOk)
     {
         // The draw is abandoned: drop the queued binds and leave the cache exactly as the
         // previous draw left it, because none of these were issued.
-        BindBatchDiscard();
+        BindBatchDiscard(ctx);
         return false;
     }
     if (!g_noBindBatch)
     {
-        BindBatchFlush();
+        BindBatchFlush(ctx);
         ++g_bindBatchDraws;
     }
     // The evaluation half of CW_VK_RANGE_CENSUS, shared by the indexed branch
@@ -14758,12 +14776,12 @@ bool RecordDrawCore(uint8_t* base, const DrawTicket& t, const uint32_t* liveRegs
         const VkDeviceSize at = ExpandIndices(base, t.draw, t.expand, expandedCount);
         if (at == VkDeviceSize(-1))
             return false;
-        BindIndexBufferCached(R->arena.buffer, at, VK_INDEX_TYPE_UINT32);
+        BindIndexBufferCached(ctx, R->arena.buffer, at, VK_INDEX_TYPE_UINT32);
         // t.rectSynth already folded the base vertex into its three corners, and its
         // expanded indices name a private four-vertex stream — so offsetting again
         // would apply it twice.
         if (!NoDriverRecord())
-            vkCmdDrawIndexed(R->cmd, expandedCount, 1, 0, t.rectSynth ? 0 : t.indxOffset, 0);
+            vkCmdDrawIndexed(ctx.cmd, expandedCount, 1, 0, t.rectSynth ? 0 : t.indxOffset, 0);
         else
             ++g_noDriverRecordSkipped;
     }
@@ -14821,9 +14839,9 @@ bool RecordDrawCore(uint8_t* base, const DrawTicket& t, const uint32_t* liveRegs
         }
         const VkIndexType itype =
             t.draw.index32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
-        BindIndexBufferCached(loc.handle(), loc.at, itype);
+        BindIndexBufferCached(ctx, loc.handle(), loc.at, itype);
         if (!NoDriverRecord())
-            vkCmdDrawIndexed(R->cmd, t.draw.indexCount, 1, 0, t.indxOffset, 0);
+            vkCmdDrawIndexed(ctx.cmd, t.draw.indexCount, 1, 0, t.indxOffset, 0);
         else
             ++g_noDriverRecordSkipped;
         COUNT("draw: indexed");
@@ -14835,7 +14853,7 @@ bool RecordDrawCore(uint8_t* base, const DrawTicket& t, const uint32_t* liveRegs
         if (rangeCensus && rangeAttrCount && t.draw.indexCount)
             RangeCensusEval(t.draw.indexCount - 1);
         if (!NoDriverRecord())
-            vkCmdDraw(R->cmd, t.draw.indexCount, 1, uint32_t(t.indxOffset), 0);
+            vkCmdDraw(ctx.cmd, t.draw.indexCount, 1, uint32_t(t.indxOffset), 0);
         else
             ++g_noDriverRecordSkipped;
         COUNT("draw: auto-index");
@@ -14920,8 +14938,9 @@ void OnRangeClosed(uint8_t reason)
         return;
     }
     ++g_stats.ranges;
+    RecordCtx ctx{ R->cmd, R->bound, R->skips, g_pumpBindBatch };
     for (const DrawTicket& tk : g_queue)
-        if (!RecordDrawCore(g_base, tk, nullptr))
+        if (!RecordDrawCore(ctx, g_base, tk, nullptr))
             ++g_stats.replayFailed;
     g_queue.clear();
 }
@@ -17845,8 +17864,12 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     // close — see namespace defer for the two documented divergences.
     if (defer::On())
         defer::Queue(base, t);
-    else if (!RecordDrawCore(base, t, regs))
-        return;
+    else
+    {
+        RecordCtx ctx{ R->cmd, R->bound, R->skips, g_pumpBindBatch };
+        if (!RecordDrawCore(ctx, base, t, regs))
+            return;
+    }
     // Fingerprint the draw. Order matters and is included by construction, because the
     // accumulator is sequential — two frames with the same draws in a different order
     // are correctly different frames.
