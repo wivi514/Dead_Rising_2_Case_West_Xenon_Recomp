@@ -268,4 +268,17 @@ microseconds before their pass ends) — the crowd's 61-draw ranges are where wo
 get room. **The heavy-band gate + workers-vs-serial A/B are the campaign's decisive
 measurement** — running as this is written.
 
-*(2c verdicts land here)*
+**2c verdicts (2026-08-30, ~05:30) — findings 70-71:**
+
+* **Gate**: 110.4 M draws through the workers, 0 order failures, 0 failed draws,
+  0 repairs. The concurrency is RIGHT.
+* **A/B: NULL** (+0.2% weighted, mixed sign). Two mechanisms in the counters: the
+  pump steals 65% of ranges (jobs arrive too late in each pass), and 2b.5 already
+  moved the moveable — the deferred core is ~0.3 µs/draw, too thin for three shared
+  workers to beat the scheduling. The sibling's refutation, reached from the other
+  side: each stage of making recording distributable also made it cheaper serial.
+* **Range 64** lifts worker share to 52% and reads −0.6% — the share was never the
+  bottleneck. 128 stays; `CW_VK_PREC_EXEC` stays a proven-correct arm, off.
+* **The stack vs plain defaults: +0.35 ms at the decisive band, all bands positive
+  (+3.0% weighted)** — the campaign's banked win. Default flip prepared; the
+  operator's fresh eyeball on the CURRENT stack is the last gate.

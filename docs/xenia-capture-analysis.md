@@ -3238,3 +3238,25 @@ the campaign's honest yield is: **+0.64 ms of locality behind arms that net free
 record path split behind a ticket seam any future work can lift, the sibling's
 hardest hazard dissolved rather than solved, and the refutation documented at
 110 M draws of proof instead of an untested belief.**
+
+## 71. **THE STACK BEATS THE DEFAULTS: sec+defer is +0.35 ms at the crowd, every band in its favour — the campaign's banked win, ready for the default flip** — part 7, 2026-08-30
+
+The closing pair of A/Bs (3 accepted alternated runs per arm, 2c binary):
+
+* **The stack (CW_VK_SECONDARIES=1 + CW_VK_DEFER_RECORD=1) vs plain defaults: ALL
+  EIGHT printed bands positive** — +3.3% / **+0.35 ms at the decisive 6,500-7,000
+  band**, +5.6% at 6,000-6,500, +3.0% frame-weighted. What began as 2a's −0.6 ms of
+  secondary overhead ended as a net win once 2b's range-batched replay and 2b.5's
+  capture-side resolve landed on top: the mechanics pay for themselves and then some.
+* **The worker-share lever confirms finding 70**: CW_VK_PREC_RANGE=64 raises the
+  worker share from 35% to 52% of ranges (1.53 M worker-run vs 1.39 M stolen,
+  113 M draws, still 0 failures) and the frame time reads −0.6% — the share was never
+  the bottleneck; the residual work is. 128 stays; exec stays a proven-correct
+  off-by-default arm.
+
+**The default flip is the one open decision, and it is the operator's**: the stack's
+correctness is proven at ~450 M draws across the night's gates, but the operator's
+"everything looks fine" eyeball was on the 2b binary — before the capture-resolve and
+the flip machinery. One fresh session on the current stack is the last gate; the flip
+itself is inverting two opt-ins into `CW_VK_NO_SECONDARIES` / `CW_VK_NO_DEFER_RECORD`
+controls plus the battery, prepared and waiting.
