@@ -79,3 +79,17 @@ ordered by what it established.
 * The one-pad fix (imports.cpp): synthetic input served every user index, so pads
   0+1 both pressed START and the title could bind the unsigned pad-1 user — Load
   Game refused the save. Synthetic input is one pad now.
+
+## 6. The first banked item (2026-08-29, evening)
+
+**The ring-latency package (eager tick + mid-walk rptr + fast-retry backoff) is
+MEASURED at the heavy band: −0.19 ms/frame (+1.7%) at 6,500-7,000 draws**, 3 accepted
+soaks per arm, 90k frames each, every heavy band consistently in the fix's favour and
+the light bands flat (they have no naps to save). Mechanism confirmed: sleep/frame
+0.47 → 0.15 ms; part of the reclaimed time reappears as walk. The route replays at
+100% this session (6/6 accepted after the doorway war: WAITWORLD + compound entries +
+calibration + lerp + the retry wrapper).
+
+The same decomposition names the next target: at the heavy band the wall is 11.1 ms
+and the pump's WALK is 10.97 of it — the pump is the frame. GPU 7.3 ms concurrent,
+fence 0.
