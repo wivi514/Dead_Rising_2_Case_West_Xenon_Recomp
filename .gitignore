@@ -31,3 +31,4 @@ tools/__pycache__/
 # Generated SPIR-V shader cache (game-derived; already covered by /assets/ above,
 # named here so it is not a mystery). Rebuild it from captured microcode — see the
 # Commands section of CLAUDE.md.
+runtime/build-o3/
