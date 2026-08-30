@@ -14294,9 +14294,22 @@ struct DrawTicket
     {
         xenos::VertexFetch vf;
         const VertexAttribute* attr;
+        // Resolved at capture (2c prep): the stream is already device-resident by the
+        // time the ticket leaves the pump, so a worker never touches the stream store,
+        // the guard, the persist twins or the arena cursor.
+        VkBuffer buf = VK_NULL_HANDLE;
+        VkDeviceSize off = 0;
     };
     uint8_t nFetch = 0;
     AttrFetch fetch[24];
+    // The draw call itself, resolved at capture the same way.
+    enum class DrawPath : uint8_t { kExpanded, kIndexed, kAuto };
+    DrawPath path = DrawPath::kAuto;
+    VkBuffer ibuf = VK_NULL_HANDLE;
+    VkDeviceSize iat = 0;
+    VkIndexType itype = VK_INDEX_TYPE_UINT16;
+    uint32_t drawCount = 0;
+    int32_t baseVertex = 0;
 };
 
 // Returns false when the draw was abandoned (a degenerate stream, an unreadable index
@@ -14481,382 +14494,39 @@ bool RecordDrawCore(RecordCtx& ctx, uint8_t* base, const DrawTicket& t,
     }
     }   // end recordState
 
+    // THE MINIMAL CORE (2c prep): everything stream-shaped resolved at capture, so
+    // what records here is exactly what a worker thread can safely do — the state
+    // cache, the binds and the draw, against its own context. The bind-run census is
+    // a pump-only diagnostic (globals), so it rides the liveRegs gate like the others.
     ProfScope _pVertex(&g_prof.recordVertex);
-    uint32_t binding = 0;
-    bool streamsOk = true;
-    if (g_bindRunCensus)
+    if (g_bindRunCensus && liveRegs)
         BindRunCensusBeginDraw();
-    // CW_VK_RANGE_CENSUS=1 — per indexed draw, the two questions the part-33 NaN chain
-    // left: (1) do this draw's INDEX VALUES reach vertices past the fetch constant's
-    // declared size — the guard above bounds t.indxOffset + indexCount, which is the
-    // number of indices, not the vertices they name — and (2) do the IN-RANGE bytes of
-    // any float-format attribute already decode to NaN. On Xenos an out-of-range vfetch
-    // returns zero; our streams live in one shared arena buffer, so even
-    // robustBufferAccess cannot bound them (the binding's range is the whole arena),
-    // and an overrun reads a neighbouring stream's bytes as this draw's floats.
-    // A DIAGNOSTIC ARM: it walks every index and every vertex of every draw (gotcha 7).
-    static const bool rangeCensus = [] {
-        const char* e = getenv("CW_VK_RANGE_CENSUS");
-        return e && *e && *e != '0';
-    }();
-    struct RangeAttr { uint32_t strideDw, offsetDw, format; uint64_t bytes; const uint8_t* p; };
-    RangeAttr rangeAttrs[32];
-    uint32_t rangeAttrCount = 0;
-    // The ticket's fetch array is the attribute walk PRE-FILTERED and PRE-DECODED at
-    // capture time (location >= 0, not indirect, in t.vs->attributes order) — the
-    // decode's inputs are the fetch constants as of the WALK, which is the point.
-    for (uint32_t fi = 0; fi < t.nFetch; ++fi)
     {
-        const VertexAttribute& a = *t.fetch[fi].attr;
-        const xenos::VertexFetch& vf = t.fetch[fi].vf;
-        const uint32_t va = PhysToVa(vf.address);
-        const uint64_t bytes = uint64_t(vf.sizeDwords) * 4;
-        if (!GuestRangeOk(va, bytes) || !bytes)
-        {
-            Count("draw: vertex stream outside the physical arena");
-            streamsOk = false;
-            break;
-        }
-        // The whole fetch buffer is uploaded, so a base vertex stays inside it — but
-        // only if the guest's own numbers say it does. A draw whose offset plus count
-        // runs off the end would read another draw's vertices (or, past the arena, walk
-        // off a Vulkan buffer), and that has to be LOUD rather than quietly clamped
-        // back to zero: clamping is the defect this offset exists to fix, reintroduced
-        // wearing a safety check's name.
-        if (t.indxOffset && a.strideDwords)
-        {
-            const uint64_t need =
-                (uint64_t(uint32_t(t.indxOffset) + t.draw.indexCount) * a.strideDwords) * 4;
-            if (need > bytes)
-            {
-                Count("draw: VGT_INDX_OFFSET runs past the vertex stream");
-                streamsOk = false;
-                break;
-            }
-        }
-        const StreamLoc loc = UploadStream(base, va, bytes, vf.endian, 0);
-        if (!loc.ok())
-        {
-            streamsOk = false;
-            break;
-        }
-        if (t.rectSynth && a.strideDwords)
-        {
-            // CW_VK_RECT_TRACE=<surfacePitch> — the CORNERS of every distinct clear
-            // rect on one EDRAM surface, printed once per distinct rect.
-            //
-            // A rect-list draw at the head of a pass IS the guest's clear, and the only
-            // way to know what it clears is to read its three corners. Part 32 needed
-            // this for the shadow cascade: the cascade's depth buffer comes out half
-            // empty, the geometry is provably submitted for all of it (CW_VK_DEPTH_ALWAYS
-            // fills it), so the question is which rectangles the title actually asked to
-            // be cleared — and that is data, not something to infer from the result.
-            static const char* const rectTraceEnv = Env("CW_VK_RECT_TRACE");
-            // A pitch of 0 means EVERY surface. Naming one pitch is right when the
-            // question is "what does this pass clear"; it is wrong when the question is
-            // "where does that rect live", and part 32 needed the second — a clear rect
-            // recorded in part 15 as the cascade's turned out to be on another surface
-            // entirely, which is only visible if the trace prints the pitch.
-            if (liveRegs && rectTraceEnv &&
-                (strtoul(rectTraceEnv, nullptr, 10) == 0 ||
-                 (liveRegs[xenos::kRbSurfaceInfo] & 0x3FFF) ==
-                     uint32_t(strtoul(rectTraceEnv, nullptr, 10))))
-            {
-                const uint8_t* p = loc.bytes();
-                float c[3][2] = {};
-                bool ok = p != nullptr;
-                for (uint32_t k = 0; ok && k < 3; k++)
-                {
-                    const uint64_t at =
-                        (uint64_t(t.rectCorner[k]) * a.strideDwords + a.offsetDwords) * 4;
-                    if (at + 8 > bytes) { ok = false; break; }
-                    // The arena copy is ALREADY little-endian — the stream uploader
-                    // swaps on the way in. Byte-swapping again here read every corner as
-                    // 0.0, which reads as "the title asks for nothing to be cleared" and
-                    // is the opposite of what the data says.
-                    memcpy(&c[k][0], p + at, 8);
-                }
-                if (ok)
-                {
-                    static std::vector<std::string> seenRect;
-                    // OCCURRENCES AS WELL AS DISTINCT RECTS, and the distinction is the
-                    // whole question. "One distinct clear rect" and "one clear rect a
-                    // frame" are different facts: the first is consistent with the title
-                    // issuing sixteen strips that all look alike, the second says it
-                    // issues one. Part 32 needed the second to conclude that the cascade
-                    // passes clear nothing of their own.
-                    static int rectOccurrences = 0;
-                    if (rectOccurrences < 40)
-                    {
-                        ++rectOccurrences;
-                        fprintf(stderr,
-                                "[vkrect] occurrence frame=%llu (%.1f,%.1f)-(%.1f,%.1f) "
-                                "idx=%u,%u,%u\n",
-                                (unsigned long long)R->frame, c[0][0], c[0][1], c[2][0],
-                                c[2][1], t.rectCorner[0], t.rectCorner[1], t.rectCorner[2]);
-                    }
-                    char line[256];
-                    snprintf(line, sizeof line,
-                             "[vkrect] pitch=%u msaa=%u loc=%d fmt=%u off=%u "
-                             "stride=%u idx=%u,%u,%u  "
-                             "(%.2f,%.2f) (%.2f,%.2f) (%.2f,%.2f)  -> BL (%.2f,%.2f)  "
-                             "depthControl=%02X vte=%02X",
-                             liveRegs[xenos::kRbSurfaceInfo] & 0x3FFF,
-                             (liveRegs[xenos::kRbSurfaceInfo] >> 16) & 3,
-                             a.location, a.format, a.offsetDwords, a.strideDwords,
-                             t.rectCorner[0], t.rectCorner[1], t.rectCorner[2],
-                             c[0][0], c[0][1], c[1][0], c[1][1], c[2][0], c[2][1],
-                             c[0][0] + c[2][0] - c[1][0], c[0][1] + c[2][1] - c[1][1],
-                             liveRegs[xenos::kRbDepthControl] & 0xFF,
-                             liveRegs[xenos::kPaClVteCntl] & 0x3F);
-                    if (std::find(seenRect.begin(), seenRect.end(), line) ==
-                            seenRect.end() && seenRect.size() < 64)
-                    {
-                        seenRect.push_back(line);
-                        fprintf(stderr, "%s\n", line);
-                    }
-                }
-            }
-            // The synthesised four-corner stream is always in the per-frame arena, even
-            // when its source is in the cross-frame store — it is built from THIS draw's
-            // corner indices, so it is not shared and must not be persisted.
-            const VkDeviceSize four =
-                SynthRectStream(loc.bytes(), bytes, a.strideDwords, t.rectCorner, a.format);
-            if (four == VkDeviceSize(-1))
-            {
-                streamsOk = false;
-                break;
-            }
-            const VkDeviceSize offset = four + uint64_t(a.offsetDwords) * 4;
-            BindVertexBufferCached(ctx, binding, R->arena.buffer, offset);
-            ++binding;
-            continue;
-        }
-        const VkDeviceSize offset = loc.at + uint64_t(a.offsetDwords) * 4;
-        if (offset >= loc.capacity())
-        {
-            Count("draw: vertex element offset past the stream");
-            streamsOk = false;
-            break;
-        }
-        if (rangeCensus && a.strideDwords && rangeAttrCount < 32)
-            rangeAttrs[rangeAttrCount++] = { a.strideDwords, a.offsetDwords,
-                                             uint32_t(a.format), bytes, loc.bytes() };
-        BindVertexBufferCached(ctx, binding, loc.handle(), offset);
-        ++binding;
-    }
-    if (!streamsOk)
-    {
-        // The draw is abandoned: drop the queued binds and leave the cache exactly as the
-        // previous draw left it, because none of these were issued.
-        BindBatchDiscard(ctx);
-        return false;
+        uint32_t binding = 0;
+        for (uint32_t fi = 0; fi < t.nFetch; ++fi)
+            BindVertexBufferCached(ctx, binding++, t.fetch[fi].buf, t.fetch[fi].off);
     }
     if (!g_noBindBatch)
     {
         BindBatchFlush(ctx);
         ++g_bindBatchDraws;
     }
-    // The evaluation half of CW_VK_RANGE_CENSUS, shared by the indexed branch
-    // (maxIdx = largest index VALUE) and the auto-index branch (maxIdx = count-1):
-    // the reachable-vertex question is the same, only the source of maxIdx differs.
-    auto RangeCensusEval = [&](uint32_t maxIdx) {
-            const uint32_t lastV = uint32_t(int64_t(maxIdx) + t.indxOffset);
-            bool over = false, nan = false;
-            uint64_t nanVerts = 0;
-            uint32_t overFmt = 0, nanFmt = 0;
-            uint64_t overBy = 0;
-            for (uint32_t k = 0; k < rangeAttrCount; k++)
-            {
-                const RangeAttr& at = rangeAttrs[k];
-                uint32_t attrDw = 1;
-                switch (at.format)
-                {
-                case xenos::kFmt_32_32_FLOAT:          attrDw = 2; break;
-                case xenos::kFmt_32_32_32_FLOAT:       attrDw = 3; break;
-                case xenos::kFmt_32_32_32_32_FLOAT:    attrDw = 4; break;
-                case xenos::kFmt_32_32:                attrDw = 2; break;
-                case xenos::kFmt_32_32_32_32:          attrDw = 4; break;
-                case xenos::kFmt_16_16_16_16:
-                case xenos::kFmt_16_16_16_16_FLOAT:    attrDw = 2; break;
-                default:                               attrDw = 1; break;
-                }
-                const uint64_t need =
-                    (uint64_t(lastV) * at.strideDw + at.offsetDw + attrDw) * 4;
-                if (need > at.bytes)
-                {
-                    over = true;
-                    overFmt = at.format;
-                    overBy = std::max(overBy, need - at.bytes);
-                }
-                // In-range NaN scan, float formats only — these bytes go into the
-                // shader as IEEE floats with no conversion to hide behind. FP16 formats
-                // are floats too: a NaN half in a 16_16_16_16_FLOAT attribute expands to
-                // a NaN float in the shader, and the first census missed them.
-                uint32_t floats = 0, halves = 0;
-                if (at.format == xenos::kFmt_32_FLOAT) floats = 1;
-                else if (at.format == xenos::kFmt_32_32_FLOAT) floats = 2;
-                else if (at.format == xenos::kFmt_32_32_32_FLOAT) floats = 3;
-                else if (at.format == xenos::kFmt_32_32_32_32_FLOAT) floats = 4;
-                else if (at.format == xenos::kFmt_16_FLOAT) halves = 1;
-                else if (at.format == xenos::kFmt_16_16_FLOAT) halves = 2;
-                else if (at.format == xenos::kFmt_16_16_16_16_FLOAT) halves = 4;
-                if ((floats || halves) && at.p)
-                {
-                    const uint64_t availV =
-                        at.bytes / 4 >= at.offsetDw + attrDw
-                            ? (at.bytes / 4 - at.offsetDw - attrDw) / at.strideDw + 1
-                            : 0;
-                    const uint64_t scanV = std::min<uint64_t>(availV, uint64_t(lastV) + 1);
-                    for (uint64_t v = 0; v < scanV; v++)
-                    {
-                        const uint8_t* fp = at.p + (v * at.strideDw + at.offsetDw) * 4;
-                        bool vNan = false;
-                        for (uint32_t c = 0; c < floats; c++)
-                        {
-                            uint32_t bits;
-                            memcpy(&bits, fp + c * 4, 4);
-                            if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x7FFFFFu))
-                                vNan = true;
-                        }
-                        for (uint32_t c = 0; c < halves; c++)
-                        {
-                            uint16_t bits;
-                            memcpy(&bits, fp + c * 2, 2);
-                            if ((bits & 0x7C00u) == 0x7C00u && (bits & 0x3FFu))
-                                vNan = true;
-                        }
-                        if (vNan)
-                        {
-                            nan = true;
-                            nanFmt = at.format;
-                            ++nanVerts;
-                        }
-                    }
-                }
-            }
-            Count("rangecensus: indexed draw walked");
-            if (over) Count("rangecensus: index values reach past a stream");
-            if (nan)  Count("rangecensus: NaN bytes IN RANGE in a float attribute");
-            static int printed = 0;
-            if ((over || nan) && printed < 40)
-            {
-                ++printed;
-                fprintf(stderr,
-                        "[range] frame=%llu vs=%016llx idx=%u maxIdx=%u base=%d "
-                        "%s%s overFmt=%u overBy=%llu nanFmt=%u nanVerts=%llu\n",
-                        (unsigned long long)R->frame,
-                        (unsigned long long)t.vsHash, t.draw.indexCount, maxIdx,
-                        int(t.indxOffset), over ? "OVERRUN " : "", nan ? "NAN-IN-RANGE " : "",
-                        overFmt, (unsigned long long)overBy, nanFmt,
-                        (unsigned long long)nanVerts);
-            }
-    };
-
-    // --- indices ---------------------------------------------------------------------
-    // `recordVertex` ends here by assignment rather than by scope, because the vertex
-    // section is not braced and bracing it would move a dozen locals the index section
-    // reads. Same trick, one line: hand the scope a sink it can no longer reach.
     _pVertex.Close();
     ProfScope _pIndex(&g_prof.recordIndex);
-    if (t.expand != Expansion::None)
+    if (t.path != DrawTicket::DrawPath::kAuto)
     {
-        // Both expansions need the source indices, so an indexed one has to have a
-        // readable buffer; an auto-index one synthesises them from the vertex number.
-        if (t.draw.indexed)
-        {
-            const uint64_t bytes = uint64_t(t.draw.indexCount) * (t.draw.index32 ? 4 : 2);
-            if (!GuestRangeOk(t.draw.indexVa, bytes))
-            {
-                Count("draw: index buffer outside the physical arena");
-                return false;
-            }
-        }
-        uint32_t expandedCount = 0;
-        const VkDeviceSize at = ExpandIndices(base, t.draw, t.expand, expandedCount);
-        if (at == VkDeviceSize(-1))
-            return false;
-        BindIndexBufferCached(ctx, R->arena.buffer, at, VK_INDEX_TYPE_UINT32);
-        // t.rectSynth already folded the base vertex into its three corners, and its
-        // expanded indices name a private four-vertex stream — so offsetting again
-        // would apply it twice.
+        BindIndexBufferCached(ctx, t.ibuf, t.iat, t.itype);
         if (!NoDriverRecord())
-            vkCmdDrawIndexed(ctx.cmd, expandedCount, 1, 0, t.rectSynth ? 0 : t.indxOffset, 0);
+            vkCmdDrawIndexed(ctx.cmd, t.drawCount, 1, 0, t.baseVertex, 0);
         else
             ++g_noDriverRecordSkipped;
-    }
-    else if (t.draw.indexed)
-    {
-        const uint32_t indexBytes = t.draw.index32 ? 4 : 2;
-        const uint64_t bytes = uint64_t(t.draw.indexCount) * indexBytes;
-        if (!GuestRangeOk(t.draw.indexVa, bytes))
-        {
-            Count("draw: index buffer outside the physical arena");
-            return false;
-        }
-        // CW_VK_INDEX_ENDIAN=N overrides the packet's own swizzle code. Scrambled
-        // triangles are the classic symptom of an index buffer read with the wrong
-        // swizzle — a 16-bit stream under an 8-in-32 code has its PAIRS transposed as
-        // well as its bytes — and an arm settles in one run what staring at the
-        // geometry cannot.
-        static const char* endianOverride = Env("CW_VK_INDEX_ENDIAN");
-        const uint32_t endian =
-            endianOverride ? uint32_t(atoi(endianOverride)) : t.draw.indexEndian;
-        {
-            static uint64_t* slots[4];
-            static bool built = false;
-            if (!built)
-            {
-                built = true;
-                char name[32];
-                for (uint32_t i = 0; i < 4; i++)
-                {
-                    snprintf(name, sizeof name, "index endian code %u", i);
-                    slots[i] = CounterSlot(name);
-                }
-            }
-            ++*slots[t.draw.indexEndian & 3];
-        }
-        const StreamLoc loc = UploadStream(base, t.draw.indexVa, bytes, endian, 1);
-        if (!loc.ok())
-            return false;
-        // The CW_VK_RANGE_CENSUS read-out. The index copy is little-endian by here, so
-        // the walk is a plain array scan; 0xFFFF/0xFFFFFFFF is primitive restart and is
-        // not a vertex.
-        if (rangeCensus && rangeAttrCount)
-        {
-            const uint8_t* ip = loc.bytes();
-            uint32_t maxIdx = 0;
-            for (uint32_t i = 0; i < t.draw.indexCount; i++)
-            {
-                const uint32_t v = t.draw.index32
-                    ? reinterpret_cast<const uint32_t*>(ip)[i]
-                    : reinterpret_cast<const uint16_t*>(ip)[i];
-                if (v != (t.draw.index32 ? 0xFFFFFFFFu : 0xFFFFu) && v > maxIdx)
-                    maxIdx = v;
-            }
-            RangeCensusEval(maxIdx);
-        }
-        const VkIndexType itype =
-            t.draw.index32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
-        BindIndexBufferCached(ctx, loc.handle(), loc.at, itype);
-        if (!NoDriverRecord())
-            vkCmdDrawIndexed(ctx.cmd, t.draw.indexCount, 1, 0, t.indxOffset, 0);
-        else
-            ++g_noDriverRecordSkipped;
-        COUNT("draw: indexed");
     }
     else
     {
-        // Auto-index reaches vertices [t.indxOffset, t.indxOffset + count); the census
-        // question is identical, with maxIdx implicit.
-        if (rangeCensus && rangeAttrCount && t.draw.indexCount)
-            RangeCensusEval(t.draw.indexCount - 1);
         if (!NoDriverRecord())
-            vkCmdDraw(ctx.cmd, t.draw.indexCount, 1, uint32_t(t.indxOffset), 0);
+            vkCmdDraw(ctx.cmd, t.drawCount, 1, uint32_t(t.baseVertex), 0);
         else
             ++g_noDriverRecordSkipped;
-        COUNT("draw: auto-index");
     }
     return true;
 }
@@ -17856,6 +17526,381 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
             }
         }
     }
+
+
+    // STAGE 2c PREP: THE STREAMS RESOLVE AT CAPTURE. The pump owns every upload, the
+    // guard, the persist twins and the arena cursor exactly as it always has — what a
+    // worker will receive is a ticket whose streams are already device-resident, so
+    // the record core touches no shared-mutable stream state at all. The stream-reading
+    // censuses (range, rect trace) live here too: capture is the one place that has the
+    // locs, the registers and the guest bytes together. The recordVertex/recordIndex
+    // profile scopes stay with the work they have always measured.
+    ProfScope _pVertex(&g_prof.recordVertex);
+    bool streamsOk = true;
+    // CW_VK_RANGE_CENSUS=1 — per indexed draw, the two questions the part-33 NaN chain
+    // left: (1) do this draw's INDEX VALUES reach vertices past the fetch constant's
+    // declared size — the guard above bounds t.indxOffset + indexCount, which is the
+    // number of indices, not the vertices they name — and (2) do the IN-RANGE bytes of
+    // any float-format attribute already decode to NaN. On Xenos an out-of-range vfetch
+    // returns zero; our streams live in one shared arena buffer, so even
+    // robustBufferAccess cannot bound them (the binding's range is the whole arena),
+    // and an overrun reads a neighbouring stream's bytes as this draw's floats.
+    // A DIAGNOSTIC ARM: it walks every index and every vertex of every draw (gotcha 7).
+    static const bool rangeCensus = [] {
+        const char* e = getenv("CW_VK_RANGE_CENSUS");
+        return e && *e && *e != '0';
+    }();
+    struct RangeAttr { uint32_t strideDw, offsetDw, format; uint64_t bytes; const uint8_t* p; };
+    RangeAttr rangeAttrs[32];
+    uint32_t rangeAttrCount = 0;
+    // The ticket's fetch array is the attribute walk PRE-FILTERED and PRE-DECODED at
+    // capture time (location >= 0, not indirect, in t.vs->attributes order) — the
+    // decode's inputs are the fetch constants as of the WALK, which is the point.
+    for (uint32_t fi = 0; fi < t.nFetch; ++fi)
+    {
+        const VertexAttribute& a = *t.fetch[fi].attr;
+        const xenos::VertexFetch& vf = t.fetch[fi].vf;
+        const uint32_t va = PhysToVa(vf.address);
+        const uint64_t bytes = uint64_t(vf.sizeDwords) * 4;
+        if (!GuestRangeOk(va, bytes) || !bytes)
+        {
+            Count("draw: vertex stream outside the physical arena");
+            streamsOk = false;
+            break;
+        }
+        // The whole fetch buffer is uploaded, so a base vertex stays inside it — but
+        // only if the guest's own numbers say it does. A draw whose offset plus count
+        // runs off the end would read another draw's vertices (or, past the arena, walk
+        // off a Vulkan buffer), and that has to be LOUD rather than quietly clamped
+        // back to zero: clamping is the defect this offset exists to fix, reintroduced
+        // wearing a safety check's name.
+        if (t.indxOffset && a.strideDwords)
+        {
+            const uint64_t need =
+                (uint64_t(uint32_t(t.indxOffset) + t.draw.indexCount) * a.strideDwords) * 4;
+            if (need > bytes)
+            {
+                Count("draw: VGT_INDX_OFFSET runs past the vertex stream");
+                streamsOk = false;
+                break;
+            }
+        }
+        const StreamLoc loc = UploadStream(base, va, bytes, vf.endian, 0);
+        if (!loc.ok())
+        {
+            streamsOk = false;
+            break;
+        }
+        if (t.rectSynth && a.strideDwords)
+        {
+            // CW_VK_RECT_TRACE=<surfacePitch> — the CORNERS of every distinct clear
+            // rect on one EDRAM surface, printed once per distinct rect.
+            //
+            // A rect-list draw at the head of a pass IS the guest's clear, and the only
+            // way to know what it clears is to read its three corners. Part 32 needed
+            // this for the shadow cascade: the cascade's depth buffer comes out half
+            // empty, the geometry is provably submitted for all of it (CW_VK_DEPTH_ALWAYS
+            // fills it), so the question is which rectangles the title actually asked to
+            // be cleared — and that is data, not something to infer from the result.
+            static const char* const rectTraceEnv = Env("CW_VK_RECT_TRACE");
+            // A pitch of 0 means EVERY surface. Naming one pitch is right when the
+            // question is "what does this pass clear"; it is wrong when the question is
+            // "where does that rect live", and part 32 needed the second — a clear rect
+            // recorded in part 15 as the cascade's turned out to be on another surface
+            // entirely, which is only visible if the trace prints the pitch.
+            if (rectTraceEnv &&
+                (strtoul(rectTraceEnv, nullptr, 10) == 0 ||
+                 (regs[xenos::kRbSurfaceInfo] & 0x3FFF) ==
+                     uint32_t(strtoul(rectTraceEnv, nullptr, 10))))
+            {
+                const uint8_t* p = loc.bytes();
+                float c[3][2] = {};
+                bool ok = p != nullptr;
+                for (uint32_t k = 0; ok && k < 3; k++)
+                {
+                    const uint64_t at =
+                        (uint64_t(t.rectCorner[k]) * a.strideDwords + a.offsetDwords) * 4;
+                    if (at + 8 > bytes) { ok = false; break; }
+                    // The arena copy is ALREADY little-endian — the stream uploader
+                    // swaps on the way in. Byte-swapping again here read every corner as
+                    // 0.0, which reads as "the title asks for nothing to be cleared" and
+                    // is the opposite of what the data says.
+                    memcpy(&c[k][0], p + at, 8);
+                }
+                if (ok)
+                {
+                    static std::vector<std::string> seenRect;
+                    // OCCURRENCES AS WELL AS DISTINCT RECTS, and the distinction is the
+                    // whole question. "One distinct clear rect" and "one clear rect a
+                    // frame" are different facts: the first is consistent with the title
+                    // issuing sixteen strips that all look alike, the second says it
+                    // issues one. Part 32 needed the second to conclude that the cascade
+                    // passes clear nothing of their own.
+                    static int rectOccurrences = 0;
+                    if (rectOccurrences < 40)
+                    {
+                        ++rectOccurrences;
+                        fprintf(stderr,
+                                "[vkrect] occurrence frame=%llu (%.1f,%.1f)-(%.1f,%.1f) "
+                                "idx=%u,%u,%u\n",
+                                (unsigned long long)R->frame, c[0][0], c[0][1], c[2][0],
+                                c[2][1], t.rectCorner[0], t.rectCorner[1], t.rectCorner[2]);
+                    }
+                    char line[256];
+                    snprintf(line, sizeof line,
+                             "[vkrect] pitch=%u msaa=%u loc=%d fmt=%u off=%u "
+                             "stride=%u idx=%u,%u,%u  "
+                             "(%.2f,%.2f) (%.2f,%.2f) (%.2f,%.2f)  -> BL (%.2f,%.2f)  "
+                             "depthControl=%02X vte=%02X",
+                             regs[xenos::kRbSurfaceInfo] & 0x3FFF,
+                             (regs[xenos::kRbSurfaceInfo] >> 16) & 3,
+                             a.location, a.format, a.offsetDwords, a.strideDwords,
+                             t.rectCorner[0], t.rectCorner[1], t.rectCorner[2],
+                             c[0][0], c[0][1], c[1][0], c[1][1], c[2][0], c[2][1],
+                             c[0][0] + c[2][0] - c[1][0], c[0][1] + c[2][1] - c[1][1],
+                             regs[xenos::kRbDepthControl] & 0xFF,
+                             regs[xenos::kPaClVteCntl] & 0x3F);
+                    if (std::find(seenRect.begin(), seenRect.end(), line) ==
+                            seenRect.end() && seenRect.size() < 64)
+                    {
+                        seenRect.push_back(line);
+                        fprintf(stderr, "%s\n", line);
+                    }
+                }
+            }
+            // The synthesised four-corner stream is always in the per-frame arena, even
+            // when its source is in the cross-frame store — it is built from THIS draw's
+            // corner indices, so it is not shared and must not be persisted.
+            const VkDeviceSize four =
+                SynthRectStream(loc.bytes(), bytes, a.strideDwords, t.rectCorner, a.format);
+            if (four == VkDeviceSize(-1))
+            {
+                streamsOk = false;
+                break;
+            }
+            const VkDeviceSize offset = four + uint64_t(a.offsetDwords) * 4;
+            t.fetch[fi].buf = R->arena.buffer;
+            t.fetch[fi].off = offset;
+            continue;
+        }
+        const VkDeviceSize offset = loc.at + uint64_t(a.offsetDwords) * 4;
+        if (offset >= loc.capacity())
+        {
+            Count("draw: vertex element offset past the stream");
+            streamsOk = false;
+            break;
+        }
+        if (rangeCensus && a.strideDwords && rangeAttrCount < 32)
+            rangeAttrs[rangeAttrCount++] = { a.strideDwords, a.offsetDwords,
+                                             uint32_t(a.format), bytes, loc.bytes() };
+        t.fetch[fi].buf = loc.handle();
+        t.fetch[fi].off = offset;
+    }
+    if (!streamsOk)
+        return;   // nothing was queued or issued — the ticket simply never leaves
+    // The evaluation half of CW_VK_RANGE_CENSUS, shared by the indexed branch
+    // (maxIdx = largest index VALUE) and the auto-index branch (maxIdx = count-1):
+    // the reachable-vertex question is the same, only the source of maxIdx differs.
+    auto RangeCensusEval = [&](uint32_t maxIdx) {
+            const uint32_t lastV = uint32_t(int64_t(maxIdx) + t.indxOffset);
+            bool over = false, nan = false;
+            uint64_t nanVerts = 0;
+            uint32_t overFmt = 0, nanFmt = 0;
+            uint64_t overBy = 0;
+            for (uint32_t k = 0; k < rangeAttrCount; k++)
+            {
+                const RangeAttr& at = rangeAttrs[k];
+                uint32_t attrDw = 1;
+                switch (at.format)
+                {
+                case xenos::kFmt_32_32_FLOAT:          attrDw = 2; break;
+                case xenos::kFmt_32_32_32_FLOAT:       attrDw = 3; break;
+                case xenos::kFmt_32_32_32_32_FLOAT:    attrDw = 4; break;
+                case xenos::kFmt_32_32:                attrDw = 2; break;
+                case xenos::kFmt_32_32_32_32:          attrDw = 4; break;
+                case xenos::kFmt_16_16_16_16:
+                case xenos::kFmt_16_16_16_16_FLOAT:    attrDw = 2; break;
+                default:                               attrDw = 1; break;
+                }
+                const uint64_t need =
+                    (uint64_t(lastV) * at.strideDw + at.offsetDw + attrDw) * 4;
+                if (need > at.bytes)
+                {
+                    over = true;
+                    overFmt = at.format;
+                    overBy = std::max(overBy, need - at.bytes);
+                }
+                // In-range NaN scan, float formats only — these bytes go into the
+                // shader as IEEE floats with no conversion to hide behind. FP16 formats
+                // are floats too: a NaN half in a 16_16_16_16_FLOAT attribute expands to
+                // a NaN float in the shader, and the first census missed them.
+                uint32_t floats = 0, halves = 0;
+                if (at.format == xenos::kFmt_32_FLOAT) floats = 1;
+                else if (at.format == xenos::kFmt_32_32_FLOAT) floats = 2;
+                else if (at.format == xenos::kFmt_32_32_32_FLOAT) floats = 3;
+                else if (at.format == xenos::kFmt_32_32_32_32_FLOAT) floats = 4;
+                else if (at.format == xenos::kFmt_16_FLOAT) halves = 1;
+                else if (at.format == xenos::kFmt_16_16_FLOAT) halves = 2;
+                else if (at.format == xenos::kFmt_16_16_16_16_FLOAT) halves = 4;
+                if ((floats || halves) && at.p)
+                {
+                    const uint64_t availV =
+                        at.bytes / 4 >= at.offsetDw + attrDw
+                            ? (at.bytes / 4 - at.offsetDw - attrDw) / at.strideDw + 1
+                            : 0;
+                    const uint64_t scanV = std::min<uint64_t>(availV, uint64_t(lastV) + 1);
+                    for (uint64_t v = 0; v < scanV; v++)
+                    {
+                        const uint8_t* fp = at.p + (v * at.strideDw + at.offsetDw) * 4;
+                        bool vNan = false;
+                        for (uint32_t c = 0; c < floats; c++)
+                        {
+                            uint32_t bits;
+                            memcpy(&bits, fp + c * 4, 4);
+                            if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x7FFFFFu))
+                                vNan = true;
+                        }
+                        for (uint32_t c = 0; c < halves; c++)
+                        {
+                            uint16_t bits;
+                            memcpy(&bits, fp + c * 2, 2);
+                            if ((bits & 0x7C00u) == 0x7C00u && (bits & 0x3FFu))
+                                vNan = true;
+                        }
+                        if (vNan)
+                        {
+                            nan = true;
+                            nanFmt = at.format;
+                            ++nanVerts;
+                        }
+                    }
+                }
+            }
+            Count("rangecensus: indexed draw walked");
+            if (over) Count("rangecensus: index values reach past a stream");
+            if (nan)  Count("rangecensus: NaN bytes IN RANGE in a float attribute");
+            static int printed = 0;
+            if ((over || nan) && printed < 40)
+            {
+                ++printed;
+                fprintf(stderr,
+                        "[range] frame=%llu vs=%016llx idx=%u maxIdx=%u base=%d "
+                        "%s%s overFmt=%u overBy=%llu nanFmt=%u nanVerts=%llu\n",
+                        (unsigned long long)R->frame,
+                        (unsigned long long)t.vsHash, t.draw.indexCount, maxIdx,
+                        int(t.indxOffset), over ? "OVERRUN " : "", nan ? "NAN-IN-RANGE " : "",
+                        overFmt, (unsigned long long)overBy, nanFmt,
+                        (unsigned long long)nanVerts);
+            }
+    };
+
+
+    // --- indices ---------------------------------------------------------------------
+    // `recordVertex` ends here by assignment rather than by scope, because the vertex
+    // section is not braced and bracing it would move a dozen locals the index section
+    // reads. Same trick, one line: hand the scope a sink it can no longer reach.
+    _pVertex.Close();
+    ProfScope _pIndex(&g_prof.recordIndex);
+    if (t.expand != Expansion::None)
+    {
+        // Both expansions need the source indices, so an indexed one has to have a
+        // readable buffer; an auto-index one synthesises them from the vertex number.
+        if (t.draw.indexed)
+        {
+            const uint64_t bytes = uint64_t(t.draw.indexCount) * (t.draw.index32 ? 4 : 2);
+            if (!GuestRangeOk(t.draw.indexVa, bytes))
+            {
+                Count("draw: index buffer outside the physical arena");
+                return;
+            }
+        }
+        uint32_t expandedCount = 0;
+        const VkDeviceSize at = ExpandIndices(base, t.draw, t.expand, expandedCount);
+        if (at == VkDeviceSize(-1))
+            return;
+        t.path = DrawTicket::DrawPath::kExpanded;
+        t.ibuf = R->arena.buffer;
+        t.iat = at;
+        t.itype = VK_INDEX_TYPE_UINT32;
+        t.drawCount = expandedCount;
+        // rectSynth already folded the base vertex into its three corners, and its
+        // expanded indices name a private four-vertex stream — so offsetting again
+        // would apply it twice.
+        t.baseVertex = t.rectSynth ? 0 : t.indxOffset;
+    }
+    else if (t.draw.indexed)
+    {
+        const uint32_t indexBytes = t.draw.index32 ? 4 : 2;
+        const uint64_t bytes = uint64_t(t.draw.indexCount) * indexBytes;
+        if (!GuestRangeOk(t.draw.indexVa, bytes))
+        {
+            Count("draw: index buffer outside the physical arena");
+            return;
+        }
+        // CW_VK_INDEX_ENDIAN=N overrides the packet's own swizzle code. Scrambled
+        // triangles are the classic symptom of an index buffer read with the wrong
+        // swizzle — a 16-bit stream under an 8-in-32 code has its PAIRS transposed as
+        // well as its bytes — and an arm settles in one run what staring at the
+        // geometry cannot.
+        static const char* endianOverride = Env("CW_VK_INDEX_ENDIAN");
+        const uint32_t endian =
+            endianOverride ? uint32_t(atoi(endianOverride)) : t.draw.indexEndian;
+        {
+            static uint64_t* slots[4];
+            static bool built = false;
+            if (!built)
+            {
+                built = true;
+                char name[32];
+                for (uint32_t i = 0; i < 4; i++)
+                {
+                    snprintf(name, sizeof name, "index endian code %u", i);
+                    slots[i] = CounterSlot(name);
+                }
+            }
+            ++*slots[t.draw.indexEndian & 3];
+        }
+        const StreamLoc loc = UploadStream(base, t.draw.indexVa, bytes, endian, 1);
+        if (!loc.ok())
+            return;
+        // The CW_VK_RANGE_CENSUS read-out. The index copy is little-endian by here, so
+        // the walk is a plain array scan; 0xFFFF/0xFFFFFFFF is primitive restart and is
+        // not a vertex.
+        if (rangeCensus && rangeAttrCount)
+        {
+            const uint8_t* ip = loc.bytes();
+            uint32_t maxIdx = 0;
+            for (uint32_t i = 0; i < t.draw.indexCount; i++)
+            {
+                const uint32_t v = t.draw.index32
+                    ? reinterpret_cast<const uint32_t*>(ip)[i]
+                    : reinterpret_cast<const uint16_t*>(ip)[i];
+                if (v != (t.draw.index32 ? 0xFFFFFFFFu : 0xFFFFu) && v > maxIdx)
+                    maxIdx = v;
+            }
+            RangeCensusEval(maxIdx);
+        }
+        t.path = DrawTicket::DrawPath::kIndexed;
+        t.ibuf = loc.handle();
+        t.iat = loc.at;
+        t.itype = t.draw.index32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+        t.drawCount = t.draw.indexCount;
+        t.baseVertex = t.indxOffset;
+        COUNT("draw: indexed");
+    }
+    else
+    {
+        // Auto-index reaches vertices [t.indxOffset, t.indxOffset + count); the census
+        // question is identical, with maxIdx implicit.
+        if (rangeCensus && rangeAttrCount && t.draw.indexCount)
+            RangeCensusEval(t.draw.indexCount - 1);
+        t.path = DrawTicket::DrawPath::kAuto;
+        t.drawCount = t.draw.indexCount;
+        t.baseVertex = t.indxOffset;
+        COUNT("draw: auto-index");
+    }
+
+    _pIndex.Close();   // the capture-side index scope must not swallow the core call
 
     // THE CORE CALL (part 7 stage 2b). Inline by default: the ticket was built just
     // above from the same values the code that used to live here read in place, and
