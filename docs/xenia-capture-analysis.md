@@ -3106,3 +3106,39 @@ First soak band: **3,100-4,800 draws at 9-12 ms** in the heavy stretches, unatte
 reproducible from a cold boot in ~75 s. `tools/cw_autochuck_soak.sh` +
 `tools/cw_trace_band.py` (Case Zero's banding reader, imported). Every heavy-band claim
 this port makes from here on has this scene as its floor.
+
+## 66. **THE AUTONOMOUS HEAVY-BAND PIPELINE WORKS — the operator's route, replayed at 100% this evening** — part 6, 2026-08-29
+
+The full chain: the operator records once (`cw_route_record.sh`, with the pad's resting
+bias CALIBRATED out — three designs, the third is per-stick median below half
+deflection); the transcriber emits compound entries (buttons ride sticks — a dropped
+START cost a whole evening) at 40 ms knots the replay LERPS between; `WAITWORLD` parks
+the sequence emitting nothing until the renderer sustains a world-sized frame (the
+save-load's seconds of variance was the drift that no input fidelity could fix); the
+harness appends camera pans and GATES every run, and `cw_soak_until.sh` retries until K
+runs are accepted. Six of six accepted in the evening's A/B session, 6,800-7,000 draw
+peaks, 43-57 heavy windows per run, every run under the operator's 3-minute cap.
+
+What it is for: pump-side CPU A/Bs. What it is NOT: the crowd's guest-side load — the
+operator's manual soak at their crowd save remains the oracle for whole-frame claims.
+
+## 67. **THE HEAVY-BAND VERDICTS: the ring package banks −0.19 ms, −O3 is null, the pump IS the frame, and the order gate is proven** — part 6, 2026-08-29
+
+Three accepted soaks per arm, ~90k frames each, banded medians:
+
+* **The ring-latency package** (eager tick + mid-walk rptr + fast-retry backoff) is
+  the session's banked item: **−0.19 ms/frame (+1.7%) at 6,500-7,000 draws**, every
+  heavy band in its favour, light bands flat. Mechanism: pump sleep 0.47 → 0.15
+  ms/frame. The fast-retry backoff was designed against the crowd decomposition
+  (walk 8.2 + SLEEP 1.25 of a 9.55 ms frame) and the naps turned out to be
+  drained-ring idles, not WAIT holds (4 holds in a 10-minute soak).
+* **CW_PPC_O3 is NULL at the heavy band** (+0.7% frame-weighted, mixed sign). The
+  guest render thread's light-scene saturation is ring-space spin, not codegen-bound
+  work; the default build stays -O2.
+* **The pump IS the crowd frame**: wall 11.1 ms, walk 10.97 of it. GPU 7.3 concurrent,
+  fence 0. GuardFold is 22.9% of the process but ALL on the three prehash workers.
+  Pump split: our code ~8.9 ms, driver ~2.1 ms, libc ~1.4 ms.
+* **The order gate is ALIVE both ways**: serial 20,063 frames / 0 failed / 19.3M draws
+  logged; `CW_VK_ORDER_POISON=100` fails it by name. The parallel-record campaign's
+  technical prerequisite is met; what remains is the THREAD-BUDGET decision (the
+  campaign's workers are the guard pool's), which is the operator's.
