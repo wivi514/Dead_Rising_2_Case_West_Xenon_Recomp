@@ -310,7 +310,7 @@ fix for the same defect. Watch the named item, import when it closes, add a row 
 
 | defect here | Case Zero item | state there (checked 2026-08-16) | what to watch |
 |---|---|---|---|
-| **Decals not rendering properly** — minor visual, operator says fix later | **00m** in `docs/open-items.md` | Reported at their part 47, **explicitly NOT investigated**, no captures requested. Theirs to characterise once the performance work lands. | any commit touching decals / the decal draw pass |
+| ~~**Decals not rendering properly**~~ | ~~**00m**~~ | **FIXED — operator's statement, 2026-08-30** (part 7's close): the decal defect no longer shows. Mechanism not established here — most plausibly resolved by one of the imported/landed renderer changes since 2026-08-16; if the sibling's 00m closes with a named fix, diff rather than assume. | nothing — closed |
 | ~~**Performance**~~ | ~~**00l**, parts 47-48~~ | **IMPORTED 2026-08-18 — row 2 above.** The campaign ran to their part 55+ and came across wholesale. | further perf commits there; `git log 444631f..HEAD -- runtime/` in the sibling gives the delta |
 
 Their likely handle on decals, recorded so it is not re-derived: decals are a separate draw

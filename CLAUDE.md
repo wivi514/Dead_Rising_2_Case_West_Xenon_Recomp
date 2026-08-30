@@ -24,7 +24,7 @@ low-risk — the import table says so.
 
 ## Status — and where a new conversation starts
 
-> **THE LIVE HAND-OFF IS `docs/part7-kickoff.md`.** Read it first in a new conversation:
+> **THE LIVE HAND-OFF IS `docs/part8-kickoff.md`.** Read it first in a new conversation:
 > it says what already exists (so it is not rebuilt), names where to start, and lists the
 > gates that are run and owed. When a part ends, write the next `part<N>-kickoff.md`,
 > demote this pointer to it, and refresh the memory directory.
@@ -67,7 +67,7 @@ argument, the link register, the object's vtable pointer — never by static rea
 **Case West boots, renders, and completes Case 1-3** — new areas, zombie combat, cinematics
 with subtitles, the full HUD, the pause menu, working save/load. Further than the operator
 ever drove Xenia. The only two defects reported are **both inherited from Case Zero and open
-there** (decals, performance), tracked as PENDING in `docs/imported-fixes.md`.
+there** (decals — since fixed, see the status table — and performance), tracked in `docs/imported-fixes.md`.
 
 Part 2's findings are **27-34** and it authored this port's first two gotchas, **320 and
 321**. Its close-out is `docs/part3-kickoff.md`.
@@ -115,10 +115,10 @@ inferences from a **count** or a **truncated listing**.
 | **Gameplay** | ✅ **IT PLAYS** — 20,765-frame drive: gameplay, cinematics with subtitles, full HUD, pause menu. 26.2 M draws, 0 truncated IBs, only **2** shader-cache misses (finding 28) |
 | **Intro → safehouse** | ✅ **playable, with zombie combat**, and "pretty much exactly like Xenia" — **and better in one place: a cutscene Xenia truncates plays through here** (operator, finding 29, gotcha 320) |
 | **CASE 1-3 COMPLETE** | ✅ **new areas, no crash, no hang, "didn't have any issue except" two INHERITED defects** — and this is **FURTHER THAN THE OPERATOR EVER DROVE XENIA**, so past here the port has **no capture ground truth at all** (finding 33) |
-| Decals | ⏳ minor visual defect — **Case Zero's open item 00m, NOT investigated there or here.** Import when it closes; `docs/imported-fixes.md` |
+| Decals | ✅ **FIXED per the operator, 2026-08-30** (part 7) — mechanism not established; `docs/imported-fixes.md` §PENDING has the note. Separate MINOR visual issues exist that the operator has deliberately parked and not yet described — do not hunt them unprompted |
 | Progress widgets | ✅ **FIXED 2026-08-23** — imported with Case Zero's non-RT block; mechanism named by A/B (`CW_VK_NO_PACKED_SMALL=1` brings the defect back). Findings 60-61, `docs/imported-fixes.md` §3 |
 | Visuals menu | ✅ **IN 2026-08-23** — the title's own Options → Visuals opens a host panel (6 rows, no ray tracing). `CW_NO_PC_OPTIONS=1` restores the shipped screen |
-| Performance | ✅ **IMPORTED TWICE** — their parts 47-55 (2026-08-18) and parts 72-81 (2026-08-27, `03dc55e`): 215-252 fps at ~1,350 draws with the profiler on. Earlier row: — Case Zero's whole parts 47-55 campaign (`82d181f..444631f`), confirmed in play by the operator: **16-24 fps at 720p before → 68-120 fps at 2560x1440 internal after, no visible regression**. Swapchain present + 60 fps pacing are now the DEFAULTS. `docs/imported-fixes.md` §2 |
+| Performance | ✅ **IMPORTED TWICE, then EXTENDED NATIVELY (part 7)** — the parallel-record stack (per-range secondaries + deferred replay) is the DEFAULT since 2026-08-30: +0.35 ms at the crowd, all bands positive, findings 68-71. Earlier rows: **IMPORTED TWICE** — their parts 47-55 (2026-08-18) and parts 72-81 (2026-08-27, `03dc55e`): 215-252 fps at ~1,350 draws with the profiler on. Earlier row: — Case Zero's whole parts 47-55 campaign (`82d181f..444631f`), confirmed in play by the operator: **16-24 fps at 720p before → 68-120 fps at 2560x1440 internal after, no visible regression**. Swapchain present + 60 fps pacing are now the DEFAULTS. `docs/imported-fixes.md` §2 |
 | Save/load | ✅ **behaviourally confirmed** — saved and loaded inside a real session (finding 29). Part 1's confirmation was static only |
 | HUD/menu text | ✅ **FIXED** — imported 2026-08-16 from Case Zero `82d181f` (part 46), **confirmed in play by the operator** ("Ui seems to work really well this time"). Costs ~12 MB/frame of extra hashing in gameplay. `docs/imported-fixes.md` |
 
