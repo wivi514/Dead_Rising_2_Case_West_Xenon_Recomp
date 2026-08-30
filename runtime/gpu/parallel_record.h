@@ -46,6 +46,11 @@ struct Host
 {
     void (*kick)() = nullptr;
     bool (*alive)() = nullptr;
+    // Stage 2's seam: called on the pump thread, outside this module's lock, after a
+    // range CLOSES (with the reason). The renderer's secondary-command-buffer path
+    // rotates buffers here so its ranges are exactly this module's ranges — one source
+    // of truth for the partition, two consumers of it.
+    void (*rangeClosed)(uint8_t reason) = nullptr;
 };
 void Init(const Host& h);
 

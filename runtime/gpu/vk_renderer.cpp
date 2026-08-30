@@ -2052,6 +2052,13 @@ const GuardOut* GuardPoolTake(uint32_t slot, uint64_t stamp, uint64_t frame,
 // slip between a worker's predicate check and its wait, and the job would sleep until
 // the next guard dispatch. prec itself never calls this while holding its own lock
 // (the lock-order note in GuardWorker).
+// Defined with the stage-2a machinery next to the frame boundary; declared here so the
+// hook below can name it (both anonymous namespaces are one namespace in this TU).
+namespace sec
+{
+void OnRangeClosed(uint8_t reason);
+}
+
 void PrecInitOnce()
 {
     static bool done = false;
@@ -2071,6 +2078,9 @@ void PrecInitOnce()
             g_gp->wake.notify_one();
         }
     };
+    // Stage 2a's rotation point: prec's ranges and the secondary command buffers are
+    // one partition, rotated from one place.
+    h.rangeClosed = [](uint8_t reason) { sec::OnRangeClosed(reason); };
     prec::Init(h);
 }
 
@@ -9934,6 +9944,231 @@ void PersistMaintenance()
 void OrderGateCheck();
 bool OrderGateArmed();
 
+// ===================================================================================
+// STAGE 2a: SECONDARY-COMMAND-BUFFER PASS CONTENTS, RECORDED SERIALLY (part 7)
+// ===================================================================================
+//
+// The campaign's second proof, still with zero concurrency: when armed, every rendering
+// instance is begun with CONTENTS_SECONDARY_COMMAND_BUFFERS and the draw path records
+// into per-range secondaries — the PUMP still records everything, in walk order, but
+// through the exact mechanics stage 2c will hand to workers. What this isolates and
+// prices, before any thread touches it: dynamic-rendering inheritance, per-range full
+// state re-establishment (R->bound resets at every secondary, so the part-18 bind
+// elision provably cannot leak across a range boundary), vkCmdExecuteCommands, and the
+// driver's cost for all of the above. The ranges ARE the prec module's ranges — its
+// rangeClosed hook rotates the buffers, so one partition has two consumers and cannot
+// drift.
+//
+// The swap discipline is the whole correctness argument: R->cmd points at the current
+// range's secondary ONLY between the instance's begin and end; every other record in
+// this file — barriers, resolves, snapshot copies, the readback — happens outside an
+// instance and therefore lands on the primary, untouched. The one exception is the
+// CW_VK_GPU_PASSES per-pass timestamps, which would put a primary-side write inside a
+// CONTENTS_SECONDARY instance; that combination is refused loudly and the per-pass
+// split is skipped (whole-frame GPU timestamps are outside instances and unaffected).
+//
+// `CW_VK_SECONDARIES=1` arms it (opt-in until its own soak verdict lands); allocation
+// failure falls back per pass (the flag is only set when a secondary is already open)
+// or per rotation (the range just keeps growing in the current secondary) — both
+// counted, neither able to produce an illegal command buffer.
+namespace sec
+{
+
+bool On()
+{
+    static const bool on = [] {
+        const bool o = EnvOn("CW_VK_SECONDARIES");
+        if (o)
+            fprintf(stderr,
+                    "[sec] CW_VK_SECONDARIES=1 — pass contents go through per-range "
+                    "SECONDARY command buffers (recorded serially on the pump; stage "
+                    "2a of the parallel-record campaign)\n");
+        return o;
+    }();
+    return on;
+}
+
+struct SlotPool
+{
+    VkCommandPool pool = VK_NULL_HANDLE;
+    std::vector<VkCommandBuffer> bufs;
+    uint32_t cursor = 0;
+};
+SlotPool g_slot[kMaxFramesInFlight];
+std::vector<VkCommandBuffer> g_passList; // the open pass's secondaries, execution order
+VkCommandBuffer g_primary = VK_NULL_HANDLE; // saved while R->cmd points at a secondary
+bool g_open = false;                        // a secondary is current (R->cmd swapped)
+
+struct Stats
+{
+    uint64_t passes = 0;         // instances begun with CONTENTS_SECONDARY
+    uint64_t secondaries = 0;    // secondaries begun
+    uint64_t rotations = 0;      // size-cap rotations inside a pass
+    uint64_t executes = 0;       // vkCmdExecuteCommands calls
+    uint64_t allocFails = 0;     // secondary unavailable; fell back, counted
+    uint64_t inlinePasses = 0;   // passes recorded inline because PassPrepare failed
+    uint64_t maxPerPass = 0;
+} g_stats;
+
+// One secondary from the current slot's pool, begun with the inheritance the pipelines
+// were created against (one colour attachment of R->color.format, depth+stencil both
+// R->depth.format — the exact mirror of GetPipeline's VkPipelineRenderingCreateInfo).
+VkCommandBuffer BeginSecondary()
+{
+    SlotPool& sp = g_slot[R->frameSlot];
+    if (sp.pool == VK_NULL_HANDLE)
+    {
+        VkCommandPoolCreateInfo pci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+        pci.queueFamilyIndex = R->queueFamily;
+        if (vkCreateCommandPool(R->device, &pci, nullptr, &sp.pool) != VK_SUCCESS)
+        {
+            sp.pool = VK_NULL_HANDLE;
+            return VK_NULL_HANDLE;
+        }
+    }
+    if (sp.cursor == sp.bufs.size())
+    {
+        // Grown in batches, never shrunk; the pool is reset per frame so the buffers
+        // recycle. 64 covers a crowd frame (~90 ranges) in two batches.
+        VkCommandBuffer batch[64];
+        VkCommandBufferAllocateInfo ai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+        ai.commandPool = sp.pool;
+        ai.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+        ai.commandBufferCount = 64;
+        if (vkAllocateCommandBuffers(R->device, &ai, batch) != VK_SUCCESS)
+            return VK_NULL_HANDLE;
+        sp.bufs.insert(sp.bufs.end(), batch, batch + 64);
+    }
+    VkCommandBuffer cb = sp.bufs[sp.cursor];
+
+    const VkFormat colorFormat = R->color.format;
+    VkCommandBufferInheritanceRenderingInfo iri{
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO
+    };
+    iri.colorAttachmentCount = 1;
+    iri.pColorAttachmentFormats = &colorFormat;
+    iri.depthAttachmentFormat = R->depth.format;
+    iri.stencilAttachmentFormat = R->depth.format;
+    iri.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkCommandBufferInheritanceInfo ii{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO };
+    ii.pNext = &iri;
+    VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT |
+               VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
+    bi.pInheritanceInfo = &ii;
+    if (vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+    ++sp.cursor;
+    ++g_stats.secondaries;
+    return cb;
+}
+
+// Called from BeginFrame for the incoming slot — the swap already waited on this
+// slot's fence, so its secondaries are provably not being read (same argument as the
+// vkResetCommandBuffer beside it).
+void FrameReset()
+{
+    if (!On())
+        return;
+    SlotPool& sp = g_slot[R->frameSlot];
+    if (sp.pool != VK_NULL_HANDLE)
+        vkResetCommandPool(R->device, sp.pool, 0);
+    sp.cursor = 0;
+}
+
+// Open the pass's first secondary BEFORE the instance begins, so the CONTENTS flag is
+// only ever set when a secondary provably exists — an allocation failure here means
+// this pass records inline exactly as the unarmed renderer does, and is counted.
+bool PassPrepare()
+{
+    if (!On())
+        return false;
+    VkCommandBuffer cb = BeginSecondary();
+    if (cb == VK_NULL_HANDLE)
+    {
+        ++g_stats.allocFails;
+        ++g_stats.inlinePasses;
+        return false;
+    }
+    g_passList.clear();
+    g_passList.push_back(cb);
+    ++g_stats.passes;
+    return true;
+}
+
+// After the primary's vkCmdBeginRendering: point the draw path at the secondary. The
+// fresh BoundState is the "each range re-establishes full state" requirement made
+// structural — the existing bind-elision code sees an empty cache and re-issues
+// everything, so a range can never depend on a previous range's binds.
+void SwapIn()
+{
+    g_primary = R->cmd;
+    R->cmd = g_passList.back();
+    R->bound = Renderer::BoundState{};
+    g_open = true;
+}
+
+// The prec module's rangeClosed hook: rotate at a size-cap boundary. A rotation
+// failure is safe by construction — the current secondary just keeps recording (the
+// range grows past its target, which the stats call out but the picture cannot see).
+void OnRangeClosed(uint8_t reason)
+{
+    if (!g_open || reason != uint8_t(prec::kSizeCap))
+        return;
+    VkCommandBuffer next = BeginSecondary();
+    if (next == VK_NULL_HANDLE)
+    {
+        ++g_stats.allocFails;
+        return;
+    }
+    vkEndCommandBuffer(R->cmd);
+    g_passList.push_back(next);
+    R->cmd = next;
+    R->bound = Renderer::BoundState{};
+    ++g_stats.rotations;
+}
+
+// At EndRendering, before anything else: close the current secondary and put the
+// primary back so the caller's GpuSeg/vkCmdEndRendering land where they must.
+void SwapOut()
+{
+    if (!g_open)
+        return;
+    vkEndCommandBuffer(R->cmd);
+    R->cmd = g_primary;
+    g_open = false;
+}
+
+// Inside the instance, before vkCmdEndRendering: hand the pass's secondaries to the
+// primary in creation order — the serial pump's creation order IS the walk order, and
+// the order gate adjudicates exactly this sequence every frame it is armed.
+void ExecutePass()
+{
+    if (g_passList.empty())
+        return;
+    vkCmdExecuteCommands(R->cmd, uint32_t(g_passList.size()), g_passList.data());
+    ++g_stats.executes;
+    if (g_passList.size() > g_stats.maxPerPass)
+        g_stats.maxPerPass = g_passList.size();
+    g_passList.clear();
+}
+
+void PrintStats(FILE* f)
+{
+    if (!On() || !g_stats.passes)
+        return;
+    fprintf(f,
+            "[sec]     secondaries: %llu passes, %llu secondaries (%llu size-cap "
+            "rotations, peak %llu per pass), %llu executes | %llu alloc failures, "
+            "%llu passes fell back to inline\n",
+            (unsigned long long)g_stats.passes, (unsigned long long)g_stats.secondaries,
+            (unsigned long long)g_stats.rotations, (unsigned long long)g_stats.maxPerPass,
+            (unsigned long long)g_stats.executes, (unsigned long long)g_stats.allocFails,
+            (unsigned long long)g_stats.inlinePasses);
+}
+
+} // namespace sec
+
 void BeginFrame()
 {
     if (R->recording)
@@ -9951,6 +10186,7 @@ void BeginFrame()
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkResetCommandBuffer(R->cmd, 0);
     vkBeginCommandBuffer(R->cmd, &bi);
+    sec::FrameReset(); // this slot's secondaries recycle under the same fence argument
     R->recording = true;
     R->rendering = false;
     // THE FRAME'S GPU TIMESTAMPS — two per slot, reset and written on the frame's own
@@ -10113,6 +10349,12 @@ void BeginRendering()
     ri.pColorAttachments = &colorAtt;
     ri.pDepthAttachment = &depthAtt;
     ri.pStencilAttachment = &depthAtt;
+    // STAGE 2a: the flag is set only when the pass's first secondary already exists, so
+    // an allocation failure can never leave an instance whose contents promise what the
+    // draw path cannot deliver.
+    const bool secPass = sec::PassPrepare();
+    if (secPass)
+        ri.flags |= VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
     vkCmdBeginRendering(R->cmd, &ri);
     R->rendering = true;
     // A parallel-record range cannot span a rendering-instance boundary (a secondary
@@ -10122,7 +10364,28 @@ void BeginRendering()
     g_cycPendBeginNs += CycNow() - cycT0;
     // The GPU-side segment for this pass opens AFTER the barriers, so a layout transition
     // the device performs is charged to whatever preceded it rather than to the draws.
-    g_gpPassSeg = GpuSegBegin();
+    // Under CONTENTS_SECONDARY the primary may record nothing inside the instance except
+    // the execute, so the per-pass split is refused — loudly, once — and the whole-frame
+    // timestamps (outside any instance) carry the GPU number.
+    if (secPass)
+    {
+        if (GpuPassesOn())
+        {
+            static bool said = false;
+            if (!said)
+            {
+                said = true;
+                fprintf(stderr, "[sec] CW_VK_GPU_PASSES is incompatible with "
+                                "CW_VK_SECONDARIES (a primary may not timestamp inside "
+                                "a CONTENTS_SECONDARY instance) — the per-pass GPU "
+                                "split is OFF this run\n");
+            }
+        }
+        g_gpPassSeg = -1;
+        sec::SwapIn();
+    }
+    else
+        g_gpPassSeg = GpuSegBegin();
     g_gpPassDraws = 0;
     g_gpPassExt = 0;
     g_gpPassExtPx = 0;
@@ -10132,6 +10395,9 @@ void EndRendering()
 {
     if (!R->rendering)
         return;
+    // STAGE 2a: put the primary back first — everything below must land on it — then
+    // hand the pass's secondaries to the instance in creation order before it closes.
+    sec::SwapOut();
     // Close the pass's GPU segment BEFORE vkCmdEndRendering, and classify it by how many
     // draws it actually held — the bucket is the whole point, because "the crowd" and "the
     // 39 near-empty passes a frame" are different answers to where the device's time is.
@@ -10147,6 +10413,7 @@ void EndRendering()
                   g_gpPassExt, d);
         g_gpPassSeg = -1;
     }
+    sec::ExecutePass();
     vkCmdEndRendering(R->cmd);
     R->rendering = false;
     prec::RangeBreak(prec::kPassEnd);
@@ -22330,6 +22597,7 @@ void VkRenderer_DumpStats()
     // must still be able to say the arm engaged (gotcha 151). Silent when off; the
     // control arm announced itself at init.
     prec::PrintStats(stderr);
+    sec::PrintStats(stderr);
     // Part 72 item 1. Printed HERE as well as on the census's own cadence, so a soak
     // that ends off a 600-frame boundary still lands the number — the same defect the
     // stencil skip counter had for fifteen parts (collected since part 56, printed by

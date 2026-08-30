@@ -226,6 +226,11 @@ void CloseOpenRange(BreakReason r)
         ++g_stats.kicks;
         g_host.kick();
     }
+    // Stage 2's rotation point, after all of this module's own work and outside its
+    // lock. Fires only when a range actually closed — the empty-break early return
+    // above never reaches here.
+    if (g_host.rangeClosed)
+        g_host.rangeClosed(uint8_t(r));
 }
 
 } // namespace
