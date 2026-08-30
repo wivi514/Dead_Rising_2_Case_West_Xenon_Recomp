@@ -183,9 +183,26 @@ the restructured binary under the old binary's label. `cw_crowdroute.sh` now sta
 the binary's sha256 in every log header, so this contamination class is a fact in the
 log rather than an mtime reconstruction. **Rule: no builds while a chain measures.**
 
-Gates owed before 2b closes: title validation + order gate on the restructured
-INLINE path; a null A/B of the restructure against the pre-split binary (the control
-is the old binary run NOW — gotcha 50/51/86); then the same pair for the defer arm.
+**2b verdicts (2026-08-30, ~01:30) — finding 69, STAGE 2b CLOSES:**
+
+* Title gates all green: restructured inline validation identical to control, order
+  gate 0/13,122; defer arm **8.28 M draws deferred / 471,594 ranges / 0 early-outs /
+  0 dropped / 0 new VUIDs**, order gate 0/13,186.
+* **Restructure null HOLDS** (2b binary vs `4f1993c` control, default config, 3+3):
+  −0.0% frame-weighted, mixed sign, decisive band −0.9%.
+* **Defer is a WIN, not a cost**: +6.0% / **+0.64 ms at 6,500-7,000** (dose-response
+  +5.8/+6.0/+6.8% across the heavy bands, GPU medians identical). Hypothesis: range-
+  batched replay keeps the record path's code and state hot where inline recording
+  interleaves it with decode/constants/texture work per draw.
+* **The stack nets free**: sec+defer vs pre-campaign baseline +0.8% frame-weighted,
+  +1.2% at the decisive band (cross-chain, indicative). 2c's workers start from a
+  zero-cost scaffold. Arms stay opt-in until 2c settles the final default.
+
+Additional 2c prerequisite found while reading: the bind batch
+(`g_pendMask/g_pendBuf/g_pendOff` + verify arrays) is more per-context worker state
+alongside `cmd`/`bound`; the bind-run/state censuses and `Count()`'s map are
+pump-only and gate off (or shard) under workers — the counter-thread-safety pass is
+part of the RecordCtx refactor, not an afterthought.
 
 ## 4. Stage 2c — the flip to workers (designed 2026-08-30, not implemented)
 
