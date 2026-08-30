@@ -3142,3 +3142,39 @@ Three accepted soaks per arm, ~90k frames each, banded medians:
   logged; `CW_VK_ORDER_POISON=100` fails it by name. The parallel-record campaign's
   technical prerequisite is met; what remains is the THREAD-BUDGET decision (the
   campaign's workers are the guard pool's), which is the operator's.
+
+## 68. **PARALLEL RECORD STAGE 1: the skeleton is CORRECT AND FREE — after its own A/B refuted the first version** — part 7, 2026-08-29
+
+The campaign's agreed stage 1 (a worker-pool skeleton that partitions frames into
+contiguous draw ranges, dispatches them to the SHARED guard-pool workers, and rebuilds
+the order gate's submitted sequence from the concatenation — execution untouched) is
+in, as `runtime/gpu/parallel_record.{h,cpp}` plus call sites, staged for the first
+export that flows TOWARD Case Zero.
+
+* **Correct, at scale, twice**: heavy-band gate runs on both versions — 99.1M draws /
+  0 failed (v1, `8ebe410`), **103.9M draws / 32,576 frames / 0 failed** (v2,
+  `d37ed23`), peak frame 7,329 draws in 96 ranges, drain never blocked. Five positive
+  controls all scream on cue: draw-transposition poison (11,546/11,546), the new
+  range-transposition poison `CW_VK_PREC_POISON=1` (13,172/13,184 — the remainder are
+  single-range frames it cannot touch), the worker-hash poison `=2` (470,818 mismatches
+  with the gate correctly still passing), and the control arm announces itself.
+* **The v1 null FAILED — the pre-registration did its job.** The first version logged
+  the full draw identity and kicked all three workers per range close in every run:
+  −3.6% / −0.41 ms at the decisive 6,500-7,000 band, every heavy band the same sign,
+  dose-response with draw count. ~60 ns/draw of bookkeeping nobody consumed, and the
+  mechanisms were all boring: notify_all for nanosecond jobs (~67/frame), a mutex in
+  the workers' wake predicate, a static-init guard on the per-draw path (gotcha 453's
+  exact shape, put back on the path it was once taken off), an unconsumed per-draw
+  hash.
+* **The v2 null HOLDS.** Two modes: id mode (gate armed) keeps the full concurrency
+  proof as a diagnostic arm; count mode (every default run) tracks a count — no
+  per-draw hash, no per-range wake (**8 kicks in 13,385 frames** against id mode's
+  ~468,000), lock-free HasWork. A/B (3 accepted alternated runs per arm): decisive
+  band **−0.5% / −0.05 ms**, non-monotone, mixed sign — the pipeline's own definition
+  of noise. A concurrent Case Zero session overlapped the v1 GATE run only (operator
+  flagged it); a correctness gate under scheduler contention is a harder test, not a
+  contaminated one, and the timing arms ran on a clean machine.
+
+The general lesson, added to the campaign notes rather than re-argued each stage:
+**per-range wakes are priced by the job they wake for** — stage 2's jobs are tens of
+microseconds and can afford them; stage 1's nanosecond jobs could not.

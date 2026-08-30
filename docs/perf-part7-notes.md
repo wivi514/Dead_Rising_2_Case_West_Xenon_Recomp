@@ -101,7 +101,20 @@ poison 13,172/13,184 failed; hash poison 470,818 mismatches with the gate correc
 passing; control announces). **Owed: the heavy-band gate rerun and the A/B rerun on
 the revised binary — same pre-registered null.**
 
-*(v2 results land here)*
+**v2 results (2026-08-29, late evening) — STAGE 1 CLOSES.** Finding 68.
+
+* **Gate v2** (`prec7bgate_r1`, revised binary): 32,576 frames, **103.9 M draws,
+  0 failed**, 1.95 M ranges (59.9/frame, peak 95 ranges / 7,242 draws), 1,950,034
+  worker jobs, 0 stolen, drain never blocked, 0 mismatches.
+* **A/B v2** (`prec7bon_r{1,3,5}` vs `prec7boff_r{2,4,6}`, 6/6 accepted, no
+  attrition): **NULL.** Decisive 6,500-7,000 band −0.5% / −0.05 ms (19,696 vs 28,466
+  frames); bands non-monotone and mixed-sign (+0.3% at 7,000-7,500, −0.1% at
+  6,000-6,500), frame-weighted −0.6% — inside the pipeline's noise envelope (the
+  sibling's two NULLS differed by up to 2.9% per band). The v1 signature — consistent
+  sign with a draw-count gradient — is gone.
+
+Stage 1 is therefore **correct and free**, and the campaign proceeds to stage 2 with
+the skeleton on by default.
 
 ## 3. Stage 2 — the flip (not started)
 
