@@ -3,6 +3,15 @@
 // bookkeeping and proof; nothing here touches the renderer, the driver, or guest
 // memory, which is what "zero behaviour change" means and what the stage-1 soak A/B
 // must confirm (prediction: null against CW_VK_NO_PARALLEL_RECORD=1).
+//
+// REVISED ONCE ALREADY, BY ITS OWN A/B. The first version logged the full draw
+// identity and kicked all three workers on every range close in every run, and the
+// pre-registered null FAILED: −3.6% (−0.41 ms) at the 6,500-7,000 band, dose-response
+// with draw count, every heavy band the same way (perf-part7-notes §2). The costs were
+// exactly the boring ones: ~67 notify_all a frame for nanosecond jobs, a mutex in the
+// workers' wake predicate, a static-init guard on the per-draw path, and a per-draw
+// hash nobody consumed with the gate off. Hence the two modes in the header, the
+// empty→non-empty single-worker kick, and the lock-free HasWork.
 
 #include "parallel_record.h"
 
@@ -16,17 +25,22 @@
 
 namespace prec
 {
+
+bool g_on = false; // resolved by Init(); see the header for why not a local static
+
 namespace
 {
 
 Host g_host;
 
-// A contiguous run of draws. `ids` is the same identity sequence the order gate hashes;
-// `workerHash` is the stage-1 job's product. Ranges live in a deque so a worker holding
-// a pointer survives the pump appending more ranges (deque growth never moves elements).
+// A contiguous run of draws. In gate mode `ids` is the identity sequence the order
+// gate rebuilds from; in count mode the range is just `count` draws and `ids` stays
+// empty. Ranges live in a deque so a worker holding a pointer survives the pump
+// appending more ranges (deque growth never moves elements).
 struct Range
 {
     std::vector<uint64_t> ids;
+    uint32_t count = 0;
     uint64_t workerHash = 0;
     uint8_t reason = kFrameSeal; // why the range CLOSED
     bool ranInline = false;      // no worker existed; the pump ran it at dispatch
@@ -38,9 +52,11 @@ std::mutex g_mx;                 // guards g_ranges growth, g_queue, g_outstandi
 std::condition_variable g_drainCv;
 std::deque<Range> g_ranges;      // this frame's closed ranges, in creation order
 std::deque<Range*> g_queue;      // dispatched, unclaimed jobs
+std::atomic<size_t> g_queued{ 0 }; // mirror of g_queue.size() for the lock-free HasWork
 size_t g_outstanding = 0;        // dispatched jobs not yet finished
-std::vector<uint64_t> g_open;    // the range currently being appended to (pump only)
-uint8_t g_openBreakPending = kPassBegin; // reason recorded when the open range closes
+std::vector<uint64_t> g_open;    // gate mode: the open range's ids (pump only)
+uint32_t g_openCount = 0;        // count mode: the open range's draw count (pump only)
+bool g_idsMode = false;          // set by the first OnDraw(id); constant per run
 
 struct Stats
 {
@@ -51,6 +67,7 @@ struct Stats
     uint64_t jobsWorker = 0;
     uint64_t jobsInline = 0;
     uint64_t jobsStolen = 0;
+    uint64_t kicks = 0;          // worker wakes this module asked for
     uint64_t drainBlocked = 0;   // FrameSeals that had to wait on an in-flight job
     uint64_t drainNs = 0;
     uint64_t hashMismatch = 0;   // worker hash != pump recompute — a real defect
@@ -110,10 +127,14 @@ uint64_t FnvOver(const std::vector<uint64_t>& ids)
 
 // The stage-1 job body. Deliberately tiny: what stage 1 proves is the MACHINERY —
 // dispatch, out-of-order completion, the drain — not the work. Stage 2 replaces this
-// with recording the range into a secondary command buffer.
+// with recording the range into a secondary command buffer. In count mode there are no
+// ids; folding the count keeps the job deterministic so the verify still means
+// something.
 void RunJob(Range& r)
 {
-    r.workerHash = FnvOver(r.ids);
+    r.workerHash = r.ids.empty()
+                       ? (0xCBF29CE484222325ull ^ r.count) * 0x100000001B3ull
+                       : FnvOver(r.ids);
     if (PoisonMode() == 2)
         r.workerHash ^= 0x9E3779B97F4A7C15ull;
 }
@@ -144,6 +165,7 @@ bool RunOne(bool stolen)
             return false;
         r = g_queue.front();
         g_queue.pop_front();
+        g_queued.store(g_queue.size(), std::memory_order_release);
     }
     RunJob(*r);
     r->ranStolen = stolen;
@@ -152,32 +174,44 @@ bool RunOne(bool stolen)
 }
 
 // Close the open range (if it holds anything) into g_ranges and hand it to the pool.
-// The kick happens OUTSIDE this module's lock: the workers' wait predicate calls
-// HasWork() while holding the POOL's mutex, so kicking while holding ours would be the
-// classic two-lock inversion.
+//
+// THE WAKE POLICY IS THE FIRST A/B's LESSON. Gate mode kicks ONE worker, and only on
+// the queue's empty→non-empty transition (a draining worker empties the whole queue
+// before sleeping, so a push onto a non-empty queue is already spoken for). Count mode
+// — every default run — kicks nobody here at all: the jobs are nanoseconds, the only
+// consumer is the frame boundary, and FrameSeal's single kick plus the steal-back
+// finishes them there. The kick happens OUTSIDE this module's lock: the workers' wait
+// predicate calls HasWork() while holding the POOL's mutex, so kicking while holding
+// ours would be the classic two-lock inversion.
 void CloseOpenRange(BreakReason r)
 {
     ++g_stats.breaks[r];
-    if (g_open.empty())
+    if (g_open.empty() && !g_openCount)
         return;
     Range* range = nullptr;
     bool inlineRun = false;
+    bool kick = false;
     {
         std::lock_guard<std::mutex> lk(g_mx);
         g_ranges.emplace_back();
         range = &g_ranges.back();
         range->ids.swap(g_open);
+        range->count = g_openCount ? g_openCount : uint32_t(range->ids.size());
         range->reason = uint8_t(r);
         ++g_stats.ranges;
         if (g_host.alive && g_host.alive())
         {
+            kick = g_idsMode && g_queue.empty();
             g_queue.push_back(range);
+            g_queued.store(g_queue.size(), std::memory_order_release);
             ++g_outstanding;
         }
         else
             inlineRun = true;
     }
-    g_open.reserve(RangeTarget());
+    g_openCount = 0;
+    if (g_idsMode)
+        g_open.reserve(RangeTarget());
     if (inlineRun)
     {
         // No worker thread exists yet (the guard pool starts on its first dispatch).
@@ -187,8 +221,11 @@ void CloseOpenRange(BreakReason r)
         range->done = true;
         ++g_stats.jobsInline;
     }
-    else if (g_host.kick)
+    else if (kick && g_host.kick)
+    {
+        ++g_stats.kicks;
         g_host.kick();
+    }
 }
 
 } // namespace
@@ -196,6 +233,7 @@ void CloseOpenRange(BreakReason r)
 void Init(const Host& h)
 {
     g_host = h;
+    g_on = On();
 }
 
 bool On()
@@ -218,15 +256,16 @@ bool On()
 
 void RangeBreak(BreakReason r)
 {
-    if (!On())
+    if (!g_on)
         return;
     CloseOpenRange(r);
 }
 
 void OnDraw(uint64_t id)
 {
-    if (!On())
+    if (!g_on)
         return;
+    g_idsMode = true;
     g_open.push_back(id);
     ++g_stats.draws;
     if (g_open.size() >= RangeTarget())
@@ -240,14 +279,36 @@ void OnDraw(uint64_t id)
     }
 }
 
+void OnDrawCount()
+{
+    if (!g_on)
+        return;
+    ++g_openCount;
+    ++g_stats.draws;
+    if (g_openCount >= RangeTarget())
+    {
+        if (g_ranges.size() < kMaxRangesPerFrame)
+            CloseOpenRange(kSizeCap);
+        else if (g_openCount == RangeTarget())
+            ++g_stats.rangeOverflow;
+    }
+}
+
 void FrameSeal()
 {
-    if (!On())
+    if (!g_on)
         return;
     CloseOpenRange(kFrameSeal);
+    // Count mode never kicked mid-frame; one wake here lets a worker share the drain
+    // while the pump steals from the other end.
+    if (!g_idsMode && g_queued.load(std::memory_order_acquire) && g_host.kick)
+    {
+        ++g_stats.kicks;
+        g_host.kick();
+    }
     // Steal-back: any range the workers have not CLAIMED yet is run here, so the wait
     // below is bounded by one in-flight job rather than by a worker's whole guard
-    // dispatch. This is the same design decision GuardPoolDrain documents — a stall the
+    // chew. This is the same design decision GuardPoolDrain documents — a stall the
     // pump pays must be visible — applied before the stall instead of after.
     while (RunOne(/*stolen=*/true))
     {
@@ -267,7 +328,7 @@ void FrameSeal()
 
 bool BuildSubmitted(std::vector<uint64_t>& out)
 {
-    if (!On() || g_ranges.empty())
+    if (!g_on || !g_idsMode || g_ranges.empty())
         return false;
     // Post-drain, so every range is done and no worker holds a pointer; the pump is the
     // only thread here.
@@ -303,14 +364,14 @@ bool BuildSubmitted(std::vector<uint64_t>& out)
 
 void FrameReset()
 {
-    if (!On())
+    if (!g_on)
         return;
     std::lock_guard<std::mutex> lk(g_mx);
     if (g_ranges.size() > g_stats.maxRangesFrame)
         g_stats.maxRangesFrame = g_ranges.size();
     uint64_t d = 0;
     for (const Range& r : g_ranges)
-        d += r.ids.size();
+        d += r.count;
     if (d > g_stats.maxDrawsFrame)
         g_stats.maxDrawsFrame = d;
     if (!g_ranges.empty())
@@ -318,35 +379,37 @@ void FrameReset()
     g_ranges.clear();
     g_queue.clear(); // provably empty post-drain; cleared anyway so a defect cannot
                      // leave a dangling pointer to a range the line above just freed
+    g_queued.store(0, std::memory_order_release);
     g_outstanding = 0;
 }
 
 bool HasWork()
 {
-    if (!On())
-        return false;
-    std::lock_guard<std::mutex> lk(g_mx);
-    return !g_queue.empty();
+    // One atomic load, no lock, no init guard: this runs in the workers' wake
+    // predicate under the POOL's mutex. When the module is off the counter is
+    // simply never non-zero.
+    return g_queued.load(std::memory_order_acquire) != 0;
 }
 
 bool RunOneJob()
 {
-    if (!On())
+    if (g_queued.load(std::memory_order_acquire) == 0)
         return false;
     return RunOne(/*stolen=*/false);
 }
 
 void PrintStats(FILE* f)
 {
-    if (!On() || !g_stats.frames)
+    if (!g_on || !g_stats.frames)
         return;
     const Stats& s = g_stats;
     fprintf(f,
-            "[prec]   stage 1: %llu frames, %llu draws in %llu ranges "
+            "[prec]   stage 1 (%s mode): %llu frames, %llu draws in %llu ranges "
             "(%.1f ranges/frame, %.1f draws/range, peak %llu ranges / %llu draws) | "
             "breaks pass %llu/%llu size %llu seal %llu | jobs: worker %llu inline "
-            "%llu stolen %llu | drain blocked %llu (%.2f ms total) | "
+            "%llu stolen %llu, %llu kicks | drain blocked %llu (%.2f ms total) | "
             "**%llu hash mismatches**%s%s\n",
+            g_idsMode ? "id" : "count",
             (unsigned long long)s.frames, (unsigned long long)s.draws,
             (unsigned long long)s.ranges,
             double(s.ranges) / double(s.frames),
@@ -357,7 +420,8 @@ void PrintStats(FILE* f)
             (unsigned long long)s.breaks[kSizeCap],
             (unsigned long long)s.breaks[kFrameSeal],
             (unsigned long long)s.jobsWorker, (unsigned long long)s.jobsInline,
-            (unsigned long long)s.jobsStolen, (unsigned long long)s.drainBlocked,
+            (unsigned long long)s.jobsStolen, (unsigned long long)s.kicks,
+            (unsigned long long)s.drainBlocked,
             double(s.drainNs) / 1e6, (unsigned long long)s.hashMismatch,
             s.rangeOverflow ? "  (RANGE CAP HIT)" : "",
             PoisonMode() ? "  (POISONED — a clean line here means a check is BLIND)"

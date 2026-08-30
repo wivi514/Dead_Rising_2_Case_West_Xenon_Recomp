@@ -1848,9 +1848,10 @@ void GuardWorker()
             std::unique_lock<std::mutex> lk(gp.mx);
             // The predicate may also fire for a parallel-record range job (part 7: the
             // campaign SHARES this pool rather than confiscating it — the operator's
-            // staging decision). prec::HasWork takes prec's own lock while this thread
-            // holds gp.mx, so the reverse order must never happen: prec kicks this pool
-            // only from OUTSIDE its lock, which is stated at its call site too.
+            // staging decision). prec::HasWork is one atomic load — it MUST stay
+            // lock-free, because this predicate runs on every worker wake while gp.mx
+            // is held, and the first stage-1 A/B priced a mutex here as part of a real
+            // regression. prec kicks this pool only from outside its own lock.
             gp.wake.wait(lk, [&] { return gp.generation != seen || prec::HasWork(); });
             seen = gp.generation;
         }
@@ -2062,8 +2063,12 @@ void PrecInitOnce()
     h.kick = [] {
         if (g_gp && g_gp->started)
         {
+            // notify_ONE: a range job needs one worker, and the first A/B priced the
+            // notify_all version — three workers waking for a nanosecond job, ~67
+            // times a frame, was a measurable slice of the 0.4 ms regression that
+            // failed the stage-1 null (perf-part7-notes §2).
             std::lock_guard<std::mutex> lk(g_gp->mx);
-            g_gp->wake.notify_all();
+            g_gp->wake.notify_one();
         }
     };
     prec::Init(h);
@@ -17421,8 +17426,12 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     // hash that could not tell them apart would pass while the picture was wrong.
     // The parallel-record skeleton logs the SAME identity (part 7): its ranges must
     // concatenate back to exactly this sequence, and only one definition of "this draw"
-    // can make that a statement rather than a tautology.
-    if (OrderGateArmed() || prec::On())
+    // can make that a statement rather than a tautology. With the gate off — every
+    // default run — the skeleton takes a COUNT instead: the first A/B (perf-part7-notes
+    // §2) measured the always-on identity hash at 0.4 ms/frame at the crowd, charged to
+    // runs in which nothing consumed it. `prec::g_on` is a plain global load, not a
+    // static-init guard (gotcha 453).
+    if (OrderGateArmed())
     {
         uint64_t id = 0xCBF29CE484222325ull;
         auto mixq = [](uint64_t h, uint64_t v) {
@@ -17435,13 +17444,12 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
         id = mixq(id, (uint64_t(uint32_t(indxOffset)) << 32) | uint32_t(draw.indexVa));
         id = mixq(id, vsBind.hash);
         id = mixq(id, psBind.hash);
-        if (OrderGateArmed())
-        {
-            R->orderLog.push_back(id);
-            ++R->orderDrawsLogged;
-        }
+        R->orderLog.push_back(id);
+        ++R->orderDrawsLogged;
         prec::OnDraw(id);
     }
+    else if (prec::g_on)
+        prec::OnDrawCount();
     ++R->drawsThisFrame;
     ++R->drawsThisPass;
     // Unconditional, and it costs exactly what the line above it costs. Gating it on the

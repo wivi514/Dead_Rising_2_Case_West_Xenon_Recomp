@@ -36,10 +36,12 @@
 namespace prec
 {
 
-// The renderer's side of the shared-pool seam. `kick` wakes the guard-pool workers
+// The renderer's side of the shared-pool seam. `kick` wakes ONE guard-pool worker
 // (they sleep on the pool's own condition variable, which this module must not know
-// about); `alive` says whether any worker thread exists yet — before the first guard
-// dispatch none do, and this module runs its jobs inline on the pump instead.
+// about — and one range job needs one worker, where the pool's own dispatch of a whole
+// frame's guard list rightly wakes them all); `alive` says whether any worker thread
+// exists yet — before the first guard dispatch none do, and this module runs its jobs
+// inline on the pump instead.
 struct Host
 {
     void (*kick)() = nullptr;
@@ -52,6 +54,12 @@ void Init(const Host& h);
 // that will price stage 2). Announces itself either way — an arm that is silent is an
 // arm nobody can tell was on (gotcha 151).
 bool On();
+
+// The hot-path read of the same answer, resolved once in Init(). A function-local
+// static here would put an init-guard load on the per-draw path — the exact shape
+// part 76 had to take back off it (gotcha 453) — and Init() runs from BeginFrame,
+// which every frame's first draw passes through before any call site below.
+extern bool g_on;
 
 // Why a range closed. `kSizeCap` is the balance knob (CW_VK_PREC_RANGE, default 128
 // draws); the pass reasons exist because a secondary command buffer cannot span a
@@ -67,10 +75,22 @@ enum BreakReason : uint8_t
 
 void RangeBreak(BreakReason r);
 
-// One call per accepted draw, with the SAME identity the order gate hashes — pipeline,
-// primitive, index range, shader pair. The identity is computed by the caller (DoDraw)
-// because only it has the draw in hand.
+// One call per accepted draw. TWO MODES, chosen by the caller per draw and constant
+// per run, because the first A/B refuted the "always log the identity" version — it
+// cost 0.4 ms/frame at the crowd before distributing any work (perf-part7-notes §2):
+//
+// - OnDraw(id): the ORDER-GATE arm. The same identity the gate hashes — pipeline,
+//   primitive, index range, shader pair — computed by the caller (only DoDraw has the
+//   draw in hand). Ranges carry the full id sequence and every range close kicks a
+//   worker, so the gate adjudicates the complete concurrent machinery.
+// - OnDrawCount(): the DEFAULT arm. One increment; ranges carry a count, jobs fold the
+//   count, no per-range wake (one kick at FrameSeal). The plumbing stays exercised
+//   every frame at a cost the soak cannot see. Stage 2 note: real range jobs are tens
+//   of microseconds, so per-range wakes stop being 67 futex calls a frame exactly when
+//   the jobs become worth waking for — the count mode is stage 1's shape, not the
+//   campaign's.
 void OnDraw(uint64_t id);
+void OnDrawCount();
 
 // Close and dispatch the frame's final range, then drain: steal any un-started range
 // job back onto the pump (a worker mid-guard-chew must not stall the frame boundary),
@@ -90,9 +110,10 @@ bool BuildSubmitted(std::vector<uint64_t>& out);
 // Forget the frame. Called after the order gate has consumed the ranges.
 void FrameReset();
 
-// The shared pool's side. HasWork is safe to call from a worker's wait predicate
-// (it takes this module's own lock, never the pool's); RunOneJob claims and runs one
-// range job, returning false when the queue is empty.
+// The shared pool's side. HasWork is one atomic load — it runs inside every worker
+// wake's predicate while the POOL's mutex is held, so it must take no lock and touch
+// no init guard. RunOneJob claims and runs one range job, returning false when the
+// queue is empty.
 bool HasWork();
 bool RunOneJob();
 
