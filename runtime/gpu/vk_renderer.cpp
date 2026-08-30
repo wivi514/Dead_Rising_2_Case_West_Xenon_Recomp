@@ -10023,14 +10023,19 @@ namespace sec
 
 bool On()
 {
+    // DEFAULT ON since part 7 closed (finding 71): secondaries + deferred replay
+    // measured +0.35 ms at the crowd against the old defaults, all bands positive,
+    // correctness proven at ~450M draws of gates and confirmed in play by the
+    // operator on 2026-08-30. CW_VK_SECONDARIES=1 is accepted as a no-op so the
+    // part-7 harness recipes keep working. Note CW_VK_GPU_PASSES needs the control
+    // arm (a primary may not timestamp inside a CONTENTS_SECONDARY instance).
     static const bool on = [] {
-        const bool o = EnvOn("CW_VK_SECONDARIES");
-        if (o)
-            fprintf(stderr,
-                    "[sec] CW_VK_SECONDARIES=1 — pass contents go through per-range "
-                    "SECONDARY command buffers (recorded serially on the pump; stage "
-                    "2a of the parallel-record campaign)\n");
-        return o;
+        const bool off = EnvOn("CW_VK_NO_SECONDARIES");
+        if (off)
+            fprintf(stderr, "[sec] CW_VK_NO_SECONDARIES=1 — per-range secondary "
+                            "command buffers are OFF (the pre-part-7 recorder; "
+                            "control arm)\n");
+        return !off;
     }();
     return on;
 }
@@ -14666,14 +14671,16 @@ namespace defer
 
 bool On()
 {
+    // DEFAULT ON since part 7 closed (finding 71) — the range-batched replay is the
+    // larger half of the stack's +0.35 ms. CW_VK_DEFER_RECORD=1 is accepted as a
+    // no-op for the part-7 harness recipes. The walk-time diagnostic arms inside the
+    // record core (rect trace, const-race) need the control arm to fire.
     static const bool on = [] {
-        const bool o = EnvOn("CW_VK_DEFER_RECORD");
-        if (o)
-            fprintf(stderr,
-                    "[defer] CW_VK_DEFER_RECORD=1 — draw recording is DEFERRED to the "
-                    "range boundary (stage 2b: tickets, serial replay; walk-time "
-                    "diagnostic arms inside the core are OFF in this mode)\n");
-        return o;
+        const bool off = EnvOn("CW_VK_NO_DEFER_RECORD");
+        if (off)
+            fprintf(stderr, "[defer] CW_VK_NO_DEFER_RECORD=1 — recording is INLINE "
+                            "at the walk (the pre-part-7 shape; control arm)\n");
+        return !off;
     }();
     return on;
 }
@@ -14773,11 +14780,10 @@ bool On()
     static const bool on = [] {
         if (!EnvOn("CW_VK_PREC_EXEC"))
             return false;
-        if (!EnvOn("CW_VK_SECONDARIES") || !EnvOn("CW_VK_DEFER_RECORD"))
+        if (!sec::On() || !defer::On())
         {
-            fprintf(stderr, "[rexec] CW_VK_PREC_EXEC=1 REFUSED: it requires "
-                            "CW_VK_SECONDARIES=1 and CW_VK_DEFER_RECORD=1 armed "
-                            "alongside it\n");
+            fprintf(stderr, "[rexec] CW_VK_PREC_EXEC=1 REFUSED: it cannot run with "
+                            "CW_VK_NO_SECONDARIES or CW_VK_NO_DEFER_RECORD set\n");
             return false;
         }
         if (Env("CW_VK_PROFILE"))
