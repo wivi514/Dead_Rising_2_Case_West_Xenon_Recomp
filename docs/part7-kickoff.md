@@ -56,7 +56,30 @@ as part of the measurement configuration.
 
 ---
 
-## 2. THE DECISION PART 7 OPENS WITH — the operator's, by the sibling's own governance
+## 2. THE CAMPAIGN IS GO — the operator's call, closing part 6
+
+**Operator, 2026-08-29:** *"Well perfect — a huge gain for both games."* The maximal
+parallel-record campaign is part 7's work. Two facts that frame it:
+
+* **Case Zero NEVER BUILT IT** (verified in their tree: zero secondary command
+  buffers, only the guard pool takes threads, and their own commit says the low-risk
+  design is DEAD). Nothing to import; if it lands here, the export flows the OTHER
+  way for the first time — stage it so the eventual sibling import is a module plus
+  call sites, not a hand-merge (their own three-way-merge lesson, in reverse).
+* **The staging, agreed:** (1) a worker-pool skeleton that records ranges but still
+  EXECUTES SERIALLY — proving re-entrancy under the order gate with zero behaviour
+  change; (2) flip execution to secondaries behind an arm, `CW_VK_NO_PARALLEL_RECORD=1`
+  as the control; measure every stage on the soak pipeline (3 accepted runs per arm).
+  Workers: SHARE the guard pool's three (each ~23% busy at the crowd) rather than
+  confiscate — and measure that trade, not assume it.
+
+The design hazards, named by the sibling and adopted here: workers own CONTIGUOUS
+draw ranges concatenated in order; each range re-establishes full state; UploadStream
+must be re-entrant against the shared stream store; a per-worker arena must not
+change which buffer a stream lands in (it would defeat the bind cache). The order
+gate adjudicates every frame and is already proven both ways.
+
+### The original decision framing (kept for the record)
 
 **The maximal parallel-record campaign** is the one large CPU item left anywhere
 (sibling §6eb §3c; local numbers below). Its technical prerequisite is MET: the order
