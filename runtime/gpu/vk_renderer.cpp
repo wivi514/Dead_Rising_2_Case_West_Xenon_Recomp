@@ -1,5 +1,6 @@
 #include "vk_renderer.h"
 
+#include "parallel_record.h"
 #include "pm4.h"
 #include "pump_stats.h"
 #include "drawid_ps_spv.h"
@@ -1845,8 +1846,19 @@ void GuardWorker()
     {
         {
             std::unique_lock<std::mutex> lk(gp.mx);
-            gp.wake.wait(lk, [&] { return gp.generation != seen; });
+            // The predicate may also fire for a parallel-record range job (part 7: the
+            // campaign SHARES this pool rather than confiscating it — the operator's
+            // staging decision). prec::HasWork takes prec's own lock while this thread
+            // holds gp.mx, so the reverse order must never happen: prec kicks this pool
+            // only from OUTSIDE its lock, which is stated at its call site too.
+            gp.wake.wait(lk, [&] { return gp.generation != seen || prec::HasWork(); });
             seen = gp.generation;
+        }
+        // Range jobs first: they are the latency-sensitive kind (the pump drains them at
+        // the frame boundary), where a guard job missed merely falls back to an inline
+        // hash next frame.
+        while (prec::RunOneJob())
+        {
         }
         for (;;)
         {
@@ -2027,6 +2039,34 @@ const GuardOut* GuardPoolTake(uint32_t slot, uint64_t stamp, uint64_t frame,
     }
     ++g_gpStats.served;
     return &o;
+}
+
+// The parallel-record module's side of the shared pool (part 7 stage 1). The hooks are
+// function pointers so parallel_record.cpp links against nothing in this file — the
+// module is staged for export to the sibling, which never built this item. Both hooks
+// run on the pump thread only (prec dispatches from the walk, and the walk is serial):
+// `started` is written by GuardPoolDispatch on the same thread, so the unlocked reads
+// here cannot race. The kick takes gp.mx before notifying because the workers' wait
+// predicate reads prec's queue state under gp.mx — notifying without the lock could
+// slip between a worker's predicate check and its wait, and the job would sleep until
+// the next guard dispatch. prec itself never calls this while holding its own lock
+// (the lock-order note in GuardWorker).
+void PrecInitOnce()
+{
+    static bool done = false;
+    if (done)
+        return;
+    done = true;
+    prec::Host h;
+    h.alive = [] { return g_gp != nullptr && g_gp->started && g_gp->workers > 0; };
+    h.kick = [] {
+        if (g_gp && g_gp->started)
+        {
+            std::lock_guard<std::mutex> lk(g_gp->mx);
+            g_gp->wake.notify_all();
+        }
+    };
+    prec::Init(h);
 }
 
 // ===================================================================================
@@ -10007,8 +10047,13 @@ void BeginFrame()
     R->probeBudgetLeft = Renderer::kGuardProbeBudget;
     // THE ORDER GATE, checked at the frame boundary and BEFORE the log is cleared. It runs
     // on the finished frame's draws, which is the only point where "submission order" is a
-    // complete statement.
+    // complete statement. The parallel-record skeleton seals first (closing its last range
+    // and draining the shared pool) so the gate can rebuild the submitted order from the
+    // concatenated ranges, and resets after the gate has consumed them.
+    PrecInitOnce();
+    prec::FrameSeal();
     OrderGateCheck();
+    prec::FrameReset();
     R->orderLog.clear();
     R->lastFrameDraws = R->drawsThisFrame;
     R->drawsThisFrame = 0;
@@ -10065,6 +10110,10 @@ void BeginRendering()
     ri.pStencilAttachment = &depthAtt;
     vkCmdBeginRendering(R->cmd, &ri);
     R->rendering = true;
+    // A parallel-record range cannot span a rendering-instance boundary (a secondary
+    // command buffer inherits exactly one), so the skeleton's partition breaks here —
+    // stage 2 inherits these break points unchanged.
+    prec::RangeBreak(prec::kPassBegin);
     g_cycPendBeginNs += CycNow() - cycT0;
     // The GPU-side segment for this pass opens AFTER the barriers, so a layout transition
     // the device performs is charged to whatever preceded it rather than to the draws.
@@ -10095,6 +10144,7 @@ void EndRendering()
     }
     vkCmdEndRendering(R->cmd);
     R->rendering = false;
+    prec::RangeBreak(prec::kPassEnd);
 }
 
 // Submit whatever has been recorded into this frame's slot, and DO NOT wait for it
@@ -13354,10 +13404,16 @@ void OrderGateCheck()
     for (uint64_t v : R->orderLog)
         want = mixq(want, v);
 
-    // THE SUBMITTED ORDER. Identical to the log today; a parallel path will build this
-    // from its secondaries instead, and nothing else here has to change.
+    // THE SUBMITTED ORDER. With the part-7 skeleton on, this is REBUILT from the
+    // parallel-record ranges concatenated in creation order — the same reconstruction a
+    // parallel submitter will perform from its secondaries — so a partition defect (a
+    // dropped draw, a split that reordered, ranges concatenated out of order) fails the
+    // gate even though execution is still serial. Without the skeleton it is a copy of
+    // the log, and the gate is pure ceremony without its poison arm either way.
     static std::vector<uint64_t> submitted;
-    submitted = R->orderLog;
+    submitted.clear();
+    if (!prec::BuildSubmitted(submitted))
+        submitted = R->orderLog;
     static const long poison = [] {
         const char* e = Env("CW_VK_ORDER_POISON");
         const long n = e ? atol(e) : -1;
@@ -17363,7 +17419,10 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     // the shaders: two adjacent draws sharing a pipeline and differing only in their index
     // range are exactly the pair a parallel recorder is most likely to transpose, and a
     // hash that could not tell them apart would pass while the picture was wrong.
-    if (OrderGateArmed())
+    // The parallel-record skeleton logs the SAME identity (part 7): its ranges must
+    // concatenate back to exactly this sequence, and only one definition of "this draw"
+    // can make that a statement rather than a tautology.
+    if (OrderGateArmed() || prec::On())
     {
         uint64_t id = 0xCBF29CE484222325ull;
         auto mixq = [](uint64_t h, uint64_t v) {
@@ -17376,8 +17435,12 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
         id = mixq(id, (uint64_t(uint32_t(indxOffset)) << 32) | uint32_t(draw.indexVa));
         id = mixq(id, vsBind.hash);
         id = mixq(id, psBind.hash);
-        R->orderLog.push_back(id);
-        ++R->orderDrawsLogged;
+        if (OrderGateArmed())
+        {
+            R->orderLog.push_back(id);
+            ++R->orderDrawsLogged;
+        }
+        prec::OnDraw(id);
     }
     ++R->drawsThisFrame;
     ++R->drawsThisPass;
@@ -22254,6 +22317,11 @@ void VkRenderer_DumpStats()
                 Env("CW_VK_ORDER_POISON")
                     ? "  (POISONED — a zero here means the gate is BLIND)"
                     : "  (serial recording: zero is the only correct result)");
+    // The parallel-record skeleton's run totals (part 7 stage 1), printed on every dump
+    // for the same reason as the gate's verdict above — a soak without CW_VK_PROFILE
+    // must still be able to say the arm engaged (gotcha 151). Silent when off; the
+    // control arm announced itself at init.
+    prec::PrintStats(stderr);
     // Part 72 item 1. Printed HERE as well as on the census's own cadence, so a soak
     // that ends off a 600-frame boundary still lands the number — the same defect the
     // stencil skip counter had for fifteen parts (collected since part 56, printed by

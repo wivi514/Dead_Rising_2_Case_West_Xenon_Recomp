@@ -175,6 +175,7 @@ add_executable(cw_runtime
     kernel/xex_imports.cpp
     gpu/vd.cpp
     gpu/pm4.cpp
+    gpu/parallel_record.cpp          # part 7: the parallel-record campaign's module seam
     gpu/vk_renderer.cpp              # phase 5; inert unless CW_VKDRAW=1
     # gpu/d3d_hooks.cpp and gpu/d3d_draw.cpp: same reason, also in port-pending/. The
     # D3D arm was always inert without CW_D3D_DRAW=1, so the stub's "not enabled" is the
