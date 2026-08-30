@@ -204,7 +204,21 @@ alongside `cmd`/`bound`; the bind-run/state censuses and `Count()`'s map are
 pump-only and gate off (or shard) under workers — the counter-thread-safety pass is
 part of the RecordCtx refactor, not an afterthought.
 
-## 4. Stage 2c — the flip to workers (designed 2026-08-30, not implemented)
+## 3c. Stage 2b.5 — streams resolve at capture (2026-08-30, ~03:30)
+
+The vertex/index uploads, rect-synth, index expansion and every stream-reading census
+moved to the CAPTURE side of the ticket; the ticket carries resolved (buffer, offset)
+pairs and the resolved draw path; `RecordDrawCore` shrank to state cache + binds +
+draw — a body whose only shared-mutable touches are four counters (made relaxed
+atomics). **This dissolved the UploadStream-re-entrancy hazard** — the sibling's
+hardest-named — by moving the work instead of locking it. RecordCtx null banked first
+(−0.7% frame-weighted, mixed sign, no dose-response = noise); battery green
+(validation clean both arms, order gate 0/21,428 and 0/21,455, 14.5 M draws deferred /
+0 dropped). Two script near-misses during the surgery (a first-occurrence `.index`
+anchor and an unasserted slice) were both caught before any build — every slice now
+asserts its order and every pattern its presence.
+
+## 4. Stage 2c — THE FLIP (implemented 2026-08-30, ~04:00; verdict pending)
 
 What stages 1-2b already retired from the sibling's hazard list: the partition and its
 order proof (stage 1), the secondaries and per-range state re-establishment (2a — the
@@ -239,3 +253,19 @@ remains, with the design settled tonight:
 * Numbers to beat, from this part's own ledger: 2a overhead ~0.6 ms already paid;
   worker ceiling ~2.3 ms at 3 workers; **net ~1.7 ms is the honest target**, and the
   guard-pool share trade (each worker ~23% busy on prehash) is measured alongside.
+
+**Implemented as designed** behind `CW_VK_PREC_EXEC=1` (requires sec+defer, refused
+loudly otherwise; also refused under CW_VK_PROFILE — the phase sinks are not
+thread-safe). Workers begin secondaries from their own per-slot pools, record ranges
+through the minimal core against job-local contexts, and park buffers for the pass
+drain (steal → wait → repair → merge skips); the pump reserves pass-list slots at
+range close so execution order is creation order regardless of completion order.
+
+Title battery: refusals announce; validation identical to control on the full worker
+path; order gate 0/21,460 over 14.5 M draws; 0 failed draws / 0 repaired ranges /
+0 dropped / no null slots. Title share is steal-heavy (17-draw ranges close
+microseconds before their pass ends) — the crowd's 61-draw ranges are where workers
+get room. **The heavy-band gate + workers-vs-serial A/B are the campaign's decisive
+measurement** — running as this is written.
+
+*(2c verdicts land here)*
