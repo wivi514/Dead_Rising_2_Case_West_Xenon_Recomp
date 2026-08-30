@@ -1838,9 +1838,21 @@ void GuardRunJob(const GuardJob& j, GuardOut& o)
     o.done.store(1, std::memory_order_release);
 }
 
-void GuardWorker()
+// Which record-execution worker this thread is (part 7 stage 2c): guard workers get
+// 0..n-1, the pump uses slot n when it steals. -1 = a thread that must never record.
+thread_local int g_recWorkerId = -1;
+
+// Forward decls for the shared-pool coupling (defined with the rexec machinery below).
+namespace rexec
+{
+bool HasWork();
+bool RunOneJob();
+}
+
+void GuardWorker(unsigned id)
 {
     GuardPool& gp = *g_gp;
+    g_recWorkerId = int(id);
     uint64_t seen = 0;
     for (;;)
     {
@@ -1852,13 +1864,20 @@ void GuardWorker()
             // lock-free, because this predicate runs on every worker wake while gp.mx
             // is held, and the first stage-1 A/B priced a mutex here as part of a real
             // regression. prec kicks this pool only from outside its own lock.
-            gp.wake.wait(lk, [&] { return gp.generation != seen || prec::HasWork(); });
+            gp.wake.wait(lk, [&] {
+                return gp.generation != seen || prec::HasWork() || rexec::HasWork();
+            });
             seen = gp.generation;
         }
         // Range jobs first: they are the latency-sensitive kind (the pump drains them at
         // the frame boundary), where a guard job missed merely falls back to an inline
         // hash next frame.
         while (prec::RunOneJob())
+        {
+        }
+        // Range-record jobs (stage 2c) — the campaign's actual work, latency-sensitive
+        // like prec's (the pump drains at pass end).
+        while (rexec::RunOneJob())
         {
         }
         for (;;)
@@ -1977,7 +1996,7 @@ void GuardPoolDispatch()
     {
         gp.started = true;
         for (unsigned i = 0; i < n; ++i)
-            std::thread(GuardWorker).detach();
+            std::thread(GuardWorker, i).detach();
     }
 }
 
@@ -2061,6 +2080,17 @@ void OnRangeClosed(uint8_t reason);
 namespace defer
 {
 void OnRangeClosed(uint8_t reason);
+}
+
+// Wake ONE pool worker — the shape both prec and rexec dispatch with (their jobs need
+// one worker each; the pool's own guard dispatch is the only notify_all).
+void GuardPoolKickOne()
+{
+    if (g_gp && g_gp->started)
+    {
+        std::lock_guard<std::mutex> lk(g_gp->mx);
+        g_gp->wake.notify_one();
+    }
 }
 
 void PrecInitOnce()
@@ -2853,7 +2883,8 @@ uint64_t g_flatCacheLookups = 0;
 uint64_t g_polyOffsetDraws = 0;
 // Draws that enabled the STENCIL TEST. ~18% of a gameplay frame on the operator's own
 // captures, and this renderer honoured none of them until part 56.
-uint64_t g_stencilDraws = 0;
+std::atomic<uint64_t> g_stencilDraws{ 0 };   // atomic: bumped inside the record core,
+                                             // which stage 2c runs on worker threads
 bool g_constMemoOff = false;
 bool g_psConstScaleActive = false;   // CW_VK_PS_CONST_SCALE mutates in place; see its use
 bool g_constMemoVerify = false;
@@ -9980,6 +10011,13 @@ bool OrderGateArmed();
 // failure falls back per pass (the flag is only set when a secondary is already open)
 // or per rotation (the range just keeps growing in the current secondary) — both
 // counted, neither able to produce an illegal command buffer.
+namespace rexec
+{
+bool On();          // all defined with the machinery, below DrawTicket
+void FrameReset();
+void PassDrain();
+}
+
 namespace sec
 {
 
@@ -10022,9 +10060,8 @@ struct Stats
 // One secondary from the current slot's pool, begun with the inheritance the pipelines
 // were created against (one colour attachment of R->color.format, depth+stencil both
 // R->depth.format — the exact mirror of GetPipeline's VkPipelineRenderingCreateInfo).
-VkCommandBuffer BeginSecondary()
+VkCommandBuffer BeginSecondaryFrom(SlotPool& sp)
 {
-    SlotPool& sp = g_slot[R->frameSlot];
     if (sp.pool == VK_NULL_HANDLE)
     {
         VkCommandPoolCreateInfo pci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
@@ -10072,6 +10109,11 @@ VkCommandBuffer BeginSecondary()
     return cb;
 }
 
+VkCommandBuffer BeginSecondary()
+{
+    return BeginSecondaryFrom(g_slot[R->frameSlot]);
+}
+
 // Called from BeginFrame for the incoming slot — the swap already waited on this
 // slot's fence, so its secondaries are provably not being read (same argument as the
 // vkResetCommandBuffer beside it).
@@ -10092,6 +10134,17 @@ bool PassPrepare()
 {
     if (!On())
         return false;
+    // Stage 2c: the WORKERS begin their own secondaries from their own pools (two
+    // threads may never touch one pool at once, and the pump opening the next range's
+    // buffer while a worker records the previous one would be exactly that). The pass
+    // list holds a RESERVED slot per range, filled at the pass drain.
+    if (rexec::On())
+    {
+        g_passList.clear();
+        g_passList.push_back(VK_NULL_HANDLE);
+        ++g_stats.passes;
+        return true;
+    }
     VkCommandBuffer cb = BeginSecondary();
     if (cb == VK_NULL_HANDLE)
     {
@@ -10105,12 +10158,26 @@ bool PassPrepare()
     return true;
 }
 
+uint32_t CurrentSlot()
+{
+    return uint32_t(g_passList.size() - 1);
+}
+
+void SetPassSlot(uint32_t i, VkCommandBuffer cb)
+{
+    if (i < g_passList.size())
+        g_passList[i] = cb;
+}
+
 // After the primary's vkCmdBeginRendering: point the draw path at the secondary. The
 // fresh BoundState is the "each range re-establishes full state" requirement made
 // structural — the existing bind-elision code sees an empty cache and re-issues
 // everything, so a range can never depend on a previous range's binds.
 void SwapIn()
 {
+    if (rexec::On())
+        return;   // nothing records inline in a pass whose ranges the workers own
+
     g_primary = R->cmd;
     R->cmd = g_passList.back();
     R->bound = Renderer::BoundState{};
@@ -10122,6 +10189,18 @@ void SwapIn()
 // range grows past its target, which the stats call out but the picture cannot see).
 void OnRangeClosed(uint8_t reason)
 {
+    // Stage 2c: reserve the next range's slot; the worker's finished buffer lands in
+    // it at the pass drain. (R->rendering gates it the way g_open gates the serial
+    // path — a close outside a pass reserves nothing.)
+    if (rexec::On())
+    {
+        if (R->rendering && reason == uint8_t(prec::kSizeCap))
+        {
+            g_passList.push_back(VK_NULL_HANDLE);
+            ++g_stats.rotations;
+        }
+        return;
+    }
     if (!g_open || reason != uint8_t(prec::kSizeCap))
         return;
     VkCommandBuffer next = BeginSecondary();
@@ -10153,6 +10232,25 @@ void SwapOut()
 // the order gate adjudicates exactly this sequence every frame it is armed.
 void ExecutePass()
 {
+    if (g_passList.empty())
+        return;
+    // Stage 2c: a slot a worker could not fill was already repaired (or loudly
+    // dropped) by the pass drain; a null here would be a sequencing defect and
+    // executing it is a crash, so it is filtered and screamed about.
+    size_t w = 0;
+    for (size_t i = 0; i < g_passList.size(); ++i)
+    {
+        if (g_passList[i] != VK_NULL_HANDLE)
+            g_passList[w++] = g_passList[i];
+        else
+        {
+            static uint64_t nulls = 0;
+            if (++nulls <= 8)
+                fprintf(stderr, "[sec] ** NULL pass slot %zu survived the drain — a "
+                                "range's draws are MISSING from this pass\n", i);
+        }
+    }
+    g_passList.resize(w);
     if (g_passList.empty())
         return;
     vkCmdExecuteCommands(R->cmd, uint32_t(g_passList.size()), g_passList.data());
@@ -10196,6 +10294,7 @@ void BeginFrame()
     vkResetCommandBuffer(R->cmd, 0);
     vkBeginCommandBuffer(R->cmd, &bi);
     sec::FrameReset(); // this slot's secondaries recycle under the same fence argument
+    rexec::FrameReset();
     R->recording = true;
     R->rendering = false;
     // THE FRAME'S GPU TIMESTAMPS — two per slot, reset and written on the frame's own
@@ -10427,6 +10526,7 @@ void EndRendering()
                   g_gpPassExt, d);
         g_gpPassSeg = -1;
     }
+    rexec::PassDrain();
     sec::ExecutePass();
     vkCmdEndRendering(R->cmd);
     R->rendering = false;
@@ -12282,7 +12382,7 @@ bool NoDriverRecord()
     }();
     return off;
 }
-uint64_t g_noDriverRecordSkipped = 0;
+std::atomic<uint64_t> g_noDriverRecordSkipped{ 0 };   // atomic: record-core counter (2c)
 
 bool NoBufferBindCache()
 {
@@ -12321,8 +12421,9 @@ constexpr uint32_t kBindBatchMax = Renderer::BoundState::kMaxTrackedBindings;
 bool g_noBindBatch = false;        // CW_VK_NO_BIND_BATCH — one call per binding
 bool g_verifyBindBatch = false;    // CW_VK_VERIFY_BIND_BATCH
 bool g_verifyBindPoison = false;   // ...and its positive control
-uint64_t g_bindBatchCalls = 0;     // vkCmdBindVertexBuffers the batched path issued
-uint64_t g_bindBatchDraws = 0;
+std::atomic<uint64_t> g_bindBatchCalls{ 0 };   // vkCmdBindVertexBuffers the batched path
+                                               // issued; atomic: record-core counter (2c)
+std::atomic<uint64_t> g_bindBatchDraws{ 0 };   // atomic: record-core counter (2c)
 uint64_t g_bindVerifyChecked = 0, g_bindVerifyBad = 0;
 
 // THE PER-CONTEXT RECORDING STATE (part 7, 2c prep). Everything a thread needs to
@@ -14312,6 +14413,11 @@ struct DrawTicket
     int32_t baseVertex = 0;
 };
 
+namespace rexec
+{
+void Submit(std::vector<DrawTicket>& tickets);   // defined with the machinery below
+}
+
 // Returns false when the draw was abandoned (a degenerate stream, an unreadable index
 // buffer) — exactly the early-outs the inline path always had, so the caller skips the
 // per-draw bookkeeping the same way falling through a `return` used to.
@@ -14595,6 +14701,14 @@ void OnRangeClosed(uint8_t reason)
 {
     if (g_queue.empty())
         return;
+    // Stage 2c: the range's tickets become a worker job instead of a pump replay.
+    // Same close reasons, same drop rule for the rest.
+    if (rexec::On() &&
+        (reason == uint8_t(prec::kSizeCap) || reason == uint8_t(prec::kPassEnd)))
+    {
+        rexec::Submit(g_queue);
+        return;
+    }
     if (reason != uint8_t(prec::kSizeCap) && reason != uint8_t(prec::kPassEnd))
     {
         g_stats.dropped += g_queue.size();
@@ -14628,6 +14742,265 @@ void PrintStats(FILE* f)
 }
 
 } // namespace defer
+
+
+// ===================================================================================
+// STAGE 2c: THE FLIP — range recording on the shared workers (part 7)
+// ===================================================================================
+//
+// Behind `CW_VK_PREC_EXEC=1` (which requires CW_VK_SECONDARIES=1 and
+// CW_VK_DEFER_RECORD=1 armed alongside it — refused loudly otherwise), a closed
+// range's tickets become a JOB on the guard-pool workers: the worker begins a
+// secondary from ITS OWN per-slot pool (two threads must never touch one command
+// pool), replays the tickets through the minimal record core against a job-local
+// context (a fresh BoundState per range is the design, so there is no cross-range
+// state to share), ends the buffer and parks it for the pass drain. The pump reserves
+// a pass-list slot per range at close time, so execution order is CREATION order
+// whatever order the workers finish in — the property the order gate has adjudicated
+// since stage 1.
+//
+// The pass drain (EndRendering, before ExecuteCommands) is stage 1's steal-back made
+// load-bearing: the pump claims unstarted jobs itself — the LAST range of every pass
+// is always freshly submitted — then waits out the in-flight remainder, repairs any
+// slot a worker could not fill by recording it on the pump's own pool, and merges the
+// job-local skip counters. CW_VK_PROFILE is refused under this arm: the per-phase
+// sinks are plain uint64 adds and worker-side scopes would corrupt every column.
+namespace rexec
+{
+
+bool On()
+{
+    static const bool on = [] {
+        if (!EnvOn("CW_VK_PREC_EXEC"))
+            return false;
+        if (!EnvOn("CW_VK_SECONDARIES") || !EnvOn("CW_VK_DEFER_RECORD"))
+        {
+            fprintf(stderr, "[rexec] CW_VK_PREC_EXEC=1 REFUSED: it requires "
+                            "CW_VK_SECONDARIES=1 and CW_VK_DEFER_RECORD=1 armed "
+                            "alongside it\n");
+            return false;
+        }
+        if (Env("CW_VK_PROFILE"))
+        {
+            fprintf(stderr, "[rexec] CW_VK_PREC_EXEC=1 REFUSED under CW_VK_PROFILE: "
+                            "the profiler's phase sinks are not thread-safe and every "
+                            "column would be corrupt\n");
+            return false;
+        }
+        fprintf(stderr, "[rexec] CW_VK_PREC_EXEC=1 — range recording runs on the "
+                        "SHARED guard-pool workers (stage 2c; pump steals at every "
+                        "pass drain)\n");
+        return true;
+    }();
+    return on;
+}
+
+// Per-worker, per-frame-slot secondary pools. Slot count is the guard pool's maximum
+// plus one for the pump's steal/fallback path.
+constexpr unsigned kMaxRecWorkers = 5;
+sec::SlotPool g_wp[kMaxRecWorkers][kMaxFramesInFlight];
+
+struct RangeJob
+{
+    std::vector<DrawTicket> tickets;
+    uint32_t passSlot = 0;
+    uint32_t frameSlot = 0;
+    VkCommandBuffer out = VK_NULL_HANDLE;
+    Renderer::BindSkips skips{};
+    uint32_t failedDraws = 0;
+    bool done = false;
+};
+
+std::mutex g_mx;
+std::condition_variable g_drainCv;
+std::deque<RangeJob> g_jobs;      // the open pass's jobs, creation order (stable refs)
+std::deque<RangeJob*> g_queue;    // unclaimed
+std::atomic<size_t> g_queued{ 0 };
+size_t g_outstanding = 0;
+
+struct Stats
+{
+    uint64_t jobs = 0;
+    uint64_t worker = 0;
+    uint64_t stolen = 0;
+    uint64_t fallbackRanges = 0;  // a worker could not begin a buffer; pump repaired
+    uint64_t drainBlocked = 0;
+    uint64_t drainNs = 0;
+    uint64_t draws = 0;
+    uint64_t failedDraws = 0;
+} g_stats;
+
+void RunJob(RangeJob& j, unsigned wid)
+{
+    VkCommandBuffer cmd =
+        wid < kMaxRecWorkers ? sec::BeginSecondaryFrom(g_wp[wid][j.frameSlot])
+                             : VK_NULL_HANDLE;
+    if (cmd == VK_NULL_HANDLE)
+    {
+        j.out = VK_NULL_HANDLE;   // the drain repairs or screams
+        return;
+    }
+    VkCommandBuffer cmdVar = cmd;
+    Renderer::BoundState bound{};
+    BindBatch batch{};
+    RecordCtx ctx{ cmdVar, bound, j.skips, batch };
+    for (const DrawTicket& tk : j.tickets)
+        if (!RecordDrawCore(ctx, defer::g_base, tk, nullptr))
+            ++j.failedDraws;
+    vkEndCommandBuffer(cmd);
+    j.out = cmd;
+}
+
+bool RunOne(bool stolen, unsigned wid)
+{
+    RangeJob* j = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_mx);
+        if (g_queue.empty())
+            return false;
+        j = g_queue.front();
+        g_queue.pop_front();
+        g_queued.store(g_queue.size(), std::memory_order_release);
+    }
+    RunJob(*j, wid);
+    {
+        std::lock_guard<std::mutex> lk(g_mx);
+        j->done = true;
+        if (stolen)
+            ++g_stats.stolen;
+        else
+            ++g_stats.worker;
+        if (--g_outstanding == 0)
+            g_drainCv.notify_all();
+    }
+    return true;
+}
+
+bool HasWork()
+{
+    return g_queued.load(std::memory_order_acquire) != 0;
+}
+
+bool RunOneJob()
+{
+    if (!HasWork() || g_recWorkerId < 0)
+        return false;
+    return RunOne(/*stolen=*/false, unsigned(g_recWorkerId));
+}
+
+void Submit(std::vector<DrawTicket>& tickets)
+{
+    if (tickets.empty())
+        return;
+    if (!R->rendering)
+    {
+        // A range closing outside a pass has no buffer to land in — same drop rule as
+        // defer's, same loudness.
+        static uint64_t printed = 0;
+        if (++printed <= 8)
+            fprintf(stderr, "[rexec] ** %zu tickets dropped at a close with no pass "
+                            "open\n", tickets.size());
+        tickets.clear();
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_mx);
+        g_jobs.emplace_back();
+        RangeJob& j = g_jobs.back();
+        j.tickets.swap(tickets);   // the defer queue keeps its capacity back
+        j.passSlot = sec::CurrentSlot();
+        j.frameSlot = R->frameSlot;
+        g_queue.push_back(&j);
+        g_queued.store(g_queue.size(), std::memory_order_release);
+        ++g_outstanding;
+        ++g_stats.jobs;
+        g_stats.draws += j.tickets.size();
+    }
+    GuardPoolKickOne();
+}
+
+// EndRendering, before ExecuteCommands: finish this pass's jobs — steal, wait, repair
+// — and land every buffer in its reserved slot.
+void PassDrain()
+{
+    if (!On() || g_jobs.empty())
+        return;
+    const unsigned pumpId = GuardPoolWorkers(); // one past the last worker, < kMaxRecWorkers
+    while (RunOne(/*stolen=*/true, pumpId))
+    {
+    }
+    {
+        std::unique_lock<std::mutex> lk(g_mx);
+        if (g_outstanding)
+        {
+            ++g_stats.drainBlocked;
+            const auto t0 = std::chrono::steady_clock::now();
+            g_drainCv.wait(lk, [] { return g_outstanding == 0; });
+            g_stats.drainNs += uint64_t(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count());
+        }
+    }
+    for (RangeJob& j : g_jobs)
+    {
+        if (j.out == VK_NULL_HANDLE)
+        {
+            // The worker had no buffer to give (its pool failed to grow). Repair on
+            // the pump's own pool — a missing range is missing GEOMETRY, so this path
+            // exists even though it should never run.
+            ++g_stats.fallbackRanges;
+            RunJob(j, pumpId);
+        }
+        sec::SetPassSlot(j.passSlot, j.out);
+        R->skips.pipeline += j.skips.pipeline;
+        R->skips.viewport += j.skips.viewport;
+        R->skips.scissor += j.skips.scissor;
+        R->skips.blend += j.skips.blend;
+        R->skips.sets += j.skips.sets;
+        R->skips.draws += j.skips.draws;
+        R->skips.depthBias += j.skips.depthBias;
+        R->skips.stencil += j.skips.stencil;
+        R->skips.vertexBinds += j.skips.vertexBinds;
+        R->skips.vertexBindRepeats += j.skips.vertexBindRepeats;
+        R->skips.indexBinds += j.skips.indexBinds;
+        R->skips.indexBindRepeats += j.skips.indexBindRepeats;
+        g_stats.failedDraws += j.failedDraws;
+    }
+    g_jobs.clear();
+}
+
+// BeginFrame: the incoming slot's worker pools recycle under the same fence argument
+// as the pump's — every job was drained at its own pass end, so nothing holds them.
+void FrameReset()
+{
+    if (!On())
+        return;
+    for (unsigned w = 0; w < kMaxRecWorkers; ++w)
+    {
+        sec::SlotPool& sp = g_wp[w][R->frameSlot];
+        if (sp.pool != VK_NULL_HANDLE)
+            vkResetCommandPool(R->device, sp.pool, 0);
+        sp.cursor = 0;
+    }
+}
+
+void PrintStats(FILE* f)
+{
+    if (!On() || !g_stats.jobs)
+        return;
+    fprintf(f,
+            "[rexec]   stage 2c: %llu range jobs (%llu draws) | worker %llu stolen "
+            "%llu | %llu pump-repaired ranges | drain blocked %llu (%.2f ms total) | "
+            "**%llu failed draws**\n",
+            (unsigned long long)g_stats.jobs, (unsigned long long)g_stats.draws,
+            (unsigned long long)g_stats.worker, (unsigned long long)g_stats.stolen,
+            (unsigned long long)g_stats.fallbackRanges,
+            (unsigned long long)g_stats.drainBlocked, double(g_stats.drainNs) / 1e6,
+            (unsigned long long)g_stats.failedDraws);
+}
+
+} // namespace rexec
 
 void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
             const Pm4ShaderBinding& vsBind, const Pm4ShaderBinding& psBind)
@@ -22892,6 +23265,7 @@ void VkRenderer_DumpStats()
     prec::PrintStats(stderr);
     sec::PrintStats(stderr);
     defer::PrintStats(stderr);
+    rexec::PrintStats(stderr);
     // Part 72 item 1. Printed HERE as well as on the census's own cadence, so a soak
     // that ends off a 600-frame boundary still lands the number — the same defect the
     // stencil skip counter had for fifteen parts (collected since part 56, printed by
@@ -22917,7 +23291,7 @@ void VkRenderer_DumpStats()
     // The polygon offset, printed on every run: an arm with no counter cannot be shown to
     // have engaged (gotcha 151), and this one's effect is a judgement about a picture.
     fprintf(stderr, "[vk]   stencil test: %llu draws enabled it%s\n",
-            (unsigned long long)g_stencilDraws,
+            (unsigned long long)g_stencilDraws.load(),
             EnvOn("CW_VK_NO_STENCIL") ? "  [CW_VK_NO_STENCIL: none were honoured]" : "");
     fprintf(stderr, "[vk]   polygon offset: %llu draws asked for one%s\n",
             (unsigned long long)g_polyOffsetDraws,
@@ -23041,13 +23415,13 @@ void VkRenderer_DumpStats()
     // THE BATCH'S OWN MECHANISM NUMBER, unconditional — it is the statistic the item is
     // judged on and it cannot be argued with, where a frame time on this route has a
     // ±2.9% floor. `CW_VK_NO_BIND_BATCH=1` should read ~1.74 here and the batch ~0.47.
-    if (g_bindBatchDraws)
+    if (g_bindBatchDraws.load())
         fprintf(stderr,
                 "[vk]   vertex bind calls: %.3f per draw over %llu batched draws (%llu "
                 "vkCmdBindVertexBuffers)%s\n",
-                double(g_bindBatchCalls) / double(g_bindBatchDraws),
-                (unsigned long long)g_bindBatchDraws,
-                (unsigned long long)g_bindBatchCalls,
+                double(g_bindBatchCalls.load()) / double(g_bindBatchDraws.load()),
+                (unsigned long long)g_bindBatchDraws.load(),
+                (unsigned long long)g_bindBatchCalls.load(),
                 g_noBindBatch ? " [CW_VK_NO_BIND_BATCH=1, one call per binding]" : "");
     if (g_verifyBindBatch)
         fprintf(stderr,
@@ -23123,12 +23497,12 @@ void VkRenderer_DumpStats()
                 g_dedupLookups ? 100.0 * double(g_dedupRepeats) / double(g_dedupLookups) : 0.0,
                 (unsigned long long)g_dedupRepeats, (unsigned long long)g_dedupLookups,
                 (unsigned long long)g_dedupOverflow);
-    if (g_noDriverRecordSkipped && R->skips.draws)
+    if (g_noDriverRecordSkipped.load() && R->skips.draws)
         fprintf(stderr,
                 "[vk]   CW_VK_NO_DRIVER_RECORD: %llu vkCmd* calls skipped, %.2f per draw "
                 "— NOTHING WAS DRAWN in this run\n",
-                (unsigned long long)g_noDriverRecordSkipped,
-                double(g_noDriverRecordSkipped) / double(R->skips.draws));
+                (unsigned long long)g_noDriverRecordSkipped.load(),
+                double(g_noDriverRecordSkipped.load()) / double(R->skips.draws));
     // THE STENCIL SKIP, ADDED IN PART 72's PREP — and it was COLLECTED SINCE PART 56 AND
     // NEVER PRINTED, which is the defect this project keeps rediscovering (a counter you
     // already pay for that no log carries). It is the deciding number for
