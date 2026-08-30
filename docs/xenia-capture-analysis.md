@@ -3206,3 +3206,35 @@ Also banked: the range-size knob is noise at the decisive band (512 vs 128, +0.4
 128 stays default for worker balance. And the harness now stamps every run's binary
 sha256 — a mid-chain rebuild nearly relabelled an A/B's back half tonight, and the
 class is now detectable in the log rather than by mtime archaeology.
+
+## 70. **STAGE 2c: THE FLIP IS CORRECT AND NULL — the campaign's decisive measurement, and why the win moved out from under it** — part 7, 2026-08-30
+
+The workers record ranges for real behind `CW_VK_PREC_EXEC=1`, and the machinery is
+proven at the campaign's full standard: heavy-band gate run of 34,142 frames /
+**110.4 M draws / 0 order failures / 0 failed draws / 0 repaired ranges**, validation
+identical to control, per-worker command pools, pass-drain steal-back live (11,272
+drains blocked for 280 ms total ≈ 8 µs/frame).
+
+**The A/B is NULL**: +0.2% frame-weighted, mixed sign, +1.1% / +0.12 ms at the
+decisive band — not a win by this pipeline's own standards. Two mechanisms, both in
+the run's own counters:
+
+1. **The pump steals 65% of the ranges** (1.33 M stolen vs 728 k worker-run at the
+   crowd): ranges close late relative to their pass end, and the last range of every
+   pass is by construction fresh at the drain — so two-thirds of the "parallel" work
+   is the pump recording serially with scheduling overhead added.
+2. **Stage 2b.5 already moved the moveable.** With decode and uploads resolved at
+   capture, the deferred core is ~0.3 µs/draw of driver-and-bind work — ~2 ms of
+   fully-parallel ceiling at the crowd, cut by the worker share and the machinery's
+   own cost to approximately zero. The sibling's low-risk refutation (§6eb §3),
+   arrived at from the other direction: **each stage of making recording safe to
+   distribute also made it cheaper to keep serial**, and the campaign's banked wins
+   came from exactly those stages (the defer locality +0.64 ms, finding 69) rather
+   than from the distribution itself.
+
+The arm stays in the tree as proven-correct machinery (off by default) with the
+range-size lever and the stack-default question measured next; whatever they read,
+the campaign's honest yield is: **+0.64 ms of locality behind arms that net free, a
+record path split behind a ticket seam any future work can lift, the sibling's
+hardest hazard dissolved rather than solved, and the refutation documented at
+110 M draws of proof instead of an untested belief.**
