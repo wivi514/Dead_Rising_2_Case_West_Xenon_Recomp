@@ -187,21 +187,38 @@ Gates owed before 2b closes: title validation + order gate on the restructured
 INLINE path; a null A/B of the restructure against the pre-split binary (the control
 is the old binary run NOW — gotcha 50/51/86); then the same pair for the defer arm.
 
-## 4. Stage 2c — the flip to workers (not started)
+## 4. Stage 2c — the flip to workers (designed 2026-08-30, not implemented)
 
-The hazards, named by the sibling's §6eb §3c and adopted by the kickoff, live here:
+What stages 1-2b already retired from the sibling's hazard list: the partition and its
+order proof (stage 1), the secondaries and per-range state re-establishment (2a — the
+`R->bound` reset at every secondary makes it structural), and the per-draw capture
+(2b's DrawTicket — the register state a worker needs turned out to be the ~750-byte
+resolved ticket, not the register file, because the decode moved to capture). What
+remains, with the design settled tonight:
 
-* Workers record their ranges into **secondary command buffers** (dynamic-rendering
-  inheritance); the pump executes them in range order inside the pass's instance. The
-  range breaks stage 1 placed at pass boundaries are exactly the legal ones.
-* **Per-draw capture**: a worker needs the draw's register state (fetch constants, ALU
-  windows, render state) as of the walk — the capture cost is real and was the sibling's
-  reason to price this as a campaign.
-* **UploadStream re-entrancy** against the shared stream store, and an arena discipline
-  that must not change which buffer a stream lands in (a per-worker arena would defeat
-  the vertex/index bind cache).
-* Each range **re-establishes full state** — the `R->bound` elision cannot span a range
-  boundary.
-* `RunImmediate` (texture uploads) stays on the pump; a range that needs one breaks.
-* The guard-pool share: each worker is ~23% busy on prehash at the crowd; the trade of
-  loading them with record work is measured (guard served-% before/after), not assumed.
+* **A RecordCtx refactor**: `RecordDrawCore` and `Bind{Vertex,Index}BufferCached`
+  read `R->cmd`/`R->bound` directly; workers need those as a context parameter
+  (`struct RecordCtx { VkCommandBuffer cmd; BoundState bound; }`) plus per-worker
+  command POOLS (a pool is externally-synchronized state; 2a's per-slot pool becomes
+  per-slot-per-worker).
+* **UploadStream re-entrancy is the whole game.** If uploads stay on the pump the
+  workers do only driver calls — the low-risk design the sibling killed (~1.1-1.4 ms
+  ceiling here, minus 2a's 0.6). The maximal win needs workers running UploadStream:
+  atomic arena cursor (one arena, so buffer identity is stable and the bind cache
+  survives — the hazard's answer); the per-frame stream cache sharded (~16 mutexes by
+  VA hash — the flat probe is ~100 ns, contention at 3 workers should be small and is
+  measured, not assumed); duplicate concurrent uploads of one stream are benign
+  (two arena copies, cache keeps one — count them); the cross-frame persist store and
+  guard-pool FILING are pump-only in v1 (a worker-uploaded stream misses prehash next
+  frame — the guard served-% before/after is the price tag to read).
+* **Scheduling is stage 1's machinery made real**: range closed → the ticket batch
+  plus its secondary become the range job on the shared pool; the pump's pass-end
+  drain steals unclaimed ranges (the steal-back becomes load-bearing — the LAST range
+  of a pass is always freshly enqueued). ExecuteCommands order is creation order
+  regardless of completion order; the order gate's reconstruction already adjudicates
+  exactly this.
+* `RunImmediate` (texture uploads) is capture-side already — DoDraw's fetch walk runs
+  before the ticket. Nothing to move.
+* Numbers to beat, from this part's own ledger: 2a overhead ~0.6 ms already paid;
+  worker ceiling ~2.3 ms at 3 workers; **net ~1.7 ms is the honest target**, and the
+  guard-pool share trade (each worker ~23% busy on prehash) is measured alongside.

@@ -3178,3 +3178,31 @@ export that flows TOWARD Case Zero.
 The general lesson, added to the campaign notes rather than re-argued each stage:
 **per-range wakes are priced by the job they wake for** — stage 2's jobs are tens of
 microseconds and can afford them; stage 1's nanosecond jobs could not.
+
+## 69. **STAGE 2b: THE TICKET SPLIT IS FREE, AND DEFERRED REPLAY IS FASTER — the range's locality pays back the secondaries' cost** — part 7, 2026-08-30
+
+The record core was severed behind a ~750-byte `DrawTicket` (decode at capture,
+recording from the ticket alone), gated the same way every stage has been:
+
+* **Capture completeness, at title scale**: 8.28 M draws deferred through 471,594
+  ranges with **0 replay early-outs, 0 dropped, 0 new validation complaints, order
+  gate 0 failed** — the property stage 2c's workers cannot debug after the fact,
+  proven while execution is still serial.
+* **The restructure null HOLDS** (3+3 accepted runs, 2b binary vs `4f1993c` control,
+  default config): frame-weighted −0.0%, mixed sign, decisive band −0.9%.
+* **The defer arm is not free — it is a WIN**: +6.0% / **+0.64 ms at 6,500-7,000**
+  (26,802 vs 23,245 frames), +5.8%/+6.8% in the neighbour bands, dose-response with
+  draw count, GPU medians identical — the same signature shape that condemned stage
+  1's first version, with the sign flipped. Mechanism (stated as hypothesis, one A/B
+  old): replaying a range's ~128 draws back-to-back keeps the record path's code and
+  state hot, where inline recording interleaves it with decode, constants and texture
+  work per draw.
+* **The stack nets out**: sec+defer vs the pre-campaign baseline reads +0.8%
+  frame-weighted, +1.2% at the decisive band (cross-chain, indicative) — 2a's ~0.6 ms
+  secondary overhead is paid back by 2b's locality, so the worker flip starts from a
+  scaffold that costs nothing.
+
+Also banked: the range-size knob is noise at the decisive band (512 vs 128, +0.4%);
+128 stays default for worker balance. And the harness now stamps every run's binary
+sha256 — a mid-chain rebuild nearly relabelled an A/B's back half tonight, and the
+class is now detectable in the log rather than by mtime archaeology.
