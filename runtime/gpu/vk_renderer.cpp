@@ -2058,6 +2058,10 @@ namespace sec
 {
 void OnRangeClosed(uint8_t reason);
 }
+namespace defer
+{
+void OnRangeClosed(uint8_t reason);
+}
 
 void PrecInitOnce()
 {
@@ -2078,9 +2082,14 @@ void PrecInitOnce()
             g_gp->wake.notify_one();
         }
     };
-    // Stage 2a's rotation point: prec's ranges and the secondary command buffers are
-    // one partition, rotated from one place.
-    h.rangeClosed = [](uint8_t reason) { sec::OnRangeClosed(reason); };
+    // Stage 2a/2b's shared boundary: prec's ranges, the deferred-ticket replay and the
+    // secondary command buffers are ONE partition, driven from one place. Replay FIRST
+    // — the range's tickets must land in its own command buffer before the rotation
+    // ends it.
+    h.rangeClosed = [](uint8_t reason) {
+        defer::OnRangeClosed(reason);
+        sec::OnRangeClosed(reason);
+    };
     prec::Init(h);
 }
 
@@ -10395,6 +10404,11 @@ void EndRendering()
 {
     if (!R->rendering)
         return;
+    // The pass-end range break moved ABOVE the swap-out (stage 2b): the rangeClosed
+    // hook replays any deferred tickets, and they must land in the range's own command
+    // buffer while it is still current. Under inline recording the early break is a
+    // no-op reordering — no draw happens between here and the old position.
+    prec::RangeBreak(prec::kPassEnd);
     // STAGE 2a: put the primary back first — everything below must land on it — then
     // hand the pass's secondaries to the instance in creation order before it closes.
     sec::SwapOut();
@@ -10416,7 +10430,6 @@ void EndRendering()
     sec::ExecutePass();
     vkCmdEndRendering(R->cmd);
     R->rendering = false;
-    prec::RangeBreak(prec::kPassEnd);
 }
 
 // Submit whatever has been recorded into this frame's slot, and DO NOT wait for it
@@ -14216,6 +14229,717 @@ uint64_t g_noLight = 0, g_noScene = 0, g_noTlas = 0, g_singular = 0;
 // The register file and shader bindings are PARAMETERS, not globals: the PM4 feed
 // passes pm4.cpp's, the D3D feed (phase C) passes the private file its walker built
 // from the title's own flush output. Everything below is feed-agnostic.
+// ===================================================================================
+// THE RECORD CORE (part 7 stage 2b) — the draw's recording, severed from its decode
+// ===================================================================================
+//
+// Everything a draw RECORDS — the state binds, the vertex-stream uploads and binds,
+// the index setup and the vkCmdDraw* — now lives in `RecordDrawCore`, whose only
+// inputs are a `DrawTicket` (the decoded, resolved values the walk computed) and guest
+// memory. DoDraw builds the ticket and calls it inline today, so behaviour is
+// unchanged; the campaign's stage 2b defers the call to the range boundary and stage
+// 2c hands it to workers — and the ticket is the exact seam both need, because a
+// function whose inputs are a struct and `base` is a function another thread can run.
+//
+// `liveRegs` is the register file WHEN THE CALL IS INLINE, and null when deferred: a
+// handful of diagnostic arms inside the core (the rect trace, the const-race recorder)
+// read registers that only mean anything at walk time, so each is gated on it — a
+// deferred run skips them rather than reading another draw's registers. Everything
+// load-bearing reads the ticket.
+//
+// The capture-side diagnostics (state/fetch probes, the fetch-memo census, the draw
+// probe) stay in DoDraw where the walk's locals live; the dependent-fetch publication
+// stays there too, KEEPING its order before the vertex-stream uploads so the arena
+// allocation sequence is byte-identical to the pre-split renderer.
+struct DrawTicket
+{
+    Pm4Draw draw;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkViewport viewport{};
+    VkRect2D scissor{};
+    float blend[4] = {};
+    uint32_t stencilRefMask = 0;   // regs[kRbStencilRefMask], raw
+    bool stencilTest = false;      // regs[kRbDepthControl] bit 0
+    bool rectSynth = false;
+    Expansion expand = Expansion::None;
+    int32_t indxOffset = 0;
+    uint32_t rectCorner[3] = { 0, 1, 2 };
+    VkDeviceSize vsConstAt = 0, psConstAt = 0, sharedAt = 0;
+    uint32_t drawIndex = 0;        // R->drawsThisFrame at capture — the push-constant one
+    const ShaderMeta* vs = nullptr;
+    const ShaderMeta* ps = nullptr;
+    uint64_t vsHash = 0, psHash = 0;
+    // The attribute walk, pre-filtered (location >= 0, not indirect) and pre-decoded —
+    // the fetch constants are walk-time state, so the decode happens at capture. 24 is
+    // headroom over the 16 bindings the tracked-binding cap allows; the capture site
+    // counts and drops a draw that would overflow rather than truncating it silently.
+    struct AttrFetch
+    {
+        xenos::VertexFetch vf;
+        const VertexAttribute* attr;
+    };
+    uint8_t nFetch = 0;
+    AttrFetch fetch[24];
+};
+
+// Returns false when the draw was abandoned (a degenerate stream, an unreadable index
+// buffer) — exactly the early-outs the inline path always had, so the caller skips the
+// per-draw bookkeeping the same way falling through a `return` used to.
+bool RecordDrawCore(uint8_t* base, const DrawTicket& t, const uint32_t* liveRegs)
+{
+    ProfScope _pRecord(&g_prof.record);
+    {
+    ProfScope _pState(&g_prof.recordState);
+    // Only what has actually changed since the last draw on this command buffer. See
+    // Renderer::BoundState for why that is sound; CW_VK_NO_STATE_CACHE=1 re-issues
+    // everything every draw, which is the pre-part-18 renderer and the control arm.
+    static const bool noStateCache = Env("CW_VK_NO_STATE_CACHE") != nullptr;
+    ++R->skips.draws;
+    const float blendConstants[4] = { t.blend[0], t.blend[1], t.blend[2], t.blend[3] };
+    if (noStateCache || t.pipeline != R->bound.pipeline)
+    {
+        if (!NoDriverRecord())
+            vkCmdBindPipeline(R->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, t.pipeline);
+        else
+            ++g_noDriverRecordSkipped;
+        // BINDING A PIPELINE THAT SPECIFIES STATE STATICALLY MAKES THE CORRESPONDING
+        // DYNAMIC STATE UNDEFINED, so the skip-if-unchanged cache below cannot survive a
+        // bind. The stencil states are declared dynamic only on stencil-enabled pipelines
+        // (see the dynamic-state array), which means every non-stencil draw in between
+        // invalidates them — and the symptom is not a wrong picture but 60
+        // `VUID-vkCmdDrawIndexed-None-0783{7,8,9}`, i.e. a draw reading undefined stencil
+        // state. The t.viewport, t.scissor and blend constants above are dynamic on EVERY
+        // t.pipeline, so they are unaffected and keep their cache.
+        R->bound.haveStencil = false;
+        R->bound.pipeline = t.pipeline;
+    }
+    else
+        ++R->skips.pipeline;
+    if (noStateCache || !R->bound.haveViewport ||
+        memcmp(&t.viewport, &R->bound.viewport, sizeof(t.viewport)) != 0)
+    {
+        if (!NoDriverRecord())
+            vkCmdSetViewport(R->cmd, 0, 1, &t.viewport);
+        else
+            ++g_noDriverRecordSkipped;
+        R->bound.viewport = t.viewport;
+        R->bound.haveViewport = true;
+    }
+    else
+        ++R->skips.viewport;
+    if (noStateCache || !R->bound.haveScissor ||
+        memcmp(&t.scissor, &R->bound.scissor, sizeof(t.scissor)) != 0)
+    {
+        if (!NoDriverRecord())
+            vkCmdSetScissor(R->cmd, 0, 1, &t.scissor);
+        else
+            ++g_noDriverRecordSkipped;
+        R->bound.scissor = t.scissor;
+        R->bound.haveScissor = true;
+    }
+    else
+        ++R->skips.scissor;
+    if (noStateCache || !R->bound.haveBlend ||
+        memcmp(blendConstants, R->bound.blend, sizeof(blendConstants)) != 0)
+    {
+        if (!NoDriverRecord())
+            vkCmdSetBlendConstants(R->cmd, blendConstants);
+        else
+            ++g_noDriverRecordSkipped;
+        memcpy(R->bound.blend, blendConstants, sizeof(blendConstants));
+        R->bound.haveBlend = true;
+    }
+    else
+        ++R->skips.blend;
+
+    // ---- THE STENCIL REFERENCE AND MASKS (part 56) -------------------------------
+    //
+    // RB_STENCILREFMASK, layout ref:8 / mask:8 @8 / writemask:8 @16 — confirmed the same
+    // way the ops were, by whether the values come out sensible rather than from a
+    // header. They do: the draws that carry `ALWAYS / REPLACE` read `sr=00FFFFFE`, i.e.
+    // write reference **254** through full masks, and a matching draw tests `EQUAL`
+    // against it. Dynamic state, so none of this enters the t.pipeline key.
+    {
+        static const bool noStencil = EnvOn("CW_VK_NO_STENCIL");
+        const uint32_t sr = t.stencilRefMask;
+        const uint32_t ref = sr & 0xFF;
+        const uint32_t mask = (sr >> 8) & 0xFF;
+        const uint32_t wmask = (sr >> 16) & 0xFF;
+        const bool stencilOn = !noStencil && t.stencilTest;
+        if (stencilOn)
+            ++g_stencilDraws;
+        // ONLY WHEN THE BOUND PIPELINE DECLARES THEM DYNAMIC, which is exactly when the
+        // stencil test is on. Calling a dynamic-state setter for state a t.pipeline
+        // specifies STATICALLY is illegal in the other direction — `VUID-vkCmdDraw-None-
+        // 08608`, 40 of them, and the message says so plainly once read rather than
+        // guessed at: "doesn't set up VK_DYNAMIC_STATE_STENCIL_*, but since the
+        // vkCmdBindPipeline, the related dynamic state commands have been called".
+        if (stencilOn &&
+            (noStateCache || !R->bound.haveStencil || R->bound.stencilRef != ref ||
+             R->bound.stencilMask != mask || R->bound.stencilWriteMask != wmask))
+        {
+            if (!NoDriverRecord())
+            {
+                vkCmdSetStencilReference(R->cmd, VK_STENCIL_FACE_FRONT_AND_BACK, ref);
+                vkCmdSetStencilCompareMask(R->cmd, VK_STENCIL_FACE_FRONT_AND_BACK, mask);
+                vkCmdSetStencilWriteMask(R->cmd, VK_STENCIL_FACE_FRONT_AND_BACK, wmask);
+            }
+            else
+                g_noDriverRecordSkipped += 3;
+            R->bound.stencilRef = ref;
+            R->bound.stencilMask = mask;
+            R->bound.stencilWriteMask = wmask;
+            R->bound.haveStencil = true;
+        }
+        else if (stencilOn)
+            ++R->skips.stencil;
+    }
+
+    // The five bindless heaps never change address, so this is once per command
+    // buffer rather than once per draw — and it is the most expensive of the five.
+    if (noStateCache || !R->bound.setsBound)
+    {
+        if (!NoDriverRecord())
+            vkCmdBindDescriptorSets(R->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, R->pipeLayout,
+                                    0, 5, R->sets, 0, nullptr);
+        else
+            ++g_noDriverRecordSkipped;
+        R->bound.setsBound = true;
+    }
+    else
+        ++R->skips.sets;
+
+    // The three constant-buffer addresses, then THE DRAW INDEX at offset 24 for the
+    // draw-ID pass. The index is pushed on every draw, armed or not: it costs four bytes
+    // in a call that is already being made, and a value that is only correct when an
+    // instrument is enabled is a trap for the next person to use it.
+    struct { uint64_t vs, ps, shared; uint32_t drawIndex, pad; } pushConstants = {
+        uint64_t(R->arena.address + t.vsConstAt),
+        uint64_t(R->arena.address + t.psConstAt),
+        uint64_t(R->arena.address + t.sharedAt),
+        t.drawIndex, 0 };
+    if (!NoDriverRecord())
+        vkCmdPushConstants(R->cmd, R->pipeLayout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32,
+                           &pushConstants);
+    else
+        ++g_noDriverRecordSkipped;
+
+    // THE CONSTANT-SLOT RACE DETECTOR's record half. This is the right place and the only
+    // right place: the address has just been pushed, so these are exactly the bytes this
+    // draw is being recorded to read, after the memo top-up and after any miss-path
+    // patching. The check half runs at submit (see SubmitFrame).
+    if (ConstRaceOn() && liveRegs)
+    {
+        ConstRef r;
+        r.draw = t.drawIndex;
+        r.windowOffset = liveRegs[xenos::kPaScWindowOffset];
+        r.vsAt = t.vsConstAt;
+        r.psAt = t.psConstAt;
+        r.vs = t.vs;
+        r.ps = t.ps;
+        auto snap = [](std::vector<uint32_t>& out, const uint32_t* win,
+                       const ShaderMeta& m, uint32_t bytes) {
+            if (m.aluDynamic || m.aluConsts.empty())
+            {
+                out.resize(bytes / 4);
+                memcpy(out.data(), win, bytes);
+            }
+            else
+            {
+                out.resize(m.aluConsts.size() * 4);
+                for (size_t i = 0; i < m.aluConsts.size(); i++)
+                    if (m.aluConsts[i] < 256)
+                        memcpy(out.data() + i * 4, win + m.aluConsts[i] * 4,
+                               4 * sizeof(uint32_t));
+            }
+        };
+        const uint32_t* vwin = reinterpret_cast<const uint32_t*>(R->arena.mapped + t.vsConstAt);
+        const uint32_t* pwin = reinterpret_cast<const uint32_t*>(R->arena.mapped + t.psConstAt);
+        memcpy(r.c0, vwin, sizeof r.c0);
+        snap(r.vsRegs, vwin, *t.vs, kVsConstBytes);
+        snap(r.psRegs, pwin, *t.ps, kPsConstBytes);
+        g_constRefs.push_back(std::move(r));
+    }
+    }   // end recordState
+
+    ProfScope _pVertex(&g_prof.recordVertex);
+    uint32_t binding = 0;
+    bool streamsOk = true;
+    if (g_bindRunCensus)
+        BindRunCensusBeginDraw();
+    // CW_VK_RANGE_CENSUS=1 — per indexed draw, the two questions the part-33 NaN chain
+    // left: (1) do this draw's INDEX VALUES reach vertices past the fetch constant's
+    // declared size — the guard above bounds t.indxOffset + indexCount, which is the
+    // number of indices, not the vertices they name — and (2) do the IN-RANGE bytes of
+    // any float-format attribute already decode to NaN. On Xenos an out-of-range vfetch
+    // returns zero; our streams live in one shared arena buffer, so even
+    // robustBufferAccess cannot bound them (the binding's range is the whole arena),
+    // and an overrun reads a neighbouring stream's bytes as this draw's floats.
+    // A DIAGNOSTIC ARM: it walks every index and every vertex of every draw (gotcha 7).
+    static const bool rangeCensus = [] {
+        const char* e = getenv("CW_VK_RANGE_CENSUS");
+        return e && *e && *e != '0';
+    }();
+    struct RangeAttr { uint32_t strideDw, offsetDw, format; uint64_t bytes; const uint8_t* p; };
+    RangeAttr rangeAttrs[32];
+    uint32_t rangeAttrCount = 0;
+    // The ticket's fetch array is the attribute walk PRE-FILTERED and PRE-DECODED at
+    // capture time (location >= 0, not indirect, in t.vs->attributes order) — the
+    // decode's inputs are the fetch constants as of the WALK, which is the point.
+    for (uint32_t fi = 0; fi < t.nFetch; ++fi)
+    {
+        const VertexAttribute& a = *t.fetch[fi].attr;
+        const xenos::VertexFetch& vf = t.fetch[fi].vf;
+        const uint32_t va = PhysToVa(vf.address);
+        const uint64_t bytes = uint64_t(vf.sizeDwords) * 4;
+        if (!GuestRangeOk(va, bytes) || !bytes)
+        {
+            Count("draw: vertex stream outside the physical arena");
+            streamsOk = false;
+            break;
+        }
+        // The whole fetch buffer is uploaded, so a base vertex stays inside it — but
+        // only if the guest's own numbers say it does. A draw whose offset plus count
+        // runs off the end would read another draw's vertices (or, past the arena, walk
+        // off a Vulkan buffer), and that has to be LOUD rather than quietly clamped
+        // back to zero: clamping is the defect this offset exists to fix, reintroduced
+        // wearing a safety check's name.
+        if (t.indxOffset && a.strideDwords)
+        {
+            const uint64_t need =
+                (uint64_t(uint32_t(t.indxOffset) + t.draw.indexCount) * a.strideDwords) * 4;
+            if (need > bytes)
+            {
+                Count("draw: VGT_INDX_OFFSET runs past the vertex stream");
+                streamsOk = false;
+                break;
+            }
+        }
+        const StreamLoc loc = UploadStream(base, va, bytes, vf.endian, 0);
+        if (!loc.ok())
+        {
+            streamsOk = false;
+            break;
+        }
+        if (t.rectSynth && a.strideDwords)
+        {
+            // CW_VK_RECT_TRACE=<surfacePitch> — the CORNERS of every distinct clear
+            // rect on one EDRAM surface, printed once per distinct rect.
+            //
+            // A rect-list draw at the head of a pass IS the guest's clear, and the only
+            // way to know what it clears is to read its three corners. Part 32 needed
+            // this for the shadow cascade: the cascade's depth buffer comes out half
+            // empty, the geometry is provably submitted for all of it (CW_VK_DEPTH_ALWAYS
+            // fills it), so the question is which rectangles the title actually asked to
+            // be cleared — and that is data, not something to infer from the result.
+            static const char* const rectTraceEnv = Env("CW_VK_RECT_TRACE");
+            // A pitch of 0 means EVERY surface. Naming one pitch is right when the
+            // question is "what does this pass clear"; it is wrong when the question is
+            // "where does that rect live", and part 32 needed the second — a clear rect
+            // recorded in part 15 as the cascade's turned out to be on another surface
+            // entirely, which is only visible if the trace prints the pitch.
+            if (liveRegs && rectTraceEnv &&
+                (strtoul(rectTraceEnv, nullptr, 10) == 0 ||
+                 (liveRegs[xenos::kRbSurfaceInfo] & 0x3FFF) ==
+                     uint32_t(strtoul(rectTraceEnv, nullptr, 10))))
+            {
+                const uint8_t* p = loc.bytes();
+                float c[3][2] = {};
+                bool ok = p != nullptr;
+                for (uint32_t k = 0; ok && k < 3; k++)
+                {
+                    const uint64_t at =
+                        (uint64_t(t.rectCorner[k]) * a.strideDwords + a.offsetDwords) * 4;
+                    if (at + 8 > bytes) { ok = false; break; }
+                    // The arena copy is ALREADY little-endian — the stream uploader
+                    // swaps on the way in. Byte-swapping again here read every corner as
+                    // 0.0, which reads as "the title asks for nothing to be cleared" and
+                    // is the opposite of what the data says.
+                    memcpy(&c[k][0], p + at, 8);
+                }
+                if (ok)
+                {
+                    static std::vector<std::string> seenRect;
+                    // OCCURRENCES AS WELL AS DISTINCT RECTS, and the distinction is the
+                    // whole question. "One distinct clear rect" and "one clear rect a
+                    // frame" are different facts: the first is consistent with the title
+                    // issuing sixteen strips that all look alike, the second says it
+                    // issues one. Part 32 needed the second to conclude that the cascade
+                    // passes clear nothing of their own.
+                    static int rectOccurrences = 0;
+                    if (rectOccurrences < 40)
+                    {
+                        ++rectOccurrences;
+                        fprintf(stderr,
+                                "[vkrect] occurrence frame=%llu (%.1f,%.1f)-(%.1f,%.1f) "
+                                "idx=%u,%u,%u\n",
+                                (unsigned long long)R->frame, c[0][0], c[0][1], c[2][0],
+                                c[2][1], t.rectCorner[0], t.rectCorner[1], t.rectCorner[2]);
+                    }
+                    char line[256];
+                    snprintf(line, sizeof line,
+                             "[vkrect] pitch=%u msaa=%u loc=%d fmt=%u off=%u "
+                             "stride=%u idx=%u,%u,%u  "
+                             "(%.2f,%.2f) (%.2f,%.2f) (%.2f,%.2f)  -> BL (%.2f,%.2f)  "
+                             "depthControl=%02X vte=%02X",
+                             liveRegs[xenos::kRbSurfaceInfo] & 0x3FFF,
+                             (liveRegs[xenos::kRbSurfaceInfo] >> 16) & 3,
+                             a.location, a.format, a.offsetDwords, a.strideDwords,
+                             t.rectCorner[0], t.rectCorner[1], t.rectCorner[2],
+                             c[0][0], c[0][1], c[1][0], c[1][1], c[2][0], c[2][1],
+                             c[0][0] + c[2][0] - c[1][0], c[0][1] + c[2][1] - c[1][1],
+                             liveRegs[xenos::kRbDepthControl] & 0xFF,
+                             liveRegs[xenos::kPaClVteCntl] & 0x3F);
+                    if (std::find(seenRect.begin(), seenRect.end(), line) ==
+                            seenRect.end() && seenRect.size() < 64)
+                    {
+                        seenRect.push_back(line);
+                        fprintf(stderr, "%s\n", line);
+                    }
+                }
+            }
+            // The synthesised four-corner stream is always in the per-frame arena, even
+            // when its source is in the cross-frame store — it is built from THIS draw's
+            // corner indices, so it is not shared and must not be persisted.
+            const VkDeviceSize four =
+                SynthRectStream(loc.bytes(), bytes, a.strideDwords, t.rectCorner, a.format);
+            if (four == VkDeviceSize(-1))
+            {
+                streamsOk = false;
+                break;
+            }
+            const VkDeviceSize offset = four + uint64_t(a.offsetDwords) * 4;
+            BindVertexBufferCached(binding, R->arena.buffer, offset);
+            ++binding;
+            continue;
+        }
+        const VkDeviceSize offset = loc.at + uint64_t(a.offsetDwords) * 4;
+        if (offset >= loc.capacity())
+        {
+            Count("draw: vertex element offset past the stream");
+            streamsOk = false;
+            break;
+        }
+        if (rangeCensus && a.strideDwords && rangeAttrCount < 32)
+            rangeAttrs[rangeAttrCount++] = { a.strideDwords, a.offsetDwords,
+                                             uint32_t(a.format), bytes, loc.bytes() };
+        BindVertexBufferCached(binding, loc.handle(), offset);
+        ++binding;
+    }
+    if (!streamsOk)
+    {
+        // The draw is abandoned: drop the queued binds and leave the cache exactly as the
+        // previous draw left it, because none of these were issued.
+        BindBatchDiscard();
+        return false;
+    }
+    if (!g_noBindBatch)
+    {
+        BindBatchFlush();
+        ++g_bindBatchDraws;
+    }
+    // The evaluation half of CW_VK_RANGE_CENSUS, shared by the indexed branch
+    // (maxIdx = largest index VALUE) and the auto-index branch (maxIdx = count-1):
+    // the reachable-vertex question is the same, only the source of maxIdx differs.
+    auto RangeCensusEval = [&](uint32_t maxIdx) {
+            const uint32_t lastV = uint32_t(int64_t(maxIdx) + t.indxOffset);
+            bool over = false, nan = false;
+            uint64_t nanVerts = 0;
+            uint32_t overFmt = 0, nanFmt = 0;
+            uint64_t overBy = 0;
+            for (uint32_t k = 0; k < rangeAttrCount; k++)
+            {
+                const RangeAttr& at = rangeAttrs[k];
+                uint32_t attrDw = 1;
+                switch (at.format)
+                {
+                case xenos::kFmt_32_32_FLOAT:          attrDw = 2; break;
+                case xenos::kFmt_32_32_32_FLOAT:       attrDw = 3; break;
+                case xenos::kFmt_32_32_32_32_FLOAT:    attrDw = 4; break;
+                case xenos::kFmt_32_32:                attrDw = 2; break;
+                case xenos::kFmt_32_32_32_32:          attrDw = 4; break;
+                case xenos::kFmt_16_16_16_16:
+                case xenos::kFmt_16_16_16_16_FLOAT:    attrDw = 2; break;
+                default:                               attrDw = 1; break;
+                }
+                const uint64_t need =
+                    (uint64_t(lastV) * at.strideDw + at.offsetDw + attrDw) * 4;
+                if (need > at.bytes)
+                {
+                    over = true;
+                    overFmt = at.format;
+                    overBy = std::max(overBy, need - at.bytes);
+                }
+                // In-range NaN scan, float formats only — these bytes go into the
+                // shader as IEEE floats with no conversion to hide behind. FP16 formats
+                // are floats too: a NaN half in a 16_16_16_16_FLOAT attribute expands to
+                // a NaN float in the shader, and the first census missed them.
+                uint32_t floats = 0, halves = 0;
+                if (at.format == xenos::kFmt_32_FLOAT) floats = 1;
+                else if (at.format == xenos::kFmt_32_32_FLOAT) floats = 2;
+                else if (at.format == xenos::kFmt_32_32_32_FLOAT) floats = 3;
+                else if (at.format == xenos::kFmt_32_32_32_32_FLOAT) floats = 4;
+                else if (at.format == xenos::kFmt_16_FLOAT) halves = 1;
+                else if (at.format == xenos::kFmt_16_16_FLOAT) halves = 2;
+                else if (at.format == xenos::kFmt_16_16_16_16_FLOAT) halves = 4;
+                if ((floats || halves) && at.p)
+                {
+                    const uint64_t availV =
+                        at.bytes / 4 >= at.offsetDw + attrDw
+                            ? (at.bytes / 4 - at.offsetDw - attrDw) / at.strideDw + 1
+                            : 0;
+                    const uint64_t scanV = std::min<uint64_t>(availV, uint64_t(lastV) + 1);
+                    for (uint64_t v = 0; v < scanV; v++)
+                    {
+                        const uint8_t* fp = at.p + (v * at.strideDw + at.offsetDw) * 4;
+                        bool vNan = false;
+                        for (uint32_t c = 0; c < floats; c++)
+                        {
+                            uint32_t bits;
+                            memcpy(&bits, fp + c * 4, 4);
+                            if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x7FFFFFu))
+                                vNan = true;
+                        }
+                        for (uint32_t c = 0; c < halves; c++)
+                        {
+                            uint16_t bits;
+                            memcpy(&bits, fp + c * 2, 2);
+                            if ((bits & 0x7C00u) == 0x7C00u && (bits & 0x3FFu))
+                                vNan = true;
+                        }
+                        if (vNan)
+                        {
+                            nan = true;
+                            nanFmt = at.format;
+                            ++nanVerts;
+                        }
+                    }
+                }
+            }
+            Count("rangecensus: indexed draw walked");
+            if (over) Count("rangecensus: index values reach past a stream");
+            if (nan)  Count("rangecensus: NaN bytes IN RANGE in a float attribute");
+            static int printed = 0;
+            if ((over || nan) && printed < 40)
+            {
+                ++printed;
+                fprintf(stderr,
+                        "[range] frame=%llu vs=%016llx idx=%u maxIdx=%u base=%d "
+                        "%s%s overFmt=%u overBy=%llu nanFmt=%u nanVerts=%llu\n",
+                        (unsigned long long)R->frame,
+                        (unsigned long long)t.vsHash, t.draw.indexCount, maxIdx,
+                        int(t.indxOffset), over ? "OVERRUN " : "", nan ? "NAN-IN-RANGE " : "",
+                        overFmt, (unsigned long long)overBy, nanFmt,
+                        (unsigned long long)nanVerts);
+            }
+    };
+
+    // --- indices ---------------------------------------------------------------------
+    // `recordVertex` ends here by assignment rather than by scope, because the vertex
+    // section is not braced and bracing it would move a dozen locals the index section
+    // reads. Same trick, one line: hand the scope a sink it can no longer reach.
+    _pVertex.Close();
+    ProfScope _pIndex(&g_prof.recordIndex);
+    if (t.expand != Expansion::None)
+    {
+        // Both expansions need the source indices, so an indexed one has to have a
+        // readable buffer; an auto-index one synthesises them from the vertex number.
+        if (t.draw.indexed)
+        {
+            const uint64_t bytes = uint64_t(t.draw.indexCount) * (t.draw.index32 ? 4 : 2);
+            if (!GuestRangeOk(t.draw.indexVa, bytes))
+            {
+                Count("draw: index buffer outside the physical arena");
+                return false;
+            }
+        }
+        uint32_t expandedCount = 0;
+        const VkDeviceSize at = ExpandIndices(base, t.draw, t.expand, expandedCount);
+        if (at == VkDeviceSize(-1))
+            return false;
+        BindIndexBufferCached(R->arena.buffer, at, VK_INDEX_TYPE_UINT32);
+        // t.rectSynth already folded the base vertex into its three corners, and its
+        // expanded indices name a private four-vertex stream — so offsetting again
+        // would apply it twice.
+        if (!NoDriverRecord())
+            vkCmdDrawIndexed(R->cmd, expandedCount, 1, 0, t.rectSynth ? 0 : t.indxOffset, 0);
+        else
+            ++g_noDriverRecordSkipped;
+    }
+    else if (t.draw.indexed)
+    {
+        const uint32_t indexBytes = t.draw.index32 ? 4 : 2;
+        const uint64_t bytes = uint64_t(t.draw.indexCount) * indexBytes;
+        if (!GuestRangeOk(t.draw.indexVa, bytes))
+        {
+            Count("draw: index buffer outside the physical arena");
+            return false;
+        }
+        // CW_VK_INDEX_ENDIAN=N overrides the packet's own swizzle code. Scrambled
+        // triangles are the classic symptom of an index buffer read with the wrong
+        // swizzle — a 16-bit stream under an 8-in-32 code has its PAIRS transposed as
+        // well as its bytes — and an arm settles in one run what staring at the
+        // geometry cannot.
+        static const char* endianOverride = Env("CW_VK_INDEX_ENDIAN");
+        const uint32_t endian =
+            endianOverride ? uint32_t(atoi(endianOverride)) : t.draw.indexEndian;
+        {
+            static uint64_t* slots[4];
+            static bool built = false;
+            if (!built)
+            {
+                built = true;
+                char name[32];
+                for (uint32_t i = 0; i < 4; i++)
+                {
+                    snprintf(name, sizeof name, "index endian code %u", i);
+                    slots[i] = CounterSlot(name);
+                }
+            }
+            ++*slots[t.draw.indexEndian & 3];
+        }
+        const StreamLoc loc = UploadStream(base, t.draw.indexVa, bytes, endian, 1);
+        if (!loc.ok())
+            return false;
+        // The CW_VK_RANGE_CENSUS read-out. The index copy is little-endian by here, so
+        // the walk is a plain array scan; 0xFFFF/0xFFFFFFFF is primitive restart and is
+        // not a vertex.
+        if (rangeCensus && rangeAttrCount)
+        {
+            const uint8_t* ip = loc.bytes();
+            uint32_t maxIdx = 0;
+            for (uint32_t i = 0; i < t.draw.indexCount; i++)
+            {
+                const uint32_t v = t.draw.index32
+                    ? reinterpret_cast<const uint32_t*>(ip)[i]
+                    : reinterpret_cast<const uint16_t*>(ip)[i];
+                if (v != (t.draw.index32 ? 0xFFFFFFFFu : 0xFFFFu) && v > maxIdx)
+                    maxIdx = v;
+            }
+            RangeCensusEval(maxIdx);
+        }
+        const VkIndexType itype =
+            t.draw.index32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+        BindIndexBufferCached(loc.handle(), loc.at, itype);
+        if (!NoDriverRecord())
+            vkCmdDrawIndexed(R->cmd, t.draw.indexCount, 1, 0, t.indxOffset, 0);
+        else
+            ++g_noDriverRecordSkipped;
+        COUNT("draw: indexed");
+    }
+    else
+    {
+        // Auto-index reaches vertices [t.indxOffset, t.indxOffset + count); the census
+        // question is identical, with maxIdx implicit.
+        if (rangeCensus && rangeAttrCount && t.draw.indexCount)
+            RangeCensusEval(t.draw.indexCount - 1);
+        if (!NoDriverRecord())
+            vkCmdDraw(R->cmd, t.draw.indexCount, 1, uint32_t(t.indxOffset), 0);
+        else
+            ++g_noDriverRecordSkipped;
+        COUNT("draw: auto-index");
+    }
+    return true;
+}
+
+
+// ===================================================================================
+// STAGE 2b: DEFERRED RECORDING — tickets replayed at the range boundary (part 7)
+// ===================================================================================
+//
+// Behind `CW_VK_DEFER_RECORD=1`, DoDraw stops calling the record core inline: it
+// queues the ticket, and the whole range's tickets replay back-to-back when the range
+// closes (the prec module's rangeClosed hook, which is also where the secondaries
+// rotate — replay lands in the range's own command buffer by construction). Execution
+// is still serial and still on the pump; what this stage proves is CAPTURE
+// COMPLETENESS — that the ticket alone reproduces the picture — which is the one
+// property stage 2c cannot debug once workers are involved, because a capture bug and
+// a race look identical from a wrong frame.
+//
+// The honest deltas from inline, both documented rather than hidden: (1) the per-draw
+// bookkeeping in DoDraw's tail runs at capture, so a draw whose replay then fails an
+// early-out is still counted/fingerprinted (failures are counted separately here);
+// (2) guest memory is read at replay, up to a range (~128 draws of walk) later than
+// inline — the same widened-race class as the parallel guard's, measured there at a
+// fraction of a percent, and torn reads still hash as "changed" on the guard path.
+//
+// Replay happens ONLY on kSizeCap and kPassEnd closes, where a command buffer is open
+// for the range. kPassBegin/kFrameSeal arrive with no recordable target; a non-empty
+// queue there is a sequencing defect and is dropped LOUDLY, never recorded blind.
+namespace defer
+{
+
+bool On()
+{
+    static const bool on = [] {
+        const bool o = EnvOn("CW_VK_DEFER_RECORD");
+        if (o)
+            fprintf(stderr,
+                    "[defer] CW_VK_DEFER_RECORD=1 — draw recording is DEFERRED to the "
+                    "range boundary (stage 2b: tickets, serial replay; walk-time "
+                    "diagnostic arms inside the core are OFF in this mode)\n");
+        return o;
+    }();
+    return on;
+}
+
+uint8_t* g_base = nullptr;         // the guest base, identical every draw
+std::vector<DrawTicket> g_queue;   // the open range's tickets, pump-only
+
+struct Stats
+{
+    uint64_t deferred = 0;
+    uint64_t ranges = 0;
+    uint64_t replayFailed = 0;   // ticket hit a core early-out (counted inline too,
+                                 // but inline also skips the tail bookkeeping)
+    uint64_t dropped = 0;        // queue non-empty at a close with no open target
+} g_stats;
+
+void Queue(uint8_t* base, const DrawTicket& t)
+{
+    g_base = base;
+    g_queue.push_back(t);
+    ++g_stats.deferred;
+}
+
+void OnRangeClosed(uint8_t reason)
+{
+    if (g_queue.empty())
+        return;
+    if (reason != uint8_t(prec::kSizeCap) && reason != uint8_t(prec::kPassEnd))
+    {
+        g_stats.dropped += g_queue.size();
+        static uint64_t printed = 0;
+        if (++printed <= 8)
+            fprintf(stderr,
+                    "[defer] ** %zu tickets dropped at a reason-%u close — draws were "
+                    "captured with no pass open to replay into (a sequencing defect)\n",
+                    g_queue.size(), reason);
+        g_queue.clear();
+        return;
+    }
+    ++g_stats.ranges;
+    for (const DrawTicket& tk : g_queue)
+        if (!RecordDrawCore(g_base, tk, nullptr))
+            ++g_stats.replayFailed;
+    g_queue.clear();
+}
+
+void PrintStats(FILE* f)
+{
+    if (!On() || !g_stats.deferred)
+        return;
+    fprintf(f,
+            "[defer]   stage 2b: %llu draws deferred, %llu ranges replayed | "
+            "%llu replay early-outs | **%llu dropped**\n",
+            (unsigned long long)g_stats.deferred, (unsigned long long)g_stats.ranges,
+            (unsigned long long)g_stats.replayFailed,
+            (unsigned long long)g_stats.dropped);
+}
+
+} // namespace defer
+
 void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
             const Pm4ShaderBinding& vsBind, const Pm4ShaderBinding& psBind)
 {
@@ -16560,193 +17284,6 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
 
     _pTail.Close();
 
-    ProfScope _pRecord(&g_prof.record);
-    {
-    ProfScope _pState(&g_prof.recordState);
-    // Only what has actually changed since the last draw on this command buffer. See
-    // Renderer::BoundState for why that is sound; CW_VK_NO_STATE_CACHE=1 re-issues
-    // everything every draw, which is the pre-part-18 renderer and the control arm.
-    static const bool noStateCache = Env("CW_VK_NO_STATE_CACHE") != nullptr;
-    ++R->skips.draws;
-    const float blendConstants[4] = {
-        F32(regs[xenos::kRbBlendRed]), F32(regs[xenos::kRbBlendRed + 1]),
-        F32(regs[xenos::kRbBlendRed + 2]), F32(regs[xenos::kRbBlendRed + 3])
-    };
-    if (noStateCache || pipeline != R->bound.pipeline)
-    {
-        if (!NoDriverRecord())
-            vkCmdBindPipeline(R->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-        else
-            ++g_noDriverRecordSkipped;
-        // BINDING A PIPELINE THAT SPECIFIES STATE STATICALLY MAKES THE CORRESPONDING
-        // DYNAMIC STATE UNDEFINED, so the skip-if-unchanged cache below cannot survive a
-        // bind. The stencil states are declared dynamic only on stencil-enabled pipelines
-        // (see the dynamic-state array), which means every non-stencil draw in between
-        // invalidates them — and the symptom is not a wrong picture but 60
-        // `VUID-vkCmdDrawIndexed-None-0783{7,8,9}`, i.e. a draw reading undefined stencil
-        // state. The viewport, scissor and blend constants above are dynamic on EVERY
-        // pipeline, so they are unaffected and keep their cache.
-        R->bound.haveStencil = false;
-        R->bound.pipeline = pipeline;
-    }
-    else
-        ++R->skips.pipeline;
-    if (noStateCache || !R->bound.haveViewport ||
-        memcmp(&viewport, &R->bound.viewport, sizeof(viewport)) != 0)
-    {
-        if (!NoDriverRecord())
-            vkCmdSetViewport(R->cmd, 0, 1, &viewport);
-        else
-            ++g_noDriverRecordSkipped;
-        R->bound.viewport = viewport;
-        R->bound.haveViewport = true;
-    }
-    else
-        ++R->skips.viewport;
-    if (noStateCache || !R->bound.haveScissor ||
-        memcmp(&scissor, &R->bound.scissor, sizeof(scissor)) != 0)
-    {
-        if (!NoDriverRecord())
-            vkCmdSetScissor(R->cmd, 0, 1, &scissor);
-        else
-            ++g_noDriverRecordSkipped;
-        R->bound.scissor = scissor;
-        R->bound.haveScissor = true;
-    }
-    else
-        ++R->skips.scissor;
-    if (noStateCache || !R->bound.haveBlend ||
-        memcmp(blendConstants, R->bound.blend, sizeof(blendConstants)) != 0)
-    {
-        if (!NoDriverRecord())
-            vkCmdSetBlendConstants(R->cmd, blendConstants);
-        else
-            ++g_noDriverRecordSkipped;
-        memcpy(R->bound.blend, blendConstants, sizeof(blendConstants));
-        R->bound.haveBlend = true;
-    }
-    else
-        ++R->skips.blend;
-
-    // The polygon offset lives in the PIPELINE now, not here — see PipelineKey. The
-    // counter stays, because an arm with no counter cannot be shown to have engaged.
-    // Hoisted in part 76 for the reason the clip dump above was: this was a `getenv` per
-    // draw, as the first operand of an `&&`, in every run.
-    static const bool noPolyOffsetArm = EnvOn("CW_VK_NO_POLY_OFFSET");
-    if (!noPolyOffsetArm &&
-        (regs[xenos::kPaSuPolyOffsetFrontScale] || regs[xenos::kPaSuPolyOffsetFrontOffset]))
-        ++g_polyOffsetDraws;
-
-    // ---- THE STENCIL REFERENCE AND MASKS (part 56) -------------------------------
-    //
-    // RB_STENCILREFMASK, layout ref:8 / mask:8 @8 / writemask:8 @16 — confirmed the same
-    // way the ops were, by whether the values come out sensible rather than from a
-    // header. They do: the draws that carry `ALWAYS / REPLACE` read `sr=00FFFFFE`, i.e.
-    // write reference **254** through full masks, and a matching draw tests `EQUAL`
-    // against it. Dynamic state, so none of this enters the pipeline key.
-    {
-        static const bool noStencil = EnvOn("CW_VK_NO_STENCIL");
-        const uint32_t sr = regs[xenos::kRbStencilRefMask];
-        const uint32_t ref = sr & 0xFF;
-        const uint32_t mask = (sr >> 8) & 0xFF;
-        const uint32_t wmask = (sr >> 16) & 0xFF;
-        const bool stencilOn = !noStencil && (regs[xenos::kRbDepthControl] & 1);
-        if (stencilOn)
-            ++g_stencilDraws;
-        // ONLY WHEN THE BOUND PIPELINE DECLARES THEM DYNAMIC, which is exactly when the
-        // stencil test is on. Calling a dynamic-state setter for state a pipeline
-        // specifies STATICALLY is illegal in the other direction — `VUID-vkCmdDraw-None-
-        // 08608`, 40 of them, and the message says so plainly once read rather than
-        // guessed at: "doesn't set up VK_DYNAMIC_STATE_STENCIL_*, but since the
-        // vkCmdBindPipeline, the related dynamic state commands have been called".
-        if (stencilOn &&
-            (noStateCache || !R->bound.haveStencil || R->bound.stencilRef != ref ||
-             R->bound.stencilMask != mask || R->bound.stencilWriteMask != wmask))
-        {
-            if (!NoDriverRecord())
-            {
-                vkCmdSetStencilReference(R->cmd, VK_STENCIL_FACE_FRONT_AND_BACK, ref);
-                vkCmdSetStencilCompareMask(R->cmd, VK_STENCIL_FACE_FRONT_AND_BACK, mask);
-                vkCmdSetStencilWriteMask(R->cmd, VK_STENCIL_FACE_FRONT_AND_BACK, wmask);
-            }
-            else
-                g_noDriverRecordSkipped += 3;
-            R->bound.stencilRef = ref;
-            R->bound.stencilMask = mask;
-            R->bound.stencilWriteMask = wmask;
-            R->bound.haveStencil = true;
-        }
-        else if (stencilOn)
-            ++R->skips.stencil;
-    }
-
-    // The five bindless heaps never change address, so this is once per command
-    // buffer rather than once per draw — and it is the most expensive of the five.
-    if (noStateCache || !R->bound.setsBound)
-    {
-        if (!NoDriverRecord())
-            vkCmdBindDescriptorSets(R->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, R->pipeLayout,
-                                    0, 5, R->sets, 0, nullptr);
-        else
-            ++g_noDriverRecordSkipped;
-        R->bound.setsBound = true;
-    }
-    else
-        ++R->skips.sets;
-
-    // The three constant-buffer addresses, then THE DRAW INDEX at offset 24 for the
-    // draw-ID pass. The index is pushed on every draw, armed or not: it costs four bytes
-    // in a call that is already being made, and a value that is only correct when an
-    // instrument is enabled is a trap for the next person to use it.
-    struct { uint64_t vs, ps, shared; uint32_t drawIndex, pad; } pushConstants = {
-        uint64_t(R->arena.address + vsConstAt),
-        uint64_t(R->arena.address + psConstAt),
-        uint64_t(R->arena.address + sharedAt),
-        uint32_t(R->drawsThisFrame), 0 };
-    if (!NoDriverRecord())
-        vkCmdPushConstants(R->cmd, R->pipeLayout,
-                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32,
-                           &pushConstants);
-    else
-        ++g_noDriverRecordSkipped;
-
-    // THE CONSTANT-SLOT RACE DETECTOR's record half. This is the right place and the only
-    // right place: the address has just been pushed, so these are exactly the bytes this
-    // draw is being recorded to read, after the memo top-up and after any miss-path
-    // patching. The check half runs at submit (see SubmitFrame).
-    if (ConstRaceOn())
-    {
-        ConstRef r;
-        r.draw = uint32_t(R->drawsThisFrame);
-        r.windowOffset = regs[xenos::kPaScWindowOffset];
-        r.vsAt = vsConstAt;
-        r.psAt = psConstAt;
-        r.vs = &vs;
-        r.ps = &ps;
-        auto snap = [](std::vector<uint32_t>& out, const uint32_t* win,
-                       const ShaderMeta& m, uint32_t bytes) {
-            if (m.aluDynamic || m.aluConsts.empty())
-            {
-                out.resize(bytes / 4);
-                memcpy(out.data(), win, bytes);
-            }
-            else
-            {
-                out.resize(m.aluConsts.size() * 4);
-                for (size_t i = 0; i < m.aluConsts.size(); i++)
-                    if (m.aluConsts[i] < 256)
-                        memcpy(out.data() + i * 4, win + m.aluConsts[i] * 4,
-                               4 * sizeof(uint32_t));
-            }
-        };
-        const uint32_t* vwin = reinterpret_cast<const uint32_t*>(R->arena.mapped + vsConstAt);
-        const uint32_t* pwin = reinterpret_cast<const uint32_t*>(R->arena.mapped + psConstAt);
-        memcpy(r.c0, vwin, sizeof r.c0);
-        snap(r.vsRegs, vwin, vs, kVsConstBytes);
-        snap(r.psRegs, pwin, ps, kPsConstBytes);
-        g_constRefs.push_back(std::move(r));
-    }
-    }   // end recordState
 
     // CW_VK_STATE_PROBE=1 — the distinct values of the state registers this renderer
     // ASSUMES rather than reads. Each of these is a place where a wrong assumption
@@ -16849,7 +17386,6 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     }
 
     // --- vertex streams -------------------------------------------------------------
-    ProfScope _pVertex(&g_prof.recordVertex);
     // CW_VK_FETCH_MEMO_CENSUS=1 — WOULD A VERTEX-FETCH MEMO BE SERVED? Ask before building.
     //
     // §6eb §3 measured the driver's own recording at 251 ns a draw and refuted item 1's
@@ -16981,274 +17517,56 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
                          indxOffset);
     }
 
-    uint32_t binding = 0;
-    bool streamsOk = true;
-    if (g_bindRunCensus)
-        BindRunCensusBeginDraw();
-    // CW_VK_RANGE_CENSUS=1 — per indexed draw, the two questions the part-33 NaN chain
-    // left: (1) do this draw's INDEX VALUES reach vertices past the fetch constant's
-    // declared size — the guard above bounds indxOffset + indexCount, which is the
-    // number of indices, not the vertices they name — and (2) do the IN-RANGE bytes of
-    // any float-format attribute already decode to NaN. On Xenos an out-of-range vfetch
-    // returns zero; our streams live in one shared arena buffer, so even
-    // robustBufferAccess cannot bound them (the binding's range is the whole arena),
-    // and an overrun reads a neighbouring stream's bytes as this draw's floats.
-    // A DIAGNOSTIC ARM: it walks every index and every vertex of every draw (gotcha 7).
-    static const bool rangeCensus = [] {
-        const char* e = getenv("CW_VK_RANGE_CENSUS");
-        return e && *e && *e != '0';
-    }();
-    struct RangeAttr { uint32_t strideDw, offsetDw, format; uint64_t bytes; const uint8_t* p; };
-    RangeAttr rangeAttrs[32];
-    uint32_t rangeAttrCount = 0;
+
+    // The polygon offset lives in the PIPELINE now, not here — see PipelineKey. The
+    // counter stays, because an arm with no counter cannot be shown to have engaged.
+    // Hoisted in part 76 for the reason the clip dump above was: this was a `getenv` per
+    // draw, as the first operand of an `&&`, in every run. (Capture-side since the
+    // stage-2b split: it reads registers, and it only counts.)
+    static const bool noPolyOffsetArm = EnvOn("CW_VK_NO_POLY_OFFSET");
+    if (!noPolyOffsetArm &&
+        (regs[xenos::kPaSuPolyOffsetFrontScale] || regs[xenos::kPaSuPolyOffsetFrontOffset]))
+        ++g_polyOffsetDraws;
+
+    // THE TICKET (part 7 stage 2b) — every resolved value the record core needs, filled
+    // from the walk's own locals. See DrawTicket for why this seam exists.
+    DrawTicket t;
+    t.draw = draw;
+    t.pipeline = pipeline;
+    t.viewport = viewport;
+    t.scissor = scissor;
+    for (uint32_t i = 0; i < 4; ++i)
+        t.blend[i] = F32(regs[xenos::kRbBlendRed + i]);
+    t.stencilRefMask = regs[xenos::kRbStencilRefMask];
+    t.stencilTest = (regs[xenos::kRbDepthControl] & 1) != 0;
+    t.rectSynth = rectSynth;
+    t.expand = expand;
+    t.indxOffset = indxOffset;
+    for (uint32_t i = 0; i < 3; ++i)
+        t.rectCorner[i] = rectCorner[i];
+    t.vsConstAt = vsConstAt;
+    t.psConstAt = psConstAt;
+    t.sharedAt = sharedAt;
+    t.drawIndex = uint32_t(R->drawsThisFrame);
+    t.vs = &vs;
+    t.ps = &ps;
+    t.vsHash = vsBind.hash;
+    t.psHash = psBind.hash;
     for (const VertexAttribute& a : vs.attributes)
     {
         if (a.location < 0 || a.indirect)
             continue;
-        const xenos::VertexFetch vf = xenos::DecodeVertexFetch(regs, FetchSlot(a.fetchSlot));
-        const uint32_t va = PhysToVa(vf.address);
-        const uint64_t bytes = uint64_t(vf.sizeDwords) * 4;
-        if (!GuestRangeOk(va, bytes) || !bytes)
+        if (t.nFetch == sizeof(t.fetch) / sizeof(t.fetch[0]))
         {
-            Count("draw: vertex stream outside the physical arena");
-            streamsOk = false;
-            break;
+            // Never seen (the binding cap is 16); dropped LOUDLY rather than truncated
+            // silently, because a draw missing its last attribute is a plausible wrong
+            // picture and this is a hard count.
+            Count("draw: ticket attribute overflow — draw dropped");
+            return;
         }
-        // The whole fetch buffer is uploaded, so a base vertex stays inside it — but
-        // only if the guest's own numbers say it does. A draw whose offset plus count
-        // runs off the end would read another draw's vertices (or, past the arena, walk
-        // off a Vulkan buffer), and that has to be LOUD rather than quietly clamped
-        // back to zero: clamping is the defect this offset exists to fix, reintroduced
-        // wearing a safety check's name.
-        if (indxOffset && a.strideDwords)
-        {
-            const uint64_t need =
-                (uint64_t(uint32_t(indxOffset) + draw.indexCount) * a.strideDwords) * 4;
-            if (need > bytes)
-            {
-                Count("draw: VGT_INDX_OFFSET runs past the vertex stream");
-                streamsOk = false;
-                break;
-            }
-        }
-        const StreamLoc loc = UploadStream(base, va, bytes, vf.endian, 0);
-        if (!loc.ok())
-        {
-            streamsOk = false;
-            break;
-        }
-        if (rectSynth && a.strideDwords)
-        {
-            // CW_VK_RECT_TRACE=<surfacePitch> — the CORNERS of every distinct clear
-            // rect on one EDRAM surface, printed once per distinct rect.
-            //
-            // A rect-list draw at the head of a pass IS the guest's clear, and the only
-            // way to know what it clears is to read its three corners. Part 32 needed
-            // this for the shadow cascade: the cascade's depth buffer comes out half
-            // empty, the geometry is provably submitted for all of it (CW_VK_DEPTH_ALWAYS
-            // fills it), so the question is which rectangles the title actually asked to
-            // be cleared — and that is data, not something to infer from the result.
-            static const char* const rectTraceEnv = Env("CW_VK_RECT_TRACE");
-            // A pitch of 0 means EVERY surface. Naming one pitch is right when the
-            // question is "what does this pass clear"; it is wrong when the question is
-            // "where does that rect live", and part 32 needed the second — a clear rect
-            // recorded in part 15 as the cascade's turned out to be on another surface
-            // entirely, which is only visible if the trace prints the pitch.
-            if (rectTraceEnv &&
-                (strtoul(rectTraceEnv, nullptr, 10) == 0 ||
-                 (regs[xenos::kRbSurfaceInfo] & 0x3FFF) ==
-                     uint32_t(strtoul(rectTraceEnv, nullptr, 10))))
-            {
-                const uint8_t* p = loc.bytes();
-                float c[3][2] = {};
-                bool ok = p != nullptr;
-                for (uint32_t k = 0; ok && k < 3; k++)
-                {
-                    const uint64_t at =
-                        (uint64_t(rectCorner[k]) * a.strideDwords + a.offsetDwords) * 4;
-                    if (at + 8 > bytes) { ok = false; break; }
-                    // The arena copy is ALREADY little-endian — the stream uploader
-                    // swaps on the way in. Byte-swapping again here read every corner as
-                    // 0.0, which reads as "the title asks for nothing to be cleared" and
-                    // is the opposite of what the data says.
-                    memcpy(&c[k][0], p + at, 8);
-                }
-                if (ok)
-                {
-                    static std::vector<std::string> seenRect;
-                    // OCCURRENCES AS WELL AS DISTINCT RECTS, and the distinction is the
-                    // whole question. "One distinct clear rect" and "one clear rect a
-                    // frame" are different facts: the first is consistent with the title
-                    // issuing sixteen strips that all look alike, the second says it
-                    // issues one. Part 32 needed the second to conclude that the cascade
-                    // passes clear nothing of their own.
-                    static int rectOccurrences = 0;
-                    if (rectOccurrences < 40)
-                    {
-                        ++rectOccurrences;
-                        fprintf(stderr,
-                                "[vkrect] occurrence frame=%llu (%.1f,%.1f)-(%.1f,%.1f) "
-                                "idx=%u,%u,%u\n",
-                                (unsigned long long)R->frame, c[0][0], c[0][1], c[2][0],
-                                c[2][1], rectCorner[0], rectCorner[1], rectCorner[2]);
-                    }
-                    char line[256];
-                    snprintf(line, sizeof line,
-                             "[vkrect] pitch=%u msaa=%u loc=%d fmt=%u off=%u "
-                             "stride=%u idx=%u,%u,%u  "
-                             "(%.2f,%.2f) (%.2f,%.2f) (%.2f,%.2f)  -> BL (%.2f,%.2f)  "
-                             "depthControl=%02X vte=%02X",
-                             regs[xenos::kRbSurfaceInfo] & 0x3FFF,
-                             (regs[xenos::kRbSurfaceInfo] >> 16) & 3,
-                             a.location, a.format, a.offsetDwords, a.strideDwords,
-                             rectCorner[0], rectCorner[1], rectCorner[2],
-                             c[0][0], c[0][1], c[1][0], c[1][1], c[2][0], c[2][1],
-                             c[0][0] + c[2][0] - c[1][0], c[0][1] + c[2][1] - c[1][1],
-                             regs[xenos::kRbDepthControl] & 0xFF,
-                             regs[xenos::kPaClVteCntl] & 0x3F);
-                    if (std::find(seenRect.begin(), seenRect.end(), line) ==
-                            seenRect.end() && seenRect.size() < 64)
-                    {
-                        seenRect.push_back(line);
-                        fprintf(stderr, "%s\n", line);
-                    }
-                }
-            }
-            // The synthesised four-corner stream is always in the per-frame arena, even
-            // when its source is in the cross-frame store — it is built from THIS draw's
-            // corner indices, so it is not shared and must not be persisted.
-            const VkDeviceSize four =
-                SynthRectStream(loc.bytes(), bytes, a.strideDwords, rectCorner, a.format);
-            if (four == VkDeviceSize(-1))
-            {
-                streamsOk = false;
-                break;
-            }
-            const VkDeviceSize offset = four + uint64_t(a.offsetDwords) * 4;
-            BindVertexBufferCached(binding, R->arena.buffer, offset);
-            ++binding;
-            continue;
-        }
-        const VkDeviceSize offset = loc.at + uint64_t(a.offsetDwords) * 4;
-        if (offset >= loc.capacity())
-        {
-            Count("draw: vertex element offset past the stream");
-            streamsOk = false;
-            break;
-        }
-        if (rangeCensus && a.strideDwords && rangeAttrCount < 32)
-            rangeAttrs[rangeAttrCount++] = { a.strideDwords, a.offsetDwords,
-                                             uint32_t(a.format), bytes, loc.bytes() };
-        BindVertexBufferCached(binding, loc.handle(), offset);
-        ++binding;
+        t.fetch[t.nFetch++] = { xenos::DecodeVertexFetch(regs, FetchSlot(a.fetchSlot)),
+                                &a };
     }
-    if (!streamsOk)
-    {
-        // The draw is abandoned: drop the queued binds and leave the cache exactly as the
-        // previous draw left it, because none of these were issued.
-        BindBatchDiscard();
-        return;
-    }
-    if (!g_noBindBatch)
-    {
-        BindBatchFlush();
-        ++g_bindBatchDraws;
-    }
-    // The evaluation half of CW_VK_RANGE_CENSUS, shared by the indexed branch
-    // (maxIdx = largest index VALUE) and the auto-index branch (maxIdx = count-1):
-    // the reachable-vertex question is the same, only the source of maxIdx differs.
-    auto RangeCensusEval = [&](uint32_t maxIdx) {
-            const uint32_t lastV = uint32_t(int64_t(maxIdx) + indxOffset);
-            bool over = false, nan = false;
-            uint64_t nanVerts = 0;
-            uint32_t overFmt = 0, nanFmt = 0;
-            uint64_t overBy = 0;
-            for (uint32_t k = 0; k < rangeAttrCount; k++)
-            {
-                const RangeAttr& at = rangeAttrs[k];
-                uint32_t attrDw = 1;
-                switch (at.format)
-                {
-                case xenos::kFmt_32_32_FLOAT:          attrDw = 2; break;
-                case xenos::kFmt_32_32_32_FLOAT:       attrDw = 3; break;
-                case xenos::kFmt_32_32_32_32_FLOAT:    attrDw = 4; break;
-                case xenos::kFmt_32_32:                attrDw = 2; break;
-                case xenos::kFmt_32_32_32_32:          attrDw = 4; break;
-                case xenos::kFmt_16_16_16_16:
-                case xenos::kFmt_16_16_16_16_FLOAT:    attrDw = 2; break;
-                default:                               attrDw = 1; break;
-                }
-                const uint64_t need =
-                    (uint64_t(lastV) * at.strideDw + at.offsetDw + attrDw) * 4;
-                if (need > at.bytes)
-                {
-                    over = true;
-                    overFmt = at.format;
-                    overBy = std::max(overBy, need - at.bytes);
-                }
-                // In-range NaN scan, float formats only — these bytes go into the
-                // shader as IEEE floats with no conversion to hide behind. FP16 formats
-                // are floats too: a NaN half in a 16_16_16_16_FLOAT attribute expands to
-                // a NaN float in the shader, and the first census missed them.
-                uint32_t floats = 0, halves = 0;
-                if (at.format == xenos::kFmt_32_FLOAT) floats = 1;
-                else if (at.format == xenos::kFmt_32_32_FLOAT) floats = 2;
-                else if (at.format == xenos::kFmt_32_32_32_FLOAT) floats = 3;
-                else if (at.format == xenos::kFmt_32_32_32_32_FLOAT) floats = 4;
-                else if (at.format == xenos::kFmt_16_FLOAT) halves = 1;
-                else if (at.format == xenos::kFmt_16_16_FLOAT) halves = 2;
-                else if (at.format == xenos::kFmt_16_16_16_16_FLOAT) halves = 4;
-                if ((floats || halves) && at.p)
-                {
-                    const uint64_t availV =
-                        at.bytes / 4 >= at.offsetDw + attrDw
-                            ? (at.bytes / 4 - at.offsetDw - attrDw) / at.strideDw + 1
-                            : 0;
-                    const uint64_t scanV = std::min<uint64_t>(availV, uint64_t(lastV) + 1);
-                    for (uint64_t v = 0; v < scanV; v++)
-                    {
-                        const uint8_t* fp = at.p + (v * at.strideDw + at.offsetDw) * 4;
-                        bool vNan = false;
-                        for (uint32_t c = 0; c < floats; c++)
-                        {
-                            uint32_t bits;
-                            memcpy(&bits, fp + c * 4, 4);
-                            if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x7FFFFFu))
-                                vNan = true;
-                        }
-                        for (uint32_t c = 0; c < halves; c++)
-                        {
-                            uint16_t bits;
-                            memcpy(&bits, fp + c * 2, 2);
-                            if ((bits & 0x7C00u) == 0x7C00u && (bits & 0x3FFu))
-                                vNan = true;
-                        }
-                        if (vNan)
-                        {
-                            nan = true;
-                            nanFmt = at.format;
-                            ++nanVerts;
-                        }
-                    }
-                }
-            }
-            Count("rangecensus: indexed draw walked");
-            if (over) Count("rangecensus: index values reach past a stream");
-            if (nan)  Count("rangecensus: NaN bytes IN RANGE in a float attribute");
-            static int printed = 0;
-            if ((over || nan) && printed < 40)
-            {
-                ++printed;
-                fprintf(stderr,
-                        "[range] frame=%llu vs=%016llx idx=%u maxIdx=%u base=%d "
-                        "%s%s overFmt=%u overBy=%llu nanFmt=%u nanVerts=%llu\n",
-                        (unsigned long long)R->frame,
-                        (unsigned long long)vsBind.hash, draw.indexCount, maxIdx,
-                        int(indxOffset), over ? "OVERRUN " : "", nan ? "NAN-IN-RANGE " : "",
-                        overFmt, (unsigned long long)overBy, nanFmt,
-                        (unsigned long long)nanVerts);
-            }
-    };
 
     // CW_VK_DRAW_PROBE=<vsHash> — for the first few draws with that vertex shader,
     // print the constants and the vertex data it will actually read.
@@ -17520,111 +17838,15 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
         }
     }
 
-    // --- indices ---------------------------------------------------------------------
-    // `recordVertex` ends here by assignment rather than by scope, because the vertex
-    // section is not braced and bracing it would move a dozen locals the index section
-    // reads. Same trick, one line: hand the scope a sink it can no longer reach.
-    _pVertex.Close();
-    ProfScope _pIndex(&g_prof.recordIndex);
-    if (expand != Expansion::None)
-    {
-        // Both expansions need the source indices, so an indexed one has to have a
-        // readable buffer; an auto-index one synthesises them from the vertex number.
-        if (draw.indexed)
-        {
-            const uint64_t bytes = uint64_t(draw.indexCount) * (draw.index32 ? 4 : 2);
-            if (!GuestRangeOk(draw.indexVa, bytes))
-            {
-                Count("draw: index buffer outside the physical arena");
-                return;
-            }
-        }
-        uint32_t expandedCount = 0;
-        const VkDeviceSize at = ExpandIndices(base, draw, expand, expandedCount);
-        if (at == VkDeviceSize(-1))
-            return;
-        BindIndexBufferCached(R->arena.buffer, at, VK_INDEX_TYPE_UINT32);
-        // rectSynth already folded the base vertex into its three corners, and its
-        // expanded indices name a private four-vertex stream — so offsetting again
-        // would apply it twice.
-        if (!NoDriverRecord())
-            vkCmdDrawIndexed(R->cmd, expandedCount, 1, 0, rectSynth ? 0 : indxOffset, 0);
-        else
-            ++g_noDriverRecordSkipped;
-    }
-    else if (draw.indexed)
-    {
-        const uint32_t indexBytes = draw.index32 ? 4 : 2;
-        const uint64_t bytes = uint64_t(draw.indexCount) * indexBytes;
-        if (!GuestRangeOk(draw.indexVa, bytes))
-        {
-            Count("draw: index buffer outside the physical arena");
-            return;
-        }
-        // CW_VK_INDEX_ENDIAN=N overrides the packet's own swizzle code. Scrambled
-        // triangles are the classic symptom of an index buffer read with the wrong
-        // swizzle — a 16-bit stream under an 8-in-32 code has its PAIRS transposed as
-        // well as its bytes — and an arm settles in one run what staring at the
-        // geometry cannot.
-        static const char* endianOverride = Env("CW_VK_INDEX_ENDIAN");
-        const uint32_t endian =
-            endianOverride ? uint32_t(atoi(endianOverride)) : draw.indexEndian;
-        {
-            static uint64_t* slots[4];
-            static bool built = false;
-            if (!built)
-            {
-                built = true;
-                char name[32];
-                for (uint32_t i = 0; i < 4; i++)
-                {
-                    snprintf(name, sizeof name, "index endian code %u", i);
-                    slots[i] = CounterSlot(name);
-                }
-            }
-            ++*slots[draw.indexEndian & 3];
-        }
-        const StreamLoc loc = UploadStream(base, draw.indexVa, bytes, endian, 1);
-        if (!loc.ok())
-            return;
-        // The CW_VK_RANGE_CENSUS read-out. The index copy is little-endian by here, so
-        // the walk is a plain array scan; 0xFFFF/0xFFFFFFFF is primitive restart and is
-        // not a vertex.
-        if (rangeCensus && rangeAttrCount)
-        {
-            const uint8_t* ip = loc.bytes();
-            uint32_t maxIdx = 0;
-            for (uint32_t i = 0; i < draw.indexCount; i++)
-            {
-                const uint32_t v = draw.index32
-                    ? reinterpret_cast<const uint32_t*>(ip)[i]
-                    : reinterpret_cast<const uint16_t*>(ip)[i];
-                if (v != (draw.index32 ? 0xFFFFFFFFu : 0xFFFFu) && v > maxIdx)
-                    maxIdx = v;
-            }
-            RangeCensusEval(maxIdx);
-        }
-        const VkIndexType itype =
-            draw.index32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
-        BindIndexBufferCached(loc.handle(), loc.at, itype);
-        if (!NoDriverRecord())
-            vkCmdDrawIndexed(R->cmd, draw.indexCount, 1, 0, indxOffset, 0);
-        else
-            ++g_noDriverRecordSkipped;
-        COUNT("draw: indexed");
-    }
-    else
-    {
-        // Auto-index reaches vertices [indxOffset, indxOffset + count); the census
-        // question is identical, with maxIdx implicit.
-        if (rangeCensus && rangeAttrCount && draw.indexCount)
-            RangeCensusEval(draw.indexCount - 1);
-        if (!NoDriverRecord())
-            vkCmdDraw(R->cmd, draw.indexCount, 1, uint32_t(indxOffset), 0);
-        else
-            ++g_noDriverRecordSkipped;
-        COUNT("draw: auto-index");
-    }
+    // THE CORE CALL (part 7 stage 2b). Inline by default: the ticket was built just
+    // above from the same values the code that used to live here read in place, and
+    // `regs` rides along so the walk-time diagnostic arms still fire. Under
+    // CW_VK_DEFER_RECORD the ticket queues instead and the range replays it at its
+    // close — see namespace defer for the two documented divergences.
+    if (defer::On())
+        defer::Queue(base, t);
+    else if (!RecordDrawCore(base, t, regs))
+        return;
     // Fingerprint the draw. Order matters and is included by construction, because the
     // accumulator is sequential — two frames with the same draws in a different order
     // are correctly different frames.
@@ -17728,13 +17950,16 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     // a static-init guard, so an ordinary run pays one predictable branch here.
     if (g_gpPassSeg >= 0)
     {
-        const uint64_t px = uint64_t(R->bound.scissor.extent.width) *
-                            uint64_t(R->bound.scissor.extent.height);
+        // The draw's own scissor, not the bound cache's: since the stage-2b split this
+        // tail runs at CAPTURE time, where R->bound still holds the previous range's
+        // state under deferral. Identical values on the inline path.
+        const uint64_t px = uint64_t(scissor.extent.width) *
+                            uint64_t(scissor.extent.height);
         if (px > g_gpPassExtPx)
         {
             g_gpPassExtPx = px;
-            g_gpPassExt = (uint64_t(R->bound.scissor.extent.width) << 32) |
-                          R->bound.scissor.extent.height;
+            g_gpPassExt = (uint64_t(scissor.extent.width) << 32) |
+                          scissor.extent.height;
         }
     }
     R->verticesThisPass += draw.indexCount;
@@ -22598,6 +22823,7 @@ void VkRenderer_DumpStats()
     // control arm announced itself at init.
     prec::PrintStats(stderr);
     sec::PrintStats(stderr);
+    defer::PrintStats(stderr);
     // Part 72 item 1. Printed HERE as well as on the census's own cadence, so a soak
     // that ends off a 600-frame boundary still lands the number — the same defect the
     // stencil skip counter had for fifteen parts (collected since part 56, printed by

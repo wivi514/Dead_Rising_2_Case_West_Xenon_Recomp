@@ -116,7 +116,78 @@ the revised binary — same pre-registered null.**
 Stage 1 is therefore **correct and free**, and the campaign proceeds to stage 2 with
 the skeleton on by default.
 
-## 3. Stage 2 — the flip (not started)
+## 3. Stage 2a — secondaries, recorded serially (2026-08-29/30, committed `4f1993c`)
+
+The flip is sub-staged like everything else. 2a: behind `CW_VK_SECONDARIES=1`, every
+rendering instance runs CONTENTS_SECONDARY and the draw path records into per-range
+secondary command buffers — still on the pump, still in walk order. What it isolates
+before any thread exists: inheritance, per-range full state re-establishment
+(`R->bound` resets at every secondary — the bind elision structurally cannot span a
+range), and `vkCmdExecuteCommands`. The prec module's new `rangeClosed` host hook
+rotates the buffers, so prec ranges and secondaries are ONE partition (title screen:
+exactly 1:1, 480,909 = 436,769 pass opens + 44,140 rotations).
+
+Title-screen gates: validation ZERO new complaints (the 3x point-list PointSize
+pipeline VUID is in the control too); order gate 0/13,418 failed; 0 alloc failures.
+`CW_VK_GPU_PASSES` is refused under the arm (a primary may not timestamp inside a
+CONTENTS_SECONDARY instance) — whole-frame GPU timestamps are unaffected.
+
+**Pre-registered for the heavy band:** the gate run holds 0 failed; the A/B
+(sec-on vs inline, both prec-default) is expected to read a SMALL REGRESSION — the
+sibling killed their secondaries variant at their load, and 2a adds driver work
+(~90 secondary begins/ends + ~30 executes a frame, plus per-range full re-binds)
+while moving nothing off the pump. The A/B exists to measure that price, not to hope
+it away; 2c's worker win must clear it.
+
+**2a heavy-band results (2026-08-30, 00:00-00:10):**
+
+* **Gate** (`sec2agate_r1`): 33,503 frames, **111.4 M draws, 0 failed**; 1.28 M passes,
+  2.05 M secondaries (773,917 rotations, peak **21 per pass** at the crowd), 0 alloc
+  failures, 0 fallbacks.
+* **A/B** (`sec2aon` vs `sec2aoff`, 6/6 accepted): the pre-registered regression, with
+  a clean dose-response — 5,500-6,000 −3.2%, 6,000-6,500 −4.3%, **6,500-7,000 −5.1% /
+  −0.58 ms** (26,160 vs 24,586 frames), 7,000-7,500 −5.1%; light bands null-to-positive.
+  **Secondaries alone cost ~0.6 ms at the crowd** — the sibling's secondaries-variant
+  verdict reproduced locally. GPU medians match across arms (7.26 vs 7.31 at the
+  decisive band): this is CPU/driver overhead, not a GPU effect.
+
+The honest ledger for 2c: worker ceiling ~2.3 ms minus this ~0.6 ms of mechanics ≈
+**~1.7 ms net expectation**, before capture and re-entrancy costs. A range-size
+mechanism A/B (128 vs 512 draws/range, both sec-on) runs next: if the overhead scales
+with range count, bigger ranges cheapen the floor 2c starts from.
+
+## 3b. Stage 2b — the ticket split and deferred serial replay (2026-08-30, ~01:00)
+
+The record core — state binds, vertex uploads/binds, index setup, the vkCmdDraw* —
+is SEVERED from its decode: `RecordDrawCore(base, DrawTicket, liveRegs)` reads only
+the ticket (the walk's resolved values: pipeline, viewport/scissor, blend/stencil,
+constant offsets, pre-decoded per-attribute fetches) plus guest memory. DoDraw builds
+the ticket and calls it inline by default — same code, same order, and the
+capture-side diagnostics (state/fetch probes, memo census, draw probe) stay in DoDraw
+with their locals. Walk-time-only arms inside the core (rect trace, const-race) gate
+on `liveRegs` and announce off under deferral.
+
+`CW_VK_DEFER_RECORD=1` (stage 2b proper): tickets queue and the whole range replays
+back-to-back at its close, in the range's own command buffer (the same `rangeClosed`
+hook that rotates secondaries — replay first, rotate second). Still serial, still the
+pump. **What it proves is capture completeness** — the one property stage 2c cannot
+debug once workers exist, because a capture bug and a race look identical from a wrong
+frame. Documented divergences under the arm: the tail bookkeeping runs at capture
+(replay early-outs counted separately), and guest reads happen up to a range later
+(the parallel guard's widened-race class, fractions of a percent there).
+
+**A harness near-miss worth its sentence** (2026-08-30, 00:22): rebuilding
+`runtime/build/cw_runtime` while a soak chain runs silently swaps what the next
+replay copies — caught two minutes before the range-size chain's r4 would have run
+the restructured binary under the old binary's label. `cw_crowdroute.sh` now stamps
+the binary's sha256 in every log header, so this contamination class is a fact in the
+log rather than an mtime reconstruction. **Rule: no builds while a chain measures.**
+
+Gates owed before 2b closes: title validation + order gate on the restructured
+INLINE path; a null A/B of the restructure against the pre-split binary (the control
+is the old binary run NOW — gotcha 50/51/86); then the same pair for the defer arm.
+
+## 4. Stage 2c — the flip to workers (not started)
 
 The hazards, named by the sibling's §6eb §3c and adopted by the kickoff, live here:
 

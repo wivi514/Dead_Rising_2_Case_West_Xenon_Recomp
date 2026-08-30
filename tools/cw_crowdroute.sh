@@ -66,7 +66,13 @@ BIN=cw_runtime_crowd
 BIN_SRC="${BIN_SRC:-$ROOT/runtime/build/cw_runtime}"
 [ -x "$BIN_SRC" ] || { echo "!! no such binary: $BIN_SRC"; exit 2; }
 cp -f "$BIN_SRC" "$ROOT/runtime/build/$BIN"
-HEAD="$(cd "$ROOT" && git rev-parse --short HEAD 2>/dev/null || echo unknown) [$BIN_SRC]"
+# The BINARY'S OWN IDENTITY, not the tree's: the git hash below names HEAD, but the
+# binary is whatever sits in build/ — and a rebuild mid-chain silently swaps what the
+# next run copies (part 7 nearly ate a range-size A/B exactly this way, saved only by
+# mtime archaeology). The hash makes that contamination a fact in the log instead of a
+# reconstruction.
+BINSHA="$(sha256sum "$ROOT/runtime/build/$BIN" | cut -c1-16)"
+HEAD="$(cd "$ROOT" && git rev-parse --short HEAD 2>/dev/null || echo unknown) [$BIN_SRC sha=$BINSHA]"
 STAMP="$(date +%m%d_%H%M%S)"
 LOG="$OUT/crowd_${STAMP}_${TAG}.log"
 TRACE="$OUT/crowd_${STAMP}_${TAG}.trace"
