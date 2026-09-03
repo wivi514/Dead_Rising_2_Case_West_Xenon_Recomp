@@ -32,3 +32,4 @@ tools/__pycache__/
 # named here so it is not a mystery). Rebuild it from captured microcode — see the
 # Commands section of CLAUDE.md.
 runtime/build-o3/
+assets/game_kbm/

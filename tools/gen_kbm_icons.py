@@ -424,9 +424,13 @@ def main():
     # replacements are SAME-LENGTH in-place edits of the game_patched bank (the
     # str banks are layout-pinned like everything else), served from this
     # overlay only while the keyboard is the input path.
-    sbank = (REPO / "assets/game_patched/data/frontend/str_en.bcs").read_bytes()
-    for old, new in ((b"PRESS\x00START\x00", b"PRESS\x00ENTER\x00"),
-                     (b"PRESS START\x00", b"PRESS ENTER\x00")):
+    # CASE WEST: the string bank is read LOOSE from the disc tree (this title
+    # opens game:\\data\\frontend\\str_en.bcs directly — measured at boot, unlike
+    # Case Zero where only the game_patched copy was live), and it ships ONE
+    # "PRESS START" spelling and NO PRESS\0START id pair (measured; the sibling
+    # had both).
+    sbank = (REPO / "assets/game/data/frontend/str_en.bcs").read_bytes()
+    for old, new in ((b"PRESS START\x00", b"PRESS ENTER\x00"),):
         n = sbank.count(old)
         if n != 1:
             print(f"GATE FAILED: str_en.bcs holds {n} of {old!r}, expected 1",
@@ -436,7 +440,7 @@ def main():
     sout = OUT.parent / "str_en.bcs"
     OUT.parent.mkdir(parents=True, exist_ok=True)
     sout.write_bytes(sbank)
-    print(f"wrote {sout} (2 same-length PRESS ENTER edits)")
+    print(f"wrote {sout} (1 same-length PRESS ENTER edit)")
 
     swp = bytearray()
     swp += struct.pack("<4sI", b"KBSW", len(swap_entries))
