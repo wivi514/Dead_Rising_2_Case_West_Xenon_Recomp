@@ -356,6 +356,22 @@ operator's instruction, and the configuration Case Zero itself ships since their
   in-process STFS extract, **saves in the OS location** (`~/.local/share/Dead Rising 2
   Case West/`, migration verified here on the operator's real save).
 
+
+### Addendum — the local wall-time A/B (2026-09-03, preliminary)
+
+`p8_parrec_on` (3 accepted) vs `p8_parrec_off` = `CW_VK_NO_PAR_RECORD=1` (2 accepted),
+one binary (`sha=8eb792bfb41bd48e`), both arms at the new MSAA-2x default, verdict via
+`cw_trace_band.py` (91,822 frames): **frame-weighted +0.7%, NON-monotone** — the
+decisive 6,500-7,000 band reads −4.6% and 5,500-6,000 reads +8.2%, mixed signs =
+composition noise, not a real change. The GPU column says why: at the crowd, wall ≈
+GPU + ~1.4 ms in BOTH arms — **this title's crowd is GPU-BOUND under MSAA 2x**, so a
+CPU-side recorder cannot convert (their part-90 flip warning, arrived here on day
+one). The recorder stays default on the sibling's −1.80 ms proof at a CPU-bound
+crowd plus its own order-gate correctness; the pre-registered follow-up, if anyone
+wants a local CPU-regime price, is the same A/B with `CW_VK_MSAA=1` on BOTH arms.
+The chain was stopped at 3v2 (operator wanted the machine); 3v3 completion is a
+five-minute errand, not a blocker.
+
 ### Not imported
 
 * `debug_tunables.cpp` delta (their level-cap-50 / skill-grant work) — Case Zero

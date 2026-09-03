@@ -24,7 +24,7 @@ low-risk — the import table says so.
 
 ## Status — and where a new conversation starts
 
-> **THE LIVE HAND-OFF IS `docs/part8-kickoff.md`.** Read it first in a new conversation:
+> **THE LIVE HAND-OFF IS `docs/part9-kickoff.md`.** Read it first in a new conversation:
 > it says what already exists (so it is not rebuilt), names where to start, and lists the
 > gates that are run and owed. When a part ends, write the next `part<N>-kickoff.md`,
 > demote this pointer to it, and refresh the memory directory.
@@ -33,6 +33,43 @@ low-risk — the import table says so.
 > **`docs/part2-kickoff.md` is superseded** and is kept as the cautionary example: its
 > problem statement was false and part 2 refuted it with the measurement that section
 > itself asked for.
+
+## Status: PART 8 LANDED THE PARTS 83-93 IMPORT (2026-09-03)
+
+**Case Zero's whole intervening campaign is HERE** — one import commit (`85324f8`),
+one row in `docs/imported-fixes.md` §5, method three-way merge with our part-7 record
+stack deliberately reverted first (their part-89 recorder supersedes it; with the
+stack gone the 26k-line renderer merge had ZERO conflicts). What is now default:
+
+- **Their parallel recorder** (resolve serial / record parallel, 512-draw chunks on
+  the 3 shared workers). `CW_VK_NO_PAR_RECORD=1` is the serial control.
+  `gpu/parallel_record.cpp` (our part-7 stack) is parked out of the build.
+- **Deferred scoped clears** (their part 90 + the surface-footprint fix).
+  `CW_VK_NO_DEFERRED_CLEAR=1` / `CW_VK_DEFER_FULL_RECT=1`.
+- **Bounded dynamic constant gather + projection-patch memo** (their part 88) —
+  first boot here: −81.6% dynamic-copy bytes, 99.9% memo hits, and our own sidecars
+  confirm the class (20 VS, all `vc({8,9,10}+a0)`, no outliers).
+- **REAL MSAA, default 2x** (`CW_VK_MSAA`; their part 93 + the operator's default
+  decision). `CW_VK_MSAA=1` is the single-sample control, FIRST in any picture
+  bisection, then `CW_VK_NO_PAR_RECORD=1`, then `CW_VK_NO_DEFERRED_CLEAR=1`.
+- **NATIVE KEYBOARD/MOUSE** through the title's own command layer — every guest
+  address re-derived on this image (`docs/native-kbm-import.md`; shape-matching
+  method recorded there). First boot: 93 bindings, 0 bad, 86 spliced. Key-cap prompt
+  icons + PRESS ENTER + device-follow serve from the `assets/game_kbm/` overlay
+  (regenerate: `python3 tools/gen_kbm_icons.py`). **MOUSE CAMERA is a Visuals-panel
+  row and defaults OFF** — the mouse looks around only when it is on (the operator's
+  first report of "mouse didn't work" was exactly this; their settings now carry
+  `mouse_cam=1`).
+- **Live resolution apply** — the Visuals row steps a PENDING value, X applies at the
+  frame boundary. Panel is 8 rows now (…, MOUSE CAMERA, MOUSE SENS).
+- **The release infrastructure**: in-process shader translation
+  (`cw_runtime --translate-shaders`, byte-identity gate vs the Python cache PASSED
+  480/480 here), first-boot disc shader prebuild, exe-anchored paths, in-process
+  STFS extract, and **saves in the OS location**
+  (`~/.local/share/Dead Rising 2 Case West/`, migration verified on the real save).
+- NOT imported: their level-cap/skill work (Case Zero demo specifics), per-title
+  camera_fov/property censuses, their uncommitted shadow-distance work (watch for
+  the commit), release packaging.
 
 ## Status: THE PROGRESS-WIDGET DEFECT IS CLOSED (2026-08-23, part 5)
 
@@ -107,7 +144,7 @@ inferences from a **count** or a **truncated listing**.
 | Runtime | ❌ does not exist yet |
 | Xenia ground truth | ✅ **round 1 COMPLETE** — 13 captures delivered and consumed; nothing outstanding |
 | Coverage oracle | ✅ 104 entry points recovered from C1+C2; config at **135 overrides, 58,448 functions** |
-| Shader cache | ✅ **480 shaders, 480 translated, 0 failures**, dim census 0 disagreements — grew 443 → 461 → 480 across two long operator sessions (2026-08-27/28, finding 62). **Arm `CW_SHADER_DUMP` on every session** — a miss is silent (gotcha 324) |
+| Shader cache | ✅ **480 shaders, 480 translated, 0 failures**, dim census 0 disagreements — grew 443 → 461 → 480 across two long operator sessions (2026-08-27/28, finding 62). **Arm `CW_SHADER_DUMP` on every session** — a miss is silent (gotcha 324). **Softened in part 8**: the in-process translator (import row 5) now translates a missing shader at first sight in-boot, and sidecars carry `aluConsts` (regenerated 2026-09-03; the .spv bytes proved identical 480/480) — the dump discipline still applies for growing the committed bank |
 | Bink | ✅ **SOLVED — the host contributes file I/O and nothing else.** Guest code decodes it on its own 2 threads, a guest shader converts it (findings 14, 17, 22, 23) |
 | Runtime (W1) | ✅ **COMPLETE** — links, boots (58,695 symbols; 60 s, 87 `.big`, vblanks delivered), save layer confirmed |
 | Kernel-call order | ✅ **set-exact prefix of A5, 0 real divergences** (part 2, finding 27) |
@@ -118,7 +155,7 @@ inferences from a **count** or a **truncated listing**.
 | Decals | ✅ **FIXED per the operator, 2026-08-30** (part 7) — mechanism not established; `docs/imported-fixes.md` §PENDING has the note. Separate MINOR visual issues exist that the operator has deliberately parked and not yet described — do not hunt them unprompted |
 | Progress widgets | ✅ **FIXED 2026-08-23** — imported with Case Zero's non-RT block; mechanism named by A/B (`CW_VK_NO_PACKED_SMALL=1` brings the defect back). Findings 60-61, `docs/imported-fixes.md` §3 |
 | Visuals menu | ✅ **IN 2026-08-23** — the title's own Options → Visuals opens a host panel (6 rows, no ray tracing). `CW_NO_PC_OPTIONS=1` restores the shipped screen |
-| Performance | ✅ **IMPORTED TWICE, then EXTENDED NATIVELY (part 7)** — the parallel-record stack (per-range secondaries + deferred replay) is the DEFAULT since 2026-08-30: +0.35 ms at the crowd, all bands positive, findings 68-71. Earlier rows: **IMPORTED TWICE** — their parts 47-55 (2026-08-18) and parts 72-81 (2026-08-27, `03dc55e`): 215-252 fps at ~1,350 draws with the profiler on. Earlier row: — Case Zero's whole parts 47-55 campaign (`82d181f..444631f`), confirmed in play by the operator: **16-24 fps at 720p before → 68-120 fps at 2560x1440 internal after, no visible regression**. Swapchain present + 60 fps pacing are now the DEFAULTS. `docs/imported-fixes.md` §2 |
+| Performance | ✅ **IMPORTED AGAIN (part 8, 2026-09-03)** — Case Zero's part-89 recorder + part-90 deferred scoped clears + part-88 gather/memo are the DEFAULTS and **supersede part 7's stack** (parked out of the build; `CW_VK_NO_PAR_RECORD=1` is the serial arm). Local wall-time verdict: see `docs/imported-fixes.md` §5 addendum. Earlier row: part 7's stack (per-range secondaries + deferred replay), +0.35 ms at the crowd, findings 68-71. Earlier rows: **IMPORTED TWICE** — their parts 47-55 (2026-08-18) and parts 72-81 (2026-08-27, `03dc55e`): 215-252 fps at ~1,350 draws with the profiler on. Earlier row: — Case Zero's whole parts 47-55 campaign (`82d181f..444631f`), confirmed in play by the operator: **16-24 fps at 720p before → 68-120 fps at 2560x1440 internal after, no visible regression**. Swapchain present + 60 fps pacing are now the DEFAULTS. `docs/imported-fixes.md` §2 |
 | Save/load | ✅ **behaviourally confirmed** — saved and loaded inside a real session (finding 29). Part 1's confirmation was static only |
 | HUD/menu text | ✅ **FIXED** — imported 2026-08-16 from Case Zero `82d181f` (part 46), **confirmed in play by the operator** ("Ui seems to work really well this time"). Costs ~12 MB/frame of extra hashing in gameplay. `docs/imported-fixes.md` |
 
