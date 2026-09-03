@@ -1037,7 +1037,9 @@ HostPadState ReadKeyboard()
                 // RAW per-poll pixels -> stick units; deliberately no EMA and
                 // no px/s conversion — DR2 PC's camera is displacement-shaped.
                 const float sens = float(Settings_MouseSens());
-                const float unitsPerPx = sens * sens * 140.0f;
+                // 350 = the sibling's 140 x 2.5 (operator request, 2026-09-03:
+                // "make the speed 2.5x faster for each of the settings 1 to 10").
+                const float unitsPerPx = sens * sens * 350.0f;
                 const float rx = float(dx) * unitsPerPx;
                 const float ry = float(-dy) * unitsPerPx;   // screen-down = look down
                 auto clampStick = [](float v) {
