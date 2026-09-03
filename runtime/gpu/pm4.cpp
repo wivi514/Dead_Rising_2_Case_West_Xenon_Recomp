@@ -844,6 +844,10 @@ void BindShader(uint32_t type, uint32_t ucodeVa, const uint8_t* code, uint32_t s
         fprintf(stderr, "[imload] %s va=%08X hash=%016llx size=%u\n",
                 type == 0 ? "VS" : "PS", ucodeVa, static_cast<unsigned long long>(hash),
                 sizeDwords);
+        // D.4: first sight of this hash — if the renderer's cache cannot answer it,
+        // this is where the in-process translation starts. Inside the announce-once
+        // block on purpose: one call per distinct shader per run, not per bind.
+        VkRenderer_OnShaderBind(type, hash, code, sizeDwords);
     }
 
     DumpShader(type, hash, code, sizeDwords);
@@ -1283,11 +1287,64 @@ uint64_t g_aluConstVersion[2] = { 1, 1 };
 // for its own census, not something to assume by analogy — `CW_VK_FETCH_MEMO_CENSUS=1`
 // asks it before any memo is built.
 uint64_t g_fetchConstVersion = 1;
+// CW_PM4_ALU_WRITE_CENSUS=1 — WHERE DO THE GUEST'S CONSTANT WRITES LAND? (part 87)
+//
+// The constants full-copy lead (phase5-notes §6eg) turns on one distribution: the 22
+// bone-palette vertex shaders read `vc({8,9,10}+a0)` and force a full 256-register copy
+// per draw because a0 is statically unbounded — but it is DYNAMICALLY bounded by the
+// registers the guest actually writes, and this is the only place that sees every write.
+// One counter per float4 register, both halves, bumped on both write paths (the bulk-run
+// path loops only its ALU-overlapped span, so the census costs nothing on non-ALU runs).
+// If VS-half write activity above some register X is boot-only noise, a bounded gather
+// `list ∪ [8, X]` replaces the 4 KB copy; if the writes span the window, the lead dies
+// here for the cost of one run. A DIAGNOSTIC ARM, free when off (one global bool test).
+const bool g_aluWriteCensus = getenv("CW_PM4_ALU_WRITE_CENSUS") != nullptr;
+uint64_t g_aluWriteCount[512] = {};
 constexpr uint32_t kFetchLo = xenos::kFetchConstantBase;
 constexpr uint32_t kFetchHi = xenos::kFetchConstantBase + 32 * 6;   // 32 groups of 6 dwords
 constexpr uint32_t kAluLo = xenos::kAluConstantBase;
 constexpr uint32_t kAluMid = xenos::kAluConstantBase + 256 * 4;  // PS window starts here
 constexpr uint32_t kAluHi = xenos::kAluConstantBase + 512 * 4;   // one past the end
+
+// --- the bone-palette write-extent tracker (part 88; declared in pm4.h) --------------
+//
+// Plain uint32_t, no atomics, ON PURPOSE: every writer is the PM4 walk and the consumer
+// is the renderer's draw-record path, which runs INSIDE that same walk (recording is
+// serial on the pump — part 80 refuted the parallel recorder). The take at a draw packet
+// therefore captures exactly the writes since the previous consuming draw, in stream
+// order, which is the property the bound needs.
+uint32_t g_vsPalCoverExtent = 0;
+uint32_t g_vsPalPartialExtent = 0;
+uint32_t g_vsPalCoverBursts = 0;
+uint32_t g_vsPalPartialBursts = 0;
+uint32_t g_vsPalHighWater = 0;
+
+inline void NoteVsPaletteSpan(uint32_t index, uint32_t count)
+{
+    constexpr uint32_t kPalLo = kAluLo + 8 * 4;   // c8 of the VS half
+    if (index >= kAluMid || index + count <= kPalLo)
+        return;
+    const uint32_t hi = index + count < kAluMid ? index + count : kAluMid;
+    const uint32_t endReg = (hi - 1 - kAluLo) >> 2;   // last float4 register written
+    if (index <= kPalLo)
+    {
+        // Started at or below c8, so [8, endReg] is written contiguously by this burst.
+        if (endReg > g_vsPalCoverExtent)
+            g_vsPalCoverExtent = endReg;
+        ++g_vsPalCoverBursts;
+    }
+    else
+    {
+        if (endReg > g_vsPalPartialExtent)
+            g_vsPalPartialExtent = endReg;
+        ++g_vsPalPartialBursts;
+    }
+    if (endReg > g_vsPalHighWater)
+        g_vsPalHighWater = endReg;
+}
+
+// (Pm4_TakeVsPaletteWrites / Pm4_VsPaletteHighWater are defined after the anonymous
+// namespace closes — they are the public seam over this state.)
 
 void WriteRegister(uint8_t* base, uint32_t index, uint32_t value)
 {
@@ -1296,7 +1353,11 @@ void WriteRegister(uint8_t* base, uint32_t index, uint32_t value)
     if (index >= g_constWatchLo && index <= g_constWatchHi)
         ConstWatchRecord(index, value);
     if (index >= kAluLo && index < kAluHi)
+    {
         ++g_aluConstVersion[index >= kAluMid];
+        if (g_aluWriteCensus)
+            ++g_aluWriteCount[(index - kAluLo) >> 2];
+    }
     if (index >= kFetchLo && index < kFetchHi)
         ++g_fetchConstVersion;
     g_regs[index] = value;
@@ -1379,6 +1440,11 @@ void WriteRegisterRun(uint8_t* base, const Source& fetch, uint32_t srcPos,
     if (g_noBulkRegs || RegRunHasSideEffects(index, count))
     {
         g_regRunSlow.fetch_add(count, std::memory_order_relaxed);
+        // The palette tracker still sees the whole run as ONE burst here — the per-dword
+        // loop below must not turn a covering upload into 1 cover + N-1 partials, which
+        // is why WriteRegister itself never notes spans.
+        if (index < kAluMid && index + count > kAluLo)
+            NoteVsPaletteSpan(index, count);
         for (uint32_t i = 0; i < count; i++)
             WriteRegister(base, index + i, fetch(srcPos + i));
         return;
@@ -1390,9 +1456,21 @@ void WriteRegisterRun(uint8_t* base, const Source& fetch, uint32_t srcPos,
     {
         // A run can straddle the two windows; bump whichever halves it overlaps.
         if (index < kAluMid && index + count > kAluLo)
+        {
             ++g_aluConstVersion[0];
+            NoteVsPaletteSpan(index, count);
+        }
         if (index < kAluHi && index + count > kAluMid)
             ++g_aluConstVersion[1];
+        // The census loops only the ALU-overlapped span of this run, so a run that
+        // never touches the constant file costs it nothing beyond the test above.
+        if (g_aluWriteCensus)
+        {
+            const uint32_t lo = index > kAluLo ? index : kAluLo;
+            const uint32_t hi = index + count < kAluHi ? index + count : kAluHi;
+            for (uint32_t i = lo; i < hi; ++i)
+                ++g_aluWriteCount[(i - kAluLo) >> 2];
+        }
     }
     // The same overlap test for the fetch file, and on the same principle: ONE per run, not
     // one per dword. This path exists because the per-dword path was too slow.
@@ -1610,8 +1688,14 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t pos, uint32_
         // ONE-REG is not a run — every dword lands on the same index, and its scratch
         // mirror must fire once per write, not once. It stays on the per-dword path.
         if (oneReg)
+        {
+            // A one-reg write into the palette region is a span of length 1 — noted here
+            // because WriteRegister deliberately never notes spans (see the slow path).
+            if (reg >= kAluLo && reg < kAluMid)
+                NoteVsPaletteSpan(reg, 1);
             for (uint32_t i = 0; i < bodyCount; i++)
                 WriteRegister(base, reg, fetch(pos + 1 + i));
+        }
         else
             WriteRegisterRun(base, fetch, pos + 1, reg, bodyCount);
         return bodyCount + 1;
@@ -2505,6 +2589,19 @@ void ExecuteLinearVerified(uint8_t* base, uint32_t va, uint32_t sizeDwords, int 
 
 // --- public interface ---------------------------------------------------------------
 
+// The bone-palette write-extent seam (part 88; state and rationale at the tracker's
+// definition inside the walk, next to the ALU write census).
+Pm4VsPaletteWrites Pm4_TakeVsPaletteWrites()
+{
+    const Pm4VsPaletteWrites w{ g_vsPalCoverExtent, g_vsPalPartialExtent,
+                                g_vsPalCoverBursts, g_vsPalPartialBursts };
+    g_vsPalCoverExtent = g_vsPalPartialExtent = 0;
+    g_vsPalCoverBursts = g_vsPalPartialBursts = 0;
+    return w;
+}
+
+uint32_t Pm4_VsPaletteHighWater() { return g_vsPalHighWater; }
+
 void Pm4_SetRingBuffer(uint32_t base, uint32_t sizeBytes)
 {
     g_ringBase = base;
@@ -2812,6 +2909,54 @@ uint64_t Pm4_CensusMismatches(uint64_t* threads)
         cmp(g_opcodes[op].load(),
             CensusSum([op](Census& c) -> std::atomic<uint64_t>& { return c.opcodes[op]; }));
     return bad;
+}
+
+// The per-register constant-write histogram (CW_PM4_ALU_WRITE_CENSUS=1; part 87).
+// Printed from the renderer's DumpStats so it lands beside the gather stats it exists
+// to explain. Raw counts, every nonzero register — the reader's question is "where does
+// write activity STOP in the VS half", and a summary that answered it would be a summary
+// that could hide a second cluster (gotcha 25's shape).
+void Pm4_DumpAluWriteCensus()
+{
+    if (!g_aluWriteCensus)
+        return;
+    for (int half = 0; half < 2; ++half)
+    {
+        uint64_t total = 0, top = 0;
+        int hw = -1;
+        for (int r = 0; r < 256; ++r)
+        {
+            const uint64_t c = g_aluWriteCount[half * 256 + r];
+            total += c;
+            if (c)
+                hw = r;
+            if (c > top)
+                top = c;
+        }
+        fprintf(stderr,
+                "[pm4] ALU write census, %s half: %llu float4 writes, high-water c%d, "
+                "peak %llu on one register\n",
+                half ? "PS" : "VS", (unsigned long long)total, hw,
+                (unsigned long long)top);
+        char line[256];
+        int n = 0;
+        for (int r = 0; r < 256; ++r)
+        {
+            const uint64_t c = g_aluWriteCount[half * 256 + r];
+            if (!c)
+                continue;
+            n += snprintf(line + n, sizeof(line) - n, " c%d:%llu", r,
+                          (unsigned long long)c);
+            if (n > 200)
+            {
+                fprintf(stderr, "[pm4]  %s\n", line);
+                n = 0;
+                line[0] = 0;
+            }
+        }
+        if (n)
+            fprintf(stderr, "[pm4]  %s\n", line);
+    }
 }
 
 // The (mask, select) pair table, in the same shape `tools/xtr_bin_predication.py`

@@ -22,6 +22,12 @@ struct State
     int fpsCap = 0;             // 0 = OFF, i.e. the part-54 500-ceiling that never binds
     int fov = 0;                // degrees of fov adjustment, -10..+30; 0 = OG (part 61)
     int aspect = 0;             // 0 = 16:9 (the title's own), 1 = 21:9 (part 60 wide mode)
+    int rtShadows = 0;          // 0 = none (default), 1/2/3 = RT LOW/MED/HIGH.
+                                // Non-zero REPLACES the raster cascade (part 64,
+                                // operator's spec).
+    bool mouseCam = false;      // mouse -> right-stick camera (part 91). OFF by
+                                // default so a pad player's build changes nothing.
+    int mouseSens = 5;          // 1..10, the panel's MOUSE SENS row.
 };
 
 // The frame-cap values the panel offers. A set rather than a range because the vblank
@@ -65,10 +71,14 @@ void SaveLocked()
             "shadow_tier=%d\n"     // 0 low, 1 medium, 2 high
             "fps_cap=%d\n"         // 0 = off, else 30/60/90/120/240/480
             "fov=%d\n"             // field-of-view adjustment in degrees, -10..+30, 0 = OG
-            "aspect=%d\n",         // 0 = 16:9, 1 = 21:9 (applies at next launch)
+            "aspect=%d\n"          // 0 = 16:9, 1 = 21:9 (applies at next launch)
+            "rt_shadows=%d\n"     // 0 = OG, 1 = RT LOW (needs a ray-query device)
+            "mouse_cam=%d\n"      // 1 = mouse drives the camera (part 91)
+            "mouse_sens=%d\n",    // 1..10
             int(g_state.displayMode), g_state.resW, g_state.resH, g_state.renderScale,
             g_state.vsync ? 1 : 0, g_state.shadowTier, g_state.fpsCap, g_state.fov,
-            g_state.aspect);
+            g_state.aspect, g_state.rtShadows, g_state.mouseCam ? 1 : 0,
+            g_state.mouseSens);
     fclose(f);
 }
 
@@ -122,6 +132,12 @@ void Settings_Load(const std::string& path)
             g_state.vsync = v != 0;
         else if (!strcmp(key, "shadow_tier") && v >= 0 && v <= 2)
             g_state.shadowTier = int(v);
+        else if (!strcmp(key, "rt_shadows") && v >= 0 && v <= 1)
+            g_state.rtShadows = int(v);
+        else if (!strcmp(key, "mouse_cam"))
+            g_state.mouseCam = v != 0;
+        else if (!strcmp(key, "mouse_sens") && v >= 1 && v <= 10)
+            g_state.mouseSens = int(v);
         else if (!strcmp(key, "aspect") && v >= 0 && v <= 1)
             legacyAspect = int(v);
         else if (!strcmp(key, "fps_cap"))
@@ -203,6 +219,34 @@ int Settings_ShadowTier()
     return g_state.shadowTier;
 }
 
+// The panel's single SHADOW row (imported with Case Zero's parked six-rung form).
+// 0..2 are the raster tiers; 3..5 select RT LOW/MEDIUM/HIGH — unreachable here
+// while the RT stubs hold VkRenderer_RtAvailable() false, kept so the row survives
+// future three-way merges. The raster tier is REMEMBERED while an RT value is
+// selected, so stepping back down the row returns the quality the player had.
+int Settings_ShadowRow()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_state.rtShadows ? 2 + g_state.rtShadows : g_state.shadowTier;
+}
+
+void Settings_SetShadowRow(int row)
+{
+    if (row < 0 || row > 5)
+        return;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (row < 3)
+        {
+            g_state.rtShadows = 0;
+            g_state.shadowTier = row;
+        }
+        else
+            g_state.rtShadows = row - 2;
+        SaveLocked();
+    }
+}
+
 int Settings_FpsCap()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -230,6 +274,32 @@ void Settings_SetFov(int deg)
     SaveLocked();
     // Applied LIVE: the renderer re-reads the value once per frame (the shadow-tier
     // pattern) in FovHalfRadThisFrame, vk_renderer.cpp.
+}
+
+bool Settings_MouseCam()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_state.mouseCam;
+}
+
+void Settings_SetMouseCam(bool on)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_state.mouseCam = on;
+    SaveLocked();
+}
+
+int Settings_MouseSens()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_state.mouseSens;
+}
+
+void Settings_SetMouseSens(int s)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_state.mouseSens = s < 1 ? 1 : (s > 10 ? 10 : s);
+    SaveLocked();
 }
 
 // See settings.h for the rule. The caps: 2880 tall / 6880 wide is 4x the title's
@@ -333,6 +403,8 @@ namespace
 {
 std::atomic<bool> g_overlayVisible{ false };
 std::atomic<int> g_overlaySelection{ 0 };
+// One word so a torn W/H pair cannot exist between the pump and the drawer.
+std::atomic<uint64_t> g_pendingRes{ 0 };
 }
 
 bool Settings_OverlayVisible()
@@ -345,6 +417,23 @@ void Settings_SetOverlayVisible(bool on)
     g_overlayVisible.store(on, std::memory_order_release);
     if (on)
         g_overlaySelection.store(0, std::memory_order_release);
+    // Opening OR closing the panel discards an unapplied resolution — the row must
+    // never come up showing a stale pending from a previous visit, and leaving
+    // without X means "keep what I have" (part 91, the operator's apply-button spec).
+    g_pendingRes.store(0, std::memory_order_release);
+}
+
+void Settings_PendingInternalRes(uint32_t& w, uint32_t& h)
+{
+    const uint64_t v = g_pendingRes.load(std::memory_order_acquire);
+    w = uint32_t(v >> 32);
+    h = uint32_t(v);
+}
+
+void Settings_SetPendingInternalRes(uint32_t w, uint32_t h)
+{
+    g_pendingRes.store(w && h ? (uint64_t(w) << 32) | h : 0,
+                       std::memory_order_release);
 }
 
 int Settings_OverlaySelection()

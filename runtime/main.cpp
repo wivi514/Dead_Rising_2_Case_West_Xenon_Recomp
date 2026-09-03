@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <csignal>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <thread>
@@ -37,7 +38,12 @@
 #include "cpu/fe_probe.h"
 #include "cpu/guest_thread.h"
 #include "cpu/timebase.h"
+#include "gpu/shader_prebuild.h"
+#include "gpu/shader_translator.h"
 #include "gpu/vk_renderer.h"
+#include "host/first_run.h"
+#include "host/host_paths.h"
+#include "host/stfs_extract.h"
 #include "host/settings.h"
 #include "host/window.h"
 #include "kernel/audio.h"
@@ -162,10 +168,191 @@ int main(int argc, char** argv)
     if (argc > 1 && strcmp(argv[1], "--smoke") == 0)
         return RunSmoke();
 
-    // Default is relative to runtime/build/, where the binary is built.
-    const char* xexPath = argc > 1             ? argv[1]
-                          : getenv("CW_XEX")   ? getenv("CW_XEX")
-                                               : "../../assets/game/default.xex";
+    // Release D.2: the in-process cache builder. This is the same translation D.4's
+    // first-sight path uses at [imload] time, run over a directory of microcode dumps —
+    // and it is the standing gate for the two deliberate duplicates in
+    // gpu/shader_translator.cpp: run it over ~/DR2CZ-troubleshooting/ucode-dumps and
+    // diff against assets/shader_spv; every byte must match.
+    if (argc > 1 && strcmp(argv[1], "--translate-shaders") == 0)
+    {
+        if (argc != 4)
+        {
+            fprintf(stderr, "usage: cw_runtime --translate-shaders <ucode_dir> <out_dir>\n");
+            return 2;
+        }
+        return ShaderTranslator::TranslateDirectory(argv[2], argv[3]);
+    }
+
+    // Release D.3: the disc pass by hand — what the first-run hook below runs
+    // automatically, exposed for gates and for rebuilding a cache deliberately.
+    if (argc > 1 && strcmp(argv[1], "--build-shader-cache") == 0)
+    {
+        HostPaths::Report();
+        const std::filesystem::path bank =
+            argc > 2 ? std::filesystem::path(argv[2])
+                     : HostPaths::Game() / "data" / "shaders" /
+                           "deadrisingepilogue-ps.big";
+        const std::filesystem::path out =
+            argc > 3 ? std::filesystem::path(argv[3]) : HostPaths::ShaderCache();
+        return ShaderPrebuild::BuildFromDisc(bank, out);
+    }
+
+    // Release §2.3 step 2: the extract by hand — what the first-run hook below runs
+    // automatically, exposed for the byte-identity gate against the Python reference
+    // (tools/extract_stfs.py) and for unpacking a package deliberately.
+    if (argc > 1 && strcmp(argv[1], "--extract-package") == 0)
+    {
+        if (argc != 4)
+        {
+            fprintf(stderr, "usage: cw_runtime --extract-package <package> <out_dir>\n");
+            return 2;
+        }
+        std::string err;
+        if (!StfsExtract::Extract(argv[2], argv[3], err))
+        {
+            fprintf(stderr, "[extract] FAILED: %s\n", err.c_str());
+            return 1;
+        }
+        return 0;
+    }
+
+    // Where everything is, decided once and printed once. It used to be
+    // "../../assets/game/default.xex" — CWD-relative, which is why every recipe in
+    // CLAUDE.md begins with `cd runtime/build`. See host/host_paths.h.
+    HostPaths::Report();
+
+    // RELEASE DEFAULTS (part 85). Every dev recipe in this repo says CW_VKDRAW=1 out
+    // loud, and the same binary with it unset is the control arm — but a player
+    // double-clicking a shipped bundle would get the deliberately blank window. The
+    // packaging script writes cw_defaults.env BESIDE THE EXECUTABLE (KEY=VALUE
+    // lines, # comments) — the exe dir and not the data root, because the defaults
+    // are a property of the shipped bundle and must survive a player pointing
+    // CW_ROOT at a data tree somewhere else —
+    // and this applies each line AS A DEFAULT ONLY: setenv without overwrite, so the
+    // environment always wins and CW_VKDRAW=0 still means off. A dev tree has no such
+    // file and nothing changes; it is data, not code, so the release binary stays
+    // byte-identical to the dev one (tools/release_text_identity.sh). Each applied
+    // default is printed, because an env var the player cannot see being set is a
+    // bisection that starts from a lie.
+    {
+        std::ifstream envf(HostPaths::ExeDir() / "cw_defaults.env");
+        std::string line;
+        while (envf && std::getline(envf, line))
+        {
+            if (line.empty() || line[0] == '#')
+                continue;
+            const size_t eq = line.find('=');
+            if (eq == std::string::npos || eq == 0)
+                continue;
+            const std::string key = line.substr(0, eq), val = line.substr(eq + 1);
+            if (getenv(key.c_str()))
+                continue; // the player's environment wins, always
+#ifdef _WIN32
+            _putenv_s(key.c_str(), val.c_str());
+#else
+            setenv(key.c_str(), val.c_str(), /*overwrite=*/0);
+#endif
+            fprintf(stderr, "[defaults] %s=%s (from cw_defaults.env; set %s in the "
+                            "environment to override)\n",
+                    key.c_str(), val.c_str(), key.c_str());
+        }
+    }
+
+    const std::string xexDefault = HostPaths::GameXex().string();
+    const char* xexPath = argc > 1           ? argv[1]
+                          : getenv("CW_XEX") ? getenv("CW_XEX")
+                                             : xexDefault.c_str();
+
+    // THE LAUNCHER (part 86, window.h Host_RunLauncher): settings and install before
+    // any boot machinery. CW_LAUNCHER=1 comes from the shipped cw_defaults.env, so a
+    // player's double-click gets it and no dev recipe changes. The settings need
+    // their home decided before the launcher edits them; the same calls run again
+    // below on the normal path and are idempotent (the migration guards itself).
+    {
+        const char* l = getenv("CW_LAUNCHER");
+        if (l && *l && strcmp(l, "0") != 0)
+        {
+            ContentSetRootFromGameDir(HostPaths::Game().string());
+            Settings_Load((ContentSettingsDir() / "cw_settings.txt").string());
+            if (!Host_RunLauncher())
+                return 0; // the player closed the launcher: a quit, not an error
+        }
+    }
+
+    // THE FIRST-RUN CHECK, before anything else can fail for a reason that no longer
+    // names the cause (release-plan A.2, host/first_run.h). It is placed here — after
+    // the paths are decided, before the crash reporter, the memory map or any guest
+    // code — so that its message is the first and only thing a player with a missing
+    // package sees, rather than the twentieth line of a boot log.
+    //
+    // The renderer flag is CW_VKDRAW, read the same way vk_renderer.cpp reads it: a
+    // headless gate run does not need a shader cache and must not be refused for
+    // lacking one.
+    {
+        const char* vk = getenv("CW_VKDRAW");
+        const bool renderer = vk && *vk && strcmp(vk, "0") != 0;
+        // Release §2.3 step 2: the in-process STFS extract. If the run targets the
+        // DEFAULT xex location and it is missing but a package is present, unpack it
+        // here — before the shader prebuild, which reads the disc banks the extract
+        // produces. A run pointed elsewhere by argv/CW_XEX said out loud which tree
+        // it wants and is not second-guessed. On failure this falls through and the
+        // gate names what is actually missing. CW_NO_STFS_EXTRACT=1 restores the
+        // refusal-with-command behaviour (every automatic step has an off switch).
+        // Both one-time steps below feed the first-run PROGRESS WINDOW (window.h,
+        // part 85): §2.3 asks for a moving bar, because the player this runs for
+        // may have no console at all. Begin refuses harmlessly when headless.
+        bool progressWindow = false;
+        {
+            const char* noExtract = getenv("CW_NO_STFS_EXTRACT");
+            std::error_code ec;
+            std::filesystem::path pkg;
+            if (!(noExtract && *noExtract && *noExtract != '0') &&
+                std::string(xexPath) == xexDefault &&
+                !std::filesystem::is_regular_file(xexDefault, ec) &&
+                FirstRun::FoundPackage(&pkg))
+            {
+                progressWindow = Host_ProgressBegin("PREPARING FIRST RUN");
+                std::string err;
+                if (!StfsExtract::Extract(pkg, HostPaths::Game(), err,
+                        [](uint64_t doneB, uint64_t totalB) {
+                            char l[64];
+                            snprintf(l, sizeof l, "UNPACKING GAME DATA - %u OF %u MB",
+                                     unsigned(doneB >> 20), unsigned(totalB >> 20));
+                            Host_ProgressUpdate(l, totalB ? float(double(doneB) / double(totalB)) : 1.f);
+                        }))
+                    fprintf(stderr, "[extract] FAILED: %s\n", err.c_str());
+            }
+        }
+        // Release D.3: a missing shader cache stops being a refusal the moment the
+        // game is unpacked — the disc's own banks supply the pixel half, and D.4's
+        // first-sight path supplies the vertex half at run time. Placed BEFORE the
+        // first-run gate so that the gate then finds the cache it would have refused
+        // over; if the pass cannot run (game not unpacked, bank unreadable) it falls
+        // through and the gate names what is actually missing. The marker files keep
+        // this away from developer caches built from dumps (shader_prebuild.h).
+        if (renderer && ShaderPrebuild::WantedAtBoot(HostPaths::ShaderCache()))
+        {
+            const std::filesystem::path bank = HostPaths::Game() / "data" / "shaders" /
+                                              "deadrisingepilogue-ps.big";
+            std::error_code ec;
+            if (std::filesystem::exists(bank, ec))
+            {
+                if (!progressWindow)
+                    progressWindow = Host_ProgressBegin("PREPARING FIRST RUN");
+                ShaderPrebuild::BuildFromDisc(bank, HostPaths::ShaderCache(),
+                    [](unsigned done, size_t total) {
+                        char l[64];
+                        snprintf(l, sizeof l, "PREPARING SHADERS - %u OF %zu",
+                                 done, total);
+                        Host_ProgressUpdate(l, total ? float(done) / float(total) : 1.f);
+                    });
+            }
+        }
+        if (progressWindow)
+            Host_ProgressEnd();
+        if (!FirstRun::Gate(renderer, xexPath))
+            return 1;
+    }
 
     // Before anything can fault. A SIGSEGV in recompiled code otherwise reports only
     // a host backtrace, which names the guest function but not the address, object or
@@ -226,10 +413,13 @@ int main(int argc, char** argv)
     // any guest code runs is required: A1's 22nd distinct kernel call is already an
     // NtCreateFile on `game:\layout.bin`.
     {
-        std::string root = xexPath;
-        const size_t slash = root.find_last_of('/');
-        const std::string gameDir =
-            slash == std::string::npos ? std::string(".") : root.substr(0, slash);
+        // parent_path(), not a hand-rolled split on '/'. The first version of this
+        // searched for a forward slash only, so on Windows — where the path arrives as
+        // C:\cz\...\assets\game\default.xex — it found none, fell back to ".", and
+        // mounted `game:` and `d:` on the CURRENT DIRECTORY. The guest then failed
+        // every file open and faulted through a null pointer several hundred
+        // milliseconds later, with nothing in the crash report pointing back here.
+        const std::string gameDir = std::filesystem::path(xexPath).parent_path().string();
         VfsSetGameRoot(gameDir);
         // Saves go in a SIBLING of the package directory, never inside it — see
         // kernel/content.cpp. Set up here rather than lazily so that a run whose save
@@ -240,7 +430,7 @@ int main(int argc, char** argv)
         // Loaded here — after the save root exists, BEFORE Host_WindowInit — because
         // the display mode is a window-creation decision. Env vars win over the file
         // at each consumer.
-        Settings_Load(ContentSaveRoot() + "/cw_settings.txt");
+        Settings_Load((ContentSettingsDir() / "cw_settings.txt").string());
     }
 
     // Load the XEX image into guest memory at its link base.

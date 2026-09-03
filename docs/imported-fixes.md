@@ -301,6 +301,81 @@ operator's instruction, and the configuration Case Zero itself ships since their
 
 ---
 
+## 5. The parts 83-93 campaign: performance, real MSAA, native keyboard/mouse, the release infrastructure
+
+| | |
+|---|---|
+| **Imported** | 2026-09-03 (part 8) |
+| **Source** | Case Zero `adca819..ecb6775` (their parts 83-93), plus `2bcf396` (the MSAA 2x default flip, committed there the same day) — ~9,300 runtime lines |
+| **Re-measured here?** | Mechanisms YES at first boot (see below); wall-time A/B via the soak pipeline, results in this row's addendum |
+
+### What came across, and its state here
+
+* **Their part-89 parallel recorder** ("resolve serial, record parallel": the pump
+  deposits fully-resolved DrawCaptures; 512-draw chunks record on the 3 shared
+  guard-pool workers into self-contained dynamic-rendering instances; one ordered
+  submit). **This SUPERSEDES our part-7 stack** (per-range secondaries + deferred
+  replay): their design measured −1.80 ms at their crowd where ours bought +0.35, and
+  our own 2c flip already proved worker recording under a range partition is null
+  (finding 70) — their capture/record split is exactly what removes the reason it was
+  null. `gpu/parallel_record.cpp` is parked out of the build with a header note;
+  `CW_VK_NO_PAR_RECORD=1` is the serial control arm. The part-8 reuse census
+  (`af8b5d6`, never run) retired with the DrawTicket it hooked — its question was
+  answered by their part-87 census (93-94% of crowd draws differ only in ALU
+  constants), which is also why the four-cell census plan was cancelled.
+* **Deferred scoped clears** (their part 90, WITH the `6c50716` surface-footprint
+  fix): clears latch at resolve time and emit into the next pass's first instance.
+  ~978k clears deferred in one title-screen boot here; `CW_VK_NO_DEFERRED_CLEAR=1` /
+  `CW_VK_DEFER_FULL_RECT=1` are the bisection pair.
+* **Write-extent-bounded dynamic constant gather** (their part 88): first boot here
+  moved 4.25 GB where full copies were 23.05 GB (**−81.6%**; they measured −84%), and
+  our own shader sidecars confirm the target class: 20 VS with dynamic exprs, ALL
+  `vc({8,9,10}+a0)`, zero outliers. `CW_VK_NO_BOUNDED_DYNAMIC=1`, verify/poison/fill
+  arms as theirs.
+* **Projection-patch memo** (their part 88): 99.9% MRU hit rate here at first boot —
+  the same figure as theirs. `CW_VK_NO_PATCH_MEMO=1`.
+* **Real MSAA — `CW_VK_MSAA`, DEFAULT 2x** (their part 93 + the operator's default
+  decision): truly multisampled EDRAM, resolves at RB_COPY, SAMPLE_ZERO depth
+  resolve. Engagement verified both ways here (290k colour + 30k depth resolves at
+  2x; `=1` boots the single-sample control, announced). Their verdict transfers as
+  THEIR measurement: works as game-wide AA, does not fix their hair flicker.
+* **Hair-flicker diagnostic arms** `CW_VK_NO_BLEND_DEPTH_WRITE` / `CW_VK_DEPTH_FLOAT`
+  (their part 92) — both off by default, imported as the diagnostic kit.
+* **Live internal-resolution apply** (their part 91): the Visuals panel's resolution
+  row steps a PENDING value, X applies at the frame boundary (the placement that fixed
+  their freeze). Ported by hand into our `pc_options_cw.cpp` (our panel is our own
+  RE); rows grew to 8 with MOUSE CAMERA / MOUSE SENS.
+* **Native keyboard/mouse** (their parts 91-92): all guest addresses RE-DERIVED on
+  this image — the record is `docs/native-kbm-import.md`. First boot: verify OK, 93
+  bindings resolved 0 bad, 86 spliced (their exact count). Key-cap prompt icons still
+  owed (needs our own glyph-bank census).
+* **The release infrastructure** (their parts 83-86): in-process shader translator
+  (`--translate-shaders`; **byte-identity gate run here: 480/480 .spv identical** to
+  the Python-built cache; sidecars regenerated with the new aluConsts fields the
+  gather needs), first-boot disc shader prebuild, exe-anchored paths, first-run gate,
+  in-process STFS extract, **saves in the OS location** (`~/.local/share/Dead Rising 2
+  Case West/`, migration verified here on the operator's real save).
+
+### Not imported
+
+* `debug_tunables.cpp` delta (their level-cap-50 / skill-grant work) — Case Zero
+  demo-progression specifics; our `debug_tunables_cw.cpp` is untouched.
+* `camera_fov.cpp` + `96c3b95`'s property censuses — per-title RE (backlog item).
+* Their uncommitted working-tree work (shadow_distance.{cpp,h},
+  patch_char_idmap_hlsl.py) — unfinished there; watch for the commit.
+* Release packaging scripts / CI / prewarm seed — their bundle's; revisit at release.
+
+### Method
+
+The proven three-way merge, one step further: base = CZ@adca819 renamed with our RT
+stubs swapped in; theirs = CZ@ecb6775 same treatment; ours = our file **with the
+part-7 record stack reverted** (its 2,318-line restructure is what their recorder
+replaces — merging both would have produced 32 conflicts; without it, ZERO). Our
+pre-stack local work (fast-retry backoff, mid-walk rptr, WAITWORLD, all instruments)
+survived the merge intact.
+
+---
+
 ## PENDING — defects known to be Case Zero's, waiting on a fix there
 
 **These are NOT to be investigated in this port.** They were reported here by the operator

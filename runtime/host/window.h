@@ -42,6 +42,31 @@
 // stopped working.
 bool Host_WindowInit();
 
+// THE FIRST-RUN PROGRESS WINDOW (release §2.3, part 85): a small plain-SDL window
+// that exists only while the one-time first-run work runs — the STFS extract and
+// the disc shader build, both of which happen in main() BEFORE Host_WindowInit —
+// so a player who double-clicked the executable sees a moving bar instead of a
+// console they may not even have. Begin returns false (and the others no-op)
+// headless, under CW_NO_WINDOW, or when SDL cannot make a window; the console
+// lines keep printing either way, so nothing is lost when it refuses.
+// Update pumps events (the WM must not mark us unresponsive), rate-limits its own
+// drawing, and MUST be called from the same thread as Begin — the SDL rule the
+// whole window module is built around.
+bool Host_ProgressBegin(const char* title);
+void Host_ProgressUpdate(const char* line, float fraction);
+void Host_ProgressEnd();
+
+// THE LAUNCHER (part 86, operator request): a small pre-boot window where the player
+// picks the visual settings and can install the game by DROPPING their XBLA package
+// onto it — before any of the boot machinery runs. Runs modally on the calling
+// (main) thread, edits the same cw_settings.txt the in-game panel writes, and
+// returns true to continue the boot (PLAY) or false to quit (window closed).
+// Enabled by CW_LAUNCHER=1 — which the shipped cw_defaults.env sets, so a player's
+// double-click gets it while every dev recipe stays exactly as it was. Headless,
+// CW_NO_WINDOW or a failed SDL init return true immediately: the launcher must
+// never be able to take a gate run hostage.
+bool Host_RunLauncher();
+
 // True once Host_WindowInit has succeeded. The input path asks this rather than
 // assuming, because "no window" and "window with nothing pressed" are different
 // claims to make to the guest.

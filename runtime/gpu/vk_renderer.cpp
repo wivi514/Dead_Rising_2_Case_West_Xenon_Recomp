@@ -1,19 +1,25 @@
 #include "vk_renderer.h"
 
-#include "parallel_record.h"
 #include "pm4.h"
 #include "pump_stats.h"
+#include "shader_translator.h"
 #include "drawid_ps_spv.h"
 #include "xenos.h"
+#include "../host/host_paths.h"
 #include "../host/settings.h"
 #include "../host/window.h"
 #include "../cpu/thread_budget.h"
 
 #include <vulkan/vulkan.h>
 
+#ifndef _WIN32
+#include <unistd.h>   // one readlink("/proc/self/exe") in the shader-cache fallback
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdarg>
@@ -32,7 +38,8 @@
 #include <unordered_set>
 #include <vector>
 
-#include <unistd.h>
+// <unistd.h> was here for one readlink("/proc/self/exe"); host/host_paths.h owns
+// that now (release A.1) and nothing else in this file is POSIX.
 
 // ===================================================================================
 // THE INTERFACE THE TRANSLATED SHADERS PRESENT
@@ -221,6 +228,62 @@ uint64_t* CounterSlot(const char* name) { return &g_stats[name]; }
 // session. Defined here rather than as a local static because the readers live several
 // thousand lines apart and must agree; set once in VkRenderer_Init.
 bool g_passInputsWanted = false;
+
+// CW_VK_COPY_CENSUS=1 — the resolve-copy produced-vs-sampled census (part 90 item 2,
+// perf-plan-part90.md §2). The question part 80 §1 item 5 left unasked: how many of
+// the 50.4 resolve copies a frame (0.741 ms of GPU) are DEAD — their destination
+// region overwritten by the next copy of the same (snapshot, rect) before anything
+// consumed it? Consumption is marked at every snapshot reader: the draw-path fetch
+// (BEFORE the right-sized-view early return, which the pass-inputs list misses), the
+// present, the frame-stats surface, and the cube-face assembly. The count is
+// CONSERVATIVE toward "live": a sample of the snapshot marks all its rects even
+// though it may have read only one, so a large dead share is real. A DIAGNOSTIC ARM,
+// off by default; one bool test per site when off.
+bool g_copyCensusOn = false;
+struct CcRect
+{
+    int32_t x, y;
+    uint32_t w, h;
+    bool sampled;
+    uint64_t px;
+    uint64_t deadN, deadPx;   // cumulative, for the per-key verdict rows
+};
+std::unordered_map<uint32_t, std::vector<CcRect>> g_ccMap;
+uint64_t g_ccCopies = 0, g_ccDead = 0, g_ccPixels = 0, g_ccDeadPixels = 0;
+uint64_t g_ccSampleMarks = 0;
+
+void CopyCensusCopy(uint32_t key, int32_t x, int32_t y, uint32_t w, uint32_t h,
+                    uint64_t px)
+{
+    auto& rects = g_ccMap[key];
+    ++g_ccCopies;
+    g_ccPixels += px;
+    for (auto& r : rects)
+        if (r.x == x && r.y == y && r.w == w && r.h == h)
+        {
+            if (!r.sampled)
+            {
+                ++g_ccDead;
+                g_ccDeadPixels += r.px;
+                ++r.deadN;
+                r.deadPx += r.px;
+            }
+            r.sampled = false;
+            r.px = px;
+            return;
+        }
+    rects.push_back(CcRect{ x, y, w, h, false, px, 0, 0 });
+}
+
+void CopyCensusSampled(uint32_t key)
+{
+    auto it = g_ccMap.find(key);
+    if (it == g_ccMap.end())
+        return;
+    ++g_ccSampleMarks;
+    for (auto& r : it->second)
+        r.sampled = true;
+}
 #define COUNT(lit)                                                                     \
     do                                                                                 \
     {                                                                                  \
@@ -1283,6 +1346,9 @@ std::atomic<uint32_t> g_internalW{ 0 }, g_internalH{ 0 };
 // requests are refused loudly rather than silently overriding an A/B.
 bool g_resScaleLocked = false;
 std::atomic<uint32_t> g_resScalePending{ 0 };
+// The explicit W x H form of the same request (part 91) — one word so a torn
+// half-update cannot exist. 0 = nothing pending.
+std::atomic<uint64_t> g_resWHPending{ 0 };
 
 void InternalRes(uint32_t& w, uint32_t& h)
 {
@@ -1786,6 +1852,12 @@ struct GuardPool
     uint64_t generation = 0;
     std::atomic<size_t> next{ 0 };
     std::atomic<size_t> finished{ 0 };
+    // Wall time the workers spent CHEWING, summed across the pool — part 89 step 0c's
+    // occupancy input. Two unconditional clock reads per worker per DISPATCH (once a
+    // frame, like the drain's), because "552 dispatches and 0 blocked" is a dispatch
+    // count, not an occupancy figure, and the record-sharing question needs the second
+    // (gotcha 151's shape: an idle-LOOKING count is not a measurement of idleness).
+    std::atomic<uint64_t> busyNs{ 0 };
     unsigned workers = 0;
     bool started = false;
 };
@@ -1838,48 +1910,27 @@ void GuardRunJob(const GuardJob& j, GuardOut& o)
     o.done.store(1, std::memory_order_release);
 }
 
-// Which record-execution worker this thread is (part 7 stage 2c): guard workers get
-// 0..n-1, the pump uses slot n when it steals. -1 = a thread that must never record.
-thread_local int g_recWorkerId = -1;
+// The parallel-record queue's worker hooks — defined with the rest of the machinery
+// after the Renderer (they record Vulkan commands); the pool only needs these two.
+bool ParRec_PendingChunks();
+void ParRec_WorkerDrain(uint32_t workerIdx);
 
-// Forward decls for the shared-pool coupling (defined with the rexec machinery below).
-namespace rexec
-{
-bool HasWork();
-bool RunOneJob();
-}
-
-void GuardWorker(unsigned id)
+void GuardWorker(unsigned workerIdx)
 {
     GuardPool& gp = *g_gp;
-    g_recWorkerId = int(id);
     uint64_t seen = 0;
     for (;;)
     {
         {
             std::unique_lock<std::mutex> lk(gp.mx);
-            // The predicate may also fire for a parallel-record range job (part 7: the
-            // campaign SHARES this pool rather than confiscating it — the operator's
-            // staging decision). prec::HasWork is one atomic load — it MUST stay
-            // lock-free, because this predicate runs on every worker wake while gp.mx
-            // is held, and the first stage-1 A/B priced a mutex here as part of a real
-            // regression. prec kicks this pool only from outside its own lock.
-            gp.wake.wait(lk, [&] {
-                return gp.generation != seen || prec::HasWork() || rexec::HasWork();
-            });
+            gp.wake.wait(lk,
+                         [&] { return gp.generation != seen || ParRec_PendingChunks(); });
             seen = gp.generation;
         }
-        // Range jobs first: they are the latency-sensitive kind (the pump drains them at
-        // the frame boundary), where a guard job missed merely falls back to an inline
-        // hash next frame.
-        while (prec::RunOneJob())
-        {
-        }
-        // Range-record jobs (stage 2c) — the campaign's actual work, latency-sensitive
-        // like prec's (the pump drains at pass end).
-        while (rexec::RunOneJob())
-        {
-        }
+        const uint64_t busy0 = NowNs();
+        // Record chunks FIRST: a chunk blocks THIS frame's submit where a guard job
+        // is a prediction for the next frame — the priorities are not symmetric.
+        ParRec_WorkerDrain(workerIdx);
         for (;;)
         {
             const size_t i = gp.next.fetch_add(1, std::memory_order_relaxed);
@@ -1893,7 +1944,14 @@ void GuardWorker(unsigned id)
                 std::lock_guard<std::mutex> lk(gp.mx);
                 gp.idle.notify_all();
             }
+            // ...and between guard jobs, so a chunk never waits behind a whole
+            // dispatch of hashes.
+            if (ParRec_PendingChunks())
+                ParRec_WorkerDrain(workerIdx);
         }
+        // A worker that woke to an already-drained list adds its ~0, which is correct:
+        // that IS its busy time for the dispatch.
+        gp.busyNs.fetch_add(NowNs() - busy0, std::memory_order_relaxed);
     }
 }
 
@@ -2059,68 +2117,6 @@ const GuardOut* GuardPoolTake(uint32_t slot, uint64_t stamp, uint64_t frame,
     }
     ++g_gpStats.served;
     return &o;
-}
-
-// The parallel-record module's side of the shared pool (part 7 stage 1). The hooks are
-// function pointers so parallel_record.cpp links against nothing in this file — the
-// module is staged for export to the sibling, which never built this item. Both hooks
-// run on the pump thread only (prec dispatches from the walk, and the walk is serial):
-// `started` is written by GuardPoolDispatch on the same thread, so the unlocked reads
-// here cannot race. The kick takes gp.mx before notifying because the workers' wait
-// predicate reads prec's queue state under gp.mx — notifying without the lock could
-// slip between a worker's predicate check and its wait, and the job would sleep until
-// the next guard dispatch. prec itself never calls this while holding its own lock
-// (the lock-order note in GuardWorker).
-// Defined with the stage-2a machinery next to the frame boundary; declared here so the
-// hook below can name it (both anonymous namespaces are one namespace in this TU).
-namespace sec
-{
-void OnRangeClosed(uint8_t reason);
-}
-namespace defer
-{
-void OnRangeClosed(uint8_t reason);
-}
-
-// Wake ONE pool worker — the shape both prec and rexec dispatch with (their jobs need
-// one worker each; the pool's own guard dispatch is the only notify_all).
-void GuardPoolKickOne()
-{
-    if (g_gp && g_gp->started)
-    {
-        std::lock_guard<std::mutex> lk(g_gp->mx);
-        g_gp->wake.notify_one();
-    }
-}
-
-void PrecInitOnce()
-{
-    static bool done = false;
-    if (done)
-        return;
-    done = true;
-    prec::Host h;
-    h.alive = [] { return g_gp != nullptr && g_gp->started && g_gp->workers > 0; };
-    h.kick = [] {
-        if (g_gp && g_gp->started)
-        {
-            // notify_ONE: a range job needs one worker, and the first A/B priced the
-            // notify_all version — three workers waking for a nanosecond job, ~67
-            // times a frame, was a measurable slice of the 0.4 ms regression that
-            // failed the stage-1 null (perf-part7-notes §2).
-            std::lock_guard<std::mutex> lk(g_gp->mx);
-            g_gp->wake.notify_one();
-        }
-    };
-    // Stage 2a/2b's shared boundary: prec's ranges, the deferred-ticket replay and the
-    // secondary command buffers are ONE partition, driven from one place. Replay FIRST
-    // — the range's tickets must land in its own command buffer before the rotation
-    // ends it.
-    h.rangeClosed = [](uint8_t reason) {
-        defer::OnRangeClosed(reason);
-        sec::OnRangeClosed(reason);
-    };
-    prec::Init(h);
 }
 
 // ===================================================================================
@@ -2399,6 +2395,12 @@ struct ShaderMeta
     // the key means "reads no constants" (11 modules); an empty list from one that does
     // not means "we do not know". The copy path must not merge them.
     bool aluListKnown = false;
+    // Part 88: true when EVERY dynamic expression in the sidecar is `N + a0` with N in
+    // [8, 10] — the bone palette. Only these take the write-extent-bounded copy; the
+    // one outlier (`vc(209+a0)`) and any sidecar carrying no exprs keep the full copy,
+    // because the bound is the extent of writes ANCHORED AT c8 and says nothing about
+    // a palette living anywhere else in the window.
+    bool aluDynPalette = false;
     uint8_t blendSlot = 0, blendStrideDw = 0, blendWeightOffDw = 0, blendIndexOffDw = 0;
     uint8_t blendBytes[4] = {};   // which component of each dword, per influence
     uint8_t blendCount = 0;       // 0 = no descriptor; the entry-0 fallback stands
@@ -2617,6 +2619,45 @@ bool LoadShaderMeta(const std::filesystem::path& path, ShaderMeta& meta)
     meta.aluDynamic =
         !(haveAluList && text.find("\"aluDynamic\": false") != std::string::npos);
     meta.aluListKnown = haveAluList;
+    // The dynamic EXPRESSIONS, recorded at cache-build time for exactly this decision
+    // (alu_const_sidecar.py's comment says so). Every element must parse as `N + a0`
+    // with N in [8, 10] or the shader is NOT a palette shader and keeps the full copy —
+    // an unparseable expression fails CLOSED, never into the bounded path.
+    if (meta.aluDynamic)
+    {
+        const size_t dk = text.find("\"aluDynamicExprs\"");
+        if (dk != std::string::npos)
+        {
+            const size_t open = text.find('[', dk);
+            const size_t close = open == std::string::npos ? std::string::npos
+                                                           : text.find(']', open);
+            if (open != std::string::npos && close != std::string::npos)
+            {
+                bool all = false;
+                for (size_t q = text.find('"', open); q != std::string::npos && q < close;
+                     q = text.find('"', q))
+                {
+                    const size_t q2 = text.find('"', q + 1);
+                    if (q2 == std::string::npos || q2 > close)
+                    {
+                        all = false;
+                        break;
+                    }
+                    const std::string e = text.substr(q + 1, q2 - q - 1);
+                    char* endp = nullptr;
+                    const long n = strtol(e.c_str(), &endp, 10);
+                    if (n < 8 || n > 10 || std::string(endp) != " + a0")
+                    {
+                        all = false;
+                        break;
+                    }
+                    all = true;
+                    q = q2 + 1;
+                }
+                meta.aluDynPalette = all;
+            }
+        }
+    }
 
     meta.tfetchConsts = JsonIntArray(text, "tfetchConsts");
     meta.tfetchDims = JsonIntArray(text, "tfetchDims");
@@ -2883,8 +2924,7 @@ uint64_t g_flatCacheLookups = 0;
 uint64_t g_polyOffsetDraws = 0;
 // Draws that enabled the STENCIL TEST. ~18% of a gameplay frame on the operator's own
 // captures, and this renderer honoured none of them until part 56.
-std::atomic<uint64_t> g_stencilDraws{ 0 };   // atomic: bumped inside the record core,
-                                             // which stage 2c runs on worker threads
+uint64_t g_stencilDraws = 0;
 bool g_constMemoOff = false;
 bool g_psConstScaleActive = false;   // CW_VK_PS_CONST_SCALE mutates in place; see its use
 bool g_constMemoVerify = false;
@@ -2910,6 +2950,214 @@ uint64_t g_fetchMemoShaderMiss = 0, g_fetchMemoVersionMiss = 0;
 uint64_t g_fetchMemoExactHits = 0, g_fetchMemoExactMisses = 0;
 bool g_streamDedupCensus = false;
 uint64_t g_dedupLookups = 0, g_dedupRepeats = 0, g_dedupOverflow = 0;
+
+// ---- CW_VK_RESOLVE_SPLIT_CENSUS=1 — part 89 step 0a: how much of `recordVertex` and
+// `recordIndex` is UploadStream (the RESOLVE half — flat-cache lookup, content guard,
+// cross-frame store: shared mutable state that must stay serial in any parallel-record
+// design) versus the pure per-draw work around it (decode + bind recording, which is
+// what secondary command buffers could move to workers)?
+//
+// SAMPLED, 1 DRAW IN 16, because the per-call instrument is disqualified by this
+// file's own FlatCache comment: UploadStream runs ~40-50k times a crowd frame and a
+// ProfScope per call is ~2 ms/frame of clock reads — larger than the split it would
+// be measuring (gotchas 7, 223). Raw NowNs() pairs on every 16th draw cost ~0.13 ms
+// and are unbiased across draws; the census prints its own clock bill per draw so the
+// reader subtracts it rather than trusting the raw number (gotcha 7's discipline).
+// A DIAGNOSTIC ARM: never quote a frame time from a run carrying it.
+bool g_resolveSplitCensus = false;
+uint64_t g_resolveVNs = 0, g_resolveINs = 0;        // sampled UploadStream ns, by side
+uint64_t g_resolveVCalls = 0, g_resolveICalls = 0;  // sampled call counts
+uint64_t g_resolveSampledDraws = 0;
+
+// ---- CW_VK_REUSE_CENSUS=1 — WOULD CROSS-FRAME COMMAND REUSE BE SERVED? (part 87) ----
+//
+// Case West's lead 2: their part-7 campaign left the frame partitioned into ranges with
+// per-range secondaries and guard hashes over every input, and a range whose inputs hash
+// identical to last frame's could REPLAY last frame's recorded commands and skip record
+// entirely. This renderer has none of that structure (the 2a/2b port is the wave-2
+// candidate and ~10k diverged lines), so per the rule that a hit rate is measured before
+// the thing that depends on it is written (gotchas 428, 434, 470), this census asks the
+// question the port would turn on: HOW MANY DRAWS ARE INPUT-IDENTICAL TO THE SAME-ORDINAL
+// DRAW OF THE PREVIOUS FRAME, AND IN HOW LONG A RUN?
+//
+// A draw's fingerprint folds everything the recorded commands depend on, mirrored from
+// what the renderer itself reads rather than from a model of it:
+//   * the full PipelineKey (56 B, padding-free — PipelineKeyHash already depends on that);
+//   * the draw arguments and the index buffer's address/endian;
+//   * the dynamic state the pipeline does not bake (scissors, window offset, viewport,
+//     blend constants, alpha/stencil ref, VTE, cull mode, clip control, VGT_INDX_OFFSET)
+//     and the render-target block (surface/color/depth info) — a draw into a different
+//     target is never the same draw;
+//   * the vertex-fetch constants of every declared attribute and the texture-fetch
+//     constants of every declared tfetch slot, both stages;
+//   * the ALU constants THE SHADERS ACTUALLY SEE, with the gather's own semantics
+//     (c0..c3 always + the sidecar list; the whole window when the gather is off or the
+//     shader is dynamic) — mirroring CopyConstWindow is what stops this census answering
+//     a different question than the upload path asks.
+//
+// Stream CONTENT is the part a register fingerprint cannot see, and it is folded via the
+// renderer's own verdict: a draw is dirty if any stream it touched was COPIED this frame
+// (fresh, guard-caught stale, or arena-pathed). A persist hit with a passing guard counts
+// as unchanged — including a SAMPLED guard, deliberately, because that is the semantics
+// the shipping renderer already lives by (it serves the stored bytes on a sampled pass).
+//
+// TWO STATED CEILINGS, both biased the safe way. Texture CONTENT changes are NOT folded
+// (the fetch constants are; a texture rewritten in place under an unchanged fetch
+// constant counts identical), so the number is a ceiling. And the comparison is by
+// ORDINAL: a frame whose draw list shifts by one misaligns every draw after the shift,
+// which under-reports reuse — the census fails toward the null (gotcha 30's neighbour).
+//
+// A DIAGNOSTIC ARM (gotcha 7): it hashes ~0.5-1 KB of registers per draw on the pump
+// thread. Never quote a frame time from a run carrying it. Free when off — one plain
+// global compare per draw, not a static-init guard (gotcha 453).
+bool g_reuseCensus = false;
+bool g_reuseDrawDirty = false;
+uint64_t g_reuseFpDraw = 0;
+std::unordered_set<uint64_t> g_reuseCopiedKeys;   // stream keys copied THIS frame
+namespace reusecensus
+{
+struct Fp
+{
+    uint64_t fp;       // the full fingerprint
+    uint64_t fpNoAlu;  // the same, EXCLUDING the ALU constant windows
+    uint8_t dirty;
+};
+std::vector<Fp> prev, cur;
+// THE DIAGNOSIS CHANNELS (added after the first crowd run). The ordinal channel read
+// 1.7-1.9% at the crowd with ZERO draws failing on stream bytes alone, which leaves two
+// mechanisms that want opposite responses: ORDINAL MISALIGNMENT (one inserted zombie
+// draw shifts every later ordinal — a range-partitioned scheme could resync, so the lead
+// survives) versus PER-FRAME CONSTANTS (an engine time/wind register in every shader's
+// window — reuse is dead at its mechanism). A set-membership channel is alignment-
+// insensitive, and a no-ALU fingerprint isolates the constants; the four cells of
+// (ordinal|set) x (full|noAlu) name the killer.
+std::unordered_set<uint64_t> prevFull, prevNoAlu;
+uint32_t run = 0;            // current run of identical draws
+// Totals since the run started, plus a snapshot at the last periodic print so every
+// line reports WINDOW rates — part 72's census printed a cumulative mean and the mean
+// was a transient (gotcha 428); this one never prints C/n as a rate.
+struct Tot
+{
+    uint64_t frames = 0, draws = 0, identical = 0, fpOnlyDirty = 0, misaligned = 0;
+    uint64_t runs = 0, runDraws8 = 0, runDraws32 = 0;
+    uint64_t setFull = 0, ordNoAlu = 0, setNoAlu = 0;
+    // Every draw that touched a stream copied this frame, unconditionally — the proof
+    // the dirty plumbing is alive at all. The `fpOnlyDirty` conjunction read 0.0 in all
+    // 28 windows of the first diagnosis run, and a channel that has never been seen to
+    // fire cannot have its zeros believed (gotcha 151).
+    uint64_t dirtyDraws = 0;
+} t, last;
+
+inline void FlushRun()
+{
+    if (!run)
+        return;
+    ++t.runs;
+    if (run >= 8)
+        t.runDraws8 += run;
+    if (run >= 32)
+        t.runDraws32 += run;
+    run = 0;
+}
+
+inline void EndDraw(uint64_t fp, uint64_t fpNoAlu, bool dirty)
+{
+    const size_t idx = cur.size();
+    const bool fpMatch = idx < prev.size() && prev[idx].fp == fp;
+    ++t.draws;
+    if (dirty)
+        ++t.dirtyDraws;
+    if (fpMatch && !dirty)
+    {
+        ++t.identical;
+        ++run;
+    }
+    else
+    {
+        if (fpMatch)
+            ++t.fpOnlyDirty;
+        if (idx >= prev.size())
+            ++t.misaligned;
+        FlushRun();
+    }
+    if (!dirty)
+    {
+        if (prevFull.count(fp))
+            ++t.setFull;
+        if (prevNoAlu.count(fpNoAlu))
+            ++t.setNoAlu;
+    }
+    if (idx < prev.size() && prev[idx].fpNoAlu == fpNoAlu && !dirty)
+        ++t.ordNoAlu;
+    cur.push_back(Fp{ fp, fpNoAlu, uint8_t(dirty) });
+}
+
+void Print(const char* tag)
+{
+    const Tot d{ t.frames - last.frames, t.draws - last.draws,
+                 t.identical - last.identical, t.fpOnlyDirty - last.fpOnlyDirty,
+                 t.misaligned - last.misaligned, t.runs - last.runs,
+                 t.runDraws8 - last.runDraws8, t.runDraws32 - last.runDraws32,
+                 t.setFull - last.setFull, t.ordNoAlu - last.ordNoAlu,
+                 t.setNoAlu - last.setNoAlu, t.dirtyDraws - last.dirtyDraws };
+    last = t;
+    if (!d.frames || !d.draws)
+        return;
+    const double f = double(d.frames);
+    const double dpf = double(d.draws) / f;
+    const double idf = double(d.identical) / f;
+    const double r8f = double(d.runDraws8) / f;
+    fprintf(stderr,
+            "[reuse] %llu frames (+%llu%s) — ALL FIGURES ARE PER-FRAME RATES OVER THAT "
+            "WINDOW\n"
+            "[reuse]   draws %.0f   IDENTICAL to the same-ordinal draw of the previous "
+            "frame: %.1f (%.2f%%)\n"
+            "[reuse]     in runs >=8: %.1f/frame (%.2f%%)   >=32: %.1f/frame   runs "
+            "%.1f/frame (mean identical-run length %.1f)\n"
+            "[reuse]   register-identical but stream bytes copied this frame: %.1f/frame "
+            "(dirty draws at all: %.1f/frame — the channel's liveness proof)   past "
+            "previous frame's end (misaligned): %.1f/frame\n"
+            "[reuse]   ceiling at 524 ns/draw of record (§6ec §1): identical %.3f ms, "
+            "runs>=8 %.3f ms — texture CONTENT is not folded and ordinal misalignment "
+            "under-reports, so read as a CEILING on a run-shaped saving\n",
+            (unsigned long long)t.frames, (unsigned long long)d.frames, tag,
+            dpf, idf, dpf > 0 ? 100.0 * idf / dpf : 0.0,
+            r8f, dpf > 0 ? 100.0 * r8f / dpf : 0.0,
+            double(d.runDraws32) / f, double(d.runs) / f,
+            d.runs ? double(d.identical) / double(d.runs) : 0.0,
+            double(d.fpOnlyDirty) / f, double(d.dirtyDraws) / f, double(d.misaligned) / f,
+            idf * 524e-6, r8f * 524e-6);
+    // The four-cell diagnosis: (ordinal|set) x (full|noAlu). Set >> ordinal at the same
+    // fingerprint means the draws exist but MOVE (alignment is the killer, a resyncing
+    // range scheme survives); noAlu >> full at the same matcher means the ALU constants
+    // are the killer (a per-frame engine register, and reuse dies at its mechanism).
+    fprintf(stderr,
+            "[reuse]   diagnosis/frame: ordinal full %.1f (%.2f%%) | set full %.1f "
+            "(%.2f%%) | ordinal noALU %.1f (%.2f%%) | set noALU %.1f (%.2f%%)\n",
+            idf, dpf > 0 ? 100.0 * idf / dpf : 0.0,
+            double(d.setFull) / f, dpf > 0 ? 100.0 * double(d.setFull) / f / dpf : 0.0,
+            double(d.ordNoAlu) / f, dpf > 0 ? 100.0 * double(d.ordNoAlu) / f / dpf : 0.0,
+            double(d.setNoAlu) / f, dpf > 0 ? 100.0 * double(d.setNoAlu) / f / dpf : 0.0);
+}
+
+inline void FrameBoundary()
+{
+    FlushRun();
+    prev.swap(cur);
+    cur.clear();
+    prevFull.clear();
+    prevNoAlu.clear();
+    for (const Fp& e : prev)
+    {
+        prevFull.insert(e.fp);
+        prevNoAlu.insert(e.fpNoAlu);
+    }
+    g_reuseCopiedKeys.clear();
+    ++t.frames;
+    if (t.frames == 30 || t.frames % 600 == 0)
+        Print(" since the last line");
+}
+} // namespace reusecensus
 
 // ---- PART 81 §2: WHERE IS THE GUARD'S 86.2 MB A FRAME CHARGED? ----------------------
 //
@@ -3895,6 +4143,100 @@ struct RetiredImage
     Image image;
 };
 
+// ===================================================================================
+// PARALLEL COMMAND RECORDING (part 89) — design (b): RESOLVE serial, RECORD parallel
+// ===================================================================================
+//
+// The pump keeps everything that touches shared mutable state — the PM4 walk, the
+// register decode, `UploadStream`'s flat cache / content guard / cross-frame store,
+// the bump arena, the pipeline lookup — and deposits, per draw, a `DrawCapture`:
+// resolved handles, offsets and derived state, nothing that needs re-resolving.
+// Chunks of captures become SELF-CONTAINED dynamic-rendering instances recorded by
+// the guard pool's workers (13-16% busy at the crowd, §6ei) into their own primary
+// command buffers; the frame submits as one ordered `vkQueueSubmit` of many buffers.
+//
+// WHY INSTANCE SPLITS ARE FREE HERE, and why this needs neither secondaries nor
+// suspend/resume: every attachment in the main scope is LOAD_OP_LOAD / STORE_OP_STORE
+// with no clears (the EDRAM model — the title clears with draws), so ending a
+// rendering instance and beginning another over the same attachments is semantically
+// the identity. A pass under the chunk size therefore never splits and costs nothing
+// beyond the capture write; the crowd pass yields ~16 worker chunks.
+//
+// ORDER IS PRESERVED BY CONSTRUCTION — chunks enter the submit list in capture order
+// and draws within a chunk replay in capture order — and it is GATED, not assumed:
+// the part-72 order gate's "submitted" side is now built from the replayed
+// instances' own ids (each recomputed from the capture a worker actually consumed),
+// and CW_VK_ORDER_POISON still must fail it.
+//
+// CW_VK_PAR_RECORD=1 is the arm (OFF by default until its 3v3 exists — part 87 §3's
+// rule); CW_VK_RECORD_CHUNK=N sets the chunk size (default 512). Inert without
+// workers, and refused (loudly) under CW_VK_NO_DRIVER_RECORD, whose measurement this
+// path would silently distort.
+struct DrawCapture
+{
+    static constexpr uint32_t kMaxBinds = 16;   // == BoundState::kMaxTrackedBindings
+    VkPipeline pipeline;
+    VkViewport viewport;
+    VkRect2D scissor;
+    float blend[4];
+    uint32_t stencilOn, stencilRef, stencilMask, stencilWriteMask;
+    struct { uint64_t vs, ps, shared; uint32_t drawIndex, pad; } push;
+    uint32_t bindCount;
+    VkBuffer vb[kMaxBinds];
+    VkDeviceSize vo[kMaxBinds];
+    VkBuffer ib;                 // VK_NULL_HANDLE = non-indexed draw
+    VkDeviceSize io;
+    VkIndexType it;
+    uint32_t drawCount;          // index count (indexed) or vertex count (auto)
+    int32_t baseVertex;          // VGT_INDX_OFFSET, already folded to 0 where the
+                                 // resolve folded it (rect synth, expansions)
+    // The order gate's raw material, filled only when the gate is armed: the replay
+    // recomputes the id from THESE — the fields it actually consumed — so a capture
+    // scrambled across draws fails the gate rather than passing on a precomputed id.
+    uint64_t vsHash, psHash;
+    uint32_t primType, indexVa;
+    uint32_t gateCount;          // the RAW index count the capture-side id mixed
+    int32_t gateIndxOffset;      // ...and the raw VGT_INDX_OFFSET, pre-folding
+};
+
+// A clear a resolve asked for, LATCHED instead of recorded (part 90). The full design
+// and its arm are at DoResolve's clear block; the one-line version: the title clears
+// EDRAM through the copy block's clear bits, our old mechanism honoured that with a
+// whole-image vkCmdClear*Image (7 Mpix written for the ~0.4 the pass rendered, 94.3% of
+// a 0.615 ms/frame GPU class), and the deferred form emits the clear as a
+// vkCmdClearAttachments rect at the head of the NEXT pass's first instance — an
+// instance that already exists, so it costs no dedicated render-scope cycle, which is
+// what made the part-32 CW_VK_SCOPED_CLEAR arm a wash on the pump (part 80 §1 item 4).
+struct PendingClear
+{
+    bool isColor;        // false = the depth+stencil aspect
+    VkClearValue value;
+    VkRect2D rect;       // already clamped to the target image's extent at latch time
+};
+
+struct ParRecChunk
+{
+    std::vector<DrawCapture> draws;
+    // Deferred clears this chunk must emit BEFORE its first draw — only ever non-empty
+    // on the FIRST instance of a pass (the pump moves them in at handoff). Owned by the
+    // chunk from enqueue to reset, so the worker reads them race-free the same way it
+    // reads `draws`.
+    std::vector<PendingClear> pendingClears;
+    std::vector<uint64_t> orderIds;      // filled by the recorder when the gate is armed
+    VkCommandBuffer cb = VK_NULL_HANDLE; // filled by whichever recorder claims it
+    std::atomic<uint32_t> state{ 0 };    // 0 free, 1 queued, 2 recorded
+    // The pass's attachments, snapshotted at enqueue: stable for the pass by
+    // construction, and a chunk must not read R->color at record time — the worker
+    // runs concurrently with the pump opening the NEXT pass.
+    VkImageView colorView = VK_NULL_HANDLE, depthView = VK_NULL_HANDLE;
+    uint32_t width = 0, height = 0;
+    // Replay-side skip counters, aggregated into R->skips by the pump at the wait —
+    // workers must not race plain uint64 fields (gotcha 151 needs the counters, the
+    // aggregation keeps them honest).
+    uint64_t skipPipeline = 0, skipViewport = 0, skipScissor = 0, skipBlend = 0,
+             skipStencil = 0, skipSets = 0, skipVertex = 0, skipIndex = 0;
+};
+
 struct FrameSlot
 {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -4021,6 +4363,23 @@ struct Renderer
     // The EDRAM stand-in: one persistent colour target and one depth target.
     Image color;
     Image depth;
+    // CW_VK_MSAA (part 93): when the EDRAM pair above is MULTISAMPLED, these are the
+    // single-sample images its samples resolve into. `colorResolve` serves the present
+    // fallback (blit/readback cannot read a multisampled image); `depthResolve` serves
+    // every depth-buffer resolve, because vkCmdResolveImage is defined for colour
+    // formats only — the depth path resolves through a zero-draw dynamic-rendering
+    // pass with a resolve attachment, then copies out of this image exactly as the
+    // single-sample path copies out of R->depth. Both are null at 1x, where not one
+    // line of the MSAA paths executes (the same-binary control arm).
+    Image colorResolve;
+    Image depthResolve;
+    // VK_SAMPLE_COUNT_1_BIT unless CW_VK_MSAA asked for more AND the device's
+    // framebuffer limits agreed — decided once in CreateDevice, printed there, and
+    // constant for the run (the persistent EDRAM cannot change sample count mid-frame).
+    VkSampleCountFlagBits msaaSamples = VK_SAMPLE_COUNT_1_BIT;
+    // SAMPLE_ZERO is the only mode Vulkan 1.2+ guarantees, and it is also the faithful
+    // one: hardware's depth resolve hands the consumer one sample's value, not a blend.
+    VkResolveModeFlagBits depthResolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
     Buffer readback;
 
     // Per-frame bump arena for constants, vertex copies and index copies. Device
@@ -4286,6 +4645,29 @@ struct Renderer
         VkIndexType indexType = VK_INDEX_TYPE_MAX_ENUM;
         bool haveIndex = false;
     } bound;
+    // --- parallel record (part 89; the block comment is at DrawCapture) -----------
+    bool parRec = false;              // CW_VK_PAR_RECORD=1 and workers exist
+    uint32_t parRecChunk = 512;       // CW_VK_RECORD_CHUNK
+    bool capActive = false;           // the OPEN pass is being captured, not recorded
+    uint32_t capPassInstances = 0;    // instances this pass has produced so far
+    std::vector<DrawCapture> capBuf;  // the pump's accumulating chunk
+    VkImageView capColorView = VK_NULL_HANDLE, capDepthView = VK_NULL_HANDLE;
+    uint32_t capWidth = 0, capHeight = 0;
+    // --- deferred scoped clears (part 90; the block comment is at PendingClear) ----
+    // Latched at resolve time, emitted at the head of the next pass's first instance,
+    // and FLUSHED early (counted, by reader) if anything reads EDRAM before a pass
+    // opens. May legitimately carry across a frame boundary: nothing reads EDRAM
+    // between frames except the three flush sites. Dropped on EDRAM recreation.
+    std::vector<PendingClear> pendingClears;
+    // The frame's command buffers in submission order: (cb, nullptr) for a pump
+    // segment, (VK_NULL_HANDLE, chunk) for a worker chunk resolved at submit.
+    std::vector<std::pair<VkCommandBuffer, ParRecChunk*>> submitList;
+    // The order gate's submitted side: every replayed instance's id vector, appended
+    // on the pump thread in submission order (chunk at enqueue, tail at replay).
+    std::vector<const std::vector<uint64_t>*> prIdSeq;
+    // A deque ON PURPOSE: prIdSeq holds pointers into it, and a vector's growth
+    // would silently invalidate every earlier pointer.
+    std::deque<std::vector<uint64_t>> prTailIds;
     // How often each bind was skipped, across the whole run. An arm needs a counter or
     // its absence proves nothing (gotcha 151) — but the counter must not cost more than
     // the thing it measures. The first version used Count(), which is a
@@ -4574,6 +4956,12 @@ struct Renderer
     uint32_t constMemoPsBase = 0;
     VkDeviceSize constMemoVsAt = 0;
     VkDeviceSize constMemoPsAt = 0;
+    // The bound the LAST dynamic VS copy used (0 = it was a full copy). Part 88: the
+    // memo verifier compares the arena against a recompute, and above this bound the
+    // arena deliberately holds residue — a verifier unaware of it would report the
+    // feature working as a memo defect (the exact interaction the gather already
+    // documents for its own verifier).
+    uint32_t constMemoVsDynBound = 0;
 
     uint64_t frame = 0;
     uint64_t drawsThisFrame = 0;
@@ -5351,7 +5739,8 @@ bool CreateImage(Image& img, uint32_t w, uint32_t h, VkFormat format,
                  VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_2D, uint32_t layers = 1,
                  uint32_t depthExtent = 1,
                  VkComponentMapping components = VkComponentMapping{},
-                 uint32_t levels = 1, bool poolMemory = false)
+                 uint32_t levels = 1, bool poolMemory = false,
+                 VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT)
 {
     img.width = w;
     img.height = h;
@@ -5379,7 +5768,7 @@ bool CreateImage(Image& img, uint32_t w, uint32_t h, VkFormat format,
     ci.extent = { w, h, depthExtent };
     ci.mipLevels = levels;
     ci.arrayLayers = layers;
-    ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.samples = samples;
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
     ci.usage = usage;
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -5496,6 +5885,22 @@ bool FormatHasStencil(VkFormat f)
 {
     return f == VK_FORMAT_D16_UNORM_S8_UINT || f == VK_FORMAT_D24_UNORM_S8_UINT ||
            f == VK_FORMAT_D32_SFLOAT_S8_UINT || f == VK_FORMAT_S8_UINT;
+}
+
+// The EDRAM depth format. Xenos depth is 24-bit FLOATING POINT (D24FS8), whose precision
+// is concentrated near the camera; our historical D24_UNORM spreads precision uniformly,
+// so near the camera it is far coarser. That mismatch is the part-92 Chuck-hair flicker:
+// 178 layered alpha-blended hair cards a few millimetres apart, all writing depth and
+// testing LESS_EQUAL, land on tied/inverted UNORM depths at head distance and the winner
+// re-rolls every frame as the mesh animates — a flicker hardware's float depth does not
+// show because it separates the cards cleanly. CW_VK_DEPTH_FLOAT=1 selects D32_SFLOAT_S8
+// (float depth with stencil), the faithful match, keeping depth-write and occlusion. The
+// D24_UNORM default is the same-binary control arm. Everything downstream reads
+// R->depth.format, and the depth clear/sample paths are normalised 0..1 floats either way.
+VkFormat EdramDepthFormat()
+{
+    static const bool wantFloat = EnvOn("CW_VK_DEPTH_FLOAT");
+    return wantFloat ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D24_UNORM_S8_UINT;
 }
 
 // THE STAGE AND ACCESS MASKS A LAYOUT IMPLIES (part 78 item 1).
@@ -6217,6 +6622,93 @@ bool CreateDevice()
     else if (R->rtSupported)
         fprintf(stderr, "[vk] RT: supported but OFF (CW_VK_RT=0) — device created "
                         "exactly as before part 64\n");
+
+    // ---- CW_VK_MSAA=N (part 93, docs/msaa-plan.md): true multisampled EDRAM --------
+    //
+    // Decided HERE, once, because everything downstream keys off it: the EDRAM pair is
+    // created with this sample count in InitCommon, every draw pipeline states it, and
+    // it cannot change for the run (the persistent EDRAM is one image). N in {2,4};
+    // clamped DOWN to what framebufferColor & framebufferDepth both support, falling
+    // back to 1x — the same renderer as CW_VK_MSAA unset, bit for bit — and every
+    // outcome prints, because an arm whose engagement is silent cannot be shown to
+    // have engaged (gotcha 151).
+    {
+        // 2x IS THE DEFAULT (the operator's Case Zero part-93 verdict: works as
+        // game-wide AA, +0.85 ms GPU at 3440x1440 there, picture inside the null).
+        // CW_VK_MSAA=0 or =1 is the single-sample control arm — first in any
+        // picture bisection. An invalid value warns and falls to the 2x default,
+        // never silently to 1x (a control arm must be chosen, not stumbled into).
+        const char* msaaEnv = Env("CW_VK_MSAA");
+        long msaaReq = msaaEnv ? strtol(msaaEnv, nullptr, 10) : 2;
+        if (msaaEnv && msaaReq != 0 && msaaReq != 1 && msaaReq != 2 && msaaReq != 4)
+        {
+            fprintf(stderr, "[vk] CW_VK_MSAA=%s is not 0/1/2/4 — using the 2x "
+                            "default (CW_VK_MSAA=0 is the single-sample control)\n",
+                    msaaEnv);
+            msaaReq = 2;
+        }
+        if (msaaReq == 0 || msaaReq == 1)
+            fprintf(stderr, "[vk] CW_VK_MSAA=%ld — EDRAM is SINGLE-SAMPLE by request "
+                            "(the pre-import control arm; the default is 2x)\n",
+                    msaaReq);
+        if (msaaReq == 2 || msaaReq == 4)
+        {
+            const VkSampleCountFlags supported =
+                props.limits.framebufferColorSampleCounts &
+                props.limits.framebufferDepthSampleCounts;
+            uint32_t n = uint32_t(msaaReq);
+            while (n > 1 && !(supported & n))
+                n >>= 1;
+            // SAMPLE_ZERO depth resolve is mandatory in Vulkan 1.2+, but "mandatory"
+            // is a spec claim and this is a gate: ask the device rather than assume,
+            // and refuse loudly if it declines (gotcha 5 — never guess).
+            VkPhysicalDeviceDepthStencilResolveProperties dsr{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES
+            };
+            VkPhysicalDeviceProperties2 p2m{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2
+            };
+            p2m.pNext = &dsr;
+            vkGetPhysicalDeviceProperties2(R->physical, &p2m);
+            if (n < 2)
+                fprintf(stderr, "[vk] CW_VK_MSAA=%ld REFUSED: the device's framebuffer "
+                                "sample counts (colour %#x, depth %#x) support neither "
+                                "4x nor 2x — EDRAM stays single-sample\n",
+                        msaaReq, unsigned(props.limits.framebufferColorSampleCounts),
+                        unsigned(props.limits.framebufferDepthSampleCounts));
+            else if (!(dsr.supportedDepthResolveModes & VK_RESOLVE_MODE_SAMPLE_ZERO_BIT) ||
+                     !(dsr.supportedStencilResolveModes & VK_RESOLVE_MODE_SAMPLE_ZERO_BIT))
+                // Both, because the depth resolve pass hands ONE attachment struct to
+                // pDepthAttachment and pStencilAttachment, so the mode applies to both
+                // aspects (and equal modes also sidesteps the independentResolve limit).
+                fprintf(stderr, "[vk] CW_VK_MSAA=%ld REFUSED: the device reports no "
+                                "SAMPLE_ZERO depth/stencil resolve mode (depth %#x, "
+                                "stencil %#x) — EDRAM stays single-sample\n",
+                        msaaReq, unsigned(dsr.supportedDepthResolveModes),
+                        unsigned(dsr.supportedStencilResolveModes));
+            else
+            {
+                R->msaaSamples = VkSampleCountFlagBits(n);
+                if (uint32_t(msaaReq) != n)
+                    fprintf(stderr, "[vk] CW_VK_MSAA=%ld clamped to %ux by the "
+                                    "device's framebuffer limits\n", msaaReq, n);
+                fprintf(stderr, "[vk] CW_VK_MSAA — EDRAM is MULTISAMPLED at %ux "
+                                "(resolves at RB_COPY; SAMPLE_ZERO depth resolve). "
+                                "CW_VK_MSAA=1 is the single-sample control arm (2x is the default).\n",
+                        n);
+                if (R->rtEnabled)
+                {
+                    // The RT factor pass samples R->depth through an ordinary 2D view,
+                    // which a multisampled image cannot serve. RT is parked (part 70);
+                    // refuse the combination rather than hand the pass garbage.
+                    fprintf(stderr, "[vk] CW_VK_MSAA with RT is NOT SUPPORTED — RT is "
+                                    "OFF this run (the factor pass cannot sample a "
+                                    "multisampled depth image)\n");
+                    R->rtEnabled = false;
+                }
+            }
+        }
+    }
     // Resolves to null when the extension was not enabled, which is every run without
     // CW_VK_VALIDATION — NameObject is then a branch on a null pointer and nothing else.
     R->setObjectName = reinterpret_cast<PFN_vkSetDebugUtilsObjectNameEXT>(
@@ -6358,11 +6850,28 @@ void CreatePipelineCache(const std::filesystem::path& dir)
         R->pipeCachePath = e;
     else
     {
+        // WHERE THE CACHE LIVES, and on Windows it must not depend on HOME.
+        //
+        // HOME is not a Windows variable. Git for Windows and MSYS2 set it, so a process
+        // launched from one of their shells saw C:\Users\<u>\.cache while the same build
+        // launched any other way fell through to %TEMP% — two different caches, and
+        // whichever one the player's warm 15 MB happened to be in was invisible to the
+        // other. That was found by a pre-warm A/B silently testing an empty directory,
+        // and it means a player could lose a warm cache by launching differently.
+        //
+        // LOCALAPPDATA is the Windows answer and is always set for an interactive user.
+        // XDG_CACHE_HOME still wins where it is set, because on Linux that is the
+        // standard and someone who sets it means it.
         std::filesystem::path base;
         if (const char* x = Env("XDG_CACHE_HOME"); x && *x)
             base = x;
+#if defined(_WIN32)
+        else if (const char* la = Env("LOCALAPPDATA"); la && *la)
+            base = la;
+#else
         else if (const char* h = Env("HOME"); h && *h)
             base = std::filesystem::path(h) / ".cache";
+#endif
         else
             base = std::filesystem::temp_directory_path(ec);
         base /= "cz-recomp";
@@ -6435,6 +6944,445 @@ void SavePipelineCache()
             R->pipeCachePath.c_str(), ec ? "  — RENAME FAILED" : "");
 }
 
+// ===================================================================================
+// PIPELINE PRE-WARM — record the KEYS, replay them at load
+// ===================================================================================
+//
+// THE PROBLEM, measured in an operator session on Windows (part 83). A warm
+// VkPipelineCache is not enough. vkCreateGraphicsPipelines still has to be CALLED for
+// every distinct pipeline, and this renderer calls it lazily, on the frame that first
+// needs one, on the frame thread. In three minutes of play that was 534 creations, and
+// one of them cost 200 ms:
+//
+//     frame 6696   396 ms wall = 372 ms in GetPipeline + 24 ms for everything else
+//
+// Every other phase — record, textures, constants, streams, GPU — was normal. The
+// operator's F7 marks land within 45 frames of one of these, and nowhere else.
+//
+// WHY THE EXISTING CACHE DOES NOT SOLVE IT. It removes the COMPILE, not the CALL, and
+// only once the compile has happened once. The Linux box creates 122 pipelines at
+// 0.11 ms each because its cache is 29 MB built over eighty sessions; a new player has
+// nothing, and pays 1-200 ms per pipeline at the moment the game first needs it. This
+// is therefore not a platform defect — it is what EVERY new player gets, and the Linux
+// machine only looks smooth because of a file no player will have.
+//
+// WHAT THIS DOES. PipelineKey is a 56-byte padding-free POD that already carries vsHash
+// and psHash, so the key alone identifies a pipeline completely. Dump every key seen, in
+// one flat file beside the VkPipelineCache blob; on the next start, after the shaders
+// are loaded and before the guest draws anything, create them all. The work does not go
+// away — it moves from "during play, unpredictably" to "at load, once, where a player
+// expects to wait", which is what docs/release-plan.md §2.3 step 4 asks for.
+//
+// The two files must travel together and are keyed to the same directory name, but they
+// are independent: a missing or stale key file costs a slower first session and nothing
+// else, and a key whose shader is no longer in the cache is skipped by name.
+// Defined further down, in this same namespace.
+VkPipeline GetPipeline(const PipelineKey& key, const ShaderMeta& vs, const ShaderMeta& ps);
+
+constexpr uint32_t kPrewarmMagic = 0x5750435A;   // 'ZCPW'
+constexpr uint32_t kPrewarmVersion = 1;
+
+std::string PrewarmPath()
+{
+    if (R->pipeCachePath.empty())
+        return {};
+    return R->pipeCachePath + ".keys";
+}
+
+// Called at exit AND periodically. See SavePipelineKeysIfDue.
+void SavePipelineKeys()
+{
+    const std::string path = PrewarmPath();
+    if (path.empty() || R->pipelines.empty() || EnvOn("CW_VK_NO_PREWARM"))
+        return;
+    // Written IN PLACE, deliberately, with no temp-and-rename.
+    //
+    // The rename was the first design and it failed on Windows on every save — the file
+    // is rewritten every 32 pipelines, and a rename onto a destination that another part
+    // of the same process may hold open is not reliable there. The result was
+    // "RENAME FAILED" on every line and no key file at all, which made an entire
+    // three-arm A/B measure three cold runs.
+    //
+    // In-place is safe here because the READER already tolerates a short file: it takes
+    // the count from the header but stops at the first incomplete key
+    // (`if (fread(&key,...) != 1) break;`). A write interrupted halfway therefore costs
+    // some keys, never a corrupt read — and the file is 23 KB, so the window is tiny.
+    // Losing a few keys costs a few lazy compiles; losing the file costs a whole session.
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f)
+    {
+        fprintf(stderr, "[vk] pipeline pre-warm: CANNOT WRITE %s\n", path.c_str());
+        return;
+    }
+    const uint32_t hdr[3] = { kPrewarmMagic, kPrewarmVersion,
+                              uint32_t(R->pipelines.size()) };
+    fwrite(hdr, sizeof hdr, 1, f);
+    for (const auto& kv : R->pipelines)
+        fwrite(&kv.first, sizeof(PipelineKey), 1, f);
+    fclose(f);
+    static size_t lastAnnounced = 0;
+    // Announce the first save and then only every 128, or a periodic save spams the log.
+    if (R->pipelines.size() >= lastAnnounced + 128 || lastAnnounced == 0)
+    {
+        lastAnnounced = R->pipelines.size();
+        fprintf(stderr, "[vk] pipeline pre-warm: %zu keys -> %s\n",
+                R->pipelines.size(), path.c_str());
+    }
+}
+
+// SAVE AS WE GO, not only at exit.
+//
+// A warm-up that persists only on a clean shutdown is lost exactly when it is most
+// valuable: after a crash, or after a kill, or after a player closes the window in a
+// way the handler does not see. It is also how the first attempt at measuring this
+// change measured nothing — the arm that was supposed to WRITE the key file was
+// terminated with TerminateProcess, no handler ran, and the arm that was supposed to
+// READ it reported "no key file yet".
+//
+// Rewriting is cheap and bounded: the file is one 56-byte key per pipeline, ~23 KB for
+// a full session, written to a temp and renamed. Every 32 new pipelines is far below
+// the rate at which they are created (534 in three minutes of play) and costs a
+// fraction of a millisecond against creations that cost between one and two hundred.
+void SavePipelineKeysIfDue()
+{
+    static size_t savedAt = 0;
+    if (R->pipelines.size() >= savedAt + 32)
+    {
+        savedAt = R->pipelines.size();
+        SavePipelineKeys();
+    }
+}
+
+void PrewarmPipelines()
+{
+    if (EnvOn("CW_VK_NO_PREWARM"))
+    {
+        fprintf(stderr, "[vk] CW_VK_NO_PREWARM=1 — pipelines are created lazily, on the "
+                        "frame that first needs each one (the pre-part-83 behaviour, and "
+                        "the control arm for the pre-warm)\n");
+        return;
+    }
+    std::string path = PrewarmPath();
+    if (path.empty())
+        return;
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f)
+    {
+        // THE SHIPPED SEED (part 85, release §9.8). A fresh install has no per-user
+        // key file, and that very first session is the one place the part-83 stutter
+        // fix cannot reach — it needs a previous session to have recorded the keys.
+        // The bundle carries a key set harvested from an operator playthrough
+        // (tools/release/prewarm.keys, copied beside the executable by the packaging
+        // scripts); it seeds session ONE, and the per-user file takes over from
+        // session two on — the periodic save always writes to PrewarmPath(), never
+        // back into the bundle. Keys are OUR structs (shader hashes + render state),
+        // not game data, which is what §2.1's no-game-content rule permits. On a true
+        // first boot the vertex-shader half of the cache is still being born at first
+        // sight, so keys referencing an untranslated shader are skipped and counted —
+        // the seed's coverage completes by the second launch, and the log's
+        // missing-shader count below says exactly how partial it was.
+        const std::string shipped = (HostPaths::ExeDir() / "prewarm.keys").string();
+        f = fopen(shipped.c_str(), "rb");
+        if (f)
+        {
+            fprintf(stderr, "[vk] pipeline pre-warm: no per-user key file yet — "
+                            "seeding from the shipped %s\n", shipped.c_str());
+            path = shipped;
+        }
+    }
+    if (!f)
+    {
+        fprintf(stderr, "[vk] pipeline pre-warm: no key file yet (%s) — this session "
+                        "builds one, and the NEXT start will be smooth\n", path.c_str());
+        return;
+    }
+    uint32_t hdr[3] = {};
+    if (fread(hdr, sizeof hdr, 1, f) != 1 || hdr[0] != kPrewarmMagic ||
+        hdr[1] != kPrewarmVersion)
+    {
+        fprintf(stderr, "[vk] pipeline pre-warm: %s is not a v%u key file — ignoring\n",
+                path.c_str(), kPrewarmVersion);
+        fclose(f);
+        return;
+    }
+    // READ THE WHOLE FILE FIRST, then close it, THEN create anything.
+    //
+    // Creating a pipeline inserts into R->pipelines, which calls SavePipelineKeysIfDue,
+    // which REWRITES this very file — truncating it to the keys currently in memory
+    // while this loop is still reading it. The read position was then past the new EOF,
+    // fread failed, and the loop broke early. It stopped at exactly 72 keys every time,
+    // whether the file held 352, 416 or 522, because 72 creations is where the periodic
+    // save first fires and shortens the file beneath the reader.
+    //
+    // A constant that does not move when its input triples is not a coincidence, and
+    // that is what gave it away. Reading to a vector first removes the interaction
+    // entirely rather than papering over it with a "don't save while pre-warming" flag —
+    // which would have worked and would have left the same trap for the next caller.
+    std::vector<PipelineKey> keys;
+    keys.reserve(hdr[2]);
+    for (uint32_t i = 0; i < hdr[2]; ++i)
+    {
+        PipelineKey key{};
+        if (fread(&key, sizeof key, 1, f) != 1)
+            break;   // short file: take what is there, it is still valid
+        keys.push_back(key);
+    }
+    fclose(f);
+    f = nullptr;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    uint32_t made = 0, missingShader = 0, failed = 0;
+    for (const PipelineKey& key : keys)
+    {
+        auto vs = R->shadersMap.find(key.vsHash);
+        auto ps = R->shadersMap.find(key.psHash);
+        if (vs == R->shadersMap.end() || ps == R->shadersMap.end())
+        {
+            // Not an error: the shader cache and the key file drift independently, and a
+            // key naming a shader we no longer hold simply is not ours to build.
+            ++missingShader;
+            continue;
+        }
+        if (GetPipeline(key, vs->second, ps->second) == VK_NULL_HANDLE)
+            ++failed;
+        else
+            ++made;
+    }
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0).count();
+    fprintf(stderr,
+            "[vk] pipeline pre-warm: %u of %u created in %.0f ms (%.2f ms each)"
+            "%s%s — this is the stutter that would otherwise have happened DURING play\n",
+            made, uint32_t(keys.size()), ms, made ? ms / made : 0.0,
+            missingShader ? "" : "", failed ? "  (some FAILED — see the lines above)" : "");
+    if (missingShader)
+        fprintf(stderr, "[vk]   %u key(s) skipped: their shader is not in this cache\n",
+                missingShader);
+}
+
+// --- D.4: translate on first sight (docs/release-plan.md §3.D) ----------------------
+//
+// WHY. D.1 established the disc holds no usable VERTEX shader (the title patches fetch
+// instructions at load), so a shipped build's cache starts with a vertex half built
+// from nothing — every vertex shader has to come from the running title itself. This is
+// that path: when an IM_LOAD binds microcode whose hash the cache does not hold, the
+// bytes are handed to a worker thread, translated in-process (gpu/shader_translator.cpp,
+// whose output is byte-identical to the offline pipeline by the D.2 gate), persisted
+// into the cache directory so the NEXT run starts warm, and registered in the live
+// tables. Draws that need the shader are skipped while it translates — a fraction of a
+// second, once ever per shader — and the skip is its own counter rather than the
+// "no translated shader" report, so the standing `grep -c "no translated shader"` gate
+// keeps meaning what it always meant: a shader that ENDED UP missing (translation
+// failed, or the JIT is off), not one that was momentarily in flight.
+//
+// THREADING. BindShader (the enqueue site) and DoDraw (the drain site) both run on the
+// pump thread, so the shader tables are only ever touched from the thread that reads
+// them; the worker touches only its own queue entries and the filesystem. The worker is
+// ONE thread on purpose (the operator's rule: leave the cores to the game) and is never
+// joined — this runtime shuts down with _Exit everywhere, so a blocked join would be a
+// hang and an abandoned worker is the documented shape.
+//
+// CW_VK_NO_SHADER_JIT=1 is the same-binary control arm.
+namespace shaderjit
+{
+struct Job
+{
+    uint32_t type = 0; // 0 = VS, 1 = PS
+    uint64_t hash = 0;
+    std::vector<uint8_t> ucode;
+};
+std::mutex mx;
+std::condition_variable cv;
+std::deque<Job> queue;
+struct Done
+{
+    uint64_t hash = 0;
+    std::string name;
+    std::filesystem::path dir; // where the worker persisted the pair
+};
+std::vector<Done> finished;          // guarded by mx; drained on the pump thread
+std::vector<uint64_t> failedHashes;  // guarded by mx; makes the miss report fire
+std::vector<uint64_t> requested;     // pump thread only: never enqueue a hash twice
+std::atomic<uint32_t> inFlight{ 0 }; // queued + translating, for the miss-site test
+std::filesystem::path cacheDir;      // set by LoadShaders; empty = no persistence yet
+bool workerUp = false;               // pump thread only
+// Armed at the END of LoadShaders. Before the tables are populated every hash would
+// look missing, and the JIT would busily re-translate the whole on-disk cache.
+bool tablesReady = false;
+
+void Worker()
+{
+    for (;;)
+    {
+        Job job;
+        {
+            std::unique_lock<std::mutex> lk(mx);
+            cv.wait(lk, [] { return !queue.empty(); });
+            job = std::move(queue.front());
+            queue.pop_front();
+        }
+        const char* stage = job.type == 0 ? "vs" : "ps";
+        char name[32];
+        snprintf(name, sizeof name, "%s_%016llx", stage,
+                 static_cast<unsigned long long>(job.hash));
+
+        const auto t0 = std::chrono::steady_clock::now();
+        ShaderTranslator::Result r;
+        std::string err;
+        bool ok = ShaderTranslator::Translate(name, job.ucode.data(), job.ucode.size(),
+                                              r, err);
+        std::filesystem::path dir = cacheDir;
+        if (ok)
+        {
+            // Persist so the next run starts warm — and so the drain can reuse the
+            // very same LoadShaderMeta path the startup loop uses. A cache directory
+            // that cannot be written is worth one loud line, then a scratch fallback
+            // keeps THIS run working.
+            auto persist = [&](const std::filesystem::path& d) {
+                std::error_code ec;
+                std::filesystem::create_directories(d, ec);
+                std::ofstream fs(d / (std::string(name) + ".spv"), std::ios::binary);
+                fs.write(reinterpret_cast<const char*>(r.spirv.data()),
+                         std::streamsize(r.spirv.size()));
+                if (!fs)
+                    return false;
+                std::ofstream fm(d / (std::string(name) + ".meta.json"),
+                                 std::ios::binary);
+                fm.write(r.metaJson.data(), std::streamsize(r.metaJson.size()));
+                return bool(fm);
+            };
+            if (!persist(dir))
+            {
+                const auto scratch =
+                    std::filesystem::temp_directory_path() / "cw_shader_jit";
+                fprintf(stderr,
+                        "[vk] shader cache %s is not writable — %s persisted to %s "
+                        "for this run only\n",
+                        dir.string().c_str(), name, scratch.string().c_str());
+                dir = scratch;
+                ok = persist(dir);
+                if (!ok)
+                    err = "cache dir and scratch dir both unwritable";
+            }
+        }
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+        if (ok)
+        {
+            fprintf(stderr, "[vk] first-sight translation: %s (%zu dwords -> %zu B "
+                            "SPIR-V, %lld ms)\n",
+                    name, job.ucode.size() / 4, r.spirv.size(),
+                    static_cast<long long>(ms));
+            std::lock_guard<std::mutex> lk(mx);
+            finished.push_back({ job.hash, name, dir });
+        }
+        else
+        {
+            fprintf(stderr, "[vk] first-sight translation FAILED for %s: %s\n",
+                    name, err.c_str());
+            std::lock_guard<std::mutex> lk(mx);
+            failedHashes.push_back(job.hash);
+        }
+        // Decremented only after the result is visible, so the miss site can never
+        // read "nothing in flight" while the answer is still in neither list.
+        inFlight.fetch_sub(1);
+    }
+}
+
+// Pump thread, from BindShader's first-announce of a hash: enqueue if the cache
+// cannot answer it. Cheap on the path that matters — one map lookup per DISTINCT
+// shader per run, not per bind.
+void OnFirstBind(uint32_t type, uint64_t hash, const uint8_t* code, uint32_t sizeDwords)
+{
+    static const bool off = [] {
+        const char* e = getenv("CW_VK_NO_SHADER_JIT");
+        return e && *e && strcmp(e, "0") != 0;
+    }();
+    if (off || !R || !tablesReady)
+        return;
+    if (R->shadersMap.count(hash))
+        return;
+    if (std::find(requested.begin(), requested.end(), hash) != requested.end())
+        return;
+    requested.push_back(hash);
+    if (!workerUp)
+    {
+        workerUp = true;
+        std::thread(Worker).detach();
+    }
+    inFlight.fetch_add(1);
+    {
+        std::lock_guard<std::mutex> lk(mx);
+        queue.push_back({ type, hash, std::vector<uint8_t>(code, code + size_t(sizeDwords) * 4) });
+    }
+    cv.notify_one();
+}
+
+bool InFlightOrFailed(uint64_t hash, bool& failed)
+{
+    failed = false;
+    {
+        std::lock_guard<std::mutex> lk(mx);
+        if (std::find(failedHashes.begin(), failedHashes.end(), hash) !=
+            failedHashes.end())
+        {
+            failed = true;
+            return false;
+        }
+    }
+    // In flight iff requested, not failed, and not yet in the tables — the caller only
+    // asks after a table miss, so "requested and not failed" is exactly "still coming
+    // or just landed"; either way the draw skips this frame and finds it drained next.
+    return std::find(requested.begin(), requested.end(), hash) != requested.end();
+}
+
+// Pump thread, at the draw-path miss site: register every finished translation.
+// Returns true if anything was inserted, so the caller re-runs its lookup.
+bool Drain()
+{
+    std::vector<Done> batch;
+    {
+        std::lock_guard<std::mutex> lk(mx);
+        batch.swap(finished);
+    }
+    if (batch.empty())
+        return false;
+    bool any = false;
+    for (const auto& d : batch)
+    {
+        ShaderMeta meta;
+        if (!LoadShaderMeta(d.dir / (d.name + ".meta.json"), meta))
+        {
+            fprintf(stderr, "[vk] first-sight %s: persisted sidecar unreadable\n",
+                    d.name.c_str());
+            std::lock_guard<std::mutex> lk(mx);
+            failedHashes.push_back(d.hash);
+            continue;
+        }
+        std::ifstream f(d.dir / (d.name + ".spv"), std::ios::binary);
+        std::vector<char> spv((std::istreambuf_iterator<char>(f)), {});
+        VkShaderModuleCreateInfo ci{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+        ci.codeSize = spv.size();
+        ci.pCode = reinterpret_cast<const uint32_t*>(spv.data());
+        if (spv.empty() || (spv.size() % 4) ||
+            vkCreateShaderModule(R->device, &ci, nullptr, &meta.module) != VK_SUCCESS)
+        {
+            fprintf(stderr, "[vk] first-sight %s: vkCreateShaderModule failed\n",
+                    d.name.c_str());
+            std::lock_guard<std::mutex> lk(mx);
+            failedHashes.push_back(d.hash);
+            continue;
+        }
+        ApplyWorldXform(d.name, meta);
+        R->shaders.Insert(d.hash, meta);
+        R->shadersMap.emplace(d.hash, std::move(meta));
+        any = true;
+    }
+    return any;
+}
+} // namespace shaderjit
+
 bool LoadShaders()
 {
     // The cache directory is CWD-relative and the launch CWD varies (the documented
@@ -6481,6 +7429,7 @@ bool LoadShaders()
     }
 
     fprintf(stderr, "[vk] shader cache: %s\n", dir.string().c_str());
+    shaderjit::cacheDir = dir; // D.4: where first-sight translations persist
     CreatePipelineCache(dir);
     LoadWorldXformTable(dir);
     uint32_t dropped = 0;
@@ -6530,6 +7479,7 @@ bool LoadShaders()
     }
     fprintf(stderr, "[vk] %zu shader modules loaded%s\n", R->shadersMap.size(),
             dropped ? " (see the DROPPED lines above)" : "");
+    shaderjit::tablesReady = true; // D.4 may now trust a miss to mean "not in the cache"
 
     // ROUTE (B)'s VARIANT CACHE (part 65). A sibling directory built by
     //   CW_HLSL_PATCH="python3 tools/patch_rt_shadow_hlsl.py" \
@@ -7929,6 +8879,13 @@ uint32_t UploadTexture(uint8_t* base, const uint32_t* regs, uint32_t constIdx,
                 COUNT("texture: served from a DEPTH resolve snapshot");
             else
                 COUNT("texture: served from a resolve snapshot");
+            // The copy census's consumption mark sits BEFORE the right-sized-view
+            // early return below — a view sample consumes the same copied pixels, and
+            // the pass-inputs list (which sits after) misses exactly those.
+            if (g_copyCensusOn)
+                CopyCensusSampled(
+                    (t.address & 0x1FFFFFFF) |
+                    (snap->second.fromDepth ? kSnapshotDepthBit : 0u));
             // MEASUREMENT ONLY, and the thing it measures is a real defect with a
             // quantitative fit — see docs/phase5-notes.md §6ao.
             //
@@ -9487,7 +10444,12 @@ VkPipeline GetPipeline(const PipelineKey& key, const ShaderMeta& vs, const Shade
     VkPipelineMultisampleStateCreateInfo ms{
         VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO
     };
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    // The EDRAM's own sample count (CW_VK_MSAA, part 93). Constant for the run, so it
+    // needs no pipeline-key bit; every pipeline this function makes renders into the
+    // EDRAM pair (the draw-id pass substitutes only the fragment stage, same
+    // attachments). The RT trace/factor pipelines below have their own 1x state —
+    // they render into single-sample images and RT is refused under MSAA anyway.
+    ms.rasterizationSamples = R->msaaSamples;
 
     // RB_DEPTHCONTROL: stencil_enable:1, z_enable:1, z_write_enable:1, ?:1,
     // zfunc:3 @4, backface_enable:1 @7.
@@ -9609,6 +10571,26 @@ VkPipeline GetPipeline(const PipelineKey& key, const ShaderMeta& vs, const Shade
                        cb.dstAlphaBlendFactor == VK_BLEND_FACTOR_ZERO)
                         ? VK_TRUE
                         : VK_FALSE;
+
+    // CW_VK_NO_BLEND_DEPTH_WRITE=1 — translucent geometry should depth-TEST but not
+    // depth-WRITE, so overlapping alpha-blended layers do not occlude one another via
+    // written depth. Chuck's hair is 178 layered alpha-blended cards (vs d78d670a,
+    // blend 07060706) that DO write depth (RB_DEPTHCONTROL bit 2 set); on our
+    // D24_UNORM their near-equal depths flip the LESS_EQUAL test frame to frame as the
+    // skinned mesh animates, and because the cards are transparent each flip adds or
+    // drops a layer's contribution — a continuous, motion-gated flicker that hardware's
+    // depth precision does not show (part 92 hair-flicker hunt). This arm forces
+    // depth-write off for every blended draw; the default keeps the guest's own bit so
+    // it is a same-binary control. It is aimed at the hair but applies to all blended
+    // geometry because that is the conventional, order-independent-correct behaviour for
+    // translucency; if it regresses another effect, narrow it to the hair VS.
+    static const bool noBlendDepthWrite = EnvOn("CW_VK_NO_BLEND_DEPTH_WRITE");
+    if (noBlendDepthWrite && cb.blendEnable == VK_TRUE)
+    {
+        ds.depthWriteEnable = VK_FALSE;
+        COUNT("pipeline: depth-write forced off for a blended draw "
+              "(CW_VK_NO_BLEND_DEPTH_WRITE)");
+    }
 
     VkPipelineColorBlendStateCreateInfo bs{
         VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO
@@ -9750,6 +10732,9 @@ VkPipeline GetPipeline(const PipelineKey& key, const ShaderMeta& vs, const Shade
         Count("pipeline: created");
     }
     R->pipelines.emplace(key, pipeline);
+    // Persist the growing key set as we go, so a kill or a crash cannot throw away the
+    // warm-up. See SavePipelineKeysIfDue.
+    SavePipelineKeysIfDue();
     R->lastPipelineKey = key;
     R->lastPipeline = pipeline;
     R->lastPipelineValid = true;
@@ -9978,313 +10963,539 @@ void PersistMaintenance()
     ++R->persistStats.flushes;
 }
 
+// ===================================================================================
+// PARALLEL RECORD — the machinery (part 89; the design comment is at DrawCapture)
+// ===================================================================================
+bool OrderGateArmed();   // the gate is defined further down; the replay feeds it
+
+// Command pools per (frame slot, recorder). Recorder indices 0..N-1 are the guard
+// pool's workers; index kPrPumpRecorder is the pump, which claims chunks at the
+// submit wait rather than idling (and is the reason a starved pool cannot deadlock:
+// the pump can always finish the list alone).
+constexpr uint32_t kPrMaxRecorders = 9;              // budget cap 6 + margin + pump
+constexpr uint32_t kPrPumpRecorder = kPrMaxRecorders - 1;
+constexpr uint32_t kPrMaxChunks = 256;               // ~12k draws / 512 = 24; margin 10x
+VkCommandPool g_prPools[kMaxFramesInFlight][kPrMaxRecorders] = {};
+std::vector<VkCommandBuffer> g_prCbs[kMaxFramesInFlight][kPrMaxRecorders];
+uint32_t g_prCbUsed[kMaxFramesInFlight][kPrMaxRecorders] = {};
+std::vector<std::unique_ptr<ParRecChunk>> g_prChunkPool[kMaxFramesInFlight];
+uint32_t g_prChunkUsed[kMaxFramesInFlight] = {};
+
+// The frame's chunk list and the worker protocol: the pump publishes at `queued`,
+// recorders claim by CAS on `claim`, completion is `done`. All reset at BeginFrame,
+// when no chunk can be outstanding (the previous submit waited for them all).
+ParRecChunk* g_prList[kPrMaxChunks];
+std::atomic<uint32_t> g_prQueued{ 0 }, g_prClaim{ 0 }, g_prDone{ 0 };
+
+// Engagement counters (gotcha 151: an arm with no counter cannot be shown to have
+// engaged) and the pump's one bill, the submit wait.
+uint64_t g_prChunksRecorded[kPrMaxRecorders] = {};   // each written by ONE recorder
+uint64_t g_prCaptured = 0, g_prTailDraws = 0, g_prTailInstances = 0,
+         g_prEmptyInstances = 0, g_prWaitNs = 0, g_prPumpHelped = 0,
+         g_prBindOverflow = 0, g_prOverflowInline = 0;
+ParRecChunk g_prTailCounters;   // pump-tail replay skips, pump thread only
+
+bool ParRec_PendingChunks()
+{
+    return g_prClaim.load(std::memory_order_relaxed) <
+           g_prQueued.load(std::memory_order_acquire);
+}
+
+VkCommandBuffer ParRec_AcquireCb(uint32_t slot, uint32_t rec)
+{
+    // Failures ABORT rather than return: a recorder that cannot get a command buffer
+    // has no honest partial result, and a silent null would fault in the driver with
+    // the cause erased.
+    if (!g_prPools[slot][rec])
+    {
+        VkCommandPoolCreateInfo pi{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+        pi.queueFamilyIndex = R->queueFamily;
+        const VkResult r = vkCreateCommandPool(R->device, &pi, nullptr,
+                                               &g_prPools[slot][rec]);
+        if (r != VK_SUCCESS)
+        {
+            fprintf(stderr, "[vk] parallel record: vkCreateCommandPool failed: %d\n",
+                    int(r));
+            abort();
+        }
+    }
+    auto& cbs = g_prCbs[slot][rec];
+    uint32_t& used = g_prCbUsed[slot][rec];
+    if (used == cbs.size())
+    {
+        VkCommandBuffer batch[8];
+        VkCommandBufferAllocateInfo ai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+        ai.commandPool = g_prPools[slot][rec];
+        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = 8;
+        const VkResult r = vkAllocateCommandBuffers(R->device, &ai, batch);
+        if (r != VK_SUCCESS)
+        {
+            fprintf(stderr,
+                    "[vk] parallel record: vkAllocateCommandBuffers failed: %d\n",
+                    int(r));
+            abort();
+        }
+        cbs.insert(cbs.end(), batch, batch + 8);
+    }
+    return cbs[used++];
+}
+
+// The order gate's id for a REPLAYED draw, recomputed from the fields the replay
+// actually consumed — precomputing it at capture would compare the capture with
+// itself. Must mix exactly what the capture-side log mixes.
+inline uint64_t ParRec_OrderId(const DrawCapture& c)
+{
+    auto mixq = [](uint64_t h, uint64_t v) {
+        h ^= v;
+        return h * 0x100000001B3ull;
+    };
+    uint64_t id = 0xCBF29CE484222325ull;
+    id = mixq(id, uint64_t(c.push.drawIndex));
+    id = mixq(id, uint64_t(uintptr_t(c.pipeline)));
+    id = mixq(id, (uint64_t(c.primType) << 32) | c.gateCount);
+    id = mixq(id, (uint64_t(uint32_t(c.gateIndxOffset)) << 32) | c.indexVa);
+    id = mixq(id, c.vsHash);
+    id = mixq(id, c.psHash);
+    return id;
+}
+
+// Replay a run of captures as ONE self-contained dynamic-rendering instance. Every
+// attachment is LOAD/STORE with no clear (the EDRAM model), so an instance split is
+// the identity — see the DrawCapture comment. The BoundState is fresh per instance,
+// exactly like a fresh command buffer: the first draw issues everything.
+// Emit deferred clears into an ALREADY-OPEN rendering instance, one
+// vkCmdClearAttachments per pending — per pending rather than batched into one call
+// because two pendings with different values and overlapping rects must apply in
+// latch order, and separate calls are ordered where one call's rect list is not
+// guaranteed to be. Callable from a worker: it touches only the arguments.
+void EmitPendingClears(VkCommandBuffer cb, const PendingClear* p, size_t n)
+{
+    for (size_t i = 0; i < n; ++i)
+    {
+        VkClearAttachment att{};
+        if (p[i].isColor)
+        {
+            att.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            att.colorAttachment = 0;
+        }
+        else
+            att.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+        att.clearValue = p[i].value;
+        VkClearRect rect{ p[i].rect, 0, 1 };
+        vkCmdClearAttachments(cb, 1, &att, 1, &rect);
+    }
+}
+
+void ParRec_RecordInstance(VkCommandBuffer cb, const DrawCapture* d, size_t n,
+                           VkImageView colorView, VkImageView depthView, uint32_t w,
+                           uint32_t h, std::vector<uint64_t>* ids, ParRecChunk* sk,
+                           const PendingClear* pend = nullptr, size_t pendN = 0)
+{
+    static const bool noStateCache = Env("CW_VK_NO_STATE_CACHE") != nullptr;
+    VkRenderingAttachmentInfo colorAtt{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+    colorAtt.imageView = colorView;
+    colorAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAtt.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    colorAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingAttachmentInfo depthAtt{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+    depthAtt.imageView = depthView;
+    depthAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    depthAtt.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    depthAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo ri{ VK_STRUCTURE_TYPE_RENDERING_INFO };
+    ri.renderArea = { { 0, 0 }, { w, h } };
+    ri.layerCount = 1;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &colorAtt;
+    ri.pDepthAttachment = &depthAtt;
+    ri.pStencilAttachment = &depthAtt;
+    vkCmdBeginRendering(cb, &ri);
+    // The pass's deferred clears, before its first draw — this instance is the first
+    // of its pass whenever `pend` is non-null (the pump only hands them to the first).
+    if (pendN)
+        EmitPendingClears(cb, pend, pendN);
+
+    Renderer::BoundState b;
+    for (size_t i = 0; i < n; ++i)
+    {
+        const DrawCapture& c = d[i];
+        if (noStateCache || c.pipeline != b.pipeline)
+        {
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, c.pipeline);
+            // Same rule as the inline path: a pipeline bind makes the stencil
+            // dynamic state undefined (it is dynamic only on stencil pipelines).
+            b.haveStencil = false;
+            b.pipeline = c.pipeline;
+        }
+        else
+            ++sk->skipPipeline;
+        if (noStateCache || !b.haveViewport ||
+            memcmp(&c.viewport, &b.viewport, sizeof b.viewport) != 0)
+        {
+            vkCmdSetViewport(cb, 0, 1, &c.viewport);
+            b.viewport = c.viewport;
+            b.haveViewport = true;
+        }
+        else
+            ++sk->skipViewport;
+        if (noStateCache || !b.haveScissor ||
+            memcmp(&c.scissor, &b.scissor, sizeof b.scissor) != 0)
+        {
+            vkCmdSetScissor(cb, 0, 1, &c.scissor);
+            b.scissor = c.scissor;
+            b.haveScissor = true;
+        }
+        else
+            ++sk->skipScissor;
+        if (noStateCache || !b.haveBlend ||
+            memcmp(c.blend, b.blend, sizeof b.blend) != 0)
+        {
+            vkCmdSetBlendConstants(cb, c.blend);
+            memcpy(b.blend, c.blend, sizeof b.blend);
+            b.haveBlend = true;
+        }
+        else
+            ++sk->skipBlend;
+        if (c.stencilOn)
+        {
+            if (noStateCache || !b.haveStencil || b.stencilRef != c.stencilRef ||
+                b.stencilMask != c.stencilMask || b.stencilWriteMask != c.stencilWriteMask)
+            {
+                vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, c.stencilRef);
+                vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK,
+                                           c.stencilMask);
+                vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK,
+                                         c.stencilWriteMask);
+                b.stencilRef = c.stencilRef;
+                b.stencilMask = c.stencilMask;
+                b.stencilWriteMask = c.stencilWriteMask;
+                b.haveStencil = true;
+            }
+            else
+                ++sk->skipStencil;
+        }
+        if (noStateCache || !b.setsBound)
+        {
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, R->pipeLayout, 0,
+                                    5, R->sets, 0, nullptr);
+            b.setsBound = true;
+        }
+        else
+            ++sk->skipSets;
+        vkCmdPushConstants(cb, R->pipeLayout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           32, &c.push);
+        // Vertex binds: contiguous CHANGED runs become one call, exactly what the
+        // inline bind batch produces.
+        {
+            VkBuffer bufs[DrawCapture::kMaxBinds];
+            VkDeviceSize offs[DrawCapture::kMaxBinds];
+            uint32_t runFirst = 0, cnt = 0;
+            for (uint32_t bd = 0; bd < c.bindCount; ++bd)
+            {
+                const bool changed = noStateCache || !b.haveVertex[bd] ||
+                                     b.vertexBuffer[bd] != c.vb[bd] ||
+                                     b.vertexOffset[bd] != c.vo[bd];
+                if (changed)
+                {
+                    if (cnt == 0)
+                        runFirst = bd;
+                    bufs[cnt] = c.vb[bd];
+                    offs[cnt] = c.vo[bd];
+                    ++cnt;
+                    b.vertexBuffer[bd] = c.vb[bd];
+                    b.vertexOffset[bd] = c.vo[bd];
+                    b.haveVertex[bd] = true;
+                }
+                else
+                {
+                    ++sk->skipVertex;
+                    if (cnt)
+                    {
+                        vkCmdBindVertexBuffers(cb, runFirst, cnt, bufs, offs);
+                        cnt = 0;
+                    }
+                }
+            }
+            if (cnt)
+                vkCmdBindVertexBuffers(cb, runFirst, cnt, bufs, offs);
+        }
+        if (c.ib != VK_NULL_HANDLE)
+        {
+            if (noStateCache || !b.haveIndex || b.indexBuffer != c.ib ||
+                b.indexOffset != c.io || b.indexType != c.it)
+            {
+                vkCmdBindIndexBuffer(cb, c.ib, c.io, c.it);
+                b.indexBuffer = c.ib;
+                b.indexOffset = c.io;
+                b.indexType = c.it;
+                b.haveIndex = true;
+            }
+            else
+                ++sk->skipIndex;
+            vkCmdDrawIndexed(cb, c.drawCount, 1, 0, c.baseVertex, 0);
+        }
+        else
+            vkCmdDraw(cb, c.drawCount, 1, uint32_t(c.baseVertex), 0);
+        if (ids)
+            ids->push_back(ParRec_OrderId(c));
+    }
+    vkCmdEndRendering(cb);
+}
+
+void ParRec_RecordChunk(uint32_t rec, ParRecChunk* ch, uint32_t slot)
+{
+    VkCommandBuffer cb = ParRec_AcquireCb(slot, rec);
+    VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cb, &bi);
+    std::vector<uint64_t>* ids = OrderGateArmed() ? &ch->orderIds : nullptr;
+    ParRec_RecordInstance(cb, ch->draws.data(), ch->draws.size(), ch->colorView,
+                          ch->depthView, ch->width, ch->height, ids, ch,
+                          ch->pendingClears.data(), ch->pendingClears.size());
+    vkEndCommandBuffer(cb);
+    ch->cb = cb;
+    ch->state.store(2, std::memory_order_release);
+    ++g_prChunksRecorded[rec];
+}
+
+// The frame slot chunks were enqueued under — stamped at enqueue because a WORKER
+// must not read R->frameSlot (it advances on the pump; a chunk is always consumed
+// before its frame submits, but the stamp makes that true by construction).
+uint32_t g_prSlot = 0;
+
+void ParRec_WorkerDrain(uint32_t workerIdx)
+{
+    for (;;)
+    {
+        uint32_t c = g_prClaim.load(std::memory_order_relaxed);
+        const uint32_t q = g_prQueued.load(std::memory_order_acquire);
+        if (c >= q)
+            return;
+        if (!g_prClaim.compare_exchange_weak(c, c + 1, std::memory_order_acq_rel))
+            continue;
+        ParRec_RecordChunk(workerIdx, g_prList[c], g_prSlot);
+        g_prDone.fetch_add(1, std::memory_order_release);
+    }
+}
+
+// Close the pump's current segment, append the chunk after it, open a new segment.
+void ParRec_CutPumpSegment(ParRecChunk* ch)
+{
+    vkEndCommandBuffer(R->cmd);
+    R->submitList.emplace_back(R->cmd, nullptr);
+    R->submitList.emplace_back(VK_NULL_HANDLE, ch);
+    VkCommandBuffer next = ParRec_AcquireCb(R->frameSlot, kPrPumpRecorder);
+    VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(next, &bi);
+    R->cmd = next;
+}
+
+void ParRec_Handoff()
+{
+    if (R->capBuf.empty())
+        return;
+    const uint32_t q = g_prQueued.load(std::memory_order_relaxed);
+    if (q >= kPrMaxChunks || !GuardPoolWorkers() || !g_gp)
+    {
+        // No queue room or no pool: replay inline as a pump instance. Counted — a
+        // fallback with no counter is a fallback nobody can tell fired (gotcha 151).
+        ++g_prOverflowInline;
+        std::vector<uint64_t>* ids = nullptr;
+        if (OrderGateArmed())
+        {
+            R->prTailIds.emplace_back();
+            ids = &R->prTailIds.back();
+            R->prIdSeq.push_back(ids);
+        }
+        const bool carryClears =
+            R->capPassInstances == 0 && !R->pendingClears.empty();
+        ParRec_RecordInstance(R->cmd, R->capBuf.data(), R->capBuf.size(),
+                              R->capColorView, R->capDepthView, R->capWidth,
+                              R->capHeight, ids, &g_prTailCounters,
+                              carryClears ? R->pendingClears.data() : nullptr,
+                              carryClears ? R->pendingClears.size() : 0);
+        if (carryClears)
+        {
+            R->pendingClears.clear();
+            Count("clear: deferred emitted in an inline-overflow instance");
+        }
+        ++R->capPassInstances;
+        R->capBuf.clear();
+        return;
+    }
+    const uint32_t slot = R->frameSlot;
+    auto& pool = g_prChunkPool[slot];
+    if (g_prChunkUsed[slot] == pool.size())
+        pool.emplace_back(new ParRecChunk);
+    ParRecChunk* ch = pool[g_prChunkUsed[slot]++].get();
+    ch->draws.swap(R->capBuf);
+    R->capBuf.clear();
+    // The pass's deferred clears ride the FIRST instance only; a chunk reused from the
+    // pool must not replay a previous pass's.
+    ch->pendingClears.clear();
+    if (R->capPassInstances == 0 && !R->pendingClears.empty())
+    {
+        ch->pendingClears = std::move(R->pendingClears);
+        R->pendingClears.clear();
+        Count("clear: deferred handed to a chunk instance");
+    }
+    ch->orderIds.clear();
+    ch->cb = VK_NULL_HANDLE;
+    ch->skipPipeline = ch->skipViewport = ch->skipScissor = ch->skipBlend =
+        ch->skipStencil = ch->skipSets = ch->skipVertex = ch->skipIndex = 0;
+    ch->colorView = R->capColorView;
+    ch->depthView = R->capDepthView;
+    ch->width = R->capWidth;
+    ch->height = R->capHeight;
+    g_prSlot = slot;
+    if (OrderGateArmed())
+        R->prIdSeq.push_back(&ch->orderIds);
+    ch->state.store(1, std::memory_order_relaxed);
+    ParRec_CutPumpSegment(ch);
+    g_prList[q] = ch;
+    g_prQueued.store(q + 1, std::memory_order_release);
+    ++R->capPassInstances;
+    // The empty lock section orders the store above with the workers' predicate
+    // evaluation — without it a worker can check, miss the store, and sleep through
+    // the notify (a lost wakeup, not a deadlock: the pump helps at the submit wait,
+    // but the chunk would ride the frame's critical path for nothing).
+    {
+        std::lock_guard<std::mutex> lk(g_gp->mx);
+    }
+    g_gp->wake.notify_all();
+}
+
+// The pass is closing: replay whatever the chunk cut left over, on the pump, into
+// the current segment — so an unsplit pass records exactly one instance, as today.
+void ParRec_FlushTail()
+{
+    if (R->capBuf.empty())
+    {
+        // A pass that opened and closed with no draws still records its (empty)
+        // instance, preserving the command stream's instance count exactly.
+        if (R->capPassInstances == 0)
+        {
+            const bool carryClears = !R->pendingClears.empty();
+            ParRec_RecordInstance(R->cmd, nullptr, 0, R->capColorView, R->capDepthView,
+                                  R->capWidth, R->capHeight, nullptr, &g_prTailCounters,
+                                  carryClears ? R->pendingClears.data() : nullptr,
+                                  carryClears ? R->pendingClears.size() : 0);
+            if (carryClears)
+            {
+                R->pendingClears.clear();
+                Count("clear: deferred emitted in an empty-pass instance");
+            }
+            ++g_prEmptyInstances;
+        }
+        return;
+    }
+    std::vector<uint64_t>* ids = nullptr;
+    if (OrderGateArmed())
+    {
+        R->prTailIds.emplace_back();
+        ids = &R->prTailIds.back();
+        R->prIdSeq.push_back(ids);
+    }
+    g_prTailDraws += R->capBuf.size();
+    ++g_prTailInstances;
+    const bool carryClears = R->capPassInstances == 0 && !R->pendingClears.empty();
+    ParRec_RecordInstance(R->cmd, R->capBuf.data(), R->capBuf.size(), R->capColorView,
+                          R->capDepthView, R->capWidth, R->capHeight, ids,
+                          &g_prTailCounters,
+                          carryClears ? R->pendingClears.data() : nullptr,
+                          carryClears ? R->pendingClears.size() : 0);
+    if (carryClears)
+    {
+        R->pendingClears.clear();
+        Count("clear: deferred emitted in the pump tail instance");
+    }
+    ++R->capPassInstances;
+    R->capBuf.clear();
+}
+
+// The submit wait: the pump HELPS rather than spins — a starved or busy pool can
+// never deadlock the frame, and the helped-chunk counter says how often it happened.
+void ParRec_WaitChunks()
+{
+    const uint32_t q = g_prQueued.load(std::memory_order_acquire);
+    if (!q)
+        return;
+    const uint64_t t0 = NowNs();
+    for (;;)
+    {
+        uint32_t c = g_prClaim.load(std::memory_order_relaxed);
+        if (c >= q)
+            break;
+        if (!g_prClaim.compare_exchange_weak(c, c + 1, std::memory_order_acq_rel))
+            continue;
+        ParRec_RecordChunk(kPrPumpRecorder, g_prList[c], g_prSlot);
+        g_prDone.fetch_add(1, std::memory_order_release);
+        ++g_prPumpHelped;
+    }
+    while (g_prDone.load(std::memory_order_acquire) < q)
+        std::this_thread::yield();
+    g_prWaitNs += NowNs() - t0;
+    // Aggregate the replay-side skip counters, single-threaded here by construction.
+    auto add = [&](const ParRecChunk& s) {
+        R->skips.pipeline += s.skipPipeline;
+        R->skips.viewport += s.skipViewport;
+        R->skips.scissor += s.skipScissor;
+        R->skips.blend += s.skipBlend;
+        R->skips.stencil += s.skipStencil;
+        R->skips.sets += s.skipSets;
+        R->skips.vertexBindRepeats += s.skipVertex;
+        R->skips.indexBindRepeats += s.skipIndex;
+    };
+    for (uint32_t i = 0; i < q; ++i)
+        add(*g_prList[i]);
+    add(g_prTailCounters);
+    // ParRecChunk carries an atomic and is not assignable; zero the counters by hand.
+    g_prTailCounters.skipPipeline = g_prTailCounters.skipViewport =
+        g_prTailCounters.skipScissor = g_prTailCounters.skipBlend =
+            g_prTailCounters.skipStencil = g_prTailCounters.skipSets =
+                g_prTailCounters.skipVertex = g_prTailCounters.skipIndex = 0;
+}
+
 // Defined with the gate itself further down; declared here because the frame
 // boundary is above it and moving eighty lines to satisfy an ordering rule would make
 // the gate harder to find, not easier.
 void OrderGateCheck();
-bool OrderGateArmed();
 
-// ===================================================================================
-// STAGE 2a: SECONDARY-COMMAND-BUFFER PASS CONTENTS, RECORDED SERIALLY (part 7)
-// ===================================================================================
-//
-// The campaign's second proof, still with zero concurrency: when armed, every rendering
-// instance is begun with CONTENTS_SECONDARY_COMMAND_BUFFERS and the draw path records
-// into per-range secondaries — the PUMP still records everything, in walk order, but
-// through the exact mechanics stage 2c will hand to workers. What this isolates and
-// prices, before any thread touches it: dynamic-rendering inheritance, per-range full
-// state re-establishment (R->bound resets at every secondary, so the part-18 bind
-// elision provably cannot leak across a range boundary), vkCmdExecuteCommands, and the
-// driver's cost for all of the above. The ranges ARE the prec module's ranges — its
-// rangeClosed hook rotates the buffers, so one partition has two consumers and cannot
-// drift.
-//
-// The swap discipline is the whole correctness argument: R->cmd points at the current
-// range's secondary ONLY between the instance's begin and end; every other record in
-// this file — barriers, resolves, snapshot copies, the readback — happens outside an
-// instance and therefore lands on the primary, untouched. The one exception is the
-// CW_VK_GPU_PASSES per-pass timestamps, which would put a primary-side write inside a
-// CONTENTS_SECONDARY instance; that combination is refused loudly and the per-pass
-// split is skipped (whole-frame GPU timestamps are outside instances and unaffected).
-//
-// `CW_VK_SECONDARIES=1` arms it (opt-in until its own soak verdict lands); allocation
-// failure falls back per pass (the flag is only set when a secondary is already open)
-// or per rotation (the range just keeps growing in the current secondary) — both
-// counted, neither able to produce an illegal command buffer.
-namespace rexec
-{
-bool On();          // all defined with the machinery, below DrawTicket
-void FrameReset();
-void PassDrain();
-}
-
-namespace sec
-{
-
-bool On()
-{
-    // DEFAULT ON since part 7 closed (finding 71): secondaries + deferred replay
-    // measured +0.35 ms at the crowd against the old defaults, all bands positive,
-    // correctness proven at ~450M draws of gates and confirmed in play by the
-    // operator on 2026-08-30. CW_VK_SECONDARIES=1 is accepted as a no-op so the
-    // part-7 harness recipes keep working. Note CW_VK_GPU_PASSES needs the control
-    // arm (a primary may not timestamp inside a CONTENTS_SECONDARY instance).
-    static const bool on = [] {
-        const bool off = EnvOn("CW_VK_NO_SECONDARIES");
-        if (off)
-            fprintf(stderr, "[sec] CW_VK_NO_SECONDARIES=1 — per-range secondary "
-                            "command buffers are OFF (the pre-part-7 recorder; "
-                            "control arm)\n");
-        return !off;
-    }();
-    return on;
-}
-
-struct SlotPool
-{
-    VkCommandPool pool = VK_NULL_HANDLE;
-    std::vector<VkCommandBuffer> bufs;
-    uint32_t cursor = 0;
-};
-SlotPool g_slot[kMaxFramesInFlight];
-std::vector<VkCommandBuffer> g_passList; // the open pass's secondaries, execution order
-VkCommandBuffer g_primary = VK_NULL_HANDLE; // saved while R->cmd points at a secondary
-bool g_open = false;                        // a secondary is current (R->cmd swapped)
-
-struct Stats
-{
-    uint64_t passes = 0;         // instances begun with CONTENTS_SECONDARY
-    uint64_t secondaries = 0;    // secondaries begun
-    uint64_t rotations = 0;      // size-cap rotations inside a pass
-    uint64_t executes = 0;       // vkCmdExecuteCommands calls
-    uint64_t allocFails = 0;     // secondary unavailable; fell back, counted
-    uint64_t inlinePasses = 0;   // passes recorded inline because PassPrepare failed
-    uint64_t maxPerPass = 0;
-} g_stats;
-
-// One secondary from the current slot's pool, begun with the inheritance the pipelines
-// were created against (one colour attachment of R->color.format, depth+stencil both
-// R->depth.format — the exact mirror of GetPipeline's VkPipelineRenderingCreateInfo).
-VkCommandBuffer BeginSecondaryFrom(SlotPool& sp)
-{
-    if (sp.pool == VK_NULL_HANDLE)
-    {
-        VkCommandPoolCreateInfo pci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
-        pci.queueFamilyIndex = R->queueFamily;
-        if (vkCreateCommandPool(R->device, &pci, nullptr, &sp.pool) != VK_SUCCESS)
-        {
-            sp.pool = VK_NULL_HANDLE;
-            return VK_NULL_HANDLE;
-        }
-    }
-    if (sp.cursor == sp.bufs.size())
-    {
-        // Grown in batches, never shrunk; the pool is reset per frame so the buffers
-        // recycle. 64 covers a crowd frame (~90 ranges) in two batches.
-        VkCommandBuffer batch[64];
-        VkCommandBufferAllocateInfo ai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-        ai.commandPool = sp.pool;
-        ai.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
-        ai.commandBufferCount = 64;
-        if (vkAllocateCommandBuffers(R->device, &ai, batch) != VK_SUCCESS)
-            return VK_NULL_HANDLE;
-        sp.bufs.insert(sp.bufs.end(), batch, batch + 64);
-    }
-    VkCommandBuffer cb = sp.bufs[sp.cursor];
-
-    const VkFormat colorFormat = R->color.format;
-    VkCommandBufferInheritanceRenderingInfo iri{
-        VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO
-    };
-    iri.colorAttachmentCount = 1;
-    iri.pColorAttachmentFormats = &colorFormat;
-    iri.depthAttachmentFormat = R->depth.format;
-    iri.stencilAttachmentFormat = R->depth.format;
-    iri.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    VkCommandBufferInheritanceInfo ii{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO };
-    ii.pNext = &iri;
-    VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT |
-               VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
-    bi.pInheritanceInfo = &ii;
-    if (vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS)
-        return VK_NULL_HANDLE;
-    ++sp.cursor;
-    ++g_stats.secondaries;
-    return cb;
-}
-
-VkCommandBuffer BeginSecondary()
-{
-    return BeginSecondaryFrom(g_slot[R->frameSlot]);
-}
-
-// Called from BeginFrame for the incoming slot — the swap already waited on this
-// slot's fence, so its secondaries are provably not being read (same argument as the
-// vkResetCommandBuffer beside it).
-void FrameReset()
-{
-    if (!On())
-        return;
-    SlotPool& sp = g_slot[R->frameSlot];
-    if (sp.pool != VK_NULL_HANDLE)
-        vkResetCommandPool(R->device, sp.pool, 0);
-    sp.cursor = 0;
-}
-
-// Open the pass's first secondary BEFORE the instance begins, so the CONTENTS flag is
-// only ever set when a secondary provably exists — an allocation failure here means
-// this pass records inline exactly as the unarmed renderer does, and is counted.
-bool PassPrepare()
-{
-    if (!On())
-        return false;
-    // Stage 2c: the WORKERS begin their own secondaries from their own pools (two
-    // threads may never touch one pool at once, and the pump opening the next range's
-    // buffer while a worker records the previous one would be exactly that). The pass
-    // list holds a RESERVED slot per range, filled at the pass drain.
-    if (rexec::On())
-    {
-        g_passList.clear();
-        g_passList.push_back(VK_NULL_HANDLE);
-        ++g_stats.passes;
-        return true;
-    }
-    VkCommandBuffer cb = BeginSecondary();
-    if (cb == VK_NULL_HANDLE)
-    {
-        ++g_stats.allocFails;
-        ++g_stats.inlinePasses;
-        return false;
-    }
-    g_passList.clear();
-    g_passList.push_back(cb);
-    ++g_stats.passes;
-    return true;
-}
-
-uint32_t CurrentSlot()
-{
-    return uint32_t(g_passList.size() - 1);
-}
-
-void SetPassSlot(uint32_t i, VkCommandBuffer cb)
-{
-    if (i < g_passList.size())
-        g_passList[i] = cb;
-}
-
-// After the primary's vkCmdBeginRendering: point the draw path at the secondary. The
-// fresh BoundState is the "each range re-establishes full state" requirement made
-// structural — the existing bind-elision code sees an empty cache and re-issues
-// everything, so a range can never depend on a previous range's binds.
-void SwapIn()
-{
-    if (rexec::On())
-        return;   // nothing records inline in a pass whose ranges the workers own
-
-    g_primary = R->cmd;
-    R->cmd = g_passList.back();
-    R->bound = Renderer::BoundState{};
-    g_open = true;
-}
-
-// The prec module's rangeClosed hook: rotate at a size-cap boundary. A rotation
-// failure is safe by construction — the current secondary just keeps recording (the
-// range grows past its target, which the stats call out but the picture cannot see).
-void OnRangeClosed(uint8_t reason)
-{
-    // Stage 2c: reserve the next range's slot; the worker's finished buffer lands in
-    // it at the pass drain. (R->rendering gates it the way g_open gates the serial
-    // path — a close outside a pass reserves nothing.)
-    if (rexec::On())
-    {
-        if (R->rendering && reason == uint8_t(prec::kSizeCap))
-        {
-            g_passList.push_back(VK_NULL_HANDLE);
-            ++g_stats.rotations;
-        }
-        return;
-    }
-    if (!g_open || reason != uint8_t(prec::kSizeCap))
-        return;
-    VkCommandBuffer next = BeginSecondary();
-    if (next == VK_NULL_HANDLE)
-    {
-        ++g_stats.allocFails;
-        return;
-    }
-    vkEndCommandBuffer(R->cmd);
-    g_passList.push_back(next);
-    R->cmd = next;
-    R->bound = Renderer::BoundState{};
-    ++g_stats.rotations;
-}
-
-// At EndRendering, before anything else: close the current secondary and put the
-// primary back so the caller's GpuSeg/vkCmdEndRendering land where they must.
-void SwapOut()
-{
-    if (!g_open)
-        return;
-    vkEndCommandBuffer(R->cmd);
-    R->cmd = g_primary;
-    g_open = false;
-}
-
-// Inside the instance, before vkCmdEndRendering: hand the pass's secondaries to the
-// primary in creation order — the serial pump's creation order IS the walk order, and
-// the order gate adjudicates exactly this sequence every frame it is armed.
-void ExecutePass()
-{
-    if (g_passList.empty())
-        return;
-    // Stage 2c: a slot a worker could not fill was already repaired (or loudly
-    // dropped) by the pass drain; a null here would be a sequencing defect and
-    // executing it is a crash, so it is filtered and screamed about.
-    size_t w = 0;
-    for (size_t i = 0; i < g_passList.size(); ++i)
-    {
-        if (g_passList[i] != VK_NULL_HANDLE)
-            g_passList[w++] = g_passList[i];
-        else
-        {
-            static uint64_t nulls = 0;
-            if (++nulls <= 8)
-                fprintf(stderr, "[sec] ** NULL pass slot %zu survived the drain — a "
-                                "range's draws are MISSING from this pass\n", i);
-        }
-    }
-    g_passList.resize(w);
-    if (g_passList.empty())
-        return;
-    vkCmdExecuteCommands(R->cmd, uint32_t(g_passList.size()), g_passList.data());
-    ++g_stats.executes;
-    if (g_passList.size() > g_stats.maxPerPass)
-        g_stats.maxPerPass = g_passList.size();
-    g_passList.clear();
-}
-
-void PrintStats(FILE* f)
-{
-    if (!On() || !g_stats.passes)
-        return;
-    fprintf(f,
-            "[sec]     secondaries: %llu passes, %llu secondaries (%llu size-cap "
-            "rotations, peak %llu per pass), %llu executes | %llu alloc failures, "
-            "%llu passes fell back to inline\n",
-            (unsigned long long)g_stats.passes, (unsigned long long)g_stats.secondaries,
-            (unsigned long long)g_stats.rotations, (unsigned long long)g_stats.maxPerPass,
-            (unsigned long long)g_stats.executes, (unsigned long long)g_stats.allocFails,
-            (unsigned long long)g_stats.inlinePasses);
-}
-
-} // namespace sec
+void ApplyPendingRenderScale();   // defined with the other public-seam appliers below
 
 void BeginFrame()
 {
     if (R->recording)
         return;
+    // A pending internal-resolution change (the panel's APPLY press) lands HERE and
+    // nowhere else: this is the one moment where every prior frame has been
+    // SUBMITTED and nothing of the new frame is recorded, so the wait-idle inside
+    // actually covers every command buffer that references the images it destroys.
+    // Applying anywhere mid-frame is the part-60 freeze shape (see the RetiredImage
+    // comment and the note in VkRenderer_OnSwap).
+    //
+    // CW_VK_LIVE_RES_TEST=<frame>:<w>x<h> — the headless gate for the live path:
+    // inject the panel's request at a chosen frame so a scripted route can cross a
+    // live rescale without a human at the menu. A DIAGNOSTIC ARM.
+    {
+        struct LiveResTest { uint64_t frame; uint32_t w, h; };
+        static const LiveResTest t = [] {
+            LiveResTest v{ 0, 0, 0 };
+            if (const char* e = Env("CW_VK_LIVE_RES_TEST"))
+            {
+                unsigned long long f = 0; unsigned w = 0, h = 0;
+                if (sscanf(e, "%llu:%ux%u", &f, &w, &h) == 3)
+                    v = LiveResTest{ f, w, h };
+            }
+            return v;
+        }();
+        if (t.frame && R->frame == t.frame)
+            VkRenderer_RequestInternalRes(t.w, t.h);
+    }
+    ApplyPendingRenderScale();
     // The slot this frame will record into. It was advanced at the previous swap, AFTER
     // that swap waited on this slot's fence — so `vkResetCommandBuffer` below is legal
     // and this slot's arena region is provably not being read. There is no wait here on
@@ -10298,8 +11509,6 @@ void BeginFrame()
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkResetCommandBuffer(R->cmd, 0);
     vkBeginCommandBuffer(R->cmd, &bi);
-    sec::FrameReset(); // this slot's secondaries recycle under the same fence argument
-    rexec::FrameReset();
     R->recording = true;
     R->rendering = false;
     // THE FRAME'S GPU TIMESTAMPS — two per slot, reset and written on the frame's own
@@ -10399,16 +11608,38 @@ void BeginFrame()
     // the frame budget can absorb rather than a function of how much geometry streamed
     // in this second (which is what made Case Zero's unbounded version cost 66.8 MB/frame).
     R->probeBudgetLeft = Renderer::kGuardProbeBudget;
+    // The reuse census turns over at the SAME boundary the per-frame stream cache does,
+    // because its copied-keys set answers a question about exactly that cache's frame.
+    if (g_reuseCensus)
+        reusecensus::FrameBoundary();
     // THE ORDER GATE, checked at the frame boundary and BEFORE the log is cleared. It runs
     // on the finished frame's draws, which is the only point where "submission order" is a
-    // complete statement. The parallel-record skeleton seals first (closing its last range
-    // and draining the shared pool) so the gate can rebuild the submitted order from the
-    // concatenated ranges, and resets after the gate has consumed them.
-    PrecInitOnce();
-    prec::FrameSeal();
+    // complete statement.
     OrderGateCheck();
-    prec::FrameReset();
     R->orderLog.clear();
+    // The parallel-record frame state, reset AFTER the gate has read the finished
+    // frame's replayed ids. No chunk can be outstanding here: the previous submit
+    // waited for them all, so the pool resets and counter zeroing race nothing.
+    if (R->parRec)
+    {
+        const uint32_t slot = R->frameSlot;
+        for (uint32_t rec = 0; rec < kPrMaxRecorders; ++rec)
+        {
+            if (g_prPools[slot][rec])
+                vkResetCommandPool(R->device, g_prPools[slot][rec], 0);
+            g_prCbUsed[slot][rec] = 0;
+        }
+        g_prChunkUsed[slot] = 0;
+        g_prQueued.store(0, std::memory_order_relaxed);
+        g_prClaim.store(0, std::memory_order_relaxed);
+        g_prDone.store(0, std::memory_order_relaxed);
+        R->submitList.clear();
+        R->prIdSeq.clear();
+        R->prTailIds.clear();
+        R->capBuf.clear();
+        R->capActive = false;
+        R->capPassInstances = 0;
+    }
     R->lastFrameDraws = R->drawsThisFrame;
     R->drawsThisFrame = 0;
     // The scene-camera pick is PER FRAME. Left latched, it would hold the largest draw
@@ -10462,43 +11693,37 @@ void BeginRendering()
     ri.pColorAttachments = &colorAtt;
     ri.pDepthAttachment = &depthAtt;
     ri.pStencilAttachment = &depthAtt;
-    // STAGE 2a: the flag is set only when the pass's first secondary already exists, so
-    // an allocation failure can never leave an instance whose contents promise what the
-    // draw path cannot deliver.
-    const bool secPass = sec::PassPrepare();
-    if (secPass)
-        ri.flags |= VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
-    vkCmdBeginRendering(R->cmd, &ri);
+    if (R->parRec)
+    {
+        // Capture mode: the pass opens LOGICALLY here (barriers above are already in
+        // the pump's segment, which precedes every chunk of this pass in submission
+        // order), but no instance is begun — each chunk and the pump tail record
+        // their own self-contained instance over these attachments.
+        R->capActive = true;
+        R->capPassInstances = 0;
+        R->capColorView = colorAtt.imageView;
+        R->capDepthView = depthAtt.imageView;
+        R->capWidth = R->color.width;
+        R->capHeight = R->color.height;
+    }
+    else
+    {
+        vkCmdBeginRendering(R->cmd, &ri);
+        // The serial arm's deferred clears: the instance is open right here, so they
+        // cost one vkCmdClearAttachments each and no extra scope. (Under parRec no
+        // instance exists yet — the pass's FIRST instance emits them instead.)
+        if (!R->pendingClears.empty())
+        {
+            EmitPendingClears(R->cmd, R->pendingClears.data(), R->pendingClears.size());
+            R->pendingClears.clear();
+            Count("clear: deferred emitted at pass open (serial)");
+        }
+    }
     R->rendering = true;
-    // A parallel-record range cannot span a rendering-instance boundary (a secondary
-    // command buffer inherits exactly one), so the skeleton's partition breaks here —
-    // stage 2 inherits these break points unchanged.
-    prec::RangeBreak(prec::kPassBegin);
     g_cycPendBeginNs += CycNow() - cycT0;
     // The GPU-side segment for this pass opens AFTER the barriers, so a layout transition
     // the device performs is charged to whatever preceded it rather than to the draws.
-    // Under CONTENTS_SECONDARY the primary may record nothing inside the instance except
-    // the execute, so the per-pass split is refused — loudly, once — and the whole-frame
-    // timestamps (outside any instance) carry the GPU number.
-    if (secPass)
-    {
-        if (GpuPassesOn())
-        {
-            static bool said = false;
-            if (!said)
-            {
-                said = true;
-                fprintf(stderr, "[sec] CW_VK_GPU_PASSES is incompatible with "
-                                "CW_VK_SECONDARIES (a primary may not timestamp inside "
-                                "a CONTENTS_SECONDARY instance) — the per-pass GPU "
-                                "split is OFF this run\n");
-            }
-        }
-        g_gpPassSeg = -1;
-        sec::SwapIn();
-    }
-    else
-        g_gpPassSeg = GpuSegBegin();
+    g_gpPassSeg = GpuSegBegin();
     g_gpPassDraws = 0;
     g_gpPassExt = 0;
     g_gpPassExtPx = 0;
@@ -10508,14 +11733,16 @@ void EndRendering()
 {
     if (!R->rendering)
         return;
-    // The pass-end range break moved ABOVE the swap-out (stage 2b): the rangeClosed
-    // hook replays any deferred tickets, and they must land in the range's own command
-    // buffer while it is still current. Under inline recording the early break is a
-    // no-op reordering — no draw happens between here and the old position.
-    prec::RangeBreak(prec::kPassEnd);
-    // STAGE 2a: put the primary back first — everything below must land on it — then
-    // hand the pass's secondaries to the instance in creation order before it closes.
-    sec::SwapOut();
+    // Capture mode: replay the tail BEFORE the pass's closing GPU timestamp below,
+    // so the timestamp still brackets every draw of the pass (the chunks precede
+    // this segment in submission order; the tail instance precedes the timestamp
+    // within it).
+    const bool wasCapture = R->capActive;
+    if (wasCapture)
+    {
+        ParRec_FlushTail();
+        R->capActive = false;
+    }
     // Close the pass's GPU segment BEFORE vkCmdEndRendering, and classify it by how many
     // draws it actually held — the bucket is the whole point, because "the crowd" and "the
     // 39 near-empty passes a frame" are different answers to where the device's time is.
@@ -10531,9 +11758,8 @@ void EndRendering()
                   g_gpPassExt, d);
         g_gpPassSeg = -1;
     }
-    rexec::PassDrain();
-    sec::ExecutePass();
-    vkCmdEndRendering(R->cmd);
+    if (!wasCapture)
+        vkCmdEndRendering(R->cmd);
     R->rendering = false;
 }
 
@@ -10654,6 +11880,14 @@ void SubmitFrame()
 
     vkEndCommandBuffer(R->cmd);
     R->recording = false;
+    // The parallel-record frame closes here: the final pump segment joins the list,
+    // and the wait below is the design's ONE synchronization point — the pump helps
+    // record rather than spinning, so a starved pool cannot deadlock the frame.
+    if (R->parRec)
+    {
+        R->submitList.emplace_back(R->cmd, nullptr);
+        ParRec_WaitChunks();
+    }
 
     // CW_VK_NO_SUBMIT=1 — record the whole frame and then DO NOT EXECUTE IT.
     //
@@ -10724,6 +11958,17 @@ void SubmitFrame()
     VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
     si.commandBufferCount = 1;
     si.pCommandBuffers = &fs.cmd;
+    // One ordered submit of every segment and chunk. The chunk handles were filled by
+    // whichever recorder claimed them; ParRec_WaitChunks above guaranteed they exist.
+    static std::vector<VkCommandBuffer> prCbs;
+    if (R->parRec)
+    {
+        prCbs.clear();
+        for (const auto& e : R->submitList)
+            prCbs.push_back(e.second ? e.second->cb : e.first);
+        si.commandBufferCount = uint32_t(prCbs.size());
+        si.pCommandBuffers = prCbs.data();
+    }
     // The swapchain arm's two semaphores. The wait is at TRANSFER, not at the top of the
     // pipe: the only thing in this command buffer that touches the acquired image is the
     // blit at the very end, so everything before it — the whole frame — may run before
@@ -11752,6 +12997,11 @@ StreamLoc UploadStream(uint8_t* base, uint32_t va, uint64_t bytes, uint32_t endi
             ++g_streamCensus_c.hits;
             g_streamCensus_c.bytesHit += bytes;
         }
+        // A frame-cache hit inherits the FIRST touch's verdict: if that touch copied
+        // (the bytes changed this frame), every later draw reading this key is reading
+        // this frame's bytes too and is not identical to last frame's draw.
+        if (g_reuseCensus && g_reuseCopiedKeys.count(key))
+            g_reuseDrawDirty = true;
         return *hit;
     }
 
@@ -12055,6 +13305,14 @@ StreamLoc UploadStream(uint8_t* base, uint32_t va, uint64_t bytes, uint32_t endi
             CopySwapped(R->arena.mapped + at, src, size_t(bytes), endian);
         }
         loc = StreamLoc{ &R->arena, at };
+    }
+    // The reuse census's stream verdict, on the once-per-(key, frame) path only. `copied`
+    // is false on exactly one path — a persist hit whose guard passed — which is the
+    // renderer's own definition of "these bytes are last frame's".
+    if (g_reuseCensus && copied)
+    {
+        g_reuseCopiedKeys.insert(key);
+        g_reuseDrawDirty = true;
     }
     if (!g_flatCacheOff)
         R->streamCache.Insert(key, loc);
@@ -12387,7 +13645,7 @@ bool NoDriverRecord()
     }();
     return off;
 }
-std::atomic<uint64_t> g_noDriverRecordSkipped{ 0 };   // atomic: record-core counter (2c)
+uint64_t g_noDriverRecordSkipped = 0;
 
 bool NoBufferBindCache()
 {
@@ -12426,51 +13684,33 @@ constexpr uint32_t kBindBatchMax = Renderer::BoundState::kMaxTrackedBindings;
 bool g_noBindBatch = false;        // CW_VK_NO_BIND_BATCH — one call per binding
 bool g_verifyBindBatch = false;    // CW_VK_VERIFY_BIND_BATCH
 bool g_verifyBindPoison = false;   // ...and its positive control
-std::atomic<uint64_t> g_bindBatchCalls{ 0 };   // vkCmdBindVertexBuffers the batched path
-                                               // issued; atomic: record-core counter (2c)
-std::atomic<uint64_t> g_bindBatchDraws{ 0 };   // atomic: record-core counter (2c)
+uint64_t g_bindBatchCalls = 0;     // vkCmdBindVertexBuffers the batched path issued
+uint64_t g_bindBatchDraws = 0;
 uint64_t g_bindVerifyChecked = 0, g_bindVerifyBad = 0;
 
-// THE PER-CONTEXT RECORDING STATE (part 7, 2c prep). Everything a thread needs to
-// record draws — the command buffer, the bind-elision cache, the skip counters and the
-// bind batch — gathered behind one reference bundle. The pump's context aliases the
-// renderer's own members (so the secondaries' R->cmd swaps keep working unchanged);
-// a stage-2c worker brings its own. This refactor is PLUMBING ONLY: thread safety of
-// the arena, the stream store and the global counters is the next, separate step.
-struct BindBatch
-{
-    VkBuffer pendBuf[kBindBatchMax]{};
-    VkDeviceSize pendOff[kBindBatchMax]{};
-    uint32_t pendMask = 0;
-    uint32_t recBinding[kBindBatchMax]{};
-    VkBuffer recBuf[kBindBatchMax]{};
-    VkDeviceSize recOff[kBindBatchMax]{};
-    uint32_t recN = 0;
-};
-struct RecordCtx
-{
-    VkCommandBuffer& cmd;
-    Renderer::BoundState& bound;
-    Renderer::BindSkips& skips;
-    BindBatch& batch;
-};
-BindBatch g_pumpBindBatch;
+VkBuffer g_pendBuf[kBindBatchMax]{};
+VkDeviceSize g_pendOff[kBindBatchMax]{};
+uint32_t g_pendMask = 0;
 // The verifier's record of what the draw ASKED FOR, written at offer time in offer order.
 // Compared against an expansion of what the batched calls actually handed the driver.
+uint32_t g_recBinding[kBindBatchMax]{};
+VkBuffer g_recBuf[kBindBatchMax]{};
+VkDeviceSize g_recOff[kBindBatchMax]{};
+uint32_t g_recN = 0;
 
 // The draw failed after offering some binds. Drop them WITHOUT touching the cache.
-inline void BindBatchDiscard(RecordCtx& ctx)
+inline void BindBatchDiscard()
 {
-    ctx.batch.pendMask = 0;
-    ctx.batch.recN = 0;
+    g_pendMask = 0;
+    g_recN = 0;
 }
 
 // Issue the pending binds as contiguous runs, then — and only then — update the cache.
-void BindBatchFlush(RecordCtx& ctx)
+void BindBatchFlush()
 {
-    if (!ctx.batch.pendMask)
+    if (!g_pendMask)
     {
-        ctx.batch.recN = 0;
+        g_recN = 0;
         return;
     }
     // What the driver was actually handed, expanded back to one entry per binding. This
@@ -12485,20 +13725,20 @@ void BindBatchFlush(RecordCtx& ctx)
     uint32_t isN = 0;
     for (uint32_t b = 0; b < kBindBatchMax;)
     {
-        if (!(ctx.batch.pendMask & (1u << b)))
+        if (!(g_pendMask & (1u << b)))
         {
             ++b;
             continue;
         }
         uint32_t e = b;
-        while (e + 1 < kBindBatchMax && (ctx.batch.pendMask & (1u << (e + 1))))
+        while (e + 1 < kBindBatchMax && (g_pendMask & (1u << (e + 1))))
             ++e;
         const uint32_t count = e - b + 1;
         VkBuffer bufs[kBindBatchMax];
         VkDeviceSize offs[kBindBatchMax];
         for (uint32_t i = 0; i < count; i++)
         {
-            bufs[i] = ctx.batch.pendBuf[b + i];
+            bufs[i] = g_pendBuf[b + i];
             // THE POISON, and it had to be one that fires on EVERY check rather than only
             // on multi-binding runs: 22% of runs are one binding long, so a poison that
             // needed count > 1 could not read 100% and would not have shown the checker
@@ -12506,12 +13746,12 @@ void BindBatchFlush(RecordCtx& ctx)
             // stays inside the buffer in both directions and it renders garbage on
             // purpose — this is a diagnostic arm, never a configuration.
             offs[i] = g_verifyBindPoison
-                          ? (ctx.batch.pendOff[b + i] >= 16 ? ctx.batch.pendOff[b + i] - 16
-                                                    : ctx.batch.pendOff[b + i] + 16)
-                          : ctx.batch.pendOff[b + i];
+                          ? (g_pendOff[b + i] >= 16 ? g_pendOff[b + i] - 16
+                                                    : g_pendOff[b + i] + 16)
+                          : g_pendOff[b + i];
         }
         if (!NoDriverRecord())
-            vkCmdBindVertexBuffers(ctx.cmd, b, count, bufs, offs);
+            vkCmdBindVertexBuffers(R->cmd, b, count, bufs, offs);
         else
             ++g_noDriverRecordSkipped;
         ++g_bindBatchCalls;
@@ -12526,9 +13766,9 @@ void BindBatchFlush(RecordCtx& ctx)
         // The cache records what was ISSUED, at the moment it was issued.
         for (uint32_t i = 0; i < count; i++)
         {
-            ctx.bound.haveVertex[b + i] = true;
-            ctx.bound.vertexBuffer[b + i] = ctx.batch.pendBuf[b + i];
-            ctx.bound.vertexOffset[b + i] = ctx.batch.pendOff[b + i];
+            R->bound.haveVertex[b + i] = true;
+            R->bound.vertexBuffer[b + i] = g_pendBuf[b + i];
+            R->bound.vertexOffset[b + i] = g_pendOff[b + i];
         }
         b = e + 1;
     }
@@ -12537,28 +13777,28 @@ void BindBatchFlush(RecordCtx& ctx)
         // Both lists are ascending by binding — the offers because `binding` only ever
         // increments, the issues because the runs are walked in order — so a positional
         // compare is the right one and a length disagreement is itself a defect.
-        const uint32_t n = isN < ctx.batch.recN ? isN : ctx.batch.recN;
+        const uint32_t n = isN < g_recN ? isN : g_recN;
         for (uint32_t i = 0; i < n; i++)
         {
             ++g_bindVerifyChecked;
-            if (isB[i] != ctx.batch.recBinding[i] || isBuf[i] != ctx.batch.recBuf[i] ||
-                isOff[i] != ctx.batch.recOff[i])
+            if (isB[i] != g_recBinding[i] || isBuf[i] != g_recBuf[i] ||
+                isOff[i] != g_recOff[i])
                 ++g_bindVerifyBad;
         }
-        for (uint32_t i = n; i < (isN > ctx.batch.recN ? isN : ctx.batch.recN); i++)
+        for (uint32_t i = n; i < (isN > g_recN ? isN : g_recN); i++)
         {
             ++g_bindVerifyChecked;
             ++g_bindVerifyBad;
         }
     }
-    ctx.batch.pendMask = 0;
-    ctx.batch.recN = 0;
+    g_pendMask = 0;
+    g_recN = 0;
 }
 
-void BindVertexBufferCached(RecordCtx& ctx, uint32_t binding, VkBuffer buffer, VkDeviceSize offset)
+void BindVertexBufferCached(uint32_t binding, VkBuffer buffer, VkDeviceSize offset)
 {
     const bool noStateCache = NoBufferBindCache();
-    ++ctx.skips.vertexBinds;
+    ++R->skips.vertexBinds;
     // Above the tracked range the bind is always issued — untracked, never assumed
     // unchanged. 16 is above the highest binding this title has ever used.
     if (binding >= Renderer::BoundState::kMaxTrackedBindings)
@@ -12568,7 +13808,7 @@ void BindVertexBufferCached(RecordCtx& ctx, uint32_t binding, VkBuffer buffer, V
         // that `binding` increments monotonically so an untracked bind always follows
         // every tracked one, and the census measured 0.000 of them a draw.
         if (!g_noBindBatch)
-            BindBatchFlush(ctx);
+            BindBatchFlush();
         if (g_bindRunCensus)
         {
             ++g_brOffered;
@@ -12580,16 +13820,16 @@ void BindVertexBufferCached(RecordCtx& ctx, uint32_t binding, VkBuffer buffer, V
             g_brPrevChanged = -1;
         }
         if (!NoDriverRecord())
-            vkCmdBindVertexBuffers(ctx.cmd, binding, 1, &buffer, &offset);
+            vkCmdBindVertexBuffers(R->cmd, binding, 1, &buffer, &offset);
         else
             ++g_noDriverRecordSkipped;
         return;
     }
-    if (!noStateCache && ctx.bound.haveVertex[binding] &&
-        ctx.bound.vertexOffset[binding] == offset &&
-        ctx.bound.vertexBuffer[binding] == buffer)
+    if (!noStateCache && R->bound.haveVertex[binding] &&
+        R->bound.vertexOffset[binding] == offset &&
+        R->bound.vertexBuffer[binding] == buffer)
     {
-        ++ctx.skips.vertexBindRepeats;
+        ++R->skips.vertexBindRepeats;
         if (g_bindRunCensus)
         {
             ++g_brOffered;
@@ -12600,15 +13840,15 @@ void BindVertexBufferCached(RecordCtx& ctx, uint32_t binding, VkBuffer buffer, V
     if (!g_noBindBatch)
     {
         // Queue it. The call — and the cache update — happen at the flush before the draw.
-        ctx.batch.pendBuf[binding] = buffer;
-        ctx.batch.pendOff[binding] = offset;
-        ctx.batch.pendMask |= (1u << binding);
-        if (g_verifyBindBatch && ctx.batch.recN < kBindBatchMax)
+        g_pendBuf[binding] = buffer;
+        g_pendOff[binding] = offset;
+        g_pendMask |= (1u << binding);
+        if (g_verifyBindBatch && g_recN < kBindBatchMax)
         {
-            ctx.batch.recBinding[ctx.batch.recN] = binding;
-            ctx.batch.recBuf[ctx.batch.recN] = buffer;
-            ctx.batch.recOff[ctx.batch.recN] = offset;
-            ++ctx.batch.recN;
+            g_recBinding[g_recN] = binding;
+            g_recBuf[g_recN] = buffer;
+            g_recOff[g_recN] = offset;
+            ++g_recN;
         }
     }
     if (g_bindRunCensus)
@@ -12629,33 +13869,33 @@ void BindVertexBufferCached(RecordCtx& ctx, uint32_t binding, VkBuffer buffer, V
     if (g_noBindBatch)
     {
         if (!NoDriverRecord())
-            vkCmdBindVertexBuffers(ctx.cmd, binding, 1, &buffer, &offset);
+            vkCmdBindVertexBuffers(R->cmd, binding, 1, &buffer, &offset);
         else
             ++g_noDriverRecordSkipped;
-        ctx.bound.haveVertex[binding] = true;
-        ctx.bound.vertexOffset[binding] = offset;
-        ctx.bound.vertexBuffer[binding] = buffer;
+        R->bound.haveVertex[binding] = true;
+        R->bound.vertexOffset[binding] = offset;
+        R->bound.vertexBuffer[binding] = buffer;
     }
 }
 
-void BindIndexBufferCached(RecordCtx& ctx, VkBuffer buffer, VkDeviceSize offset, VkIndexType type)
+void BindIndexBufferCached(VkBuffer buffer, VkDeviceSize offset, VkIndexType type)
 {
     const bool noStateCache = NoBufferBindCache();
-    ++ctx.skips.indexBinds;
-    if (!noStateCache && ctx.bound.haveIndex && ctx.bound.indexOffset == offset &&
-        ctx.bound.indexType == type && ctx.bound.indexBuffer == buffer)
+    ++R->skips.indexBinds;
+    if (!noStateCache && R->bound.haveIndex && R->bound.indexOffset == offset &&
+        R->bound.indexType == type && R->bound.indexBuffer == buffer)
     {
-        ++ctx.skips.indexBindRepeats;
+        ++R->skips.indexBindRepeats;
         return;
     }
     if (!NoDriverRecord())
-        vkCmdBindIndexBuffer(ctx.cmd, buffer, offset, type);
+        vkCmdBindIndexBuffer(R->cmd, buffer, offset, type);
     else
         ++g_noDriverRecordSkipped;
-    ctx.bound.haveIndex = true;
-    ctx.bound.indexOffset = offset;
-    ctx.bound.indexType = type;
-    ctx.bound.indexBuffer = buffer;
+    R->bound.haveIndex = true;
+    R->bound.indexOffset = offset;
+    R->bound.indexType = type;
+    R->bound.indexBuffer = buffer;
 }
 
 // Part 41 item 1b: the sampler a fetch ASKS FOR, by descriptor index in set 3.
@@ -13529,7 +14769,202 @@ uint64_t g_passCount = 0, g_passDraws = 0, g_passMax = 0;
 
 uint64_t g_gatherFull = 0, g_gatherGathered = 0, g_gatherDwordsCopied = 0,
          g_gatherDwordsFull = 0, g_gatherChecked = 0, g_gatherBad = 0,
-         g_gatherNoList = 0, g_gatherDynamic = 0, g_gatherEmpty = 0;
+         g_gatherNoList = 0, g_gatherDynamic = 0, g_gatherEmpty = 0,
+         g_gatherDynBounded = 0, g_gatherDwordsDynBounded = 0,
+         // Split from g_gatherBad so the BOUNDED poison can be attributed: a positive
+         // control whose firings cannot be told apart from the neighbouring arm's has
+         // not been shown to fire (gotcha 151's shape, met in this exact spot when the
+         // first poison run produced 5.6M shared disagreements).
+         g_gatherBadBounded = 0;
+
+// CW_VK_PALETTE_EXTENT_CENSUS=1 — WOULD A WRITE-EXTENT-BOUNDED GATHER BE SOUND, AND
+// WHAT WOULD IT SAVE? (part 88 step 0; phase5-notes §6eg, `part88-kickoff.md` §1.)
+//
+// The ask-first step for the bone-palette item: before `CopyConstWindow`'s dynamic path
+// copies anything differently, COUNT what the bounded copy would have moved, per dynamic
+// VS copy, using the PM4 walk's own write-extent tracker (pm4.h). Models the exact fix:
+//
+//   clean cover  — a c8-covering burst arrived since the last dynamic copy and no
+//                  partial write reached past it: bound = that burst's extent. The
+//                  cheap case, and the one part 87's whole-span histogram predicts.
+//   dirty        — palette-region writes arrived but the per-burst bound is unsound
+//                  (a non-covering write reached past the covering extent, or there
+//                  was no covering burst at all): bound = the running high-water.
+//   reuse        — NO palette-region write since the last dynamic copy: the file
+//                  content is unchanged, the previous bound still describes it.
+//
+// PRE-REGISTERED KILL (kickoff §1): if the sound bound saves < 30% of full-copy bytes,
+// the item dies. The high-water-only model is printed beside it as the conservative
+// floor. A DIAGNOSTIC ARM: one Take() and a few adds per dynamic VS copy, off by
+// default, and no frame time from a run carrying it is ever quoted.
+bool g_paletteCensus = false;
+
+// THE BOUND ITSELF (part 88 step 1), shared by the fix, the census and every verifier
+// so no two of them can take the (destructive) extent read twice for one copy.
+//
+// The rule the step-0 census validated at the crowd (98.3-98.6% clean-cover, 82% of
+// full-copy bytes saved, `part88-kickoff.md` §1 step 0):
+//   clean cover — a c8-covering burst arrived since the last dynamic copy and no
+//                 partial write reached past it: the bound is that burst's extent.
+//   dirty       — palette-region writes arrived but the per-burst bound is unsound:
+//                 fall back to the running high-water (c255 on every measured run —
+//                 i.e. a full copy — because something at boot writes the whole
+//                 window; ~1.4-2.2% of copies at the crowd).
+//   reuse       — no palette-region write since the last dynamic copy: the file
+//                 content is unchanged and the previous bound still describes it
+//                 (0.0% at the crowd, consistent with §6ef's ~98% constant churn).
+uint32_t g_vsPalSticky = 0;
+struct VsPalTake
+{
+    Pm4VsPaletteWrites w;
+    uint32_t bound;   // the sound bound for THIS copy; 0 = none known, full copy
+    uint8_t kind;     // 0 clean-cover, 1 dirty-fallback, 2 reuse
+};
+
+inline VsPalTake TakeVsPaletteBound()
+{
+    VsPalTake r;
+    r.w = Pm4_TakeVsPaletteWrites();
+    if (r.w.coverBursts && r.w.partialExtent <= r.w.coverExtent)
+    {
+        g_vsPalSticky = r.w.coverExtent;
+        r.kind = 0;
+    }
+    else if (r.w.coverBursts || r.w.partialBursts)
+    {
+        g_vsPalSticky = Pm4_VsPaletteHighWater();
+        r.kind = 1;
+    }
+    else
+        r.kind = 2;
+    r.bound = g_vsPalSticky;
+    return r;
+}
+
+// CW_VK_NO_BOUNDED_DYNAMIC=1 — the same-binary control arm for the bounded dynamic
+// copy: every dynamic VS copy goes back to the full 4 KB (the part-87 renderer). The
+// take above still runs on both arms, so the two differ by exactly the copy.
+bool NoBoundedDynamic()
+{
+    static const bool o = [] {
+        const bool v = EnvOn("CW_VK_NO_BOUNDED_DYNAMIC");
+        if (v)
+            fprintf(stderr, "[vk] CW_VK_NO_BOUNDED_DYNAMIC=1 — dynamic VS copies take "
+                            "the FULL 4 KB again (the part-87 renderer). This is the "
+                            "control arm.\n");
+        return v;
+    }();
+    return o;
+}
+
+// THE PROJECTION-PATCH MEMO (part 88 item 2; `part88-kickoff.md` §2, §6eg §3).
+//
+// `constVsPatch` read 2.8% ≈ 0.51 ms at the crowd: `SceneXformForm`'s sixteen-float
+// inspection runs TWICE per VS copy (once under each patch) on ~97% of draws, because
+// the WORLD registers churn per object while c0..c3 — the projection the patches
+// actually read — repeats across whole passes. So memoise on the input: key = the 16
+// pre-patch dwords + the two per-frame parameters (the fov half-rad and the wide flag);
+// on a hit serve the previously patched 64-byte block AND the two recognition results,
+// so the per-form draw counters keep counting what they counted before.
+//
+// A 4-way MRU rather than 1-entry because a frame interleaves projections (shadow
+// cascade, scene, UI ortho); the hit-rate counters below are what say whether 4 was
+// enough. Cached-path only: the in-place arms (GatherNoC0Always / PatchInArena) keep
+// the old path untouched, exactly as they do for the patch-source shortcut.
+//
+// CW_VK_NO_PATCH_MEMO=1        the same-binary control arm (off-arm from day one).
+// CW_VK_VERIFY_PATCH_MEMO=1    run both patches anyway on every hit and compare all 16
+//                              dwords against the served block; must read 0.
+// CW_VK_VERIFY_PATCH_MEMO_POISON=1  perturb one served float so the verifier MUST fire
+//                              (gotcha 30; implies the verify arm).
+struct PatchMemoEntry
+{
+    uint32_t key[16];
+    float fov = 0.0f;
+    uint8_t wide = 0, valid = 0;
+    uint32_t out[16];
+    int8_t fovForm = 0, wideForm = 0;
+};
+PatchMemoEntry g_patchMemoWays[4];
+uint64_t g_patchMemoHits = 0, g_patchMemoMisses = 0, g_patchMemoChecked = 0,
+         g_patchMemoBad = 0;
+bool NoPatchMemo()
+{
+    static const bool o = [] {
+        const bool v = EnvOn("CW_VK_NO_PATCH_MEMO");
+        if (v)
+            fprintf(stderr, "[vk] CW_VK_NO_PATCH_MEMO=1 — the projection patch runs "
+                            "recognition on every VS copy again. This is the control "
+                            "arm.\n");
+        return v;
+    }();
+    return o;
+}
+bool PatchMemoVerifyPoison()
+{
+    static const bool o = [] {
+        const bool v = EnvOn("CW_VK_VERIFY_PATCH_MEMO_POISON");
+        if (v)
+            fprintf(stderr, "[vk] CW_VK_VERIFY_PATCH_MEMO_POISON=1 — one served float "
+                            "is perturbed; the verifier MUST report, or it is blind.\n");
+        return v;
+    }();
+    return o;
+}
+bool PatchMemoVerify()
+{
+    static const bool o =
+        EnvOn("CW_VK_VERIFY_PATCH_MEMO") || PatchMemoVerifyPoison();
+    return o;
+}
+
+namespace palcensus
+{
+struct Tot
+{
+    uint64_t copies = 0, cleanCover = 0, dirtyFallback = 0, reuse = 0, neverBound = 0,
+             windowMoved = 0, coverBursts = 0, partialBursts = 0, extentSum = 0,
+             bytesFull = 0, bytesBounded = 0, bytesHighWater = 0;
+    uint64_t hist[32] = {};   // per-copy bound, buckets of 8 float4 registers
+} t, last;
+
+inline void Record(const VsPalTake& pt, size_t listN, uint32_t memoVsBase)
+{
+    ++t.copies;
+    t.coverBursts += pt.w.coverBursts;
+    t.partialBursts += pt.w.partialBursts;
+    if (pt.kind == 0)
+        ++t.cleanCover;
+    else if (pt.kind == 1)
+        ++t.dirtyFallback;
+    else
+        ++t.reuse;
+    uint64_t boundedRegs;
+    if (memoVsBase != 0)
+    {
+        // The guest moved the constant window: c8-in-window is no longer file c8 and
+        // the tracker's coordinates do not apply. Full copy; counted so a nonzero here
+        // says the fix needs the base folded in before it can ship.
+        ++t.windowMoved;
+        boundedRegs = 256;
+    }
+    else if (!pt.bound)
+    {
+        ++t.neverBound;
+        boundedRegs = 256;
+    }
+    else
+        boundedRegs =
+            std::min<uint64_t>(256, 4 + listN + (pt.bound >= 8 ? pt.bound - 7 : 0));
+    t.bytesFull += 256 * 16;
+    t.bytesBounded += boundedRegs * 16;
+    const uint32_t hw = Pm4_VsPaletteHighWater();
+    t.bytesHighWater +=
+        16 * std::min<uint64_t>(256, 4 + listN + (hw >= 8 ? hw - 7 : 0));
+    t.extentSum += pt.bound;
+    ++t.hist[std::min<uint32_t>(pt.bound, 255) >> 3];
+}
+} // namespace palcensus
 
 // **THE GATHER IS ON BY DEFAULT AGAIN AS OF PART 74's SECOND HALF.** It shipped enabled in
 // part 72, was turned OFF the same day on the operator's report of a half-screen sky
@@ -13652,8 +15087,27 @@ bool ConstGatherPoison()
     }();
     return on;
 }
+// Promoted out of `CopyConstWindow` in part 88 because a SECOND site now reads it (the
+// bounded dynamic path fills above its bound) — the same reason PatchInArena was
+// promoted in part 75: two sites reading one environment variable independently is how
+// an arm silently half-engages (gotcha 151). The full rationale for the fill and its
+// value stays at the gathered path's use site.
+bool GatherFillOn()
+{
+    static const bool o = [] {
+        const bool v = EnvOn("CW_VK_GATHER_FILL");
+        if (v)
+            fprintf(stderr, "[vk] CW_VK_GATHER_FILL=1 — registers NOT in a shader's list "
+                            "(and, for a bounded dynamic copy, above its bound) are "
+                            "filled with a constant instead of arena residue. A "
+                            "DIAGNOSTIC ARM: it writes what the copy exists to skip.\n");
+        return v;
+    }();
+    return o;
+}
 
-void CopyConstWindow(uint32_t* dst, const uint32_t* src, const ShaderMeta& meta, bool isVs)
+void CopyConstWindow(uint32_t* dst, const uint32_t* src, const ShaderMeta& meta, bool isVs,
+                     uint32_t dynBound = 0)
 {
     (void)isVs;
     // NOTE the absence of `aluConsts.empty()` here: an empty list from a sidecar that has
@@ -13662,6 +15116,82 @@ void CopyConstWindow(uint32_t* dst, const uint32_t* src, const ShaderMeta& meta,
     const bool full = ConstGatherOff() || meta.aluDynamic;
     if (full)
     {
+        // Part 88: the write-extent-bounded dynamic copy. `dynBound` is nonzero only for
+        // a palette-shaped dynamic VS whose caller established a sound bound (the take's
+        // clean-cover/high-water rule) — copy `c0..c3 ∪ list ∪ [8, bound]` instead of
+        // 256 registers. Registers above the bound are exactly the ones being left
+        // uncopied on purpose; under CW_VK_GATHER_FILL they are filled with the
+        // constant instead of arena residue, which is the read-above-bound
+        // discriminator no value compare can see (gotcha 432's shape).
+        if (meta.aluDynamic && dynBound)
+        {
+            const bool verify = ConstGatherVerify();
+            static thread_local std::vector<uint32_t> scratch;
+            if (verify)
+                scratch.assign(src, src + 256 * 4);
+            // The poison arm for the BOUNDED path: shrink the bound by one register, so
+            // the verifier must catch the top register served as residue. The gather's
+            // own poison (drop the first list register) is blind here — these shaders'
+            // lists sit inside the force-copied c0..c3.
+            uint32_t bound = std::min<uint32_t>(dynBound, 255);
+            if (ConstGatherPoison() && bound > 8)
+                --bound;
+            if (GatherFillOn())
+            {
+                static const uint32_t kFill = 0x461C4000u;   // 10000.0f (see below)
+                for (uint32_t i = 0; i < 256 * 4; ++i)
+                    dst[i] = kFill;
+            }
+            // c0..c3 force-copied for the same reason the gathered path does it (the
+            // renderer's own projection patch reads them); under the NO_C0_ALWAYS
+            // positive control they are left as residue THERE TOO, and list registers
+            // below 4 then still come in through the list loop, as on the gathered path.
+            const bool c0Forced = !GatherNoC0Always();
+            if (c0Forced)
+                memcpy(dst, src, 4 * 4 * sizeof(uint32_t));
+            memcpy(dst + 8 * 4, src + 8 * 4, (bound - 7) * 4 * sizeof(uint32_t));
+            uint64_t copied = 4 + (bound - 7);
+            for (uint32_t r : meta.aluConsts)
+            {
+                if (r >= 256 || (r < 4 && c0Forced) || (r >= 8 && r <= bound))
+                    continue;   // already inside the force-copy or the palette span
+                memcpy(dst + r * 4, src + r * 4, 4 * sizeof(uint32_t));
+                ++copied;
+            }
+            ++g_gatherDynBounded;
+            g_gatherDwordsDynBounded += copied * 4;
+            if (verify)
+            {
+                // Compare EVERYTHING the bounded copy claims to deliver — c0..c3, the
+                // palette span at the UNPOISONED bound, and the list — against the full
+                // copy. Under poison the top palette register is deliberately stale and
+                // this must report it.
+                ++g_gatherChecked;
+                const uint32_t vb = std::min<uint32_t>(dynBound, 255);
+                bool bad = (c0Forced &&
+                            memcmp(dst, scratch.data(), 4 * 4 * sizeof(uint32_t)) != 0) ||
+                           memcmp(dst + 8 * 4, scratch.data() + 8 * 4,
+                                  (vb - 7) * 4 * sizeof(uint32_t)) != 0;
+                for (uint32_t r : meta.aluConsts)
+                {
+                    if (bad)
+                        break;
+                    if (r >= 256 || (r < 4 && c0Forced) || (r >= 8 && r <= vb))
+                        continue;
+                    bad = memcmp(dst + r * 4, scratch.data() + r * 4,
+                                 4 * sizeof(uint32_t)) != 0;
+                }
+                if (bad)
+                {
+                    ++g_gatherBad;
+                    if (++g_gatherBadBounded <= 8)
+                        fprintf(stderr,
+                                "[vk] ** bounded dynamic copy differs from the full copy "
+                                "inside its own claim (bound c%u)\n", vb);
+                }
+            }
+            return;
+        }
         if (!meta.aluListKnown)
             ++g_gatherNoList;
         else
@@ -13699,15 +15229,7 @@ void CopyConstWindow(uint32_t* dst, const uint32_t* src, const ShaderMeta& meta,
     //
     // It is a DIAGNOSTIC ARM and never a shipping configuration: it writes the 230 or so
     // registers the gather exists to skip, so it costs the whole item.
-    static const bool fill = [] {
-        const bool o = EnvOn("CW_VK_GATHER_FILL");
-        if (o)
-            fprintf(stderr, "[vk] CW_VK_GATHER_FILL=1 — registers NOT in a shader's list "
-                            "are filled with a constant instead of arena residue. A "
-                            "DIAGNOSTIC ARM: it writes what the gather exists to skip.\n");
-        return o;
-    }();
-    if (fill)
+    if (GatherFillOn())
     {
         // A large, finite, obviously-wrong value. NaN would make every arithmetic result
         // NaN and could discard whole surfaces, which changes the picture for a reason
@@ -13812,15 +15334,18 @@ void OrderGateCheck()
     for (uint64_t v : R->orderLog)
         want = mixq(want, v);
 
-    // THE SUBMITTED ORDER. With the part-7 skeleton on, this is REBUILT from the
-    // parallel-record ranges concatenated in creation order — the same reconstruction a
-    // parallel submitter will perform from its secondaries — so a partition defect (a
-    // dropped draw, a split that reordered, ranges concatenated out of order) fails the
-    // gate even though execution is still serial. Without the skeleton it is a copy of
-    // the log, and the gate is pure ceremony without its poison arm either way.
+    // THE SUBMITTED ORDER. On the serial path this is the log itself; under
+    // CW_VK_PAR_RECORD it is rebuilt from the replayed instances' own ids — each
+    // recomputed by the recorder from the capture fields it actually consumed, in the
+    // submit list's order — which is exactly what this gate was shipped waiting for.
     static std::vector<uint64_t> submitted;
-    submitted.clear();
-    if (!prec::BuildSubmitted(submitted))
+    if (R->parRec)
+    {
+        submitted.clear();
+        for (const std::vector<uint64_t>* v : R->prIdSeq)
+            submitted.insert(submitted.end(), v->begin(), v->end());
+    }
+    else
         submitted = R->orderLog;
     static const long poison = [] {
         const char* e = Env("CW_VK_ORDER_POISON");
@@ -14352,856 +15877,6 @@ uint64_t g_noLight = 0, g_noScene = 0, g_noTlas = 0, g_singular = 0;
 // The register file and shader bindings are PARAMETERS, not globals: the PM4 feed
 // passes pm4.cpp's, the D3D feed (phase C) passes the private file its walker built
 // from the title's own flush output. Everything below is feed-agnostic.
-// ===================================================================================
-// THE RECORD CORE (part 7 stage 2b) — the draw's recording, severed from its decode
-// ===================================================================================
-//
-// Everything a draw RECORDS — the state binds, the vertex-stream uploads and binds,
-// the index setup and the vkCmdDraw* — now lives in `RecordDrawCore`, whose only
-// inputs are a `DrawTicket` (the decoded, resolved values the walk computed) and guest
-// memory. DoDraw builds the ticket and calls it inline today, so behaviour is
-// unchanged; the campaign's stage 2b defers the call to the range boundary and stage
-// 2c hands it to workers — and the ticket is the exact seam both need, because a
-// function whose inputs are a struct and `base` is a function another thread can run.
-//
-// `liveRegs` is the register file WHEN THE CALL IS INLINE, and null when deferred: a
-// handful of diagnostic arms inside the core (the rect trace, the const-race recorder)
-// read registers that only mean anything at walk time, so each is gated on it — a
-// deferred run skips them rather than reading another draw's registers. Everything
-// load-bearing reads the ticket.
-//
-// The capture-side diagnostics (state/fetch probes, the fetch-memo census, the draw
-// probe) stay in DoDraw where the walk's locals live; the dependent-fetch publication
-// stays there too, KEEPING its order before the vertex-stream uploads so the arena
-// allocation sequence is byte-identical to the pre-split renderer.
-struct DrawTicket
-{
-    Pm4Draw draw;
-    VkPipeline pipeline = VK_NULL_HANDLE;
-    VkViewport viewport{};
-    VkRect2D scissor{};
-    float blend[4] = {};
-    uint32_t stencilRefMask = 0;   // regs[kRbStencilRefMask], raw
-    bool stencilTest = false;      // regs[kRbDepthControl] bit 0
-    bool rectSynth = false;
-    Expansion expand = Expansion::None;
-    int32_t indxOffset = 0;
-    uint32_t rectCorner[3] = { 0, 1, 2 };
-    VkDeviceSize vsConstAt = 0, psConstAt = 0, sharedAt = 0;
-    uint32_t drawIndex = 0;        // R->drawsThisFrame at capture — the push-constant one
-    const ShaderMeta* vs = nullptr;
-    const ShaderMeta* ps = nullptr;
-    uint64_t vsHash = 0, psHash = 0;
-    // The attribute walk, pre-filtered (location >= 0, not indirect) and pre-decoded —
-    // the fetch constants are walk-time state, so the decode happens at capture. 24 is
-    // headroom over the 16 bindings the tracked-binding cap allows; the capture site
-    // counts and drops a draw that would overflow rather than truncating it silently.
-    struct AttrFetch
-    {
-        xenos::VertexFetch vf;
-        const VertexAttribute* attr;
-        // Resolved at capture (2c prep): the stream is already device-resident by the
-        // time the ticket leaves the pump, so a worker never touches the stream store,
-        // the guard, the persist twins or the arena cursor.
-        VkBuffer buf = VK_NULL_HANDLE;
-        VkDeviceSize off = 0;
-    };
-    uint8_t nFetch = 0;
-    AttrFetch fetch[24];
-    // The draw call itself, resolved at capture the same way.
-    enum class DrawPath : uint8_t { kExpanded, kIndexed, kAuto };
-    DrawPath path = DrawPath::kAuto;
-    VkBuffer ibuf = VK_NULL_HANDLE;
-    VkDeviceSize iat = 0;
-    VkIndexType itype = VK_INDEX_TYPE_UINT16;
-    uint32_t drawCount = 0;
-    int32_t baseVertex = 0;
-};
-
-namespace rexec
-{
-void Submit(std::vector<DrawTicket>& tickets);   // defined with the machinery below
-}
-
-// Returns false when the draw was abandoned (a degenerate stream, an unreadable index
-// buffer) — exactly the early-outs the inline path always had, so the caller skips the
-// per-draw bookkeeping the same way falling through a `return` used to.
-bool RecordDrawCore(RecordCtx& ctx, uint8_t* base, const DrawTicket& t,
-                    const uint32_t* liveRegs)
-{
-    ProfScope _pRecord(&g_prof.record);
-    {
-    ProfScope _pState(&g_prof.recordState);
-    // Only what has actually changed since the last draw on this command buffer. See
-    // Renderer::BoundState for why that is sound; CW_VK_NO_STATE_CACHE=1 re-issues
-    // everything every draw, which is the pre-part-18 renderer and the control arm.
-    static const bool noStateCache = Env("CW_VK_NO_STATE_CACHE") != nullptr;
-    ++ctx.skips.draws;
-    const float blendConstants[4] = { t.blend[0], t.blend[1], t.blend[2], t.blend[3] };
-    if (noStateCache || t.pipeline != ctx.bound.pipeline)
-    {
-        if (!NoDriverRecord())
-            vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, t.pipeline);
-        else
-            ++g_noDriverRecordSkipped;
-        // BINDING A PIPELINE THAT SPECIFIES STATE STATICALLY MAKES THE CORRESPONDING
-        // DYNAMIC STATE UNDEFINED, so the skip-if-unchanged cache below cannot survive a
-        // bind. The stencil states are declared dynamic only on stencil-enabled pipelines
-        // (see the dynamic-state array), which means every non-stencil draw in between
-        // invalidates them — and the symptom is not a wrong picture but 60
-        // `VUID-vkCmdDrawIndexed-None-0783{7,8,9}`, i.e. a draw reading undefined stencil
-        // state. The t.viewport, t.scissor and blend constants above are dynamic on EVERY
-        // t.pipeline, so they are unaffected and keep their cache.
-        ctx.bound.haveStencil = false;
-        ctx.bound.pipeline = t.pipeline;
-    }
-    else
-        ++ctx.skips.pipeline;
-    if (noStateCache || !ctx.bound.haveViewport ||
-        memcmp(&t.viewport, &ctx.bound.viewport, sizeof(t.viewport)) != 0)
-    {
-        if (!NoDriverRecord())
-            vkCmdSetViewport(ctx.cmd, 0, 1, &t.viewport);
-        else
-            ++g_noDriverRecordSkipped;
-        ctx.bound.viewport = t.viewport;
-        ctx.bound.haveViewport = true;
-    }
-    else
-        ++ctx.skips.viewport;
-    if (noStateCache || !ctx.bound.haveScissor ||
-        memcmp(&t.scissor, &ctx.bound.scissor, sizeof(t.scissor)) != 0)
-    {
-        if (!NoDriverRecord())
-            vkCmdSetScissor(ctx.cmd, 0, 1, &t.scissor);
-        else
-            ++g_noDriverRecordSkipped;
-        ctx.bound.scissor = t.scissor;
-        ctx.bound.haveScissor = true;
-    }
-    else
-        ++ctx.skips.scissor;
-    if (noStateCache || !ctx.bound.haveBlend ||
-        memcmp(blendConstants, ctx.bound.blend, sizeof(blendConstants)) != 0)
-    {
-        if (!NoDriverRecord())
-            vkCmdSetBlendConstants(ctx.cmd, blendConstants);
-        else
-            ++g_noDriverRecordSkipped;
-        memcpy(ctx.bound.blend, blendConstants, sizeof(blendConstants));
-        ctx.bound.haveBlend = true;
-    }
-    else
-        ++ctx.skips.blend;
-
-    // ---- THE STENCIL REFERENCE AND MASKS (part 56) -------------------------------
-    //
-    // RB_STENCILREFMASK, layout ref:8 / mask:8 @8 / writemask:8 @16 — confirmed the same
-    // way the ops were, by whether the values come out sensible rather than from a
-    // header. They do: the draws that carry `ALWAYS / REPLACE` read `sr=00FFFFFE`, i.e.
-    // write reference **254** through full masks, and a matching draw tests `EQUAL`
-    // against it. Dynamic state, so none of this enters the t.pipeline key.
-    {
-        static const bool noStencil = EnvOn("CW_VK_NO_STENCIL");
-        const uint32_t sr = t.stencilRefMask;
-        const uint32_t ref = sr & 0xFF;
-        const uint32_t mask = (sr >> 8) & 0xFF;
-        const uint32_t wmask = (sr >> 16) & 0xFF;
-        const bool stencilOn = !noStencil && t.stencilTest;
-        if (stencilOn)
-            ++g_stencilDraws;
-        // ONLY WHEN THE BOUND PIPELINE DECLARES THEM DYNAMIC, which is exactly when the
-        // stencil test is on. Calling a dynamic-state setter for state a t.pipeline
-        // specifies STATICALLY is illegal in the other direction — `VUID-vkCmdDraw-None-
-        // 08608`, 40 of them, and the message says so plainly once read rather than
-        // guessed at: "doesn't set up VK_DYNAMIC_STATE_STENCIL_*, but since the
-        // vkCmdBindPipeline, the related dynamic state commands have been called".
-        if (stencilOn &&
-            (noStateCache || !ctx.bound.haveStencil || ctx.bound.stencilRef != ref ||
-             ctx.bound.stencilMask != mask || ctx.bound.stencilWriteMask != wmask))
-        {
-            if (!NoDriverRecord())
-            {
-                vkCmdSetStencilReference(ctx.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, ref);
-                vkCmdSetStencilCompareMask(ctx.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, mask);
-                vkCmdSetStencilWriteMask(ctx.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, wmask);
-            }
-            else
-                g_noDriverRecordSkipped += 3;
-            ctx.bound.stencilRef = ref;
-            ctx.bound.stencilMask = mask;
-            ctx.bound.stencilWriteMask = wmask;
-            ctx.bound.haveStencil = true;
-        }
-        else if (stencilOn)
-            ++ctx.skips.stencil;
-    }
-
-    // The five bindless heaps never change address, so this is once per command
-    // buffer rather than once per draw — and it is the most expensive of the five.
-    if (noStateCache || !ctx.bound.setsBound)
-    {
-        if (!NoDriverRecord())
-            vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, R->pipeLayout,
-                                    0, 5, R->sets, 0, nullptr);
-        else
-            ++g_noDriverRecordSkipped;
-        ctx.bound.setsBound = true;
-    }
-    else
-        ++ctx.skips.sets;
-
-    // The three constant-buffer addresses, then THE DRAW INDEX at offset 24 for the
-    // draw-ID pass. The index is pushed on every draw, armed or not: it costs four bytes
-    // in a call that is already being made, and a value that is only correct when an
-    // instrument is enabled is a trap for the next person to use it.
-    struct { uint64_t vs, ps, shared; uint32_t drawIndex, pad; } pushConstants = {
-        uint64_t(R->arena.address + t.vsConstAt),
-        uint64_t(R->arena.address + t.psConstAt),
-        uint64_t(R->arena.address + t.sharedAt),
-        t.drawIndex, 0 };
-    if (!NoDriverRecord())
-        vkCmdPushConstants(ctx.cmd, R->pipeLayout,
-                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32,
-                           &pushConstants);
-    else
-        ++g_noDriverRecordSkipped;
-
-    // THE CONSTANT-SLOT RACE DETECTOR's record half. This is the right place and the only
-    // right place: the address has just been pushed, so these are exactly the bytes this
-    // draw is being recorded to read, after the memo top-up and after any miss-path
-    // patching. The check half runs at submit (see SubmitFrame).
-    if (ConstRaceOn() && liveRegs)
-    {
-        ConstRef r;
-        r.draw = t.drawIndex;
-        r.windowOffset = liveRegs[xenos::kPaScWindowOffset];
-        r.vsAt = t.vsConstAt;
-        r.psAt = t.psConstAt;
-        r.vs = t.vs;
-        r.ps = t.ps;
-        auto snap = [](std::vector<uint32_t>& out, const uint32_t* win,
-                       const ShaderMeta& m, uint32_t bytes) {
-            if (m.aluDynamic || m.aluConsts.empty())
-            {
-                out.resize(bytes / 4);
-                memcpy(out.data(), win, bytes);
-            }
-            else
-            {
-                out.resize(m.aluConsts.size() * 4);
-                for (size_t i = 0; i < m.aluConsts.size(); i++)
-                    if (m.aluConsts[i] < 256)
-                        memcpy(out.data() + i * 4, win + m.aluConsts[i] * 4,
-                               4 * sizeof(uint32_t));
-            }
-        };
-        const uint32_t* vwin = reinterpret_cast<const uint32_t*>(R->arena.mapped + t.vsConstAt);
-        const uint32_t* pwin = reinterpret_cast<const uint32_t*>(R->arena.mapped + t.psConstAt);
-        memcpy(r.c0, vwin, sizeof r.c0);
-        snap(r.vsRegs, vwin, *t.vs, kVsConstBytes);
-        snap(r.psRegs, pwin, *t.ps, kPsConstBytes);
-        g_constRefs.push_back(std::move(r));
-    }
-    }   // end recordState
-
-    // THE MINIMAL CORE (2c prep): everything stream-shaped resolved at capture, so
-    // what records here is exactly what a worker thread can safely do — the state
-    // cache, the binds and the draw, against its own context. The bind-run census is
-    // a pump-only diagnostic (globals), so it rides the liveRegs gate like the others.
-    ProfScope _pVertex(&g_prof.recordVertex);
-    if (g_bindRunCensus && liveRegs)
-        BindRunCensusBeginDraw();
-    {
-        uint32_t binding = 0;
-        for (uint32_t fi = 0; fi < t.nFetch; ++fi)
-            BindVertexBufferCached(ctx, binding++, t.fetch[fi].buf, t.fetch[fi].off);
-    }
-    if (!g_noBindBatch)
-    {
-        BindBatchFlush(ctx);
-        ++g_bindBatchDraws;
-    }
-    _pVertex.Close();
-    ProfScope _pIndex(&g_prof.recordIndex);
-    if (t.path != DrawTicket::DrawPath::kAuto)
-    {
-        BindIndexBufferCached(ctx, t.ibuf, t.iat, t.itype);
-        if (!NoDriverRecord())
-            vkCmdDrawIndexed(ctx.cmd, t.drawCount, 1, 0, t.baseVertex, 0);
-        else
-            ++g_noDriverRecordSkipped;
-    }
-    else
-    {
-        if (!NoDriverRecord())
-            vkCmdDraw(ctx.cmd, t.drawCount, 1, uint32_t(t.baseVertex), 0);
-        else
-            ++g_noDriverRecordSkipped;
-    }
-    return true;
-}
-
-
-// ===================================================================================
-// STAGE 2b: DEFERRED RECORDING — tickets replayed at the range boundary (part 7)
-// ===================================================================================
-//
-// Behind `CW_VK_DEFER_RECORD=1`, DoDraw stops calling the record core inline: it
-// queues the ticket, and the whole range's tickets replay back-to-back when the range
-// closes (the prec module's rangeClosed hook, which is also where the secondaries
-// rotate — replay lands in the range's own command buffer by construction). Execution
-// is still serial and still on the pump; what this stage proves is CAPTURE
-// COMPLETENESS — that the ticket alone reproduces the picture — which is the one
-// property stage 2c cannot debug once workers are involved, because a capture bug and
-// a race look identical from a wrong frame.
-//
-// The honest deltas from inline, both documented rather than hidden: (1) the per-draw
-// bookkeeping in DoDraw's tail runs at capture, so a draw whose replay then fails an
-// early-out is still counted/fingerprinted (failures are counted separately here);
-// (2) guest memory is read at replay, up to a range (~128 draws of walk) later than
-// inline — the same widened-race class as the parallel guard's, measured there at a
-// fraction of a percent, and torn reads still hash as "changed" on the guard path.
-//
-// Replay happens ONLY on kSizeCap and kPassEnd closes, where a command buffer is open
-// for the range. kPassBegin/kFrameSeal arrive with no recordable target; a non-empty
-// queue there is a sequencing defect and is dropped LOUDLY, never recorded blind.
-namespace defer
-{
-
-bool On()
-{
-    // DEFAULT ON since part 7 closed (finding 71) — the range-batched replay is the
-    // larger half of the stack's +0.35 ms. CW_VK_DEFER_RECORD=1 is accepted as a
-    // no-op for the part-7 harness recipes. The walk-time diagnostic arms inside the
-    // record core (rect trace, const-race) need the control arm to fire.
-    static const bool on = [] {
-        const bool off = EnvOn("CW_VK_NO_DEFER_RECORD");
-        if (off)
-            fprintf(stderr, "[defer] CW_VK_NO_DEFER_RECORD=1 — recording is INLINE "
-                            "at the walk (the pre-part-7 shape; control arm)\n");
-        return !off;
-    }();
-    return on;
-}
-
-uint8_t* g_base = nullptr;         // the guest base, identical every draw
-std::vector<DrawTicket> g_queue;   // the open range's tickets, pump-only
-
-struct Stats
-{
-    uint64_t deferred = 0;
-    uint64_t ranges = 0;
-    uint64_t replayFailed = 0;   // ticket hit a core early-out (counted inline too,
-                                 // but inline also skips the tail bookkeeping)
-    uint64_t dropped = 0;        // queue non-empty at a close with no open target
-} g_stats;
-
-void Queue(uint8_t* base, const DrawTicket& t)
-{
-    g_base = base;
-    g_queue.push_back(t);
-    ++g_stats.deferred;
-}
-
-void OnRangeClosed(uint8_t reason)
-{
-    if (g_queue.empty())
-        return;
-    // Stage 2c: the range's tickets become a worker job instead of a pump replay.
-    // Same close reasons, same drop rule for the rest.
-    if (rexec::On() &&
-        (reason == uint8_t(prec::kSizeCap) || reason == uint8_t(prec::kPassEnd)))
-    {
-        rexec::Submit(g_queue);
-        return;
-    }
-    if (reason != uint8_t(prec::kSizeCap) && reason != uint8_t(prec::kPassEnd))
-    {
-        g_stats.dropped += g_queue.size();
-        static uint64_t printed = 0;
-        if (++printed <= 8)
-            fprintf(stderr,
-                    "[defer] ** %zu tickets dropped at a reason-%u close — draws were "
-                    "captured with no pass open to replay into (a sequencing defect)\n",
-                    g_queue.size(), reason);
-        g_queue.clear();
-        return;
-    }
-    ++g_stats.ranges;
-    RecordCtx ctx{ R->cmd, R->bound, R->skips, g_pumpBindBatch };
-    for (const DrawTicket& tk : g_queue)
-        if (!RecordDrawCore(ctx, g_base, tk, nullptr))
-            ++g_stats.replayFailed;
-    g_queue.clear();
-}
-
-void PrintStats(FILE* f)
-{
-    if (!On() || !g_stats.deferred)
-        return;
-    fprintf(f,
-            "[defer]   stage 2b: %llu draws deferred, %llu ranges replayed | "
-            "%llu replay early-outs | **%llu dropped**\n",
-            (unsigned long long)g_stats.deferred, (unsigned long long)g_stats.ranges,
-            (unsigned long long)g_stats.replayFailed,
-            (unsigned long long)g_stats.dropped);
-}
-
-} // namespace defer
-
-
-// ===================================================================================
-// STAGE 2c: THE FLIP — range recording on the shared workers (part 7)
-// ===================================================================================
-//
-// Behind `CW_VK_PREC_EXEC=1` (which requires CW_VK_SECONDARIES=1 and
-// CW_VK_DEFER_RECORD=1 armed alongside it — refused loudly otherwise), a closed
-// range's tickets become a JOB on the guard-pool workers: the worker begins a
-// secondary from ITS OWN per-slot pool (two threads must never touch one command
-// pool), replays the tickets through the minimal record core against a job-local
-// context (a fresh BoundState per range is the design, so there is no cross-range
-// state to share), ends the buffer and parks it for the pass drain. The pump reserves
-// a pass-list slot per range at close time, so execution order is CREATION order
-// whatever order the workers finish in — the property the order gate has adjudicated
-// since stage 1.
-//
-// The pass drain (EndRendering, before ExecuteCommands) is stage 1's steal-back made
-// load-bearing: the pump claims unstarted jobs itself — the LAST range of every pass
-// is always freshly submitted — then waits out the in-flight remainder, repairs any
-// slot a worker could not fill by recording it on the pump's own pool, and merges the
-// job-local skip counters. CW_VK_PROFILE is refused under this arm: the per-phase
-// sinks are plain uint64 adds and worker-side scopes would corrupt every column.
-namespace rexec
-{
-
-bool On()
-{
-    static const bool on = [] {
-        if (!EnvOn("CW_VK_PREC_EXEC"))
-            return false;
-        if (!sec::On() || !defer::On())
-        {
-            fprintf(stderr, "[rexec] CW_VK_PREC_EXEC=1 REFUSED: it cannot run with "
-                            "CW_VK_NO_SECONDARIES or CW_VK_NO_DEFER_RECORD set\n");
-            return false;
-        }
-        if (Env("CW_VK_PROFILE"))
-        {
-            fprintf(stderr, "[rexec] CW_VK_PREC_EXEC=1 REFUSED under CW_VK_PROFILE: "
-                            "the profiler's phase sinks are not thread-safe and every "
-                            "column would be corrupt\n");
-            return false;
-        }
-        fprintf(stderr, "[rexec] CW_VK_PREC_EXEC=1 — range recording runs on the "
-                        "SHARED guard-pool workers (stage 2c; pump steals at every "
-                        "pass drain)\n");
-        return true;
-    }();
-    return on;
-}
-
-// Per-worker, per-frame-slot secondary pools. Slot count is the guard pool's maximum
-// plus one for the pump's steal/fallback path.
-constexpr unsigned kMaxRecWorkers = 5;
-sec::SlotPool g_wp[kMaxRecWorkers][kMaxFramesInFlight];
-
-struct RangeJob
-{
-    std::vector<DrawTicket> tickets;
-    uint32_t passSlot = 0;
-    uint32_t frameSlot = 0;
-    VkCommandBuffer out = VK_NULL_HANDLE;
-    Renderer::BindSkips skips{};
-    uint32_t failedDraws = 0;
-    bool done = false;
-};
-
-std::mutex g_mx;
-std::condition_variable g_drainCv;
-std::deque<RangeJob> g_jobs;      // the open pass's jobs, creation order (stable refs)
-std::deque<RangeJob*> g_queue;    // unclaimed
-std::atomic<size_t> g_queued{ 0 };
-size_t g_outstanding = 0;
-
-struct Stats
-{
-    uint64_t jobs = 0;
-    uint64_t worker = 0;
-    uint64_t stolen = 0;
-    uint64_t fallbackRanges = 0;  // a worker could not begin a buffer; pump repaired
-    uint64_t drainBlocked = 0;
-    uint64_t drainNs = 0;
-    uint64_t draws = 0;
-    uint64_t failedDraws = 0;
-} g_stats;
-
-void RunJob(RangeJob& j, unsigned wid)
-{
-    VkCommandBuffer cmd =
-        wid < kMaxRecWorkers ? sec::BeginSecondaryFrom(g_wp[wid][j.frameSlot])
-                             : VK_NULL_HANDLE;
-    if (cmd == VK_NULL_HANDLE)
-    {
-        j.out = VK_NULL_HANDLE;   // the drain repairs or screams
-        return;
-    }
-    VkCommandBuffer cmdVar = cmd;
-    Renderer::BoundState bound{};
-    BindBatch batch{};
-    RecordCtx ctx{ cmdVar, bound, j.skips, batch };
-    for (const DrawTicket& tk : j.tickets)
-        if (!RecordDrawCore(ctx, defer::g_base, tk, nullptr))
-            ++j.failedDraws;
-    vkEndCommandBuffer(cmd);
-    j.out = cmd;
-}
-
-bool RunOne(bool stolen, unsigned wid)
-{
-    RangeJob* j = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(g_mx);
-        if (g_queue.empty())
-            return false;
-        j = g_queue.front();
-        g_queue.pop_front();
-        g_queued.store(g_queue.size(), std::memory_order_release);
-    }
-    RunJob(*j, wid);
-    {
-        std::lock_guard<std::mutex> lk(g_mx);
-        j->done = true;
-        if (stolen)
-            ++g_stats.stolen;
-        else
-            ++g_stats.worker;
-        if (--g_outstanding == 0)
-            g_drainCv.notify_all();
-    }
-    return true;
-}
-
-bool HasWork()
-{
-    return g_queued.load(std::memory_order_acquire) != 0;
-}
-
-bool RunOneJob()
-{
-    if (!HasWork() || g_recWorkerId < 0)
-        return false;
-    return RunOne(/*stolen=*/false, unsigned(g_recWorkerId));
-}
-
-void Submit(std::vector<DrawTicket>& tickets)
-{
-    if (tickets.empty())
-        return;
-    if (!R->rendering)
-    {
-        // A range closing outside a pass has no buffer to land in — same drop rule as
-        // defer's, same loudness.
-        static uint64_t printed = 0;
-        if (++printed <= 8)
-            fprintf(stderr, "[rexec] ** %zu tickets dropped at a close with no pass "
-                            "open\n", tickets.size());
-        tickets.clear();
-        return;
-    }
-    {
-        std::lock_guard<std::mutex> lk(g_mx);
-        g_jobs.emplace_back();
-        RangeJob& j = g_jobs.back();
-        j.tickets.swap(tickets);   // the defer queue keeps its capacity back
-        j.passSlot = sec::CurrentSlot();
-        j.frameSlot = R->frameSlot;
-        g_queue.push_back(&j);
-        g_queued.store(g_queue.size(), std::memory_order_release);
-        ++g_outstanding;
-        ++g_stats.jobs;
-        g_stats.draws += j.tickets.size();
-    }
-    GuardPoolKickOne();
-}
-
-// EndRendering, before ExecuteCommands: finish this pass's jobs — steal, wait, repair
-// — and land every buffer in its reserved slot.
-void PassDrain()
-{
-    if (!On() || g_jobs.empty())
-        return;
-    const unsigned pumpId = GuardPoolWorkers(); // one past the last worker, < kMaxRecWorkers
-    while (RunOne(/*stolen=*/true, pumpId))
-    {
-    }
-    {
-        std::unique_lock<std::mutex> lk(g_mx);
-        if (g_outstanding)
-        {
-            ++g_stats.drainBlocked;
-            const auto t0 = std::chrono::steady_clock::now();
-            g_drainCv.wait(lk, [] { return g_outstanding == 0; });
-            g_stats.drainNs += uint64_t(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - t0)
-                    .count());
-        }
-    }
-    for (RangeJob& j : g_jobs)
-    {
-        if (j.out == VK_NULL_HANDLE)
-        {
-            // The worker had no buffer to give (its pool failed to grow). Repair on
-            // the pump's own pool — a missing range is missing GEOMETRY, so this path
-            // exists even though it should never run.
-            ++g_stats.fallbackRanges;
-            RunJob(j, pumpId);
-        }
-        sec::SetPassSlot(j.passSlot, j.out);
-        R->skips.pipeline += j.skips.pipeline;
-        R->skips.viewport += j.skips.viewport;
-        R->skips.scissor += j.skips.scissor;
-        R->skips.blend += j.skips.blend;
-        R->skips.sets += j.skips.sets;
-        R->skips.draws += j.skips.draws;
-        R->skips.depthBias += j.skips.depthBias;
-        R->skips.stencil += j.skips.stencil;
-        R->skips.vertexBinds += j.skips.vertexBinds;
-        R->skips.vertexBindRepeats += j.skips.vertexBindRepeats;
-        R->skips.indexBinds += j.skips.indexBinds;
-        R->skips.indexBindRepeats += j.skips.indexBindRepeats;
-        g_stats.failedDraws += j.failedDraws;
-    }
-    g_jobs.clear();
-}
-
-// BeginFrame: the incoming slot's worker pools recycle under the same fence argument
-// as the pump's — every job was drained at its own pass end, so nothing holds them.
-void FrameReset()
-{
-    if (!On())
-        return;
-    for (unsigned w = 0; w < kMaxRecWorkers; ++w)
-    {
-        sec::SlotPool& sp = g_wp[w][R->frameSlot];
-        if (sp.pool != VK_NULL_HANDLE)
-            vkResetCommandPool(R->device, sp.pool, 0);
-        sp.cursor = 0;
-    }
-}
-
-void PrintStats(FILE* f)
-{
-    if (!On() || !g_stats.jobs)
-        return;
-    fprintf(f,
-            "[rexec]   stage 2c: %llu range jobs (%llu draws) | worker %llu stolen "
-            "%llu | %llu pump-repaired ranges | drain blocked %llu (%.2f ms total) | "
-            "**%llu failed draws**\n",
-            (unsigned long long)g_stats.jobs, (unsigned long long)g_stats.draws,
-            (unsigned long long)g_stats.worker, (unsigned long long)g_stats.stolen,
-            (unsigned long long)g_stats.fallbackRanges,
-            (unsigned long long)g_stats.drainBlocked, double(g_stats.drainNs) / 1e6,
-            (unsigned long long)g_stats.failedDraws);
-}
-
-} // namespace rexec
-
-
-// ===================================================================================
-// CW_VK_REUSE_CENSUS — the ask-first census for cross-frame range reuse (part 8)
-// ===================================================================================
-//
-// The lead it prices: a range whose inputs are identical to last frame's could reuse
-// last frame's recorded secondary and skip capture+record. Case Zero built this
-// census first (CZ_VK_REUSE_CENSUS, their part 87) and REFUTED the lead at their
-// crowd: 1.2-2.1% reusable, because 93-94% of crowd draws differ ONLY in their ALU
-// constants — the guest rewrites the constant file for ~98% of draws every frame.
-// Same engine, so the expectation here is the same verdict — but a copied conclusion
-// is not a measurement (this port's own rule), so this is the ~equivalent census run
-// on OUR structures: the DrawTicket already IS "everything recorded commands depend
-// on", so the fingerprint is a fold over the ticket's input identity.
-//
-// FOUR CELLS, matching theirs: ordinal-matched (draw N vs draw N of the previous
-// frame) vs set-matched (draw appears anywhere in the previous frame), each with and
-// without the constants in the fingerprint. The constants term hashes ONLY the
-// registers this draw's shaders declare (aluConsts), falling back to the whole
-// window for dynamically-indexed shaders (bone palettes) — correctness over cost, and
-// this is a diagnostic arm whose frame times are not quotable (gotcha 7, announced).
-//
-// BUILT-IN POSITIVE CONTROL: Case Zero's menus read 69-77% reusable. Our light bucket
-// must read high or the census is broken — a zero in BOTH buckets is a defect of the
-// instrument, not a fact about the title (gotcha 25/30). Stream CONTENT is excluded
-// from the fingerprint on their evidence (0 draws failed on content alone) and that
-// exclusion is stated here rather than hidden.
-namespace reusec
-{
-
-bool On()
-{
-    static const bool on = [] {
-        const bool o = EnvOn("CW_VK_REUSE_CENSUS");
-        if (o)
-            fprintf(stderr,
-                    "[reuse] CW_VK_REUSE_CENSUS=1 — the cross-frame reuse census is "
-                    "ARMED (diagnostic: hashes each draw's declared constants; no "
-                    "frame time from this run is quotable)\n");
-        return o;
-    }();
-    return on;
-}
-
-uint64_t g_lastFrame = ~0ull;
-struct Fp { uint64_t full, noConst; };
-std::vector<Fp> g_prev, g_cur;
-std::unordered_map<uint64_t, uint32_t> g_prevFull, g_prevNoConst;
-
-struct Bucket
-{
-    uint64_t frames = 0, draws = 0;
-    uint64_t ordFull = 0, ordNoConst = 0, setFull = 0, setNoConst = 0;
-};
-Bucket g_light, g_crowd;   // split at 4,000 draws/frame — the soak gate's own line
-uint64_t g_constBytesHashed = 0;   // the liveness counter for the constants channel
-
-inline uint64_t Mix(uint64_t h, uint64_t v)
-{
-    h ^= v;
-    return h * 0x100000001B3ull;
-}
-
-void OnFrameBoundary(uint64_t frame, uint64_t drawsLastFrame)
-{
-    // Score the finished frame against the one before it, then rotate.
-    if (g_lastFrame != ~0ull && !g_prev.empty() && !g_cur.empty())
-    {
-        Bucket& b = drawsLastFrame >= 4000 ? g_crowd : g_light;
-        ++b.frames;
-        b.draws += g_cur.size();
-        auto pf = g_prevFull;       // copies: multiset semantics decrement on match
-        auto pn = g_prevNoConst;
-        const size_t n = g_cur.size();
-        for (size_t i = 0; i < n; ++i)
-        {
-            if (i < g_prev.size() && g_cur[i].full == g_prev[i].full)
-                ++b.ordFull;
-            if (i < g_prev.size() && g_cur[i].noConst == g_prev[i].noConst)
-                ++b.ordNoConst;
-            auto itf = pf.find(g_cur[i].full);
-            if (itf != pf.end() && itf->second)
-            {
-                --itf->second;
-                ++b.setFull;
-            }
-            auto itn = pn.find(g_cur[i].noConst);
-            if (itn != pn.end() && itn->second)
-            {
-                --itn->second;
-                ++b.setNoConst;
-            }
-        }
-    }
-    g_prev.swap(g_cur);
-    g_cur.clear();
-    g_prevFull.clear();
-    g_prevNoConst.clear();
-    for (const Fp& f : g_prev)
-    {
-        ++g_prevFull[f.full];
-        ++g_prevNoConst[f.noConst];
-    }
-    g_lastFrame = frame;
-}
-
-void OnDraw(const DrawTicket& t, const uint32_t* regs, uint32_t vsBase,
-            uint32_t psBase, uint64_t frame, uint64_t drawsLastFrame)
-{
-    if (!On())
-        return;
-    if (frame != g_lastFrame)
-        OnFrameBoundary(frame, drawsLastFrame);
-
-    uint64_t h = 0xCBF29CE484222325ull;
-    h = Mix(h, t.vsHash);
-    h = Mix(h, t.psHash);
-    h = Mix(h, uint64_t(uintptr_t(t.pipeline)));
-    h = Mix(h, (uint64_t(t.draw.primType) << 32) | t.draw.indexCount);
-    h = Mix(h, (uint64_t(t.draw.indexVa) << 16) | (t.draw.index32 ? 2 : 0) |
-                   (t.draw.indexed ? 1 : 0));
-    h = Mix(h, uint64_t(uint32_t(t.indxOffset)));
-    uint64_t vbits[3];   // VkViewport is 6 floats = 24 bytes = 3 words of hash input
-    memcpy(vbits, &t.viewport, sizeof(t.viewport));
-    for (int i = 0; i < 3; ++i)
-        h = Mix(h, vbits[i]);
-    h = Mix(h, (uint64_t(uint32_t(t.scissor.offset.x)) << 32) |
-                   uint32_t(t.scissor.offset.y));
-    h = Mix(h, (uint64_t(t.scissor.extent.width) << 32) | t.scissor.extent.height);
-    h = Mix(h, t.stencilRefMask | (t.stencilTest ? 1ull << 32 : 0));
-    for (uint32_t i = 0; i < t.nFetch; ++i)
-    {
-        const DrawTicket::AttrFetch& a = t.fetch[i];
-        h = Mix(h, (uint64_t(a.vf.address) << 8) | a.vf.endian);
-        h = Mix(h, (uint64_t(a.vf.sizeDwords) << 16) | (a.attr->format << 8) |
-                       a.attr->offsetDwords);
-        h = Mix(h, a.attr->strideDwords);
-    }
-    const uint64_t noConst = h;
-
-    // The constants term: only the registers the shaders declare, whole window when
-    // the shader indexes dynamically. Both halves of the guest's file, through the
-    // register file directly (capture side — regs is live here).
-    auto hashConsts = [&](const ShaderMeta* m, uint32_t base, uint32_t words) {
-        const uint32_t* win = regs + xenos::kAluConstantBase + base * 4;
-        if (!m || m->aluDynamic || m->aluConsts.empty())
-        {
-            for (uint32_t i = 0; i < words; ++i)
-                h = Mix(h, win[i]);
-            g_constBytesHashed += words * 4;
-            return;
-        }
-        for (uint32_t r : m->aluConsts)
-        {
-            if (r * 4 + 4 > words)
-                continue;
-            for (uint32_t k = 0; k < 4; ++k)
-                h = Mix(h, win[r * 4 + k]);
-            g_constBytesHashed += 16;
-        }
-    };
-    // The windows the draw ACTUALLY reads — the guest names them per draw.
-    hashConsts(t.vs, vsBase, 256 * 4);
-    hashConsts(t.ps, psBase, 224 * 4);
-    g_cur.push_back(Fp{ h, noConst });
-}
-
-void PrintStats(FILE* f)
-{
-    if (!On())
-        return;
-    auto line = [&](const char* name, const Bucket& b) {
-        if (!b.draws)
-            return;
-        fprintf(f,
-                "[reuse]   %s: %llu frames, %llu draws | ordinal full %.1f%% "
-                "no-const %.1f%% | set full %.1f%% no-const %.1f%%\n",
-                name, (unsigned long long)b.frames, (unsigned long long)b.draws,
-                100.0 * double(b.ordFull) / double(b.draws),
-                100.0 * double(b.ordNoConst) / double(b.draws),
-                100.0 * double(b.setFull) / double(b.draws),
-                100.0 * double(b.setNoConst) / double(b.draws));
-    };
-    line("light (<4,000 draws)", g_light);
-    line("CROWD (>=4,000 draws)", g_crowd);
-    if (g_light.draws || g_crowd.draws)
-        fprintf(f,
-                "[reuse]   constants channel: %.1f MB hashed (a zero here means the "
-                "constants term never ran and the full-fp columns are BLIND)\n",
-                double(g_constBytesHashed) / 1048576.0);
-}
-
-} // namespace reusec
-
 void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
             const Pm4ShaderBinding& vsBind, const Pm4ShaderBinding& psBind)
 {
@@ -15290,11 +15965,40 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     }
     if (!vsMeta || !psMeta)
     {
+        // D.4: a miss is now the drain point for finished first-sight translations —
+        // rare by construction (it recurs every draw only while a shader is missing),
+        // so the queue check costs nothing on the standing path. Insertion happens on
+        // THIS thread, so the re-lookup below cannot race anything.
+        if (shaderjit::Drain())
+        {
+            vsMeta = g_flatCacheOff ? nullptr : R->shaders.Find(vsBind.hash);
+            psMeta = g_flatCacheOff ? nullptr : R->shaders.Find(psBind.hash);
+            if (g_flatCacheOff)
+            {
+                auto vsIt = R->shadersMap.find(vsBind.hash);
+                auto psIt = R->shadersMap.find(psBind.hash);
+                vsMeta = vsIt != R->shadersMap.end() ? &vsIt->second : nullptr;
+                psMeta = psIt != R->shadersMap.end() ? &psIt->second : nullptr;
+            }
+        }
+    }
+    if (!vsMeta || !psMeta)
+    {
+        const uint64_t missing = !vsMeta ? vsBind.hash : psBind.hash;
+        // While the translation is in flight the skip is ITS OWN counter, not the miss
+        // report — so `grep -c "no translated shader"` keeps meaning "a shader ended up
+        // missing" (translation failed, or the JIT is off), never "one was momentarily
+        // being built".
+        bool jitFailed = false;
+        if (shaderjit::InFlightOrFailed(missing, jitFailed) && !jitFailed)
+        {
+            Count("draw: shader translating");
+            return;
+        }
         // Naming the missing hash is what makes this actionable: the [imload] line
         // for that hash says which stage and how big, and the two together are enough
         // to add it to the cache without another run.
         static std::vector<uint64_t> reported;
-        const uint64_t missing = !vsMeta ? vsBind.hash : psBind.hash;
         if (std::find(reported.begin(), reported.end(), missing) == reported.end())
         {
             reported.push_back(missing);
@@ -15306,6 +16010,11 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     }
     const ShaderMeta& vs = *vsMeta;
     const ShaderMeta& ps = *psMeta;
+    // The reuse census's per-draw dirty flag, reset BEFORE the first thing that can call
+    // UploadStream for this draw (the texture walk and the attribute loop both can). The
+    // fingerprint itself is computed at the tail, where the draw has proven it records.
+    if (g_reuseCensus)
+        g_reuseDrawDirty = false;
 
     // A per-primitive-type census, always on. Which topologies a title actually issues
     // is a fact about the title, and it is the difference between "quad lists are
@@ -15842,10 +16551,29 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
         {
             ProfScope _pcv(&g_prof.constVs);
             uint32_t* dst = reinterpret_cast<uint32_t*>(R->arena.mapped + vsConstAt);
+            // Part 88: the write-extent-bounded dynamic copy. The take is UNCONDITIONAL
+            // for every dynamic VS copy — it is the consume that gives "writes since the
+            // last copy" its meaning, and running it on both arms keeps the arms
+            // differing by exactly the copy. Eligibility beyond the bound itself:
+            // palette-shaped dynamics only (the vc(209+a0) outlier keeps the full copy),
+            // a known list to union in, and the window at base 0, where the tracker's
+            // c8 is the window's c8.
+            uint32_t dynBound = 0;
+            if (vs.aluDynamic)
+            {
+                const VsPalTake pt = TakeVsPaletteBound();
+                if (!NoBoundedDynamic() && !ConstGatherOff() && vs.aluDynPalette &&
+                    vs.aluListKnown && memoVsBase == 0)
+                    dynBound = pt.bound;
+                // Step 0's census, consuming the same take (it must not take twice).
+                if (g_paletteCensus)
+                    palcensus::Record(pt, vs.aluConsts.size(), memoVsBase);
+            }
+            R->constMemoVsDynBound = dynBound;
             {
                 ProfScope _pcc(&g_prof.constVsCopy);
                 CopyConstWindow(dst, regs + xenos::kAluConstantBase + memoVsBase * 4, vs,
-                                true);
+                                true, dynBound);
             }
             ProfScope _pcpatch(&g_prof.constVsPatch);
             // 21:9 (part 60) and the FOV slider (part 61): patch a recognized scene
@@ -15913,7 +16641,82 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
                         ++have;
                 c0Known = have == 4;
             }
-            const int fovForm = PatchFovProjection(patchAt, FovHalfRadThisFrame());
+            // Part 88 item 2: the patch memo (state and rationale at PatchMemoEntry).
+            // Cached-path only — the in-place arms keep the old path bit for bit, for
+            // the same reason they do at the patch-source shortcut above.
+            int fovForm = 0, wideForm = 0;
+            bool memoServed = false;
+            const float fovNow = FovHalfRadThisFrame();
+            const uint8_t wideNow = WideMode() ? 1 : 0;
+            if (!patchInPlace && !NoPatchMemo())
+            {
+                for (int way = 0; way < 4; ++way)
+                {
+                    PatchMemoEntry& e = g_patchMemoWays[way];
+                    if (!e.valid || e.fov != fovNow || e.wide != wideNow ||
+                        memcmp(e.key, patchAt, sizeof e.key) != 0)
+                        continue;
+                    if (PatchMemoVerify())
+                    {
+                        // Run both patches anyway and compare all sixteen dwords. Under
+                        // poison the compare side is perturbed (the served data is not)
+                        // — the mirror of CW_VK_VERIFY_PATCH_SRC_POISON below.
+                        uint32_t chk[16], want[16];
+                        memcpy(chk, patchAt, sizeof chk);
+                        PatchFovProjection(chk, fovNow);
+                        if (wideNow)
+                            PatchWideProjection(chk);
+                        memcpy(want, e.out, sizeof want);
+                        if (PatchMemoVerifyPoison())
+                            want[0] ^= 0x40000000u;
+                        ++g_patchMemoChecked;
+                        if (memcmp(chk, want, sizeof want) != 0 &&
+                            ++g_patchMemoBad <= 8)
+                            fprintf(stderr,
+                                    "[vk] ** PATCH MEMO MISMATCH #%llu — the served "
+                                    "block is not what the patches produce for this "
+                                    "key; this draw's projection is WRONG\n",
+                                    (unsigned long long)g_patchMemoBad);
+                    }
+                    memcpy(patchAt, e.out, sizeof e.out);
+                    fovForm = e.fovForm;
+                    wideForm = e.wideForm;
+                    memoServed = true;
+                    ++g_patchMemoHits;
+                    if (way)
+                    {
+                        const PatchMemoEntry tmp = e;
+                        for (int j = way; j > 0; --j)
+                            g_patchMemoWays[j] = g_patchMemoWays[j - 1];
+                        g_patchMemoWays[0] = tmp;
+                    }
+                    break;
+                }
+            }
+            if (!memoServed)
+            {
+                uint32_t preKey[16];
+                const bool store = !patchInPlace && !NoPatchMemo();
+                if (store)
+                    memcpy(preKey, patchAt, sizeof preKey);
+                fovForm = PatchFovProjection(patchAt, fovNow);
+                if (wideNow)
+                    wideForm = PatchWideProjection(patchAt);
+                if (store)
+                {
+                    for (int j = 3; j > 0; --j)
+                        g_patchMemoWays[j] = g_patchMemoWays[j - 1];
+                    PatchMemoEntry& e = g_patchMemoWays[0];
+                    memcpy(e.key, preKey, sizeof e.key);
+                    memcpy(e.out, patchAt, sizeof e.out);
+                    e.fov = fovNow;
+                    e.wide = wideNow;
+                    e.valid = 1;
+                    e.fovForm = int8_t(fovForm);
+                    e.wideForm = int8_t(wideForm);
+                    ++g_patchMemoMisses;
+                }
+            }
             if (c0Known)
                 ++g_patchGathered;
             else
@@ -15928,12 +16731,11 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
                 case 1: COUNT("draw: raw projection fov-adjusted (slider)"); break;
                 case 2: COUNT("draw: COMPOSITE viewproj fov-adjusted (slider)"); break;
             }
-            if (WideMode())
-                switch (PatchWideProjection(patchAt))
-                {
-                    case 1: COUNT("draw: raw projection widened to 21:9"); break;
-                    case 2: COUNT("draw: COMPOSITE viewproj widened to 21:9"); break;
-                }
+            switch (wideForm)
+            {
+                case 1: COUNT("draw: raw projection widened to 21:9"); break;
+                case 2: COUNT("draw: COMPOSITE viewproj widened to 21:9"); break;
+            }
             if (!patchInPlace)
             {
                 // CW_VK_VERIFY_PATCH_SRC=1 — the arm that makes the shortcut believable.
@@ -16044,7 +16846,25 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
             // A shader on the full-copy path (dynamic `a0` indexing, or the gather off)
             // still gets the whole-window compare, which is what it deserves.
             auto cmpStage = [&](const uint32_t* have, const uint32_t* want,
-                                const ShaderMeta& meta) {
+                                const ShaderMeta& meta, uint32_t dynBound) {
+                // Part 88: a bounded dynamic copy leaves the arena above its bound as
+                // residue ON PURPOSE. Compare exactly what it claims — c0..c3, the
+                // palette span, the list — or the feature working reads as a memo
+                // defect, in the exact instrument someone would use to investigate it.
+                if (meta.aluDynamic && dynBound)
+                {
+                    const uint32_t vb = std::min<uint32_t>(dynBound, 255);
+                    if (memcmp(have, want, 4 * 4 * sizeof(uint32_t)) != 0 ||
+                        memcmp(have + 8 * 4, want + 8 * 4,
+                               (vb - 7) * 4 * sizeof(uint32_t)) != 0)
+                        return true;
+                    for (uint32_t r : meta.aluConsts)
+                        if (r < 256 && !(r < 4) && !(r >= 8 && r <= vb) &&
+                            memcmp(have + r * 4, want + r * 4,
+                                   4 * sizeof(uint32_t)) != 0)
+                            return true;
+                    return false;
+                }
                 if (ConstGatherOff() || meta.aluDynamic || meta.aluConsts.empty())
                 {
                     for (uint32_t i = 0; i < 256 * 4; i++)
@@ -16058,8 +16878,8 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
                         return true;
                 return false;
             };
-            bad = cmpStage(haveVs, scratch.data(), vs) ||
-                  cmpStage(havePs, scratch.data() + 256 * 4, ps);
+            bad = cmpStage(haveVs, scratch.data(), vs, R->constMemoVsDynBound) ||
+                  cmpStage(havePs, scratch.data() + 256 * 4, ps, 0);
             if (bad)
             {
                 if (g_constMemoStale < 8)
@@ -17546,6 +18366,237 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
 
     _pTail.Close();
 
+    // The resolve-split census's per-draw sample decision, made once here so all three
+    // UploadStream call sites below agree on which draws are sampled.
+    const bool resolveSample =
+        g_resolveSplitCensus && ((R->drawsThisFrame & 15) == 0);
+    if (resolveSample)
+        ++g_resolveSampledDraws;
+
+    // PARALLEL RECORD's capture (part 89, design (b)) — declared here because the
+    // vertex and index sections below fill it too; see the block in recordState.
+    DrawCapture cap;
+    const bool capturing = R->capActive;
+
+    ProfScope _pRecord(&g_prof.record);
+    {
+    ProfScope _pState(&g_prof.recordState);
+    // Only what has actually changed since the last draw on this command buffer. See
+    // Renderer::BoundState for why that is sound; CW_VK_NO_STATE_CACHE=1 re-issues
+    // everything every draw, which is the pre-part-18 renderer and the control arm.
+    static const bool noStateCache = Env("CW_VK_NO_STATE_CACHE") != nullptr;
+    ++R->skips.draws;
+    const float blendConstants[4] = {
+        F32(regs[xenos::kRbBlendRed]), F32(regs[xenos::kRbBlendRed + 1]),
+        F32(regs[xenos::kRbBlendRed + 2]), F32(regs[xenos::kRbBlendRed + 3])
+    };
+    // PARALLEL RECORD's capture (part 89, design (b)): everything below that would
+    // talk to the driver instead fills this, and the replay — a worker's chunk or the
+    // pump's tail — issues the calls with its own per-instance state cache. The
+    // resolve side (UploadStream, decode, arena writes, every census) runs UNCHANGED
+    // either way; only the vkCmd* work moves.
+    if (capturing)
+    {
+        cap.pipeline = pipeline;
+        cap.viewport = viewport;
+        cap.scissor = scissor;
+        memcpy(cap.blend, blendConstants, sizeof cap.blend);
+        cap.bindCount = 0;
+        cap.ib = VK_NULL_HANDLE;
+        cap.io = 0;
+        cap.it = VK_INDEX_TYPE_UINT16;
+        cap.drawCount = 0;
+        cap.baseVertex = 0;
+    }
+    if (!capturing)
+    {
+    if (noStateCache || pipeline != R->bound.pipeline)
+    {
+        if (!NoDriverRecord())
+            vkCmdBindPipeline(R->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        else
+            ++g_noDriverRecordSkipped;
+        // BINDING A PIPELINE THAT SPECIFIES STATE STATICALLY MAKES THE CORRESPONDING
+        // DYNAMIC STATE UNDEFINED, so the skip-if-unchanged cache below cannot survive a
+        // bind. The stencil states are declared dynamic only on stencil-enabled pipelines
+        // (see the dynamic-state array), which means every non-stencil draw in between
+        // invalidates them — and the symptom is not a wrong picture but 60
+        // `VUID-vkCmdDrawIndexed-None-0783{7,8,9}`, i.e. a draw reading undefined stencil
+        // state. The viewport, scissor and blend constants above are dynamic on EVERY
+        // pipeline, so they are unaffected and keep their cache.
+        R->bound.haveStencil = false;
+        R->bound.pipeline = pipeline;
+    }
+    else
+        ++R->skips.pipeline;
+    if (noStateCache || !R->bound.haveViewport ||
+        memcmp(&viewport, &R->bound.viewport, sizeof(viewport)) != 0)
+    {
+        if (!NoDriverRecord())
+            vkCmdSetViewport(R->cmd, 0, 1, &viewport);
+        else
+            ++g_noDriverRecordSkipped;
+        R->bound.viewport = viewport;
+        R->bound.haveViewport = true;
+    }
+    else
+        ++R->skips.viewport;
+    if (noStateCache || !R->bound.haveScissor ||
+        memcmp(&scissor, &R->bound.scissor, sizeof(scissor)) != 0)
+    {
+        if (!NoDriverRecord())
+            vkCmdSetScissor(R->cmd, 0, 1, &scissor);
+        else
+            ++g_noDriverRecordSkipped;
+        R->bound.scissor = scissor;
+        R->bound.haveScissor = true;
+    }
+    else
+        ++R->skips.scissor;
+    if (noStateCache || !R->bound.haveBlend ||
+        memcmp(blendConstants, R->bound.blend, sizeof(blendConstants)) != 0)
+    {
+        if (!NoDriverRecord())
+            vkCmdSetBlendConstants(R->cmd, blendConstants);
+        else
+            ++g_noDriverRecordSkipped;
+        memcpy(R->bound.blend, blendConstants, sizeof(blendConstants));
+        R->bound.haveBlend = true;
+    }
+    else
+        ++R->skips.blend;
+    }   // end !capturing (pipeline/viewport/scissor/blend)
+
+    // The polygon offset lives in the PIPELINE now, not here — see PipelineKey. The
+    // counter stays, because an arm with no counter cannot be shown to have engaged.
+    // Hoisted in part 76 for the reason the clip dump above was: this was a `getenv` per
+    // draw, as the first operand of an `&&`, in every run.
+    static const bool noPolyOffsetArm = EnvOn("CW_VK_NO_POLY_OFFSET");
+    if (!noPolyOffsetArm &&
+        (regs[xenos::kPaSuPolyOffsetFrontScale] || regs[xenos::kPaSuPolyOffsetFrontOffset]))
+        ++g_polyOffsetDraws;
+
+    // ---- THE STENCIL REFERENCE AND MASKS (part 56) -------------------------------
+    //
+    // RB_STENCILREFMASK, layout ref:8 / mask:8 @8 / writemask:8 @16 — confirmed the same
+    // way the ops were, by whether the values come out sensible rather than from a
+    // header. They do: the draws that carry `ALWAYS / REPLACE` read `sr=00FFFFFE`, i.e.
+    // write reference **254** through full masks, and a matching draw tests `EQUAL`
+    // against it. Dynamic state, so none of this enters the pipeline key.
+    {
+        static const bool noStencil = EnvOn("CW_VK_NO_STENCIL");
+        const uint32_t sr = regs[xenos::kRbStencilRefMask];
+        const uint32_t ref = sr & 0xFF;
+        const uint32_t mask = (sr >> 8) & 0xFF;
+        const uint32_t wmask = (sr >> 16) & 0xFF;
+        const bool stencilOn = !noStencil && (regs[xenos::kRbDepthControl] & 1);
+        if (stencilOn)
+            ++g_stencilDraws;
+        if (capturing)
+        {
+            cap.stencilOn = stencilOn ? 1u : 0u;
+            cap.stencilRef = ref;
+            cap.stencilMask = mask;
+            cap.stencilWriteMask = wmask;
+        }
+        // ONLY WHEN THE BOUND PIPELINE DECLARES THEM DYNAMIC, which is exactly when the
+        // stencil test is on. Calling a dynamic-state setter for state a pipeline
+        // specifies STATICALLY is illegal in the other direction — `VUID-vkCmdDraw-None-
+        // 08608`, 40 of them, and the message says so plainly once read rather than
+        // guessed at: "doesn't set up VK_DYNAMIC_STATE_STENCIL_*, but since the
+        // vkCmdBindPipeline, the related dynamic state commands have been called".
+        if (!capturing && stencilOn &&
+            (noStateCache || !R->bound.haveStencil || R->bound.stencilRef != ref ||
+             R->bound.stencilMask != mask || R->bound.stencilWriteMask != wmask))
+        {
+            if (!NoDriverRecord())
+            {
+                vkCmdSetStencilReference(R->cmd, VK_STENCIL_FACE_FRONT_AND_BACK, ref);
+                vkCmdSetStencilCompareMask(R->cmd, VK_STENCIL_FACE_FRONT_AND_BACK, mask);
+                vkCmdSetStencilWriteMask(R->cmd, VK_STENCIL_FACE_FRONT_AND_BACK, wmask);
+            }
+            else
+                g_noDriverRecordSkipped += 3;
+            R->bound.stencilRef = ref;
+            R->bound.stencilMask = mask;
+            R->bound.stencilWriteMask = wmask;
+            R->bound.haveStencil = true;
+        }
+        else if (!capturing && stencilOn)
+            ++R->skips.stencil;
+    }
+
+    // The five bindless heaps never change address, so this is once per command
+    // buffer rather than once per draw — and it is the most expensive of the five.
+    // (Captured draws bind them once per INSTANCE instead — the replay's fresh
+    // BoundState makes its first draw issue them.)
+    if (!capturing && (noStateCache || !R->bound.setsBound))
+    {
+        if (!NoDriverRecord())
+            vkCmdBindDescriptorSets(R->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, R->pipeLayout,
+                                    0, 5, R->sets, 0, nullptr);
+        else
+            ++g_noDriverRecordSkipped;
+        R->bound.setsBound = true;
+    }
+    else if (!capturing)
+        ++R->skips.sets;
+
+    // The three constant-buffer addresses, then THE DRAW INDEX at offset 24 for the
+    // draw-ID pass. The index is pushed on every draw, armed or not: it costs four bytes
+    // in a call that is already being made, and a value that is only correct when an
+    // instrument is enabled is a trap for the next person to use it.
+    struct { uint64_t vs, ps, shared; uint32_t drawIndex, pad; } pushConstants = {
+        uint64_t(R->arena.address + vsConstAt),
+        uint64_t(R->arena.address + psConstAt),
+        uint64_t(R->arena.address + sharedAt),
+        uint32_t(R->drawsThisFrame), 0 };
+    if (capturing)
+        memcpy(&cap.push, &pushConstants, sizeof cap.push);
+    else if (!NoDriverRecord())
+        vkCmdPushConstants(R->cmd, R->pipeLayout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32,
+                           &pushConstants);
+    else
+        ++g_noDriverRecordSkipped;
+
+    // THE CONSTANT-SLOT RACE DETECTOR's record half. This is the right place and the only
+    // right place: the address has just been pushed, so these are exactly the bytes this
+    // draw is being recorded to read, after the memo top-up and after any miss-path
+    // patching. The check half runs at submit (see SubmitFrame).
+    if (ConstRaceOn())
+    {
+        ConstRef r;
+        r.draw = uint32_t(R->drawsThisFrame);
+        r.windowOffset = regs[xenos::kPaScWindowOffset];
+        r.vsAt = vsConstAt;
+        r.psAt = psConstAt;
+        r.vs = &vs;
+        r.ps = &ps;
+        auto snap = [](std::vector<uint32_t>& out, const uint32_t* win,
+                       const ShaderMeta& m, uint32_t bytes) {
+            if (m.aluDynamic || m.aluConsts.empty())
+            {
+                out.resize(bytes / 4);
+                memcpy(out.data(), win, bytes);
+            }
+            else
+            {
+                out.resize(m.aluConsts.size() * 4);
+                for (size_t i = 0; i < m.aluConsts.size(); i++)
+                    if (m.aluConsts[i] < 256)
+                        memcpy(out.data() + i * 4, win + m.aluConsts[i] * 4,
+                               4 * sizeof(uint32_t));
+            }
+        };
+        const uint32_t* vwin = reinterpret_cast<const uint32_t*>(R->arena.mapped + vsConstAt);
+        const uint32_t* pwin = reinterpret_cast<const uint32_t*>(R->arena.mapped + psConstAt);
+        memcpy(r.c0, vwin, sizeof r.c0);
+        snap(r.vsRegs, vwin, vs, kVsConstBytes);
+        snap(r.psRegs, pwin, ps, kPsConstBytes);
+        g_constRefs.push_back(std::move(r));
+    }
+    }   // end recordState
 
     // CW_VK_STATE_PROBE=1 — the distinct values of the state registers this renderer
     // ASSUMES rather than reads. Each of these is a place where a wrong assumption
@@ -17631,7 +18682,16 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
             Count("draw: dependent fetch stream outside the physical arena");
             continue;
         }
-        const StreamLoc loc = UploadStream(base, sva, bytes, vf.endian, 2);
+        StreamLoc loc;
+        if (resolveSample)
+        {
+            const uint64_t rs0 = NowNs();
+            loc = UploadStream(base, sva, bytes, vf.endian, 2);
+            g_resolveVNs += NowNs() - rs0;
+            ++g_resolveVCalls;
+        }
+        else
+            loc = UploadStream(base, sva, bytes, vf.endian, 2);
         if (!loc.ok())
             continue;
         // {deviceAddress.lo, deviceAddress.hi, sizeDwords, 0} — the layout the
@@ -17648,6 +18708,7 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     }
 
     // --- vertex streams -------------------------------------------------------------
+    ProfScope _pVertex(&g_prof.recordVertex);
     // CW_VK_FETCH_MEMO_CENSUS=1 — WOULD A VERTEX-FETCH MEMO BE SERVED? Ask before building.
     //
     // §6eb §3 measured the driver's own recording at 251 ns a draw and refuted item 1's
@@ -17779,56 +18840,307 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
                          indxOffset);
     }
 
-
-    // The polygon offset lives in the PIPELINE now, not here — see PipelineKey. The
-    // counter stays, because an arm with no counter cannot be shown to have engaged.
-    // Hoisted in part 76 for the reason the clip dump above was: this was a `getenv` per
-    // draw, as the first operand of an `&&`, in every run. (Capture-side since the
-    // stage-2b split: it reads registers, and it only counts.)
-    static const bool noPolyOffsetArm = EnvOn("CW_VK_NO_POLY_OFFSET");
-    if (!noPolyOffsetArm &&
-        (regs[xenos::kPaSuPolyOffsetFrontScale] || regs[xenos::kPaSuPolyOffsetFrontOffset]))
-        ++g_polyOffsetDraws;
-
-    // THE TICKET (part 7 stage 2b) — every resolved value the record core needs, filled
-    // from the walk's own locals. See DrawTicket for why this seam exists.
-    DrawTicket t;
-    t.draw = draw;
-    t.pipeline = pipeline;
-    t.viewport = viewport;
-    t.scissor = scissor;
-    for (uint32_t i = 0; i < 4; ++i)
-        t.blend[i] = F32(regs[xenos::kRbBlendRed + i]);
-    t.stencilRefMask = regs[xenos::kRbStencilRefMask];
-    t.stencilTest = (regs[xenos::kRbDepthControl] & 1) != 0;
-    t.rectSynth = rectSynth;
-    t.expand = expand;
-    t.indxOffset = indxOffset;
-    for (uint32_t i = 0; i < 3; ++i)
-        t.rectCorner[i] = rectCorner[i];
-    t.vsConstAt = vsConstAt;
-    t.psConstAt = psConstAt;
-    t.sharedAt = sharedAt;
-    t.drawIndex = uint32_t(R->drawsThisFrame);
-    t.vs = &vs;
-    t.ps = &ps;
-    t.vsHash = vsBind.hash;
-    t.psHash = psBind.hash;
+    uint32_t binding = 0;
+    bool streamsOk = true;
+    if (g_bindRunCensus)
+        BindRunCensusBeginDraw();
+    // CW_VK_RANGE_CENSUS=1 — per indexed draw, the two questions the part-33 NaN chain
+    // left: (1) do this draw's INDEX VALUES reach vertices past the fetch constant's
+    // declared size — the guard above bounds indxOffset + indexCount, which is the
+    // number of indices, not the vertices they name — and (2) do the IN-RANGE bytes of
+    // any float-format attribute already decode to NaN. On Xenos an out-of-range vfetch
+    // returns zero; our streams live in one shared arena buffer, so even
+    // robustBufferAccess cannot bound them (the binding's range is the whole arena),
+    // and an overrun reads a neighbouring stream's bytes as this draw's floats.
+    // A DIAGNOSTIC ARM: it walks every index and every vertex of every draw (gotcha 7).
+    static const bool rangeCensus = [] {
+        const char* e = getenv("CW_VK_RANGE_CENSUS");
+        return e && *e && *e != '0';
+    }();
+    struct RangeAttr { uint32_t strideDw, offsetDw, format; uint64_t bytes; const uint8_t* p; };
+    RangeAttr rangeAttrs[32];
+    uint32_t rangeAttrCount = 0;
     for (const VertexAttribute& a : vs.attributes)
     {
         if (a.location < 0 || a.indirect)
             continue;
-        if (t.nFetch == sizeof(t.fetch) / sizeof(t.fetch[0]))
+        const xenos::VertexFetch vf = xenos::DecodeVertexFetch(regs, FetchSlot(a.fetchSlot));
+        const uint32_t va = PhysToVa(vf.address);
+        const uint64_t bytes = uint64_t(vf.sizeDwords) * 4;
+        if (!GuestRangeOk(va, bytes) || !bytes)
         {
-            // Never seen (the binding cap is 16); dropped LOUDLY rather than truncated
-            // silently, because a draw missing its last attribute is a plausible wrong
-            // picture and this is a hard count.
-            Count("draw: ticket attribute overflow — draw dropped");
-            return;
+            Count("draw: vertex stream outside the physical arena");
+            streamsOk = false;
+            break;
         }
-        t.fetch[t.nFetch++] = { xenos::DecodeVertexFetch(regs, FetchSlot(a.fetchSlot)),
-                                &a };
+        // The whole fetch buffer is uploaded, so a base vertex stays inside it — but
+        // only if the guest's own numbers say it does. A draw whose offset plus count
+        // runs off the end would read another draw's vertices (or, past the arena, walk
+        // off a Vulkan buffer), and that has to be LOUD rather than quietly clamped
+        // back to zero: clamping is the defect this offset exists to fix, reintroduced
+        // wearing a safety check's name.
+        if (indxOffset && a.strideDwords)
+        {
+            const uint64_t need =
+                (uint64_t(uint32_t(indxOffset) + draw.indexCount) * a.strideDwords) * 4;
+            if (need > bytes)
+            {
+                Count("draw: VGT_INDX_OFFSET runs past the vertex stream");
+                streamsOk = false;
+                break;
+            }
+        }
+        StreamLoc loc;
+        if (resolveSample)
+        {
+            const uint64_t rs0 = NowNs();
+            loc = UploadStream(base, va, bytes, vf.endian, 0);
+            g_resolveVNs += NowNs() - rs0;
+            ++g_resolveVCalls;
+        }
+        else
+            loc = UploadStream(base, va, bytes, vf.endian, 0);
+        if (!loc.ok())
+        {
+            streamsOk = false;
+            break;
+        }
+        if (rectSynth && a.strideDwords)
+        {
+            // CW_VK_RECT_TRACE=<surfacePitch> — the CORNERS of every distinct clear
+            // rect on one EDRAM surface, printed once per distinct rect.
+            //
+            // A rect-list draw at the head of a pass IS the guest's clear, and the only
+            // way to know what it clears is to read its three corners. Part 32 needed
+            // this for the shadow cascade: the cascade's depth buffer comes out half
+            // empty, the geometry is provably submitted for all of it (CW_VK_DEPTH_ALWAYS
+            // fills it), so the question is which rectangles the title actually asked to
+            // be cleared — and that is data, not something to infer from the result.
+            static const char* const rectTraceEnv = Env("CW_VK_RECT_TRACE");
+            // A pitch of 0 means EVERY surface. Naming one pitch is right when the
+            // question is "what does this pass clear"; it is wrong when the question is
+            // "where does that rect live", and part 32 needed the second — a clear rect
+            // recorded in part 15 as the cascade's turned out to be on another surface
+            // entirely, which is only visible if the trace prints the pitch.
+            if (rectTraceEnv &&
+                (strtoul(rectTraceEnv, nullptr, 10) == 0 ||
+                 (regs[xenos::kRbSurfaceInfo] & 0x3FFF) ==
+                     uint32_t(strtoul(rectTraceEnv, nullptr, 10))))
+            {
+                const uint8_t* p = loc.bytes();
+                float c[3][2] = {};
+                bool ok = p != nullptr;
+                for (uint32_t k = 0; ok && k < 3; k++)
+                {
+                    const uint64_t at =
+                        (uint64_t(rectCorner[k]) * a.strideDwords + a.offsetDwords) * 4;
+                    if (at + 8 > bytes) { ok = false; break; }
+                    // The arena copy is ALREADY little-endian — the stream uploader
+                    // swaps on the way in. Byte-swapping again here read every corner as
+                    // 0.0, which reads as "the title asks for nothing to be cleared" and
+                    // is the opposite of what the data says.
+                    memcpy(&c[k][0], p + at, 8);
+                }
+                if (ok)
+                {
+                    static std::vector<std::string> seenRect;
+                    // OCCURRENCES AS WELL AS DISTINCT RECTS, and the distinction is the
+                    // whole question. "One distinct clear rect" and "one clear rect a
+                    // frame" are different facts: the first is consistent with the title
+                    // issuing sixteen strips that all look alike, the second says it
+                    // issues one. Part 32 needed the second to conclude that the cascade
+                    // passes clear nothing of their own.
+                    static int rectOccurrences = 0;
+                    if (rectOccurrences < 40)
+                    {
+                        ++rectOccurrences;
+                        fprintf(stderr,
+                                "[vkrect] occurrence frame=%llu (%.1f,%.1f)-(%.1f,%.1f) "
+                                "idx=%u,%u,%u\n",
+                                (unsigned long long)R->frame, c[0][0], c[0][1], c[2][0],
+                                c[2][1], rectCorner[0], rectCorner[1], rectCorner[2]);
+                    }
+                    char line[256];
+                    snprintf(line, sizeof line,
+                             "[vkrect] pitch=%u msaa=%u loc=%d fmt=%u off=%u "
+                             "stride=%u idx=%u,%u,%u  "
+                             "(%.2f,%.2f) (%.2f,%.2f) (%.2f,%.2f)  -> BL (%.2f,%.2f)  "
+                             "depthControl=%02X vte=%02X",
+                             regs[xenos::kRbSurfaceInfo] & 0x3FFF,
+                             (regs[xenos::kRbSurfaceInfo] >> 16) & 3,
+                             a.location, a.format, a.offsetDwords, a.strideDwords,
+                             rectCorner[0], rectCorner[1], rectCorner[2],
+                             c[0][0], c[0][1], c[1][0], c[1][1], c[2][0], c[2][1],
+                             c[0][0] + c[2][0] - c[1][0], c[0][1] + c[2][1] - c[1][1],
+                             regs[xenos::kRbDepthControl] & 0xFF,
+                             regs[xenos::kPaClVteCntl] & 0x3F);
+                    if (std::find(seenRect.begin(), seenRect.end(), line) ==
+                            seenRect.end() && seenRect.size() < 64)
+                    {
+                        seenRect.push_back(line);
+                        fprintf(stderr, "%s\n", line);
+                    }
+                }
+            }
+            // The synthesised four-corner stream is always in the per-frame arena, even
+            // when its source is in the cross-frame store — it is built from THIS draw's
+            // corner indices, so it is not shared and must not be persisted.
+            const VkDeviceSize four =
+                SynthRectStream(loc.bytes(), bytes, a.strideDwords, rectCorner, a.format);
+            if (four == VkDeviceSize(-1))
+            {
+                streamsOk = false;
+                break;
+            }
+            const VkDeviceSize offset = four + uint64_t(a.offsetDwords) * 4;
+            if (capturing)
+            {
+                if (binding < DrawCapture::kMaxBinds)
+                {
+                    cap.vb[binding] = R->arena.buffer;
+                    cap.vo[binding] = offset;
+                    cap.bindCount = binding + 1;
+                }
+                else
+                    ++g_prBindOverflow;   // cannot happen per the bind census; screams
+            }
+            else
+                BindVertexBufferCached(binding, R->arena.buffer, offset);
+            ++binding;
+            continue;
+        }
+        const VkDeviceSize offset = loc.at + uint64_t(a.offsetDwords) * 4;
+        if (offset >= loc.capacity())
+        {
+            Count("draw: vertex element offset past the stream");
+            streamsOk = false;
+            break;
+        }
+        if (rangeCensus && a.strideDwords && rangeAttrCount < 32)
+            rangeAttrs[rangeAttrCount++] = { a.strideDwords, a.offsetDwords,
+                                             uint32_t(a.format), bytes, loc.bytes() };
+        if (capturing)
+        {
+            if (binding < DrawCapture::kMaxBinds)
+            {
+                cap.vb[binding] = loc.handle();
+                cap.vo[binding] = offset;
+                cap.bindCount = binding + 1;
+            }
+            else
+                ++g_prBindOverflow;
+        }
+        else
+            BindVertexBufferCached(binding, loc.handle(), offset);
+        ++binding;
     }
+    if (!streamsOk)
+    {
+        // The draw is abandoned: drop the queued binds and leave the cache exactly as the
+        // previous draw left it, because none of these were issued.
+        BindBatchDiscard();
+        return;
+    }
+    if (!capturing && !g_noBindBatch)
+    {
+        BindBatchFlush();
+        ++g_bindBatchDraws;
+    }
+    // The evaluation half of CW_VK_RANGE_CENSUS, shared by the indexed branch
+    // (maxIdx = largest index VALUE) and the auto-index branch (maxIdx = count-1):
+    // the reachable-vertex question is the same, only the source of maxIdx differs.
+    auto RangeCensusEval = [&](uint32_t maxIdx) {
+            const uint32_t lastV = uint32_t(int64_t(maxIdx) + indxOffset);
+            bool over = false, nan = false;
+            uint64_t nanVerts = 0;
+            uint32_t overFmt = 0, nanFmt = 0;
+            uint64_t overBy = 0;
+            for (uint32_t k = 0; k < rangeAttrCount; k++)
+            {
+                const RangeAttr& at = rangeAttrs[k];
+                uint32_t attrDw = 1;
+                switch (at.format)
+                {
+                case xenos::kFmt_32_32_FLOAT:          attrDw = 2; break;
+                case xenos::kFmt_32_32_32_FLOAT:       attrDw = 3; break;
+                case xenos::kFmt_32_32_32_32_FLOAT:    attrDw = 4; break;
+                case xenos::kFmt_32_32:                attrDw = 2; break;
+                case xenos::kFmt_32_32_32_32:          attrDw = 4; break;
+                case xenos::kFmt_16_16_16_16:
+                case xenos::kFmt_16_16_16_16_FLOAT:    attrDw = 2; break;
+                default:                               attrDw = 1; break;
+                }
+                const uint64_t need =
+                    (uint64_t(lastV) * at.strideDw + at.offsetDw + attrDw) * 4;
+                if (need > at.bytes)
+                {
+                    over = true;
+                    overFmt = at.format;
+                    overBy = std::max(overBy, need - at.bytes);
+                }
+                // In-range NaN scan, float formats only — these bytes go into the
+                // shader as IEEE floats with no conversion to hide behind. FP16 formats
+                // are floats too: a NaN half in a 16_16_16_16_FLOAT attribute expands to
+                // a NaN float in the shader, and the first census missed them.
+                uint32_t floats = 0, halves = 0;
+                if (at.format == xenos::kFmt_32_FLOAT) floats = 1;
+                else if (at.format == xenos::kFmt_32_32_FLOAT) floats = 2;
+                else if (at.format == xenos::kFmt_32_32_32_FLOAT) floats = 3;
+                else if (at.format == xenos::kFmt_32_32_32_32_FLOAT) floats = 4;
+                else if (at.format == xenos::kFmt_16_FLOAT) halves = 1;
+                else if (at.format == xenos::kFmt_16_16_FLOAT) halves = 2;
+                else if (at.format == xenos::kFmt_16_16_16_16_FLOAT) halves = 4;
+                if ((floats || halves) && at.p)
+                {
+                    const uint64_t availV =
+                        at.bytes / 4 >= at.offsetDw + attrDw
+                            ? (at.bytes / 4 - at.offsetDw - attrDw) / at.strideDw + 1
+                            : 0;
+                    const uint64_t scanV = std::min<uint64_t>(availV, uint64_t(lastV) + 1);
+                    for (uint64_t v = 0; v < scanV; v++)
+                    {
+                        const uint8_t* fp = at.p + (v * at.strideDw + at.offsetDw) * 4;
+                        bool vNan = false;
+                        for (uint32_t c = 0; c < floats; c++)
+                        {
+                            uint32_t bits;
+                            memcpy(&bits, fp + c * 4, 4);
+                            if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x7FFFFFu))
+                                vNan = true;
+                        }
+                        for (uint32_t c = 0; c < halves; c++)
+                        {
+                            uint16_t bits;
+                            memcpy(&bits, fp + c * 2, 2);
+                            if ((bits & 0x7C00u) == 0x7C00u && (bits & 0x3FFu))
+                                vNan = true;
+                        }
+                        if (vNan)
+                        {
+                            nan = true;
+                            nanFmt = at.format;
+                            ++nanVerts;
+                        }
+                    }
+                }
+            }
+            Count("rangecensus: indexed draw walked");
+            if (over) Count("rangecensus: index values reach past a stream");
+            if (nan)  Count("rangecensus: NaN bytes IN RANGE in a float attribute");
+            static int printed = 0;
+            if ((over || nan) && printed < 40)
+            {
+                ++printed;
+                fprintf(stderr,
+                        "[range] frame=%llu vs=%016llx idx=%u maxIdx=%u base=%d "
+                        "%s%s overFmt=%u overBy=%llu nanFmt=%u nanVerts=%llu\n",
+                        (unsigned long long)R->frame,
+                        (unsigned long long)vsBind.hash, draw.indexCount, maxIdx,
+                        int(indxOffset), over ? "OVERRUN " : "", nan ? "NAN-IN-RANGE " : "",
+                        overFmt, (unsigned long long)overBy, nanFmt,
+                        (unsigned long long)nanVerts);
+            }
+    };
 
     // CW_VK_DRAW_PROBE=<vsHash> — for the first few draws with that vertex shader,
     // print the constants and the vertex data it will actually read.
@@ -18100,312 +19412,55 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
         }
     }
 
-
-    // STAGE 2c PREP: THE STREAMS RESOLVE AT CAPTURE. The pump owns every upload, the
-    // guard, the persist twins and the arena cursor exactly as it always has — what a
-    // worker will receive is a ticket whose streams are already device-resident, so
-    // the record core touches no shared-mutable stream state at all. The stream-reading
-    // censuses (range, rect trace) live here too: capture is the one place that has the
-    // locs, the registers and the guest bytes together. The recordVertex/recordIndex
-    // profile scopes stay with the work they have always measured.
-    ProfScope _pVertex(&g_prof.recordVertex);
-    bool streamsOk = true;
-    // CW_VK_RANGE_CENSUS=1 — per indexed draw, the two questions the part-33 NaN chain
-    // left: (1) do this draw's INDEX VALUES reach vertices past the fetch constant's
-    // declared size — the guard above bounds t.indxOffset + indexCount, which is the
-    // number of indices, not the vertices they name — and (2) do the IN-RANGE bytes of
-    // any float-format attribute already decode to NaN. On Xenos an out-of-range vfetch
-    // returns zero; our streams live in one shared arena buffer, so even
-    // robustBufferAccess cannot bound them (the binding's range is the whole arena),
-    // and an overrun reads a neighbouring stream's bytes as this draw's floats.
-    // A DIAGNOSTIC ARM: it walks every index and every vertex of every draw (gotcha 7).
-    static const bool rangeCensus = [] {
-        const char* e = getenv("CW_VK_RANGE_CENSUS");
-        return e && *e && *e != '0';
-    }();
-    struct RangeAttr { uint32_t strideDw, offsetDw, format; uint64_t bytes; const uint8_t* p; };
-    RangeAttr rangeAttrs[32];
-    uint32_t rangeAttrCount = 0;
-    // The ticket's fetch array is the attribute walk PRE-FILTERED and PRE-DECODED at
-    // capture time (location >= 0, not indirect, in t.vs->attributes order) — the
-    // decode's inputs are the fetch constants as of the WALK, which is the point.
-    for (uint32_t fi = 0; fi < t.nFetch; ++fi)
-    {
-        const VertexAttribute& a = *t.fetch[fi].attr;
-        const xenos::VertexFetch& vf = t.fetch[fi].vf;
-        const uint32_t va = PhysToVa(vf.address);
-        const uint64_t bytes = uint64_t(vf.sizeDwords) * 4;
-        if (!GuestRangeOk(va, bytes) || !bytes)
-        {
-            Count("draw: vertex stream outside the physical arena");
-            streamsOk = false;
-            break;
-        }
-        // The whole fetch buffer is uploaded, so a base vertex stays inside it — but
-        // only if the guest's own numbers say it does. A draw whose offset plus count
-        // runs off the end would read another draw's vertices (or, past the arena, walk
-        // off a Vulkan buffer), and that has to be LOUD rather than quietly clamped
-        // back to zero: clamping is the defect this offset exists to fix, reintroduced
-        // wearing a safety check's name.
-        if (t.indxOffset && a.strideDwords)
-        {
-            const uint64_t need =
-                (uint64_t(uint32_t(t.indxOffset) + t.draw.indexCount) * a.strideDwords) * 4;
-            if (need > bytes)
-            {
-                Count("draw: VGT_INDX_OFFSET runs past the vertex stream");
-                streamsOk = false;
-                break;
-            }
-        }
-        const StreamLoc loc = UploadStream(base, va, bytes, vf.endian, 0);
-        if (!loc.ok())
-        {
-            streamsOk = false;
-            break;
-        }
-        if (t.rectSynth && a.strideDwords)
-        {
-            // CW_VK_RECT_TRACE=<surfacePitch> — the CORNERS of every distinct clear
-            // rect on one EDRAM surface, printed once per distinct rect.
-            //
-            // A rect-list draw at the head of a pass IS the guest's clear, and the only
-            // way to know what it clears is to read its three corners. Part 32 needed
-            // this for the shadow cascade: the cascade's depth buffer comes out half
-            // empty, the geometry is provably submitted for all of it (CW_VK_DEPTH_ALWAYS
-            // fills it), so the question is which rectangles the title actually asked to
-            // be cleared — and that is data, not something to infer from the result.
-            static const char* const rectTraceEnv = Env("CW_VK_RECT_TRACE");
-            // A pitch of 0 means EVERY surface. Naming one pitch is right when the
-            // question is "what does this pass clear"; it is wrong when the question is
-            // "where does that rect live", and part 32 needed the second — a clear rect
-            // recorded in part 15 as the cascade's turned out to be on another surface
-            // entirely, which is only visible if the trace prints the pitch.
-            if (rectTraceEnv &&
-                (strtoul(rectTraceEnv, nullptr, 10) == 0 ||
-                 (regs[xenos::kRbSurfaceInfo] & 0x3FFF) ==
-                     uint32_t(strtoul(rectTraceEnv, nullptr, 10))))
-            {
-                const uint8_t* p = loc.bytes();
-                float c[3][2] = {};
-                bool ok = p != nullptr;
-                for (uint32_t k = 0; ok && k < 3; k++)
-                {
-                    const uint64_t at =
-                        (uint64_t(t.rectCorner[k]) * a.strideDwords + a.offsetDwords) * 4;
-                    if (at + 8 > bytes) { ok = false; break; }
-                    // The arena copy is ALREADY little-endian — the stream uploader
-                    // swaps on the way in. Byte-swapping again here read every corner as
-                    // 0.0, which reads as "the title asks for nothing to be cleared" and
-                    // is the opposite of what the data says.
-                    memcpy(&c[k][0], p + at, 8);
-                }
-                if (ok)
-                {
-                    static std::vector<std::string> seenRect;
-                    // OCCURRENCES AS WELL AS DISTINCT RECTS, and the distinction is the
-                    // whole question. "One distinct clear rect" and "one clear rect a
-                    // frame" are different facts: the first is consistent with the title
-                    // issuing sixteen strips that all look alike, the second says it
-                    // issues one. Part 32 needed the second to conclude that the cascade
-                    // passes clear nothing of their own.
-                    static int rectOccurrences = 0;
-                    if (rectOccurrences < 40)
-                    {
-                        ++rectOccurrences;
-                        fprintf(stderr,
-                                "[vkrect] occurrence frame=%llu (%.1f,%.1f)-(%.1f,%.1f) "
-                                "idx=%u,%u,%u\n",
-                                (unsigned long long)R->frame, c[0][0], c[0][1], c[2][0],
-                                c[2][1], t.rectCorner[0], t.rectCorner[1], t.rectCorner[2]);
-                    }
-                    char line[256];
-                    snprintf(line, sizeof line,
-                             "[vkrect] pitch=%u msaa=%u loc=%d fmt=%u off=%u "
-                             "stride=%u idx=%u,%u,%u  "
-                             "(%.2f,%.2f) (%.2f,%.2f) (%.2f,%.2f)  -> BL (%.2f,%.2f)  "
-                             "depthControl=%02X vte=%02X",
-                             regs[xenos::kRbSurfaceInfo] & 0x3FFF,
-                             (regs[xenos::kRbSurfaceInfo] >> 16) & 3,
-                             a.location, a.format, a.offsetDwords, a.strideDwords,
-                             t.rectCorner[0], t.rectCorner[1], t.rectCorner[2],
-                             c[0][0], c[0][1], c[1][0], c[1][1], c[2][0], c[2][1],
-                             c[0][0] + c[2][0] - c[1][0], c[0][1] + c[2][1] - c[1][1],
-                             regs[xenos::kRbDepthControl] & 0xFF,
-                             regs[xenos::kPaClVteCntl] & 0x3F);
-                    if (std::find(seenRect.begin(), seenRect.end(), line) ==
-                            seenRect.end() && seenRect.size() < 64)
-                    {
-                        seenRect.push_back(line);
-                        fprintf(stderr, "%s\n", line);
-                    }
-                }
-            }
-            // The synthesised four-corner stream is always in the per-frame arena, even
-            // when its source is in the cross-frame store — it is built from THIS draw's
-            // corner indices, so it is not shared and must not be persisted.
-            const VkDeviceSize four =
-                SynthRectStream(loc.bytes(), bytes, a.strideDwords, t.rectCorner, a.format);
-            if (four == VkDeviceSize(-1))
-            {
-                streamsOk = false;
-                break;
-            }
-            const VkDeviceSize offset = four + uint64_t(a.offsetDwords) * 4;
-            t.fetch[fi].buf = R->arena.buffer;
-            t.fetch[fi].off = offset;
-            continue;
-        }
-        const VkDeviceSize offset = loc.at + uint64_t(a.offsetDwords) * 4;
-        if (offset >= loc.capacity())
-        {
-            Count("draw: vertex element offset past the stream");
-            streamsOk = false;
-            break;
-        }
-        if (rangeCensus && a.strideDwords && rangeAttrCount < 32)
-            rangeAttrs[rangeAttrCount++] = { a.strideDwords, a.offsetDwords,
-                                             uint32_t(a.format), bytes, loc.bytes() };
-        t.fetch[fi].buf = loc.handle();
-        t.fetch[fi].off = offset;
-    }
-    if (!streamsOk)
-        return;   // nothing was queued or issued — the ticket simply never leaves
-    // The evaluation half of CW_VK_RANGE_CENSUS, shared by the indexed branch
-    // (maxIdx = largest index VALUE) and the auto-index branch (maxIdx = count-1):
-    // the reachable-vertex question is the same, only the source of maxIdx differs.
-    auto RangeCensusEval = [&](uint32_t maxIdx) {
-            const uint32_t lastV = uint32_t(int64_t(maxIdx) + t.indxOffset);
-            bool over = false, nan = false;
-            uint64_t nanVerts = 0;
-            uint32_t overFmt = 0, nanFmt = 0;
-            uint64_t overBy = 0;
-            for (uint32_t k = 0; k < rangeAttrCount; k++)
-            {
-                const RangeAttr& at = rangeAttrs[k];
-                uint32_t attrDw = 1;
-                switch (at.format)
-                {
-                case xenos::kFmt_32_32_FLOAT:          attrDw = 2; break;
-                case xenos::kFmt_32_32_32_FLOAT:       attrDw = 3; break;
-                case xenos::kFmt_32_32_32_32_FLOAT:    attrDw = 4; break;
-                case xenos::kFmt_32_32:                attrDw = 2; break;
-                case xenos::kFmt_32_32_32_32:          attrDw = 4; break;
-                case xenos::kFmt_16_16_16_16:
-                case xenos::kFmt_16_16_16_16_FLOAT:    attrDw = 2; break;
-                default:                               attrDw = 1; break;
-                }
-                const uint64_t need =
-                    (uint64_t(lastV) * at.strideDw + at.offsetDw + attrDw) * 4;
-                if (need > at.bytes)
-                {
-                    over = true;
-                    overFmt = at.format;
-                    overBy = std::max(overBy, need - at.bytes);
-                }
-                // In-range NaN scan, float formats only — these bytes go into the
-                // shader as IEEE floats with no conversion to hide behind. FP16 formats
-                // are floats too: a NaN half in a 16_16_16_16_FLOAT attribute expands to
-                // a NaN float in the shader, and the first census missed them.
-                uint32_t floats = 0, halves = 0;
-                if (at.format == xenos::kFmt_32_FLOAT) floats = 1;
-                else if (at.format == xenos::kFmt_32_32_FLOAT) floats = 2;
-                else if (at.format == xenos::kFmt_32_32_32_FLOAT) floats = 3;
-                else if (at.format == xenos::kFmt_32_32_32_32_FLOAT) floats = 4;
-                else if (at.format == xenos::kFmt_16_FLOAT) halves = 1;
-                else if (at.format == xenos::kFmt_16_16_FLOAT) halves = 2;
-                else if (at.format == xenos::kFmt_16_16_16_16_FLOAT) halves = 4;
-                if ((floats || halves) && at.p)
-                {
-                    const uint64_t availV =
-                        at.bytes / 4 >= at.offsetDw + attrDw
-                            ? (at.bytes / 4 - at.offsetDw - attrDw) / at.strideDw + 1
-                            : 0;
-                    const uint64_t scanV = std::min<uint64_t>(availV, uint64_t(lastV) + 1);
-                    for (uint64_t v = 0; v < scanV; v++)
-                    {
-                        const uint8_t* fp = at.p + (v * at.strideDw + at.offsetDw) * 4;
-                        bool vNan = false;
-                        for (uint32_t c = 0; c < floats; c++)
-                        {
-                            uint32_t bits;
-                            memcpy(&bits, fp + c * 4, 4);
-                            if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x7FFFFFu))
-                                vNan = true;
-                        }
-                        for (uint32_t c = 0; c < halves; c++)
-                        {
-                            uint16_t bits;
-                            memcpy(&bits, fp + c * 2, 2);
-                            if ((bits & 0x7C00u) == 0x7C00u && (bits & 0x3FFu))
-                                vNan = true;
-                        }
-                        if (vNan)
-                        {
-                            nan = true;
-                            nanFmt = at.format;
-                            ++nanVerts;
-                        }
-                    }
-                }
-            }
-            Count("rangecensus: indexed draw walked");
-            if (over) Count("rangecensus: index values reach past a stream");
-            if (nan)  Count("rangecensus: NaN bytes IN RANGE in a float attribute");
-            static int printed = 0;
-            if ((over || nan) && printed < 40)
-            {
-                ++printed;
-                fprintf(stderr,
-                        "[range] frame=%llu vs=%016llx idx=%u maxIdx=%u base=%d "
-                        "%s%s overFmt=%u overBy=%llu nanFmt=%u nanVerts=%llu\n",
-                        (unsigned long long)R->frame,
-                        (unsigned long long)t.vsHash, t.draw.indexCount, maxIdx,
-                        int(t.indxOffset), over ? "OVERRUN " : "", nan ? "NAN-IN-RANGE " : "",
-                        overFmt, (unsigned long long)overBy, nanFmt,
-                        (unsigned long long)nanVerts);
-            }
-    };
-
-
     // --- indices ---------------------------------------------------------------------
     // `recordVertex` ends here by assignment rather than by scope, because the vertex
     // section is not braced and bracing it would move a dozen locals the index section
     // reads. Same trick, one line: hand the scope a sink it can no longer reach.
     _pVertex.Close();
     ProfScope _pIndex(&g_prof.recordIndex);
-    if (t.expand != Expansion::None)
+    if (expand != Expansion::None)
     {
         // Both expansions need the source indices, so an indexed one has to have a
         // readable buffer; an auto-index one synthesises them from the vertex number.
-        if (t.draw.indexed)
+        if (draw.indexed)
         {
-            const uint64_t bytes = uint64_t(t.draw.indexCount) * (t.draw.index32 ? 4 : 2);
-            if (!GuestRangeOk(t.draw.indexVa, bytes))
+            const uint64_t bytes = uint64_t(draw.indexCount) * (draw.index32 ? 4 : 2);
+            if (!GuestRangeOk(draw.indexVa, bytes))
             {
                 Count("draw: index buffer outside the physical arena");
                 return;
             }
         }
         uint32_t expandedCount = 0;
-        const VkDeviceSize at = ExpandIndices(base, t.draw, t.expand, expandedCount);
+        const VkDeviceSize at = ExpandIndices(base, draw, expand, expandedCount);
         if (at == VkDeviceSize(-1))
             return;
-        t.path = DrawTicket::DrawPath::kExpanded;
-        t.ibuf = R->arena.buffer;
-        t.iat = at;
-        t.itype = VK_INDEX_TYPE_UINT32;
-        t.drawCount = expandedCount;
         // rectSynth already folded the base vertex into its three corners, and its
         // expanded indices name a private four-vertex stream — so offsetting again
         // would apply it twice.
-        t.baseVertex = t.rectSynth ? 0 : t.indxOffset;
+        if (capturing)
+        {
+            cap.ib = R->arena.buffer;
+            cap.io = at;
+            cap.it = VK_INDEX_TYPE_UINT32;
+            cap.drawCount = expandedCount;
+            cap.baseVertex = rectSynth ? 0 : indxOffset;
+        }
+        else
+        {
+            BindIndexBufferCached(R->arena.buffer, at, VK_INDEX_TYPE_UINT32);
+            if (!NoDriverRecord())
+                vkCmdDrawIndexed(R->cmd, expandedCount, 1, 0, rectSynth ? 0 : indxOffset,
+                                 0);
+            else
+                ++g_noDriverRecordSkipped;
+        }
     }
-    else if (t.draw.indexed)
+    else if (draw.indexed)
     {
-        const uint32_t indexBytes = t.draw.index32 ? 4 : 2;
-        const uint64_t bytes = uint64_t(t.draw.indexCount) * indexBytes;
-        if (!GuestRangeOk(t.draw.indexVa, bytes))
+        const uint32_t indexBytes = draw.index32 ? 4 : 2;
+        const uint64_t bytes = uint64_t(draw.indexCount) * indexBytes;
+        if (!GuestRangeOk(draw.indexVa, bytes))
         {
             Count("draw: index buffer outside the physical arena");
             return;
@@ -18417,7 +19472,7 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
         // geometry cannot.
         static const char* endianOverride = Env("CW_VK_INDEX_ENDIAN");
         const uint32_t endian =
-            endianOverride ? uint32_t(atoi(endianOverride)) : t.draw.indexEndian;
+            endianOverride ? uint32_t(atoi(endianOverride)) : draw.indexEndian;
         {
             static uint64_t* slots[4];
             static bool built = false;
@@ -18431,9 +19486,18 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
                     slots[i] = CounterSlot(name);
                 }
             }
-            ++*slots[t.draw.indexEndian & 3];
+            ++*slots[draw.indexEndian & 3];
         }
-        const StreamLoc loc = UploadStream(base, t.draw.indexVa, bytes, endian, 1);
+        StreamLoc loc;
+        if (resolveSample)
+        {
+            const uint64_t rs0 = NowNs();
+            loc = UploadStream(base, draw.indexVa, bytes, endian, 1);
+            g_resolveINs += NowNs() - rs0;
+            ++g_resolveICalls;
+        }
+        else
+            loc = UploadStream(base, draw.indexVa, bytes, endian, 1);
         if (!loc.ok())
             return;
         // The CW_VK_RANGE_CENSUS read-out. The index copy is little-endian by here, so
@@ -18443,57 +19507,74 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
         {
             const uint8_t* ip = loc.bytes();
             uint32_t maxIdx = 0;
-            for (uint32_t i = 0; i < t.draw.indexCount; i++)
+            for (uint32_t i = 0; i < draw.indexCount; i++)
             {
-                const uint32_t v = t.draw.index32
+                const uint32_t v = draw.index32
                     ? reinterpret_cast<const uint32_t*>(ip)[i]
                     : reinterpret_cast<const uint16_t*>(ip)[i];
-                if (v != (t.draw.index32 ? 0xFFFFFFFFu : 0xFFFFu) && v > maxIdx)
+                if (v != (draw.index32 ? 0xFFFFFFFFu : 0xFFFFu) && v > maxIdx)
                     maxIdx = v;
             }
             RangeCensusEval(maxIdx);
         }
-        t.path = DrawTicket::DrawPath::kIndexed;
-        t.ibuf = loc.handle();
-        t.iat = loc.at;
-        t.itype = t.draw.index32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
-        t.drawCount = t.draw.indexCount;
-        t.baseVertex = t.indxOffset;
+        const VkIndexType itype =
+            draw.index32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+        if (capturing)
+        {
+            cap.ib = loc.handle();
+            cap.io = loc.at;
+            cap.it = itype;
+            cap.drawCount = draw.indexCount;
+            cap.baseVertex = indxOffset;
+        }
+        else
+        {
+            BindIndexBufferCached(loc.handle(), loc.at, itype);
+            if (!NoDriverRecord())
+                vkCmdDrawIndexed(R->cmd, draw.indexCount, 1, 0, indxOffset, 0);
+            else
+                ++g_noDriverRecordSkipped;
+        }
         COUNT("draw: indexed");
     }
     else
     {
-        // Auto-index reaches vertices [t.indxOffset, t.indxOffset + count); the census
+        // Auto-index reaches vertices [indxOffset, indxOffset + count); the census
         // question is identical, with maxIdx implicit.
-        if (rangeCensus && rangeAttrCount && t.draw.indexCount)
-            RangeCensusEval(t.draw.indexCount - 1);
-        t.path = DrawTicket::DrawPath::kAuto;
-        t.drawCount = t.draw.indexCount;
-        t.baseVertex = t.indxOffset;
+        if (rangeCensus && rangeAttrCount && draw.indexCount)
+            RangeCensusEval(draw.indexCount - 1);
+        if (capturing)
+        {
+            cap.ib = VK_NULL_HANDLE;
+            cap.drawCount = draw.indexCount;
+            cap.baseVertex = indxOffset;
+        }
+        else if (!NoDriverRecord())
+            vkCmdDraw(R->cmd, draw.indexCount, 1, uint32_t(indxOffset), 0);
+        else
+            ++g_noDriverRecordSkipped;
         COUNT("draw: auto-index");
     }
-
-    _pIndex.Close();   // the capture-side index scope must not swallow the core call
-
-    // The reuse census reads the finished ticket plus the live registers — capture is
-    // the one place both exist (see namespace reusec for what it answers and why the
-    // sibling's verdict is not simply copied).
-    if (reusec::On())
-        reusec::OnDraw(t, regs, memoVsBase, memoPsBase, R->frame, R->lastFrameDraws);
-
-    // THE CORE CALL (part 7 stage 2b). Inline by default: the ticket was built just
-    // above from the same values the code that used to live here read in place, and
-    // `regs` rides along so the walk-time diagnostic arms still fire. Under
-    // CW_VK_DEFER_RECORD the ticket queues instead and the range replays it at its
-    // close — see namespace defer for the two documented divergences.
-    if (defer::On())
-        defer::Queue(base, t);
-    else
+    // The capture is complete: deposit it and cut a chunk when one is full. The order
+    // gate's raw fields are filled only when the gate is armed — the replay recomputes
+    // the id from them, so a capture scrambled across draws fails the gate.
+    if (capturing)
     {
-        RecordCtx ctx{ R->cmd, R->bound, R->skips, g_pumpBindBatch };
-        if (!RecordDrawCore(ctx, base, t, regs))
-            return;
+        if (OrderGateArmed())
+        {
+            cap.vsHash = vsBind.hash;
+            cap.psHash = psBind.hash;
+            cap.primType = uint32_t(draw.primType);
+            cap.indexVa = uint32_t(draw.indexVa);
+            cap.gateCount = draw.indexCount;
+            cap.gateIndxOffset = indxOffset;
+        }
+        R->capBuf.push_back(cap);
+        ++g_prCaptured;
+        if (R->capBuf.size() >= R->parRecChunk)
+            ParRec_Handoff();
     }
+
     // Fingerprint the draw. Order matters and is included by construction, because the
     // accumulator is sequential — two frames with the same draws in a different order
     // are correctly different frames.
@@ -18560,13 +19641,6 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     // the shaders: two adjacent draws sharing a pipeline and differing only in their index
     // range are exactly the pair a parallel recorder is most likely to transpose, and a
     // hash that could not tell them apart would pass while the picture was wrong.
-    // The parallel-record skeleton logs the SAME identity (part 7): its ranges must
-    // concatenate back to exactly this sequence, and only one definition of "this draw"
-    // can make that a statement rather than a tautology. With the gate off — every
-    // default run — the skeleton takes a COUNT instead: the first A/B (perf-part7-notes
-    // §2) measured the always-on identity hash at 0.4 ms/frame at the crowd, charged to
-    // runs in which nothing consumed it. `prec::g_on` is a plain global load, not a
-    // static-init guard (gotcha 453).
     if (OrderGateArmed())
     {
         uint64_t id = 0xCBF29CE484222325ull;
@@ -18582,10 +19656,95 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
         id = mixq(id, psBind.hash);
         R->orderLog.push_back(id);
         ++R->orderDrawsLogged;
-        prec::OnDraw(id);
     }
-    else if (prec::g_on)
-        prec::OnDrawCount();
+    // THE REUSE CENSUS'S FINGERPRINT, at the tail so only draws that actually recorded
+    // are censused (every early return above is a draw a reuse scheme could not have
+    // replayed either). Everything folded here is a register or sidecar value that is
+    // constant for the duration of this DoDraw call — see the census's own comment at
+    // its globals for what each term is and why.
+    if (g_reuseCensus)
+    {
+        uint64_t h = 0xCBF29CE484222325ull;
+        auto mix = [&h](uint64_t v) {
+            h ^= v;
+            h *= 0x100000001B3ull;
+        };
+        static_assert(sizeof(PipelineKey) % 8 == 0, "key folded as u64 words");
+        const uint64_t* kq = reinterpret_cast<const uint64_t*>(&key);
+        for (size_t i = 0; i < sizeof(PipelineKey) / 8; ++i)
+            mix(kq[i]);
+        mix((uint64_t(draw.primType) << 48) | (uint64_t(draw.indexCount) << 8) |
+            (draw.indexed ? 1 : 0) | (draw.index32 ? 2 : 0));
+        mix((uint64_t(draw.indexVa) << 32) | draw.indexEndian);
+        mix(uint64_t(uint32_t(indxOffset)));
+        static const uint32_t kStateRegs[] = {
+            xenos::kPaScWindowOffset,     xenos::kPaScWindowScissorTl,
+            xenos::kPaScWindowScissorBr,  xenos::kPaScScreenScissorTl,
+            xenos::kPaScScreenScissorBr,  xenos::kPaClVportXScale,
+            xenos::kPaClVportXOffset,     xenos::kPaClVportYScale,
+            xenos::kPaClVportYOffset,     xenos::kPaClVportZScale,
+            xenos::kPaClVportZOffset,     xenos::kRbBlendRed,
+            xenos::kRbBlendRed + 1,       xenos::kRbBlendRed + 2,
+            xenos::kRbBlendRed + 3,       xenos::kRbAlphaRef,
+            xenos::kRbStencilRefMask,     xenos::kPaClVteCntl,
+            xenos::kPaClClipCntl,         xenos::kPaSuScModeCntl,
+            xenos::kRbSurfaceInfo,        xenos::kRbColorInfo,
+            xenos::kRbDepthInfo,
+        };
+        for (uint32_t r : kStateRegs)
+            mix(regs[r]);
+        for (const VertexAttribute& a : vs.attributes)
+        {
+            if (a.fetchSlot >= 96)
+                continue;
+            const uint32_t sl = FetchSlot(a.fetchSlot);
+            mix((uint64_t(regs[xenos::kFetchConstantBase + sl * 2]) << 32) |
+                regs[xenos::kFetchConstantBase + sl * 2 + 1]);
+        }
+        for (const ShaderMeta* m : { &vs, &ps })
+            for (uint32_t c : m->tfetchConsts)
+            {
+                if (c >= 32)
+                    continue;
+                const uint32_t* tf = &regs[xenos::kFetchConstantBase + c * 6];
+                for (int i = 0; i < 6; ++i)
+                    mix(tf[i]);
+            }
+        // Everything above is the draw WITHOUT its ALU constants — the diagnosis
+        // channel that says whether the constants are what breaks identity.
+        const uint64_t hNoAlu = h;
+        // Part 88 note: for a PALETTE dynamic shader the copy is now bounded, so "the
+        // whole window" hashes MORE than is served there — a draw can read as changed
+        // when its served bytes were identical. Conservative for this census (it can
+        // only under-report reuse, and CW lead 2 is already refuted on its numbers);
+        // it cannot know the per-copy bound because the take is consumed by the copy.
+        // The ALU constants as CopyConstWindow serves them: the whole window when the
+        // gather is off or the shader is dynamic, else c0..c3 (the renderer itself reads
+        // them) plus the sidecar's list. Mirroring the upload path's own semantics is
+        // what keeps this census from answering a different question than it asks.
+        auto mixAlu = [&](const ShaderMeta& m, uint32_t winBase) {
+            const uint32_t* w = &regs[xenos::kAluConstantBase + winBase * 4];
+            if (ConstGatherOff() || m.aluDynamic)
+            {
+                for (uint32_t i = 0; i < 256 * 4; ++i)
+                    mix(w[i]);
+                return;
+            }
+            for (uint32_t i = 0; i < 16; ++i)
+                mix(w[i]);
+            for (uint32_t r2 : m.aluConsts)
+            {
+                if (r2 >= 256)
+                    continue;
+                const uint32_t* p = &w[r2 * 4];
+                mix((uint64_t(p[0]) << 32) | p[1]);
+                mix((uint64_t(p[2]) << 32) | p[3]);
+            }
+        };
+        mixAlu(vs, memoVsBase);
+        mixAlu(ps, memoPsBase);
+        reusecensus::EndDraw(h, hNoAlu, g_reuseDrawDirty);
+    }
     ++R->drawsThisFrame;
     ++R->drawsThisPass;
     // Unconditional, and it costs exactly what the line above it costs. Gating it on the
@@ -18597,16 +19756,13 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     // a static-init guard, so an ordinary run pays one predictable branch here.
     if (g_gpPassSeg >= 0)
     {
-        // The draw's own scissor, not the bound cache's: since the stage-2b split this
-        // tail runs at CAPTURE time, where R->bound still holds the previous range's
-        // state under deferral. Identical values on the inline path.
-        const uint64_t px = uint64_t(scissor.extent.width) *
-                            uint64_t(scissor.extent.height);
+        const uint64_t px = uint64_t(R->bound.scissor.extent.width) *
+                            uint64_t(R->bound.scissor.extent.height);
         if (px > g_gpPassExtPx)
         {
             g_gpPassExtPx = px;
-            g_gpPassExt = (uint64_t(scissor.extent.width) << 32) |
-                          scissor.extent.height;
+            g_gpPassExt = (uint64_t(R->bound.scissor.extent.width) << 32) |
+                          R->bound.scissor.extent.height;
         }
     }
     R->verticesThisPass += draw.indexCount;
@@ -18615,6 +19771,51 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
 // ===================================================================================
 // Resolve
 // ===================================================================================
+// The deferred clears' EARLY-FLUSH fallback (part 90). Correctness must never depend
+// on the "next pass opens before anything reads EDRAM" ordering, so every EDRAM
+// reader calls this first: pendings still outstanding are emitted NOW through a
+// self-contained mini instance (the part-32 scoped-clear shape, but one instance for
+// ALL pendings, and only on this rare path). The caller names the counter so the
+// census can say WHICH reader forced it — a fallback with no counter is a fallback
+// nobody can tell fired (gotcha 151), and the §1 kill threshold reads these.
+void FlushPendingClears(const char* counterName)
+{
+    if (!R || R->pendingClears.empty())
+        return;
+    // Outside any instance by construction at every call site; if not recording,
+    // nothing that could read EDRAM is being recorded either, so staying latched is
+    // both safe and correct.
+    if (!R->recording || R->rendering)
+        return;
+    GpuSeg _g(kGpResolveClear);
+    Barrier(R->cmd, R->color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_ASPECT_COLOR_BIT);
+    Barrier(R->cmd, R->depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+    VkRenderingAttachmentInfo colorAtt{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+    colorAtt.imageView = R->color.view;
+    colorAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAtt.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    colorAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingAttachmentInfo depthAtt{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+    depthAtt.imageView = R->depth.view;
+    depthAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    depthAtt.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    depthAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo ri{ VK_STRUCTURE_TYPE_RENDERING_INFO };
+    ri.renderArea = { { 0, 0 }, { R->color.width, R->color.height } };
+    ri.layerCount = 1;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &colorAtt;
+    ri.pDepthAttachment = &depthAtt;
+    ri.pStencilAttachment = &depthAtt;
+    vkCmdBeginRendering(R->cmd, &ri);
+    EmitPendingClears(R->cmd, R->pendingClears.data(), R->pendingClears.size());
+    vkCmdEndRendering(R->cmd);
+    R->pendingClears.clear();
+    Count(counterName);
+}
+
 // A resolve is a DRAW whose RB_MODECONTROL edram_mode is kCopy (6) — not a packet of
 // its own, and not "a draw with a particular shader pair bound". Gating on the shader
 // pair recognises only the one blit the present path happens to use and silently drops
@@ -19111,11 +20312,109 @@ void DoResolve(uint8_t* base, const uint32_t* regs)
             // The source EDRAM buffer, and the aspect that goes with it. A depth
             // resolve copies out of R->depth: the whole point of reading
             // copy_src_select is that these two are different pictures.
-            Image& src = fromDepth ? R->depth : R->color;
+            //
+            // CW_VK_MSAA: a multisampled image cannot be vkCmdCopyImage'd into a
+            // single-sample snapshot. Colour resolves in place of the copy below;
+            // DEPTH has no vkCmdResolveImage, so it goes through a zero-draw
+            // rendering pass whose resolve attachment writes R->depthResolve, and
+            // the existing copy then reads THAT image with the same offsets (it is
+            // the EDRAM's extent exactly).
+            const bool msaaOn = R->msaaSamples != VK_SAMPLE_COUNT_1_BIT;
+            Image& src = fromDepth ? (msaaOn ? R->depthResolve : R->depth) : R->color;
             const VkImageAspectFlags aspect =
                 fromDepth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
             BeginFrame();
             EndRendering();
+            // A deferred clear still outstanding here means a clear-then-copy with no
+            // pass in between; the copy must see the cleared pixels, so emit it now.
+            FlushPendingClears("clear: deferred FLUSHED for a resolve copy");
+            if (msaaOn && fromDepth)
+            {
+                // The depth resolve is REGIONAL: dynamic rendering resolves exactly
+                // the renderArea, so only the rectangle this copy needs is paid for.
+                // Charged to the resolve-copy class — it IS the resolve's device work.
+                GpuSeg _gdr(kGpResolveCopy);
+                Barrier(R->cmd, R->depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                        VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+                // The RESOLVE TARGET's barrier is written out rather than going through
+                // Barrier(), because the resolve-attachment WRITE at vkCmdEndRendering is
+                // performed at COLOR_ATTACHMENT_OUTPUT with COLOR_ATTACHMENT_WRITE access
+                // — even for a DEPTH resolve attachment — and LayoutMasks' depth-
+                // attachment scope (EARLY|LATE fragment tests, DS access) does not cover
+                // it. Sync validation reported exactly that, 10 WRITE-AFTER-WRITE hazards
+                // against this image, on this arm's first gate run. The dst scope below
+                // is the union of both models. (This one site bypasses the
+                // CW_VK_BARRIER_POISON/WIDE arms — a stated caveat, not an oversight.)
+                {
+                    VkImageMemoryBarrier bb{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+                    bb.oldLayout = R->depthResolve.layout;
+                    bb.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+                    bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    bb.image = R->depthResolve.image;
+                    bb.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT |
+                                                VK_IMAGE_ASPECT_STENCIL_BIT,
+                                            0, 1, 0, 1 };
+                    VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+                    bb.srcAccessMask = 0;
+                    LayoutMasks(bb.oldLayout, srcStage, bb.srcAccessMask);
+                    const VkPipelineStageFlags dstStage =
+                        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                        VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+                    bb.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                                       VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                    vkCmdPipelineBarrier(R->cmd, srcStage, dstStage, 0, 0, nullptr, 0,
+                                         nullptr, 1, &bb);
+                    R->depthResolve.layout = bb.newLayout;
+                    ++g_barrierN;
+                }
+                VkRenderingAttachmentInfo da{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+                da.imageView = R->depth.view;
+                da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+                da.resolveMode = R->depthResolveMode;
+                da.resolveImageView = R->depthResolve.view;
+                da.resolveImageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+                da.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                VkRenderingInfo rri{ VK_STRUCTURE_TYPE_RENDERING_INFO };
+                rri.renderArea = { { RZxi(int32_t(copyX)), RZyi(int32_t(copyY)) },
+                                   { RZx(copyW), RZ(copyH) } };
+                rri.layerCount = 1;
+                rri.pDepthAttachment = &da;
+                rri.pStencilAttachment = &da;
+                vkCmdBeginRendering(R->cmd, &rri);
+                vkCmdEndRendering(R->cmd);
+                // ...and straight to TRANSFER_SRC for the copy below, mirrored: the
+                // SOURCE scope must also name the resolve write's
+                // COLOR_ATTACHMENT_OUTPUT/COLOR_ATTACHMENT_WRITE model, which
+                // LayoutMasks' depth-attachment entry does not. Emitted here so the
+                // generic Barrier() in the copy block early-returns on the layout.
+                {
+                    VkImageMemoryBarrier bb{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+                    bb.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+                    bb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                    bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    bb.image = R->depthResolve.image;
+                    bb.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT |
+                                                VK_IMAGE_ASPECT_STENCIL_BIT,
+                                            0, 1, 0, 1 };
+                    bb.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                                       VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                    bb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    vkCmdPipelineBarrier(R->cmd,
+                                         VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                             VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                                         0, nullptr, 1, &bb);
+                    R->depthResolve.layout = bb.newLayout;
+                    ++g_barrierN;
+                }
+                Count("resolve: depth resolved out of the multisampled EDRAM");
+            }
             // The whole resolve's device work is one segment, barriers included. The first
             // version timed only the `vkCmdCopyImage` and left the two layout transitions
             // in the residual, where they are indistinguishable from work nobody wrapped —
@@ -19149,9 +20448,31 @@ void DoResolve(uint8_t* base, const uint32_t* regs)
             // designable once you know how many pixels it moves — 48.9 resolves a frame at
             // an unknown extent is not a number anyone can act on.
             g_gpResolvePixels += uint64_t(RZx(copyW)) * uint64_t(RZ(copyH));
-            vkCmdCopyImage(R->cmd, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           it->second.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                           1, &copy);
+            if (g_copyCensusOn)
+                CopyCensusCopy(key, RZxi(int32_t(dstX)), RZyi(int32_t(dstY)),
+                               RZx(copyW), RZ(copyH),
+                               uint64_t(RZx(copyW)) * uint64_t(RZ(copyH)));
+            if (msaaOn && !fromDepth)
+            {
+                // The MSAA resolve, where the single-sample renderer copies. Same
+                // region, same layouts; VkImageResolve is field-for-field the copy
+                // struct. This is the plan's 1:1 mapping made literal: the guest's
+                // RB_COPY *is* the resolve (docs/msaa-plan.md §1).
+                VkImageResolve rv{};
+                rv.srcSubresource = copy.srcSubresource;
+                rv.srcOffset = copy.srcOffset;
+                rv.dstSubresource = copy.dstSubresource;
+                rv.dstOffset = copy.dstOffset;
+                rv.extent = copy.extent;
+                vkCmdResolveImage(R->cmd, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                  it->second.image.image,
+                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rv);
+                Count("resolve: colour resolved out of the multisampled EDRAM");
+            }
+            else
+                vkCmdCopyImage(R->cmd, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               it->second.image.image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
             // RT STAGE 2's INJECTION EXPERIMENT (part 64; rt-and-fov-plan.md §3,
             // route (a)). CW_VK_SHADOW_FILL=<depth 0..1> overwrites the shadow
             // ATLAS snapshot's depths with a constant right after each cascade
@@ -19243,6 +20564,10 @@ void DoResolve(uint8_t* base, const uint32_t* regs)
                     if (cube != R->cubeSnapshots.end())
                     {
                         GpuSeg _gc(kGpCubeFace);
+                        // The cube assembly consumes this face's copy (the cube's own
+                        // sampling is a separate question the census does not fold in).
+                        if (g_copyCensusOn)
+                            CopyCensusSampled(key);
                         CopyFaceIntoCube(R->cmd, it->second, cube->second,
                                          owner->second.second);
                         cube->second.frameSeen = R->frame;
@@ -19266,6 +20591,79 @@ void DoResolve(uint8_t* base, const uint32_t* regs)
 
     BeginFrame();
     EndRendering();
+
+    // DEFERRED SCOPED CLEARS — the part-90 default (perf-plan-part90.md §1). The old
+    // mechanism honoured the copy block's clear bits with a whole-EDRAM
+    // vkCmdClear{Color,DepthStencil}Image: 83.8 clears a frame writing 590 Mpixel for
+    // the 33.9 the passes rendered, 0.615 ms/frame of GPU at the crowd, plus a
+    // TRANSFER_DST layout round-trip each. On Xenos a copy block's clear clears the
+    // tiles of the CURRENT SURFACE, so the scoped rect is the more faithful form, not
+    // less (the part-32 scoped arm measured scoped == full to four decimals on the
+    // cascade statistic). The clear is LATCHED here and emitted as a
+    // vkCmdClearAttachments at the head of the next pass's first instance — an
+    // instance that already exists under both arms, which is what the part-32 arm
+    // lacked (its dedicated mini-scope per clear cost 0.51 ms/frame of pump time, the
+    // wash part 80 §1 item 4 records). Anything that reads EDRAM first flushes the
+    // pendings (see FlushPendingClears); a resolve extent of zero latches the FULL
+    // extent, so the un-scopable case degrades to exactly the old pixels.
+    // CW_VK_NO_DEFERRED_CLEAR=1 is the same-binary control arm and restores the old
+    // paths byte for byte (including CW_VK_SCOPED_CLEAR's).
+    static const bool deferredClearOff = [] {
+        const bool off = EnvOn("CW_VK_NO_DEFERRED_CLEAR");
+        fprintf(stderr,
+                off ? "[vk] CW_VK_NO_DEFERRED_CLEAR=1 — resolve clears take the OLD "
+                      "whole-EDRAM path (the control arm)\n"
+                    : "[vk] resolve clears are DEFERRED and SCOPED (part 90 default; "
+                      "CW_VK_NO_DEFERRED_CLEAR=1 is the control arm)\n");
+        return off;
+    }();
+    // CW_VK_DEFER_FULL_RECT=1 — DIAGNOSTIC: defer the clear (same latch, same emission
+    // point, same ordering) but with the FULL-image rect, i.e. the old pixels through
+    // the new mechanism. This is the two-factor bisection for any picture complaint
+    // against the deferred clears: an artifact that vanishes under it indicts the
+    // SCOPING; one that survives indicts the deferral/ordering itself. It EARNED ITS
+    // KEEP on day one: the operator's giant-sun-glow blow-out vanished under it and
+    // under CW_VK_NO_DEFERRED_CLEAR while tracking the shipped default exactly
+    // (an A/B/A by eye), which is what convicted the resolve-window scoping below.
+    static const bool deferFullRect = [] {
+        const bool on = EnvOn("CW_VK_DEFER_FULL_RECT");
+        if (on)
+            fprintf(stderr, "[vk] CW_VK_DEFER_FULL_RECT=1 — deferred clears use the "
+                            "FULL-image rect (the scoping-vs-ordering diagnostic)\n");
+        return on;
+    }();
+    // THE SCOPED RECT IS THE DESTINATION SURFACE'S FOOTPRINT, NOT THE RESOLVE WINDOW.
+    // On Xenos the copy block's clear bits clear the tiles of the CURRENT SURFACE —
+    // the whole surface, pitch x height, not just the window the resolve copied. The
+    // first shipped form scoped to the resolve window and the operator convicted it
+    // the same day with an A/B/A: a view-dependent giant sun glow (the title's
+    // sun-visibility machinery reading EDRAM regions inside the surface footprint but
+    // outside the resolve window — regions the whole-image clear had always wiped).
+    // The surface footprint contains the resolve window by construction
+    // (copyX+copyW <= w, copyY+copyH <= h), starts at the EDRAM origin where every
+    // surface is laid out, and still removes the tall-EDRAM territory (the 1024-row
+    // shadow band) plus everything beyond the surface from the class.
+    //
+    // THE MSAA FACTOR IS NOT OPTIONAL: a 4x surface's coordinates are in PIXELS while
+    // our EDRAM stand-in is at SAMPLE resolution, twice as wide and twice as tall —
+    // the draw path scales every window coordinate by exactly this factor, so the
+    // footprint scales with it (gotcha 506).
+    const uint32_t clearMsaa = (regs[xenos::kRbSurfaceInfo] >> 16) & 3;
+    const uint32_t clearAxisScale = clearMsaa == 2 ? 2u : 1u;
+    const auto scopedRect = [&](const Image& im) {
+        VkRect2D r{};
+        if (w && h && !deferFullRect)
+        {
+            r.offset = { 0, 0 };
+            r.extent = { std::min(RZx(w * clearAxisScale), im.width),
+                         std::min(RZ(h * clearAxisScale), im.height) };
+        }
+        else
+            r.extent = { im.width, im.height };
+        return r;
+    };
+    if (clearMsaa == 2 && (clearColor || clearDepth))
+        COUNT("resolve: clear rect scaled for a 4x MSAA surface");
 
     if (clearColor)
     {
@@ -19309,6 +20707,25 @@ void DoResolve(uint8_t* base, const uint32_t* regs)
             value.float32[2] = 1.0f;
             value.float32[3] = 1.0f;
         }
+        if (!deferredClearOff)
+        {
+            // The census counters keep their old meaning under both arms: FULL is what
+            // the whole-image mechanism would write, SCOPED what the rect covers.
+            ++g_gpClearN;
+            g_gpClearFullPixels += uint64_t(R->color.width) * uint64_t(R->color.height);
+            const VkRect2D rect = scopedRect(R->color);
+            g_gpClearScopedPixels += uint64_t(rect.extent.width) * rect.extent.height;
+            if (rect.extent.width && rect.extent.height)
+            {
+                PendingClear p{};
+                p.isColor = true;
+                p.value.color = value;
+                p.rect = rect;
+                R->pendingClears.push_back(p);
+            }
+            COUNT("resolve: colour clear deferred (scoped)");
+        }
+        else
         {
             // The transition INTO transfer-dst is inside the segment on purpose: a clear
             // that forces a layout change is not separable from the change, and charging
@@ -19326,8 +20743,8 @@ void DoResolve(uint8_t* base, const uint32_t* regs)
             VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
             vkCmdClearColorImage(R->cmd, R->color.image,
                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &value, 1, &range);
+            COUNT("resolve: colour cleared");
         }
-        COUNT("resolve: colour cleared");
     }
     if (clearDepth)
     {
@@ -19358,6 +20775,23 @@ void DoResolve(uint8_t* base, const uint32_t* regs)
                 fprintf(stderr, "[vk] RB_DEPTH_CLEAR = %08X  (depth %.6f, stencil %u)\n",
                         dc, value.depth, value.stencil);
             }
+        }
+        if (!deferredClearOff)
+        {
+            ++g_gpClearN;
+            g_gpClearFullPixels += uint64_t(R->depth.width) * uint64_t(R->depth.height);
+            const VkRect2D rect = scopedRect(R->depth);
+            g_gpClearScopedPixels += uint64_t(rect.extent.width) * rect.extent.height;
+            if (rect.extent.width && rect.extent.height)
+            {
+                PendingClear p{};
+                p.isColor = false;
+                p.value.depthStencil = value;
+                p.rect = rect;
+                R->pendingClears.push_back(p);
+            }
+            COUNT("resolve: depth clear deferred (scoped)");
+            return;
         }
         if (!Barrier(R->cmd, R->depth, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                      VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
@@ -19463,7 +20897,46 @@ int VkRenderer_RtUnavailableReason()
 
 bool VkRenderer_Active() { return g_active; }
 
+// D.4's enqueue seam, called by pm4.cpp's BindShader once per distinct hash per run
+// (inside its announce-once block, so this is never on the per-bind path). Pump thread.
+void VkRenderer_OnShaderBind(uint32_t type, uint64_t hash, const uint8_t* code,
+                             uint32_t sizeDwords)
+{
+    if (!g_active)
+        return;
+    shaderjit::OnFirstBind(type, hash, code, sizeDwords);
+}
+
 namespace {
+
+// CW_VK_MSAA's single-sample companions, created beside the (now multisampled) EDRAM
+// pair at bring-up and at every live rescale. A no-op returning true at 1x, so the
+// control arm allocates nothing. `colorResolve` is TRANSFER_DST (vkCmdResolveImage
+// writes it on the present fallback) + TRANSFER_SRC (the readback/blit reads it);
+// `depthResolve` is a DEPTH_STENCIL_ATTACHMENT because the only defined way to resolve
+// a depth image is a resolve attachment on a rendering pass (vkCmdResolveImage is
+// colour-only), + TRANSFER_SRC for the snapshot copy that follows.
+bool CreateEdramResolveTargets(uint32_t hostW, uint32_t hostH)
+{
+    if (R->msaaSamples == VK_SAMPLE_COUNT_1_BIT)
+        return true;
+    // SAMPLED on the colour companion is not read by anything — it is there because
+    // CreateImage unconditionally builds a VkImageView and a view requires at least
+    // one view-capable usage bit (VUID-VkImageViewCreateInfo-image-04441, caught by
+    // the very first validation run of this arm).
+    if (!CreateImage(R->colorResolve, hostW, hostH, VK_FORMAT_R8G8B8A8_UNORM,
+                     VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                         VK_IMAGE_USAGE_SAMPLED_BIT,
+                     VK_IMAGE_ASPECT_COLOR_BIT) ||
+        !CreateImage(R->depthResolve, hostW, hostH, EdramDepthFormat(),
+                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                     VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
+        return false;
+    NameImage(R->colorResolve, "EDRAM colour RESOLVE %ux%u", hostW, hostH);
+    NameImage(R->depthResolve, "EDRAM depth RESOLVE %ux%u", hostW, hostH);
+    return true;
+}
 
 // Device bring-up, shared by both feeds. Sets g_active on success; which feed owns
 // the renderer is the CALLER's declaration (g_d3dMode), not decided here.
@@ -19497,7 +20970,8 @@ bool InitCommon()
                      VK_FORMAT_R8G8B8A8_UNORM,
                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                          VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                     VK_IMAGE_ASPECT_COLOR_BIT) ||
+                     VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_VIEW_TYPE_2D, 1, 1,
+                     VkComponentMapping{}, 1, false, R->msaaSamples) ||
         // TRANSFER_SRC because 18.4% of this title's resolves copy out of the DEPTH
         // buffer rather than the colour one (its shadow cascades and the scene depth
         // its depth-of-field pass reads back) — see DoResolve.
@@ -19507,12 +20981,15 @@ bool InitCommon()
         // decision, and `CW_VK_RT=0` — the master arm since part 64 — must stay a
         // bit-for-bit description of the pre-RT renderer.
         !CreateImage(R->depth, RSX(R->targetWidth), RS(edramH),
-                     VK_FORMAT_D24_UNORM_S8_UINT,
+                     EdramDepthFormat(),
                      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
                          VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                          VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                          (R->rtEnabled ? VK_IMAGE_USAGE_SAMPLED_BIT : 0u),
-                     VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
+                     VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
+                     VK_IMAGE_VIEW_TYPE_2D, 1, 1, VkComponentMapping{}, 1, false,
+                     R->msaaSamples) ||
+        !CreateEdramResolveTargets(RSX(R->targetWidth), RS(edramH)))
     {
         fprintf(stderr, "[vk] render target creation FAILED\n");
         return false;
@@ -19953,6 +21430,11 @@ bool InitCommon()
     if (!LoadShaders())
         return false;
 
+    // PRE-WARM, here and not later: after the shaders exist (the keys name them by hash)
+    // and before the guest has drawn anything, so every pipeline this session needs is
+    // already built when the first frame asks for one. See PrewarmPipelines.
+    PrewarmPipelines();
+
     R->presentPixels.resize(size_t(RSX(R->targetWidth)) * RS(R->targetHeight) * 4);
     g_texCensus = EnvOn("CW_VK_TEX_CENSUS");
     g_dimCensus = EnvOn("CW_VK_DIM_CENSUS");
@@ -19965,6 +21447,10 @@ bool InitCommon()
     // column from exactly the captures an operator takes.
     g_passInputsWanted = Env("CW_VK_PSBIND") || Env("CW_VK_DRAW_CENSUS") ||
                          Env("CW_VK_RESOLVE_TRACE") || Env("CW_CAPTURE_KEY");
+    g_copyCensusOn = EnvOn("CW_VK_COPY_CENSUS");
+    if (g_copyCensusOn)
+        fprintf(stderr, "[vk] CW_VK_COPY_CENSUS=1 — resolve-copy produced-vs-sampled "
+                        "census ARMED (part 90 item 2; a diagnostic arm)\n");
     if (const char* n = Env("CW_VK_DIM_DISAGREE"))
     {
         g_dimDisagree = true;
@@ -19994,6 +21480,42 @@ bool InitCommon()
     // `std::unordered_map` exactly and the verify arm runs both and compares.
     g_constMemoOff = EnvOn("CW_VK_NO_CONST_MEMO");
     g_fetchMemoCensus = EnvOn("CW_VK_FETCH_MEMO_CENSUS");
+    g_resolveSplitCensus = EnvOn("CW_VK_RESOLVE_SPLIT_CENSUS");
+    // PARALLEL RECORD (part 89). ON BY DEFAULT since its 3v3 (dominant crowd band
+    // 13.00 -> 11.20 ms, −13.9% / −1.80 ms; §6ej) — CW_VK_NO_PAR_RECORD=1 is the
+    // same-binary control arm, per part 87 §3's rule. It refuses two combinations
+    // out loud rather than half-engaging: no workers means the pump would capture
+    // and replay everything itself for pure overhead, and CW_VK_NO_DRIVER_RECORD's
+    // measurement would be silently distorted by a path whose whole point is moving
+    // those calls. (CW_VK_PAR_RECORD=1 is accepted and redundant, kept so the 3v3's
+    // arm spelling still means what it meant.)
+    if (!EnvOn("CW_VK_NO_PAR_RECORD"))
+    {
+        if (NoDriverRecord())
+            fprintf(stderr, "[vk] parallel record OFF: CW_VK_NO_DRIVER_RECORD is "
+                            "set and the two instruments measure the same calls\n");
+        else if (!GuardPoolWorkers())
+            fprintf(stderr, "[vk] parallel record OFF: no worker pool "
+                            "(CW_WORKERS=0 or CW_VK_NO_PARALLEL_GUARD) — the serial "
+                            "path is the control arm, not a degraded mode\n");
+        else
+        {
+            R->parRec = true;
+            const char* cs = Env("CW_VK_RECORD_CHUNK");
+            if (cs && atoi(cs) > 0)
+                R->parRecChunk = uint32_t(atoi(cs));
+            R->capBuf.reserve(R->parRecChunk);
+            fprintf(stderr,
+                    "[vk] parallel command recording ON (default since part 89): "
+                    "chunks of %u draws to %u shared guard-pool workers, resolve "
+                    "serial, order gated. CW_VK_NO_PAR_RECORD=1 is the control arm; "
+                    "CW_VK_RECORD_CHUNK=N tunes.\n",
+                    R->parRecChunk, GuardPoolWorkers());
+        }
+    }
+    else
+        fprintf(stderr, "[vk] CW_VK_NO_PAR_RECORD=1 — parallel record OFF (the "
+                        "part-88 serial recorder, same binary)\n");
     g_bindRunCensus = EnvOn("CW_VK_BIND_RUN_CENSUS");
     g_guardCensus = EnvOn("CW_VK_GUARD_CENSUS");
     g_noBindBatch = EnvOn("CW_VK_NO_BIND_BATCH");
@@ -20002,6 +21524,24 @@ bool InitCommon()
     if (g_verifyBindPoison)
         g_verifyBindBatch = true;
     g_streamDedupCensus = EnvOn("CW_VK_STREAM_DEDUP_CENSUS");
+    g_reuseCensus = EnvOn("CW_VK_REUSE_CENSUS");
+    if (g_reuseCensus)
+    {
+        reusecensus::prev.reserve(16384);
+        reusecensus::cur.reserve(16384);
+        g_reuseCopiedKeys.reserve(8192);
+        fprintf(stderr,
+                "[reuse] CW_VK_REUSE_CENSUS=1 — the cross-frame draw-identity census is "
+                "ON (CW lead 2's ask-first step). A DIAGNOSTIC ARM: it hashes ~0.5-1 KB "
+                "of registers per draw on the pump thread. NEVER quote a frame time from "
+                "this run.\n");
+    }
+    g_paletteCensus = EnvOn("CW_VK_PALETTE_EXTENT_CENSUS");
+    if (g_paletteCensus)
+        fprintf(stderr,
+                "[palcensus] CW_VK_PALETTE_EXTENT_CENSUS=1 — the bone-palette bounded-"
+                "gather census is ON (part 88 step 0). A DIAGNOSTIC ARM; it changes no "
+                "copy and no frame time from this run is quotable.\n");
     g_constMemoVerify = EnvOn("CW_VK_VERIFY_CONST_MEMO");
     g_constMemoVerifyPoison = EnvOn("CW_VK_VERIFY_CONST_MEMO_POISON");
     if (g_constMemoVerifyPoison)
@@ -20236,7 +21776,22 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
     // genuine 3,000-draw window in the other arm. It costs one counter read a frame.
     {
         static const int fpsLogSec = Env("CW_FPS_LOG") ? atoi(Env("CW_FPS_LOG")) : 0;
-        if (fpsLogSec > 0)
+
+        // CW_VK_FRAME_TRACE LIVES INSIDE THIS BLOCK AND MUST NOT DEPEND ON CW_FPS_LOG.
+        //
+        // It used to. docs/instruments.md documents the trace as a standalone
+        // instrument, and arming it alone produced an empty file, no rows, and not even
+        // its own "CANNOT WRITE" diagnostic — because that message is inside the same
+        // dead block. An operator played for an hour to capture a stutter and the file
+        // was never opened.
+        //
+        // This is gotcha 418's exact shape, which the comment forty lines below names:
+        // "the counter that was gated behind an expensive instrument and therefore never
+        // on when the thing it measures happened". It was written about the pipeline
+        // timer and applied here unnoticed.
+        static const bool traceArmed = Env("CW_VK_FRAME_TRACE") &&
+                                       *Env("CW_VK_FRAME_TRACE") != '\0';
+        if (fpsLogSec > 0 || traceArmed)
         {
             using clk = std::chrono::steady_clock;
             static clk::time_point windowStart = clk::now();
@@ -20302,6 +21857,11 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
                     if (!f || !*f)
                         return nullptr;
                     FILE* h = fopen(f, "w");
+                    // ANNOUNCE IT. An instrument that can be armed and silently record
+                    // nothing costs whoever armed it the entire session before they find
+                    // out — which is exactly what happened here.
+                    fprintf(stderr, "[vk] CW_VK_FRAME_TRACE: %s -> %s\n", f,
+                            h ? "open, one row per presented frame" : "FAILED TO OPEN");
                     if (h)
                         fprintf(h, "frame draws wallUs walkUs recordUs fenceUs sleepUs "
                                    "residualUs gpuUs texUploads texKB texUpUs "
@@ -20361,8 +21921,19 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
                 if (trace)
                 {
                     static ProfilePhases prevPhase{};
+                    // `now - prev` UNSIGNED, with a guard, because the counters it reads
+                    // are ZEROED by CW_VK_PROFILE's periodic window report. Without the
+                    // guard the frame after each window prints 18446744073709 us — a
+                    // wrapped negative — and a reader scanning for the worst frames finds
+                    // six impossible ones at the top of every sorted list. That happened:
+                    // it cost a pass over this data to notice the top six rows were the
+                    // instrument and not the game.
+                    //
+                    // Zero, not the raw wrap: after a reset the true delta is unknown, and
+                    // 0 is the only answer that cannot be mistaken for a measurement. The
+                    // frame is still emitted, so nothing is silently dropped.
                     auto d = [](uint64_t now, uint64_t& prev) {
-                        const uint64_t v = now - prev;
+                        const uint64_t v = now >= prev ? now - prev : 0;
                         prev = now;
                         return (unsigned long long)(v / 1000);
                     };
@@ -20404,7 +21975,7 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
             }
             const double elapsed =
                 std::chrono::duration<double>(now - windowStart).count();
-            if (elapsed >= double(fpsLogSec) && frames > 1)
+            if (fpsLogSec > 0 && elapsed >= double(fpsLogSec) && frames > 1)
             {
                 // The first sample of a window is the gap ACROSS the window boundary and
                 // belongs to neither; dropping it costs one frame in a few hundred.
@@ -20475,7 +22046,22 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
     auto frontSnap = R->snapshots.find(R->frontBuffer & 0x1FFFFFFF);
     if (frontSnap == R->snapshots.end())
         R->haveFrontSnapshot = false;
-    Image& source = R->haveFrontSnapshot ? frontSnap->second.image : R->color;
+    // CW_VK_MSAA: the raw-EDRAM fallback cannot blit or read back a multisampled
+    // image, so it presents through the single-sample companion, filled by the
+    // resolve a few lines below. The snapshot path is untouched — snapshots are
+    // the resolve OUTPUT and stay single-sample.
+    const bool msaaFallback =
+        !R->haveFrontSnapshot && R->msaaSamples != VK_SAMPLE_COUNT_1_BIT;
+    Image& source = R->haveFrontSnapshot ? frontSnap->second.image
+                    : msaaFallback       ? R->colorResolve
+                                         : R->color;
+    // The present consumes the front-buffer snapshot's last copy.
+    if (g_copyCensusOn && R->haveFrontSnapshot)
+        CopyCensusSampled(R->frontBuffer & 0x1FFFFFFF);
+    // The raw-EDRAM fallback is one of the three EDRAM readers, so a deferred clear
+    // still pending must land before the blit/readback samples it.
+    if (!R->haveFrontSnapshot)
+        FlushPendingClears("clear: deferred FLUSHED for the EDRAM present fallback");
     // The raw-EDRAM fallback presents the FRAME's extent, not the EDRAM image's. Those
     // stopped being the same number when the EDRAM grew to hold the 1024-row shadow
     // cascade, and reading back the whole image would hand the window a 1280x1024
@@ -20487,6 +22073,22 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
     const uint32_t height0 = RS(R->haveFrontSnapshot ? R->frontHeight : R->targetHeight);
     Count(R->haveFrontSnapshot ? "swap: presented the front-buffer resolve"
                                : "swap: presented raw EDRAM (no resolve matched)");
+    if (msaaFallback)
+    {
+        Barrier(R->cmd, R->color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_IMAGE_ASPECT_COLOR_BIT);
+        Barrier(R->cmd, R->colorResolve, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_ASPECT_COLOR_BIT);
+        VkImageResolve rv{};
+        rv.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        rv.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        rv.extent = { std::min(width0, R->color.width),
+                      std::min(height0, R->color.height), 1 };
+        vkCmdResolveImage(R->cmd, R->color.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                          R->colorResolve.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                          1, &rv);
+        Count("swap: EDRAM fallback resolved for present (CW_VK_MSAA)");
+    }
 
     // WHETHER THE READBACK STILL HAPPENS AT ALL. In the CW_VK_SWAPCHAIN arm the window
     // gets its pixels from the swapchain blit below and nothing needs them in host
@@ -21394,6 +22996,8 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
         auto sit = R->snapshots.find(statsSurface);
         if (sit != R->snapshots.end())
         {
+            if (g_copyCensusOn)
+                CopyCensusSampled(statsSurface);
             const uint64_t n =
                 uint64_t(sit->second.image.width) * sit->second.image.height * 4;
             if (n <= R->readback.size)
@@ -21950,6 +23554,74 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
                         d ? double(g_prof.recordIndex) / d : 0.0,
                         d ? double(g_prof.streamGuard) / d : 0.0,
                         d ? double(g_prof.record) / d : 0.0);
+                // THE RESOLVE SPLIT (part 89 step 0a), printed beside the record split
+                // it decomposes. ns/draw here means "per SAMPLED draw", which is the
+                // same population scaled 1/16, so the two lines compare directly. The
+                // census's own clock bill is printed so the reader subtracts it —
+                // ~one NowNs() call lands inside each measured pair (see ProfScope's
+                // bill note for the arithmetic).
+                if (g_resolveSplitCensus)
+                {
+                    static uint64_t lvn = 0, lin = 0, lvc = 0, lic = 0, lsd = 0;
+                    const uint64_t dvn = g_resolveVNs - lvn, din = g_resolveINs - lin;
+                    const uint64_t dvc = g_resolveVCalls - lvc,
+                                   dic = g_resolveICalls - lic;
+                    const uint64_t dsd = g_resolveSampledDraws - lsd;
+                    lvn = g_resolveVNs; lin = g_resolveINs;
+                    lvc = g_resolveVCalls; lic = g_resolveICalls;
+                    lsd = g_resolveSampledDraws;
+                    if (dsd)
+                        fprintf(stderr,
+                                "[vkprof] resolve split (1 draw in 16, %llu sampled): "
+                                "vertex UploadStream %.0f ns/draw (%.2f calls/draw) + "
+                                "index UploadStream %.0f ns/draw (%.2f calls/draw) = "
+                                "resolve %.0f of the record ns above; clock bill inside "
+                                "those ~%.0f ns/draw — subtract it\n",
+                                (unsigned long long)dsd, double(dvn) / double(dsd),
+                                double(dvc) / double(dsd), double(din) / double(dsd),
+                                double(dic) / double(dsd),
+                                double(dvn + din) / double(dsd),
+                                double(dvc + dic) / double(dsd) *
+                                    (double(g_profNowNs10) / 10.0));
+                }
+                // PARALLEL RECORD's engagement, windowed (gotcha 151: the arm and its
+                // control must both be provably what they claim; the control prints
+                // nothing because the counters never move).
+                if (R->parRec)
+                {
+                    static uint64_t lc = 0, lt = 0, lw = 0, lh = 0, lo = 0;
+                    static uint64_t lrec[kPrMaxRecorders] = {};
+                    uint64_t chunksNow = 0;
+                    char per[128];
+                    size_t pn = 0;
+                    for (uint32_t rIdx = 0; rIdx < kPrMaxRecorders; ++rIdx)
+                    {
+                        const uint64_t dr2 = g_prChunksRecorded[rIdx] - lrec[rIdx];
+                        lrec[rIdx] = g_prChunksRecorded[rIdx];
+                        chunksNow += dr2;
+                        if (dr2 && pn < sizeof per - 16)
+                            pn += size_t(snprintf(per + pn, sizeof per - pn, " %s%u:%llu",
+                                                  rIdx == kPrPumpRecorder ? "pump" : "w",
+                                                  rIdx, (unsigned long long)dr2));
+                    }
+                    const uint64_t dc2 = g_prCaptured - lc, dt2 = g_prTailDraws - lt;
+                    const uint64_t dw2 = g_prWaitNs - lw, dh2 = g_prPumpHelped - lh;
+                    const uint64_t do2 = g_prOverflowInline - lo;
+                    lc = g_prCaptured; lt = g_prTailDraws; lw = g_prWaitNs;
+                    lh = g_prPumpHelped; lo = g_prOverflowInline;
+                    fprintf(stderr,
+                            "[vkprof] par record: %.1f chunks/frame (%s ), tail %.0f "
+                            "draws/frame, %.0f captured/frame, submit wait %.0f "
+                            "us/frame (pump helped %llu), overflow-inline %llu%s\n",
+                            frames ? double(chunksNow) / double(frames) : 0.0, per,
+                            frames ? double(dt2) / double(frames) : 0.0,
+                            frames ? double(dc2) / double(frames) : 0.0,
+                            frames ? double(dw2) / 1e3 / double(frames) : 0.0,
+                            (unsigned long long)dh2, (unsigned long long)do2,
+                            g_prBindOverflow ? "  *** BIND OVERFLOW — captures "
+                                               "truncated, picture suspect ***"
+                                             : "");
+                }
                 // WHY `GUARD` IS INSIDE `record` AND WHAT IT MEANS FOR THE PLAN. It is
                 // the stream content hash, and it was ALWAYS in this column — it just
                 // had no name, because `ProfScope(streams)` wraps only the copy so a
@@ -22366,6 +24038,25 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
                         double(s.drainNs) / 1e6,
                         s.mixups ? "  *** SLOT MIX-UPS, see [vk] above ***" : "",
                         s.verifyChecked ? "" : "");
+                // THE POOL'S OCCUPANCY — part 89 step 0c. The dispatch/blocked counts
+                // above say the pool KEEPS UP; only this says how much worker-time is
+                // left over for a record pool to share. Windowed like every rate here
+                // (gotcha 428): a cumulative mean would blend the boot's empty frames
+                // into the crowd's.
+                if (g_gp)
+                {
+                    static uint64_t lastBusy = 0;
+                    const uint64_t busy = g_gp->busyNs.load(std::memory_order_relaxed);
+                    const uint64_t dBusy = busy - lastBusy;
+                    lastBusy = busy;
+                    const double poolNs = dt * 1e9 * double(GuardPoolWorkers());
+                    fprintf(stderr,
+                            "[vkprof] guard pool occupancy: %.2f%% busy (%.1f ms of "
+                            "work across %u workers in a %.1f s window; the rest is "
+                            "worker-time a shared record pool could take)\n",
+                            poolNs > 0 ? 100.0 * double(dBusy) / poolNs : 0.0,
+                            double(dBusy) / 1e6, GuardPoolWorkers(), dt);
+                }
                 if (s.verifyChecked)
                     fprintf(stderr,
                             "[vkprof] guard prehash VERIFY: %llu of %llu served guards "
@@ -22749,6 +24440,13 @@ void VkRenderer_RequestRenderScale(uint32_t scale)
         g_resScalePending.store(scale, std::memory_order_release);
 }
 
+// See vk_renderer.h — the panel's APPLY press (part 91).
+void VkRenderer_RequestInternalRes(uint32_t w, uint32_t h)
+{
+    if (w && h)
+        g_resWHPending.store((uint64_t(w) << 32) | h, std::memory_order_release);
+}
+
 namespace
 {
 
@@ -22762,13 +24460,24 @@ namespace
 void ApplyPendingRenderScale()
 {
     const uint32_t want = g_resScalePending.exchange(0, std::memory_order_acq_rel);
-    if (!want || !R || want == ResScale())
+    const uint64_t wantWH = g_resWHPending.exchange(0, std::memory_order_acq_rel);
+    uint32_t wantW = uint32_t(wantWH >> 32), wantH = uint32_t(wantWH);
+    if ((!want && !wantWH) || !R)
         return;
+    {
+        uint32_t cw, ch;
+        InternalRes(cw, ch);
+        if (wantWH && wantW == cw && wantH == ch)
+            wantW = wantH = 0;
+        const bool scaleChange = want != 0 && want != ResScale();
+        if (!scaleChange && !wantW)
+            return;
+    }
     if (g_resScaleLocked)
     {
-        fprintf(stderr, "[vk] render-scale change to %ux REFUSED: CW_VK_RES/"
-                        "CW_VK_RES_SCALE pin the scale for this run (the "
-                        "measurement arm wins over the menu)\n", want);
+        fprintf(stderr, "[vk] internal-resolution change REFUSED: CW_VK_RES/"
+                        "CW_VK_RES_SCALE pin it for this run (the "
+                        "measurement arm wins over the menu)\n");
         return;
     }
     vkDeviceWaitIdle(R->device);
@@ -22783,9 +24492,21 @@ void ApplyPendingRenderScale()
         im = Image{};
     };
     const uint32_t before = ResScale();
+    // Deferred clears latched against the OLD images' extents; the content they were
+    // scoped to is being destroyed with the images.
+    R->pendingClears.clear();
     destroyImage(R->color);
     destroyImage(R->depth);
-    // The parked live path speaks integer scales; preserve the current aspect.
+    destroyImage(R->colorResolve);
+    destroyImage(R->depthResolve);
+    // The explicit W x H form (part 91: the panel's APPLY press) wins; the legacy
+    // integer-scale form preserves the current aspect at 720*scale.
+    if (wantW)
+    {
+        g_internalW.store(wantW & ~1u, std::memory_order_relaxed);
+        g_internalH.store(wantH, std::memory_order_relaxed);
+    }
+    else
     {
         uint32_t w, h;
         InternalRes(w, h);
@@ -22800,13 +24521,17 @@ void ApplyPendingRenderScale()
                      VK_FORMAT_R8G8B8A8_UNORM,
                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                          VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                     VK_IMAGE_ASPECT_COLOR_BIT) ||
+                     VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_VIEW_TYPE_2D, 1, 1,
+                     VkComponentMapping{}, 1, false, R->msaaSamples) ||
         !CreateImage(R->depth, RSX(R->targetWidth), RS(edramH),
-                     VK_FORMAT_D24_UNORM_S8_UINT,
+                     EdramDepthFormat(),
                      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
                          VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                          VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                     VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
+                     VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
+                     VK_IMAGE_VIEW_TYPE_2D, 1, 1, VkComponentMapping{}, 1, false,
+                     R->msaaSamples) ||
+        !CreateEdramResolveTargets(RSX(R->targetWidth), RS(edramH)))
     {
         // A renderer with no EDRAM stand-in cannot draw at all — say so and stop
         // feeding it rather than crash on the first pass.
@@ -22870,9 +24595,15 @@ void ApplyPendingRenderScale()
         growBuffer(R->frames[i].present, "present readback");
     R->presentPixels.resize(size_t(RSX(R->targetWidth)) * RS(R->targetHeight) * 4);
 
-    fprintf(stderr, "[vk] render scale %ux -> %ux LIVE (%ux%u); snapshots and the "
-                    "cube map rebuild lazily over the next frames\n",
-            before, want, RSX(R->targetWidth), RS(R->targetHeight));
+    (void)before;
+    {
+        uint32_t nw, nh;
+        InternalRes(nw, nh);
+        fprintf(stderr, "[vk] internal resolution -> %ux%u LIVE (EDRAM stand-in "
+                        "%ux%u); snapshots and the cube map rebuild lazily over the "
+                        "next frames\n",
+                nw, nh, RSX(R->targetWidth), RS(R->edramHeight));
+    }
 }
 
 } // namespace
@@ -22882,7 +24613,13 @@ void VkRenderer_OnSwap(uint8_t* base, uint32_t frontBuffer, uint32_t width,
 {
     if (!g_active || g_d3dMode)
         return;
-    ApplyPendingRenderScale();
+    // NOTE (part 91): the pending internal-resolution change is applied at the TOP of
+    // BeginFrame, not here. Here sits MID-FRAME — the frame's draws are recorded but
+    // not submitted, and destroying the EDRAM images a recorded-but-unsubmitted
+    // command buffer references is the exact part-60 freeze shape ("a wait-idle only
+    // covers SUBMITTED work", the RetiredImage comment). This mid-frame placement is
+    // the likely reason the live path froze the operator's machine twice and spent
+    // 31 parts parked.
     DoSwapImpl(base, frontBuffer, width, height);
 }
 
@@ -22948,6 +24685,7 @@ void VkRenderer_SavePipelineCache()
     if (!g_active)
         return;
     SavePipelineCache();
+    SavePipelineKeys();
 }
 
 // The WAITWORLD barrier's predicate (kernel/imports.cpp): the last presented frame's
@@ -23231,14 +24969,18 @@ void VkRenderer_DumpStats()
                 R->color.width, R->color.height);
         if (g_gpClearN)
             fprintf(stderr,
-                    "[vk]     resolve clears wrote %.2f Mpixel/frame over %.1f clears, "
-                    "where the passes they follow rendered only %.2f Mpixel — SCOPING "
-                    "THEM WOULD REMOVE %.1f%% OF THE CLEAR CLASS\n",
+                    "[vk]     resolve clears: full-image mechanism would write %.2f "
+                    "Mpixel/frame over %.1f clears; the scoped rects cover %.2f Mpixel "
+                    "(%.1f%% of the class %s)\n",
                     double(g_gpClearFullPixels) / 1e6 / f, double(g_gpClearN) / f,
                     double(g_gpClearScopedPixels) / 1e6 / f,
                     g_gpClearFullPixels ? 100.0 * (1.0 - double(g_gpClearScopedPixels) /
                                                              double(g_gpClearFullPixels))
-                                        : 0.0);
+                                        : 0.0,
+                    EnvOn("CW_VK_NO_DEFERRED_CLEAR")
+                        ? "WOULD BE REMOVED by the deferred-scoped default (this run "
+                          "carries the CW_VK_NO_DEFERRED_CLEAR control arm)"
+                        : "REMOVED by the deferred-scoped mechanism, part 90");
         // THE PASS EXTENT CENSUS (part 79 item 2). `pass: 1 draw` is ~30 passes a frame at
         // ~28 us and this project has never listed what they ARE. Sorted by total time, so
         // the first rows are the ones worth designing against, and each row carries its own
@@ -23425,11 +25167,12 @@ void VkRenderer_DumpStats()
     // point of the item, plus the two numbers that say whether it is safe: how many stages
     // fell back to the full copy, and what the verifier found if it was armed.
     {
-        const uint64_t tot = g_gatherFull + g_gatherGathered;
+        const uint64_t tot = g_gatherFull + g_gatherGathered + g_gatherDynBounded;
         if (tot)
         {
             const uint64_t wouldBe = tot * 256 * 4;
-            const uint64_t actual = g_gatherDwordsFull + g_gatherDwordsCopied;
+            const uint64_t actual =
+                g_gatherDwordsFull + g_gatherDwordsCopied + g_gatherDwordsDynBounded;
             fprintf(stderr,
                     "[vk]   const gather: %.1f%% of window copies gathered (%llu full — "
                     "dynamic a0 or no list), %.2f GB not copied over the run (%.1f%% of "
@@ -23439,6 +25182,41 @@ void VkRenderer_DumpStats()
                     double(wouldBe - actual) * 4.0 / 1e9,
                     100.0 * double(wouldBe - actual) / double(wouldBe),
                     double(wouldBe) * 4.0 / 1e9);
+            // Part 88's mechanism number: how many dynamic copies took the bounded path
+            // and what they actually moved against the 4 KB each cost before. The
+            // step-3 reading rule wants this beside the frame time, because at the
+            // route's ±2.9% floor the byte count is the number that cannot be argued
+            // with.
+            if (g_gatherDynBounded)
+                fprintf(stderr,
+                        "[vk]     bounded dynamic: %llu copies moved %.2f GB where full "
+                        "copies were %.2f GB (-%.1f%%); %llu dynamic copies still full\n",
+                        (unsigned long long)g_gatherDynBounded,
+                        double(g_gatherDwordsDynBounded) * 4.0 / 1e9,
+                        double(g_gatherDynBounded) * 4096.0 / 1e9,
+                        100.0 * (1.0 - double(g_gatherDwordsDynBounded) /
+                                           (double(g_gatherDynBounded) * 256.0 * 4.0)),
+                        (unsigned long long)g_gatherDynamic);
+            // Part 88 item 2's mechanism number: the recognition work the memo removed
+            // is its hit share; the verify line beside it is what makes the share safe
+            // to believe.
+            if (g_patchMemoHits + g_patchMemoMisses)
+                fprintf(stderr,
+                        "[vk]     patch memo: %.1f%% of %llu VS patches served from the "
+                        "4-way MRU (%llu misses)\n",
+                        100.0 * double(g_patchMemoHits) /
+                            double(g_patchMemoHits + g_patchMemoMisses),
+                        (unsigned long long)(g_patchMemoHits + g_patchMemoMisses),
+                        (unsigned long long)g_patchMemoMisses);
+            if (g_patchMemoChecked)
+                fprintf(stderr,
+                        "[vk]     patch memo verified: %llu hits re-patched and "
+                        "compared, **%llu disagreed**%s\n",
+                        (unsigned long long)g_patchMemoChecked,
+                        (unsigned long long)g_patchMemoBad,
+                        PatchMemoVerifyPoison()
+                            ? "  (POISONED — a zero here means the verifier is BLIND)"
+                            : "");
             if (g_gatherChecked)
                 fprintf(stderr,
                         "[vk]     verified: %llu gathers checked against the full copy, "
@@ -23448,6 +25226,62 @@ void VkRenderer_DumpStats()
                         ConstGatherPoison()
                             ? "  (POISONED — a zero here means the verifier is BLIND)"
                             : "");
+            if (g_gatherChecked && g_gatherDynBounded)
+                fprintf(stderr,
+                        "[vk]     ...of which %llu were BOUNDED dynamic copies%s\n",
+                        (unsigned long long)g_gatherBadBounded,
+                        ConstGatherPoison()
+                            ? " (poisoned: zero here means the BOUNDED verifier is blind)"
+                            : "");
+        }
+    }
+    // Part 88 step 0's verdict, WINDOW rates only (gotcha 428: a cumulative mean is a
+    // transient). Each print covers the copies since the previous one.
+    if (g_paletteCensus)
+    {
+        const palcensus::Tot& t = palcensus::t;
+        palcensus::Tot& l = palcensus::last;
+        const uint64_t n = t.copies - l.copies;
+        if (n)
+        {
+            const uint64_t full = t.bytesFull - l.bytesFull;
+            const uint64_t bnd = t.bytesBounded - l.bytesBounded;
+            const uint64_t hwB = t.bytesHighWater - l.bytesHighWater;
+            fprintf(stderr,
+                    "[palcensus] %llu dynamic VS copies since last line: clean-cover "
+                    "%.1f%%, dirty-fallback %.1f%%, reuse %.1f%%; never-bound %llu, "
+                    "window-moved %llu; bursts/copy cover %.2f partial %.2f\n",
+                    (unsigned long long)n,
+                    100.0 * double(t.cleanCover - l.cleanCover) / double(n),
+                    100.0 * double(t.dirtyFallback - l.dirtyFallback) / double(n),
+                    100.0 * double(t.reuse - l.reuse) / double(n),
+                    (unsigned long long)(t.neverBound - l.neverBound),
+                    (unsigned long long)(t.windowMoved - l.windowMoved),
+                    double(t.coverBursts - l.coverBursts) / double(n),
+                    double(t.partialBursts - l.partialBursts) / double(n));
+            fprintf(stderr,
+                    "[palcensus]   bytes: full %.1f MB -> bounded %.1f MB (SAVES %.1f%%; "
+                    "kill < 30%%) | high-water-only model %.1f MB (saves %.1f%%), "
+                    "high-water c%u, mean bound %.1f regs\n",
+                    double(full) / 1e6, double(bnd) / 1e6,
+                    full ? 100.0 * double(full - bnd) / double(full) : 0.0,
+                    double(hwB) / 1e6,
+                    full ? 100.0 * double(full - hwB) / double(full) : 0.0,
+                    Pm4_VsPaletteHighWater(),
+                    double(t.extentSum - l.extentSum) / double(n));
+            std::string hg = "[palcensus]   bound histogram (regs):";
+            for (int b = 0; b < 32; ++b)
+            {
+                const uint64_t c = t.hist[b] - l.hist[b];
+                if (!c)
+                    continue;
+                char buf[64];
+                snprintf(buf, sizeof buf, " %d-%d:%llu", b * 8, b * 8 + 7,
+                         (unsigned long long)c);
+                hg += buf;
+            }
+            fprintf(stderr, "%s\n", hg.c_str());
+            l = t;
         }
     }
     // THE ORDER GATE's verdict, on every stats dump. A gate whose result is not printed is
@@ -23463,16 +25297,10 @@ void VkRenderer_DumpStats()
                 (unsigned long long)R->orderDrawsLogged,
                 Env("CW_VK_ORDER_POISON")
                     ? "  (POISONED — a zero here means the gate is BLIND)"
-                    : "  (serial recording: zero is the only correct result)");
-    // The parallel-record skeleton's run totals (part 7 stage 1), printed on every dump
-    // for the same reason as the gate's verdict above — a soak without CW_VK_PROFILE
-    // must still be able to say the arm engaged (gotcha 151). Silent when off; the
-    // control arm announced itself at init.
-    prec::PrintStats(stderr);
-    sec::PrintStats(stderr);
-    defer::PrintStats(stderr);
-    rexec::PrintStats(stderr);
-    reusec::PrintStats(stderr);
+                    : (R && R->parRec
+                           ? "  (PARALLEL recording: the replayed instances' own ids "
+                             "against the capture order — zero is the claim)"
+                           : "  (serial recording: zero is the only correct result)"));
     // Part 72 item 1. Printed HERE as well as on the census's own cadence, so a soak
     // that ends off a 600-frame boundary still lands the number — the same defect the
     // stencil skip counter had for fifteen parts (collected since part 56, printed by
@@ -23498,7 +25326,7 @@ void VkRenderer_DumpStats()
     // The polygon offset, printed on every run: an arm with no counter cannot be shown to
     // have engaged (gotcha 151), and this one's effect is a judgement about a picture.
     fprintf(stderr, "[vk]   stencil test: %llu draws enabled it%s\n",
-            (unsigned long long)g_stencilDraws.load(),
+            (unsigned long long)g_stencilDraws,
             EnvOn("CW_VK_NO_STENCIL") ? "  [CW_VK_NO_STENCIL: none were honoured]" : "");
     fprintf(stderr, "[vk]   polygon offset: %llu draws asked for one%s\n",
             (unsigned long long)g_polyOffsetDraws,
@@ -23567,6 +25395,40 @@ void VkRenderer_DumpStats()
                 "a whole frame of PUMP time and it is the hitch class §6dy §3 names\n",
                 (unsigned long long)g_persistGrowN, double(g_persistGrowNs) / 1e6,
                 double(g_persistGrowNs) / 1e6 / double(g_persistGrowN));
+    if (g_ccCopies)
+    {
+        fprintf(stderr,
+                "[vk]   copy census: %llu resolve copies, %llu DEAD (%.1f%%) — "
+                "%.2f of %.2f Gpixel dead (%.1f%%), %llu sample marks; dead = the "
+                "same (snapshot, rect) copied again with no consumer in between, "
+                "counted conservatively toward LIVE\n",
+                (unsigned long long)g_ccCopies, (unsigned long long)g_ccDead,
+                100.0 * double(g_ccDead) / double(g_ccCopies),
+                double(g_ccDeadPixels) / 1e9, double(g_ccPixels) / 1e9,
+                g_ccPixels ? 100.0 * double(g_ccDeadPixels) / double(g_ccPixels) : 0.0,
+                (unsigned long long)g_ccSampleMarks);
+        // The keys carrying the dead pixels, so a verdict names surfaces, not a share.
+        std::vector<std::tuple<uint64_t, uint64_t, uint32_t, size_t>> byDead;
+        for (const auto& kv : g_ccMap)
+        {
+            uint64_t dPx = 0, dN = 0;
+            for (const auto& r : kv.second)
+            {
+                dPx += r.deadPx;
+                dN += r.deadN;
+            }
+            byDead.emplace_back(dPx, dN, kv.first, kv.second.size());
+        }
+        std::sort(byDead.rbegin(), byDead.rend());
+        for (size_t i = 0; i < byDead.size() && i < 10; ++i)
+            fprintf(stderr,
+                    "[vk]     copy census: %08X%s  %llu dead copies, %.2f Gpixel dead, "
+                    "%zu distinct rects\n",
+                    std::get<2>(byDead[i]) & 0x1FFFFFFF,
+                    (std::get<2>(byDead[i]) & kSnapshotDepthBit) ? " (depth)" : "",
+                    (unsigned long long)std::get<1>(byDead[i]),
+                    double(std::get<0>(byDead[i])) / 1e9, std::get<3>(byDead[i]));
+    }
     fprintf(stderr, "[vk]   pipelines=%zu shaders=%zu textures=%zu arenaHighWater=%llu KB\n",
             R->pipelines.size(), R->shadersMap.size(), TexSize(),
             (unsigned long long)(R->arenaHighWater >> 10));
@@ -23583,10 +25445,37 @@ void VkRenderer_DumpStats()
                 100.0 * double(R->skips.scissor) / double(d),
                 100.0 * double(R->skips.blend) / double(d),
                 100.0 * double(R->skips.sets) / double(d), (unsigned long long)d);
+    // PARALLEL RECORD's engagement at exit, UNCONDITIONAL when the feature is on —
+    // the [vkprof] line only exists under the profiler, and a timed run (correctly)
+    // does not carry one, which left the 3v3's fix arms provable only through the
+    // skip aggregation. This line is the direct statement (gotcha 151).
+    if (R->parRec)
+    {
+        uint64_t chunks = 0;
+        for (uint32_t rec = 0; rec < kPrMaxRecorders; ++rec)
+            chunks += g_prChunksRecorded[rec];
+        fprintf(stderr,
+                "[vk]   parallel record: %llu chunks (%llu by the pump at the wait), "
+                "%llu draws captured, %llu tail draws in %llu tail instances, %llu "
+                "empty instances, submit wait %.1f ms total, overflow-inline %llu, "
+                "bind overflow %llu%s\n",
+                (unsigned long long)chunks, (unsigned long long)g_prPumpHelped,
+                (unsigned long long)g_prCaptured, (unsigned long long)g_prTailDraws,
+                (unsigned long long)g_prTailInstances,
+                (unsigned long long)g_prEmptyInstances, double(g_prWaitNs) / 1e6,
+                (unsigned long long)g_prOverflowInline,
+                (unsigned long long)g_prBindOverflow,
+                g_prBindOverflow ? "  *** CAPTURES TRUNCATED — picture suspect ***" : "");
+    }
     // THE CEILING PROBE's own engagement. Printed only when it fired, but printed with the
     // per-draw rate rather than the raw total, because the number the item's arithmetic
     // needs is "driver calls per draw" — that is what a secondary command buffer carries,
     // and the state cache means it is nowhere near the ten calls the source suggests.
+    if (g_reuseCensus)
+        reusecensus::Print(" since the last line — FINAL");
+    // The constant-write histogram, printed here so it lands beside the gather stats
+    // whose full-copy population it exists to explain (part 87, phase5-notes §6eg).
+    Pm4_DumpAluWriteCensus();
     if (g_fetchMemoCensus)
     {
         const uint64_t n = g_fetchMemoHits + g_fetchMemoMisses;
@@ -23622,13 +25511,13 @@ void VkRenderer_DumpStats()
     // THE BATCH'S OWN MECHANISM NUMBER, unconditional — it is the statistic the item is
     // judged on and it cannot be argued with, where a frame time on this route has a
     // ±2.9% floor. `CW_VK_NO_BIND_BATCH=1` should read ~1.74 here and the batch ~0.47.
-    if (g_bindBatchDraws.load())
+    if (g_bindBatchDraws)
         fprintf(stderr,
                 "[vk]   vertex bind calls: %.3f per draw over %llu batched draws (%llu "
                 "vkCmdBindVertexBuffers)%s\n",
-                double(g_bindBatchCalls.load()) / double(g_bindBatchDraws.load()),
-                (unsigned long long)g_bindBatchDraws.load(),
-                (unsigned long long)g_bindBatchCalls.load(),
+                double(g_bindBatchCalls) / double(g_bindBatchDraws),
+                (unsigned long long)g_bindBatchDraws,
+                (unsigned long long)g_bindBatchCalls,
                 g_noBindBatch ? " [CW_VK_NO_BIND_BATCH=1, one call per binding]" : "");
     if (g_verifyBindBatch)
         fprintf(stderr,
@@ -23704,12 +25593,12 @@ void VkRenderer_DumpStats()
                 g_dedupLookups ? 100.0 * double(g_dedupRepeats) / double(g_dedupLookups) : 0.0,
                 (unsigned long long)g_dedupRepeats, (unsigned long long)g_dedupLookups,
                 (unsigned long long)g_dedupOverflow);
-    if (g_noDriverRecordSkipped.load() && R->skips.draws)
+    if (g_noDriverRecordSkipped && R->skips.draws)
         fprintf(stderr,
                 "[vk]   CW_VK_NO_DRIVER_RECORD: %llu vkCmd* calls skipped, %.2f per draw "
                 "— NOTHING WAS DRAWN in this run\n",
-                (unsigned long long)g_noDriverRecordSkipped.load(),
-                double(g_noDriverRecordSkipped.load()) / double(R->skips.draws));
+                (unsigned long long)g_noDriverRecordSkipped,
+                double(g_noDriverRecordSkipped) / double(R->skips.draws));
     // THE STENCIL SKIP, ADDED IN PART 72's PREP — and it was COLLECTED SINCE PART 56 AND
     // NEVER PRINTED, which is the defect this project keeps rediscovering (a counter you
     // already pay for that no log carries). It is the deciding number for

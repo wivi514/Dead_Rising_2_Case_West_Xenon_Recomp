@@ -59,6 +59,7 @@
 
 #include "../cpu/crash_report.h"
 #include "../cpu/guest_thread.h"
+#include "../cpu/native_kbm.h"
 // For CW_TIMEBASE_HZ, so KeQueryPerformanceFrequency and the guest's own `mftb`
 // cannot drift apart — the header says they must agree, and sharing the constant is
 // what makes that enforceable rather than aspirational. Including it here is safe
@@ -121,7 +122,12 @@ static uint32_t NtAllocateVirtualMemory_x(be<uint32_t>* baseAddress, be<uint32_t
     uint32_t size = (*regionSize + 0xFFF) & ~0xFFFu;
     if (*baseAddress != 0)
     {
-        constexpr uint32_t MEM_RESERVE = 0x2000;
+        // The GUEST's flag, deliberately not named MEM_RESERVE: that is also a
+        // windows.h macro (0x00002000), and on Windows the declaration expands to
+        // `constexpr uint32_t 0x00002000 = 0x2000;`. Same value, but this constant
+        // belongs to the Xbox 360 kernel ABI we are emulating rather than to the host,
+        // and naming it that way is what makes the two impossible to confuse.
+        constexpr uint32_t kGuestMemReserve = 0x2000;
         // Explicit-base RESERVE. A game's VM manager probes 64 KB-aligned bases
         // upward until one succeeds, so returning success unconditionally makes
         // every probe "win" at the first address and all of the title's
@@ -129,7 +135,7 @@ static uint32_t NtAllocateVirtualMemory_x(be<uint32_t>* baseAddress, be<uint32_t
         // gives these real conflict semantics (Xenia returns C0000017 on conflict
         // and the guest's scan advances).
         const uint32_t reqBase = *baseAddress;
-        if ((allocType & MEM_RESERVE) && reqBase >= 0x40000000 && reqBase < 0x7FE00000)
+        if ((allocType & kGuestMemReserve) && reqBase >= 0x40000000 && reqBase < 0x7FE00000)
         {
             const uint32_t got = g_heap.ReserveVirtualAt(reqBase, size);
             if (MemTrace())
@@ -193,15 +199,17 @@ static uint32_t NtAllocateVirtualMemory_x(be<uint32_t>* baseAddress, be<uint32_t
     // reservation with type 0x60002000 — MEM_16MB_PAGES | MEM_LARGE_PAGES |
     // MEM_RESERVE — and Xenia answers 0x40000000, which is exactly where our
     // large-page arena begins.
-    constexpr uint32_t MEM_LARGE_PAGES = 0x20000000;
-    void* ptr = g_heap.AllocVirtual(size, (allocType & MEM_LARGE_PAGES) != 0);
+        // The GUEST's flag. Named kGuest* because MEM_LARGE_PAGES is also a windows.h
+    // macro, and the declaration would expand to `constexpr uint32_t 0x20000000 = ...`.
+    constexpr uint32_t kGuestMemLargePages = 0x20000000;
+    void* ptr = g_heap.AllocVirtual(size, (allocType & kGuestMemLargePages) != 0);
     if (size >= 0x400000)
         fprintf(stderr, "[heap] big NtAllocateVirtualMemory: %u MB -> %08X\n", size >> 20,
                 ptr ? g_memory.MapVirtual(ptr) : 0);
     if (MemTrace())
         fprintf(stderr,
                 "[mem] alloc NEW size=%08X type=%08X large=%d -> base=%08X end=%08X\n",
-                reqSizeIn, allocType, (allocType & MEM_LARGE_PAGES) != 0,
+                reqSizeIn, allocType, (allocType & kGuestMemLargePages) != 0,
                 ptr ? g_memory.MapVirtual(ptr) : 0, ptr ? g_memory.MapVirtual(ptr) + size : 0);
     if (!ptr)
         return STATUS_NO_MEMORY;
@@ -213,8 +221,10 @@ static uint32_t NtAllocateVirtualMemory_x(be<uint32_t>* baseAddress, be<uint32_t
 static uint32_t NtFreeVirtualMemory_x(be<uint32_t>* baseAddress, be<uint32_t>* regionSize,
                                       uint32_t freeType)
 {
-    constexpr uint32_t MEM_RELEASE = 0x8000;
-    if (baseAddress && *baseAddress && (freeType & MEM_RELEASE))
+        // Likewise: MEM_RELEASE is a windows.h macro and kernel/memory.cpp uses the real
+    // one, so the guest's gets its own name rather than taking the host's away.
+    constexpr uint32_t kGuestMemRelease = 0x8000;
+    if (baseAddress && *baseAddress && (freeType & kGuestMemRelease))
     {
         // The alloc side logs big blocks; without the matching free log a leak and
         // legitimate churn look identical in the record.
@@ -1002,7 +1012,16 @@ void SignalGuestEvent(uint32_t handle)
 {
     if (!handle || !IsKernelObject(handle) || !IsLiveKernelHandle(handle))
         return;
-    if (auto* event = dynamic_cast<Event*>(GetKernelObject(handle)))
+    // The intactness check must come BEFORE the dynamic_cast, not after. MSVC's
+    // __RTDynamicCast walks RTTI reached through the vtable pointer, so a scribbled
+    // object faults INSIDE the C++ runtime and is then rethrown as a C++ exception —
+    // which, from a path with no handler, ends in std::terminate and __fastfail. That
+    // is a process death with no report, from an operation whose whole purpose was to
+    // return null safely.
+    KernelObject* obj = GetKernelObject(handle);
+    if (!KernelObjectIsIntact(obj))
+        return;
+    if (auto* event = dynamic_cast<Event*>(obj))
         event->Set();
 }
 
@@ -3824,6 +3843,12 @@ static uint32_t XamInputGetCapabilities_x(uint32_t userIndex, uint32_t flags,
     if (!caps)
         return STATUS_INVALID_PARAMETER;
     memset(caps, 0, sizeof(*caps));
+    // Part 92 note: an earlier native-KB/M build reported a Type-2 keyboard
+    // device here on port 2 so the title's own keyboard controller class would
+    // connect — the chain worked end to end, but ENGAGING a class-0 controller
+    // crashed in profile machinery the 360 build never expected to run for a
+    // keyboard. The native path now rides the player's own port 0
+    // (cpu/native_kbm.cpp), so this HLE reports gamepads only again.
     if (userIndex >= kLocalPadCount)
         return ERROR_DEVICE_NOT_CONNECTED;
     caps->type = 1;      // XINPUT_DEVTYPE_GAMEPAD
@@ -4669,6 +4694,11 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
         }
     }
 
+    // Device-follow (part 92): a synthetic press IS pad input — it lets the
+    // headless gate exercise the prompt-art flip both ways.
+    if (outButtons || outLX || outLY || outRX || outRY)
+        NativeKbm_NoteDeviceInput(true);
+
     const uint64_t stateKey =
         stateHash(outButtons, outLX, outLY, outRX,
                   int16_t(uint16_t(outRY) ^ (uint16_t(outLT) << 1) ^
@@ -4744,26 +4774,17 @@ static uint32_t XamInputSetState_x(uint32_t userIndex, uint32_t unk,
     return 0;
 }
 
-// No keyboard is attached, and ERROR_EMPTY is the defined way to say "no keystroke
-// is queued" — not a failure, the normal answer on a console with no chatpad.
-struct GuestInputKeystroke    // 8 bytes
+// The keystroke import is REAL as of part 92: cpu/native_kbm.cpp queues SDL key
+// events (translated to Windows VK codes by host/window.cpp) for the title's own
+// keyboard controller, whose Update polls this once per controller tick. With the
+// native path off or inactive it answers exactly as the old stub did — ERROR_EMPTY,
+// the defined "no keystroke is queued", the normal answer on a console with no
+// chatpad. The handler also carries the per-tick analog/button source feed,
+// because this call IS the keyboard controller's tick (native_kbm.cpp).
+PPC_FUNC(__imp__XamInputGetKeystrokeEx)
 {
-    be<uint16_t> virtualKey;
-    be<uint16_t> unicode;
-    be<uint16_t> flags;
-    uint8_t userIndex;
-    uint8_t hidCode;
-};
-
-static uint32_t XamInputGetKeystrokeEx_x(be<uint32_t>* userIndex, uint32_t flags,
-                                         GuestInputKeystroke* keystroke)
-{
-    (void)flags;
-    if (keystroke)
-        memset(keystroke, 0, sizeof(*keystroke));
-    if (userIndex)
-        *userIndex = 0;
-    return ERROR_EMPTY;
+    KCALL("__imp__XamInputGetKeystrokeEx");
+    NativeKbm_HandleKeystroke(ctx, base);
 }
 
 GUEST_FUNCTION_HOOK(__imp__XamInputGetCapabilities, XamInputGetCapabilities_x)
@@ -4790,6 +4811,11 @@ PPC_FUNC(__imp__XamInputGetState)
     // This game has a ControllerDisconnected screen and polls capabilities ~1,100
     // times a boot per user, so that is a claim it acts on.
     const uint64_t result = ctx.r3.u64;
+
+    // Part 92: the native keyboard's one-time verify + connect. Runs here because
+    // this seam is on a guest thread every frame from boot, which is what the
+    // connect's guest calls need (docs/native-kbm-phaseA.md "What Phase B/C build").
+    NativeKbm_Pump(ctx, base);
 
     if (Host_ConsumeDebugJumpPressed())
         DebugTunables_RequestDebugJump(ctx, base);
@@ -4821,13 +4847,18 @@ PPC_FUNC(__imp__XamInputGetState)
             if (Settings_OverlayVisible())
                 memset(base + padState + 4, 0, 12);
         }
+        // Part 92 round 3: the guest Visuals screen is driven by these BUTTON
+        // bits, which the reduced native merge no longer produces from keys —
+        // OR in the keyboard equivalents for the PUMP ONLY (the guest pad
+        // state is untouched, so nothing reaches the game twice).
+        if (padUser == 0)
+            buttons |= NativeKbm_PanelButtons();
         PcOptions_Pump(ctx, base, buttons);
     }
 
     ctx.r3.u64 = result;
 }
 GUEST_FUNCTION_HOOK(__imp__XamInputSetState, XamInputSetState_x)
-GUEST_FUNCTION_HOOK(__imp__XamInputGetKeystrokeEx, XamInputGetKeystrokeEx_x)
 
 // ---------------------------------------------------------------------------
 // The content licence — finding 1, arriving in the runtime

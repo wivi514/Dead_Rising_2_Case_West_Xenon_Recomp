@@ -45,6 +45,13 @@ bool VkRenderer_Init();
 // True once Init has succeeded. Cheap; makes no Vulkan calls.
 bool VkRenderer_Active();
 
+// D.4 (release plan §3.D): first sight of a microcode hash this run. Called by pm4's
+// BindShader once per distinct hash; if the shader cache cannot answer it, the bytes
+// are translated in-process on a worker and the cache gains the entry — which is where
+// every VERTEX shader in a shipped build comes from, the disc holding none.
+void VkRenderer_OnShaderBind(uint32_t type, uint64_t hash, const uint8_t* code,
+                             uint32_t sizeDwords);
+
 // One draw, from inside the PM4 walk, with the register file and the bound shaders
 // current. Resolves arrive here too — they are draws with RB_MODECONTROL's edram_mode
 // set to kCopy, not a packet of their own — and are routed internally.
@@ -78,6 +85,29 @@ void VkRenderer_RequestSwapchainRebuild();
 // boundary — the settings panel's resolution row (part 60). Refused loudly when
 // CW_VK_RES/CW_VK_RES_SCALE pin the scale for a measurement run.
 void VkRenderer_RequestRenderScale(uint32_t scale);
+
+// Change the internal resolution to an explicit WIDTH x HEIGHT at the next frame
+// boundary — the panel's APPLY press (part 91: the operator's "change internal
+// resolution without restarting", applied on the button and never per step). The
+// caller validates with Settings_ValidInternalRes; the same CW_VK_RES pin refusal
+// as the scale form applies. Callable from any thread.
+void VkRenderer_RequestInternalRes(uint32_t w, uint32_t h);
+
+// RT stage 2 (part 64): true when the device was created with ray query (probe
+// passed and CW_VK_RT did not veto). The settings panel's RT SHADOWS row consults
+// it to show UNSUPPORTED and refuse to move — a row that pretends is the gamma
+// slider again. Safe to call before init (false then).
+bool VkRenderer_RtAvailable();
+// 0 = RT is offered, 1 = the device has no ray query, 2 = it has ray query but the
+// route (b) shader variant cache (assets/shader_spv_rt) is missing or unpatched.
+int VkRenderer_RtUnavailableReason();
+
+// The wide-mode horizontal factor k = (9*W)/(16*H) of the internal resolution
+// (1.0 at 16:9). Exported for the game-side fov substitution (cpu/camera_fov.cpp,
+// part 62): in wide mode the game's fov is over-widened by k in tan space so its
+// own 16:9 CULLING frustum covers the 21:9 view, and the renderer narrows the
+// projection back vertically. Depends only on settings/env, safe before init.
+float VkRenderer_WideFovFactor();
 
 // ===================================================================================
 // Phase C (the D3D pivot): the SAME renderer driven from the API line

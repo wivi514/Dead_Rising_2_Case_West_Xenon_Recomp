@@ -190,7 +190,7 @@ FileHandle* Resolve(uint32_t handle)
 // NOT-FOUND ACCOUNTING — because a real miss is one line in a flood of expected ones.
 //
 // A no-input outdoor run asks for 304 distinct files that do not exist, and every one of
-// them is legitimate: Case Zero is a cut-down Dead Rising 2, so its engine probes for the
+// them is legitimate: Case West is a cut-down Dead Rising 2, so its engine probes for the
 // full title's content and falls back. `data/anim/weapon` misses 66 files and has exactly
 // one on disk (`allweapons.big`), which is the fallback working. Nothing is wrong.
 //
@@ -256,7 +256,9 @@ bool NoteMiss(const std::string& guestPath)
     // host directory the file would live in, not about the guest's spelling.
     int cls = 0;
     const std::string host = VfsTranslate(guestPath);
-    const size_t slash = host.find_last_of('/');
+    // Both separators. On Windows the host path is built from a std::filesystem::path
+    // and arrives with backslashes; searching for '/' alone silently finds nothing.
+    const size_t slash = host.find_last_of("/\\");
     if (!host.empty() && slash != std::string::npos)
     {
         std::error_code ec;
@@ -345,11 +347,15 @@ enum : uint32_t
 // separates the save path from the 312 disc reads.
 bool WantsWrite(uint32_t desiredAccess, uint32_t createDisposition)
 {
-    constexpr uint32_t GENERIC_WRITE     = 0x40000000;
-    constexpr uint32_t GENERIC_ALL       = 0x10000000;
-    constexpr uint32_t FILE_WRITE_DATA   = 0x00000002;
-    constexpr uint32_t FILE_APPEND_DATA  = 0x00000004;
-    if (desiredAccess & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA))
+    // The GUEST's NT access bits. kGuest*-named because all four are windows.h macros
+    // too — same values, since the Xbox 360 kernel is NT — and the declarations would
+    // otherwise expand to `constexpr uint32_t 0x40000000 = 0x40000000;`.
+    constexpr uint32_t kGuestGenericWrite   = 0x40000000;
+    constexpr uint32_t kGuestGenericAll     = 0x10000000;
+    constexpr uint32_t kGuestFileWriteData  = 0x00000002;
+    constexpr uint32_t kGuestFileAppendData = 0x00000004;
+    if (desiredAccess & (kGuestGenericWrite | kGuestGenericAll | kGuestFileWriteData |
+                         kGuestFileAppendData))
         return true;
     // A disposition that can create or truncate is a write intent even if the access
     // mask is sloppy about saying so.
@@ -626,7 +632,7 @@ uint32_t NtReadFile_x(uint32_t handle, uint32_t event, uint32_t apcRoutine,
     {
         const uint64_t offset = *byteOffset;
         if (offset != 0xFFFFFFFFFFFFFFFEull)
-            fseeko(file->fp, off_t(offset), SEEK_SET);
+            fseeko(file->fp, int64_t(offset), SEEK_SET);
     }
 
     const size_t got = fread(buffer, 1, length, file->fp);
@@ -704,14 +710,14 @@ uint32_t NtWriteFile_x(uint32_t handle, uint32_t event, uint32_t apcRoutine,
     {
         const uint64_t offset = *byteOffset;
         if (offset != 0xFFFFFFFFFFFFFFFEull)
-            fseeko(file->fp, off_t(offset), SEEK_SET);
+            fseeko(file->fp, int64_t(offset), SEEK_SET);
     }
 
     const size_t put = fwrite(buffer, 1, length, file->fp);
     fflush(file->fp);
     file->inFlight.fetch_sub(1, std::memory_order_release);
     const uint32_t status = put == length ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
-    const off_t end = ftello(file->fp);
+    const int64_t end = ftello(file->fp);
     if (end > 0 && uint64_t(end) > file->size)
         file->size = uint64_t(end);
     if (iosb)
@@ -819,7 +825,7 @@ uint32_t NtSetInformationFile_x(uint32_t handle, XIO_STATUS_BLOCK* iosb, be<uint
         std::unique_lock<std::mutex> ioLock(file->io, std::defer_lock);
         if (!FileRacy())
             ioLock.lock();
-        fseeko(file->fp, off_t(pos), SEEK_SET);
+        fseeko(file->fp, int64_t(pos), SEEK_SET);
         if (iosb)
         {
             iosb->Status = STATUS_SUCCESS;
