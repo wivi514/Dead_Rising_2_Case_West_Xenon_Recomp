@@ -54,22 +54,22 @@ proof scale.
 * The harness stamps every soak run's **binary sha256** (a mid-chain rebuild nearly
   relabelled an A/B arm — the rule is NO BUILDS WHILE A CHAIN MEASURES).
 
-## 2. WHERE PART 8 STARTS (updated at the 2026-08-30 stop)
+## 2. WHERE PART 8 STARTS (operator's call, 2026-09-03 — supersedes the census plan)
 
-**Two censuses are owed their local verdicts** (Case Zero measured both and refuted
-both AT THEIR CROWD — same engine, but a copied conclusion is not a measurement):
+**The census plan is CANCELLED.** The operator ran a substantial research campaign in
+CASE ZERO in the intervening days, and part 8's job is to IMPLEMENT those findings
+here. **Start by reading the sibling's tree** — their `docs/` kickoffs and notes from
+their parts ~87 onward (their part87-kickoff §0b was the last verdict table this port
+saw) — and ask the operator which pieces come first. The import discipline stands:
+`docs/imported-fixes.md` gets a row per import with the source commit, and a copied
+conclusion is re-measured here when it is a measurement rather than code.
 
-1. `CW_VK_VCULL_CENSUS=1` at the crowd — is the frustum-cull pool real here? (Theirs:
-   0.1% off-screen; the engine culls before submitting. Caveat there: only ~36% of
-   crowd draws classifiable.) One diagnostic soak; the run was interrupted mid-chain
-   at the stop.
-2. `CW_VK_REUSE_CENSUS=1` at the crowd — the four-cell reuse census, WRITTEN AND
-   BUILT this session, NEVER RUN. (Theirs: crowd 1.2-2.1% reusable; 93-94% of draws
-   differ only in ALU constants. Our light bucket is the positive control — must read
-   high like their menus' 69-77%.)
-
-Then findings 72+ with the sibling cross-reference confirmed or diverged. Their ask
-back: our 2a/2b restructure is worth exporting to them once they re-price it.
+Context that still frames the work: their part-87 censuses refuted frustum-cull
+(engine culls before submitting) and cross-frame reuse (93-94% of crowd draws differ
+only in ALU constants) at their crowd; our local `CW_VK_VCULL_CENSUS` /
+`CW_VK_REUSE_CENSUS` instruments exist, BUILT BUT NEVER RUN, if a local verdict is
+ever wanted. Their ask back: our 2a/2b restructure (finding 69) exports to them once
+they re-price it.
 
 ## 2b. THE OPERATOR'S PARKED LIST
 
