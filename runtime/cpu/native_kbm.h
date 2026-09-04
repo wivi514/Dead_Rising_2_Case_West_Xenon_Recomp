@@ -71,3 +71,4 @@ void NativeKbm_PanelKeyLevel(uint16_t vk, bool down);
 // after its own per-frame publish — the race-free spelling of the DR2-PC
 // no-turn-rate-ceiling camera.
 void NativeKbm_CameraSurplus(float sx, float sy);
+void NativeKbm_AddMouseLook(int dx, int dy);

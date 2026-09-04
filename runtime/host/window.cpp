@@ -1034,6 +1034,12 @@ HostPadState ReadKeyboard()
             {
                 const int dx = g_mouseDX.exchange(0, std::memory_order_relaxed);
                 const int dy = g_mouseDY.exchange(0, std::memory_order_relaxed);
+                // DIRECT CAMERA LOOK: hand the raw deltas to the native path, which
+                // adds them straight onto the camera's yaw/pitch past the engine's
+                // radial turn-rate clamp (native_kbm.cpp, sub_82470DC0). The stick
+                // feed below stays — it keeps the "camera is being moved" state the
+                // engine reads — but the direct add is what gives uncapped speed.
+                NativeKbm_AddMouseLook(dx, dy);
                 // RAW per-poll pixels -> stick units; deliberately no EMA and
                 // no px/s conversion — DR2 PC's camera is displacement-shaped.
                 const float sens = float(Settings_MouseSens());
