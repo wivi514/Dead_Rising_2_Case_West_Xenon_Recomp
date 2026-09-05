@@ -347,8 +347,17 @@ operator's instruction, and the configuration Case Zero itself ships since their
   RE); rows grew to 8 with MOUSE CAMERA / MOUSE SENS.
 * **Native keyboard/mouse** (their parts 91-92): all guest addresses RE-DERIVED on
   this image — the record is `docs/native-kbm-import.md`. First boot: verify OK, 93
-  bindings resolved 0 bad, 86 spliced (their exact count). Key-cap prompt icons still
-  owed (needs our own glyph-bank census).
+  bindings resolved 0 bad, 86 spliced (their exact count). Key-cap prompt icons
+  generate and serve (`tools/gen_kbm_icons.py`, part 8).
+* **KB/M struggle-prompt flash** (their parts 95-96, `c23f155`/`80596ec`/`67a25a3`,
+  imported 2026-09-05): the zombie-grab QTE ("push the zombie off") is
+  hud_infobar's w_zombie_grapple, a 3-frame stick-wiggle cFEBitmapList — legending
+  `analog_move_left`=A, `_right`=D, `_center`=blank makes it flash A↔D under
+  keyboard with no runtime code, and id 4049 "LS "→"MASH" + "LEFT STICK "→"A / D
+  KEYS " relabel it. All pieces verified present on THIS image before the port
+  (glyphs exist, id 4049 == "LS ", "LEFT STICK " unique, .bcs is the {n;ids;offs}
+  model with offs[0]==header). Generator gates pass; bank 25/139 patched, under the
+  501,900 pin. `tools/gen_kbm_icons.py`.
 * **The release infrastructure** (their parts 83-86): in-process shader translator
   (`--translate-shaders`; **byte-identity gate run here: 480/480 .spv identical** to
   the Python-built cache; sidecars regenerated with the new aluConsts fields the

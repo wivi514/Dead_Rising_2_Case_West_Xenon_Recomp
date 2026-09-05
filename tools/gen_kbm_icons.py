@@ -84,7 +84,7 @@ OUT = REPO / "assets/game_kbm/data/frontend/fecmn.tex"
 BIGDEC = REPO / "tools/big_decompress"
 FONT = "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf"
 
-# glyph base name -> legend spec: ("key", text) | ("mouse", button) | ("wasd",)
+# glyph base name -> legend spec: ("key", text) | ("mouse", button) | ("wasd",) | ("blank",)
 LEGENDS = {
     "a_button": ("key", "↵"),   # ENTER as the return symbol — the 32-px slot cannot fit the word
     "a_button_ig": ("key", "SPACE"),
@@ -108,7 +108,18 @@ LEGENDS = {
     "RTbutton": ("key", "4"),
     "RTbutton_ig": ("mouse", "L"),
     "R3": ("mouse", "M"),
-    "analog_move_center": ("wasd",),
+    # THE ZOMBIE-GRAB STRUGGLE PROMPT (imported from Case Zero, part 8). The QTE
+    # to push a grabbing zombie off is hud_infobar's w_zombie_grapple, a 3-frame
+    # cFEBitmapList — analog_move_left / _center / _right — so the game itself
+    # flashes the glyph between the two tilt frames as the stick wiggles. Legend
+    # the tilt frames as A and D key caps and it flashes A<->D under keyboard (the
+    # DR2-PC behaviour); blank the center so nothing shows between presses — only
+    # the alternation, with the MASH label (id 4049, rewritten below). Census on
+    # this image: analog_move_center is referenced by exactly one string (the
+    # grapple tutorial) and no movement teaching, so blanking it is safe here too.
+    "analog_move_center": ("blank",),
+    "analog_move_left": ("key", "A"),
+    "analog_move_right": ("key", "D"),
 }
 
 
@@ -395,6 +406,8 @@ def main():
             chip = draw_key_chip((aw, ah), text)
         elif spec[0] == "mouse":
             chip = draw_mouse_chip((aw, ah), spec[1])
+        elif spec[0] == "blank":  # renders as nothing (struggle-prompt center)
+            chip = Image.new("RGBA", (aw, ah), (0, 0, 0, 0))
         else:
             chip = draw_wasd_chip((aw, ah))
         canvas.alpha_composite(chip, (1, 1))
@@ -430,17 +443,52 @@ def main():
     # "PRESS START" spelling and NO PRESS\0START id pair (measured; the sibling
     # had both).
     sbank = (REPO / "assets/game/data/frontend/str_en.bcs").read_bytes()
-    for old, new in ((b"PRESS START\x00", b"PRESS ENTER\x00"),):
+    # Same-length in-place edits. "LEFT STICK " (imported from Case Zero, part 8)
+    # is the grapple tutorial ("Wiggle the LEFT STICK [icon] to escape grapples!")
+    # — the only occurrence in the bank — reworded for the keyboard reading.
+    for old, new in ((b"PRESS START\x00", b"PRESS ENTER\x00"),
+                     (b"LEFT STICK ", b"A / D KEYS ")):
         n = sbank.count(old)
         if n != 1:
             print(f"GATE FAILED: str_en.bcs holds {n} of {old!r}, expected 1",
                   file=sys.stderr)
             sys.exit(1)
         sbank = sbank.replace(old, new)
+
+    # IDS_HUD_LS (id 4049) labels ONLY the struggle prompt and the operator wants
+    # it to read MASH, which does not fit the shipped 3-byte "LS " in place. The
+    # .bcs is {u32 n; u32 ids[n]; u32 offs[n]; NUL-terminated strings} and is NOT
+    # size-pinned, so rebuild the bank with the one string swapped and verify every
+    # id reads back. (Ported from Case Zero; confirmed here: id 4049 == b"LS ",
+    # the header is 4+8n and offs[0] lands exactly there.)
+    n = struct.unpack_from("<I", sbank, 0)[0]
+    ids = list(struct.unpack_from(f"<{n}I", sbank, 4))
+    offs = list(struct.unpack_from(f"<{n}I", sbank, 4 + 4 * n))
+    table = {ids[k]: sbank[offs[k]:sbank.index(b"\0", offs[k])] for k in range(n)}
+    if table.get(4049) != b"LS ":
+        print(f"GATE FAILED: string id 4049 reads {table.get(4049)!r}, "
+              f"expected b'LS ' — the bank layout moved; refusing to rewrite",
+              file=sys.stderr)
+        sys.exit(1)
+    table[4049] = b"MASH"
+    header = 4 + 8 * n
+    blob = bytearray()
+    new_offs = []
+    for i in ids:                      # keep the shipped id order
+        new_offs.append(header + len(blob))
+        blob += table[i] + b"\0"
+    sbank = (struct.pack("<I", n) + struct.pack(f"<{n}I", *ids) +
+             struct.pack(f"<{n}I", *new_offs) + bytes(blob))
+    got = {ids[k]: sbank[new_offs[k]:sbank.index(b"\0", new_offs[k])]
+           for k in range(n)}
+    if got != table:
+        print("GATE FAILED: rebuilt str bank does not read back", file=sys.stderr)
+        sys.exit(1)
+
     sout = OUT.parent / "str_en.bcs"
     OUT.parent.mkdir(parents=True, exist_ok=True)
     sout.write_bytes(sbank)
-    print(f"wrote {sout} (1 same-length PRESS ENTER edit)")
+    print(f"wrote {sout} (2 same-length edits + id 4049 LS->MASH via table rebuild)")
 
     swp = bytearray()
     swp += struct.pack("<4sI", b"KBSW", len(swap_entries))
