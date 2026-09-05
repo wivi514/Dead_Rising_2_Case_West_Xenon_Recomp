@@ -686,6 +686,31 @@ void DumpQueryHistogram()
 
 } // namespace
 
+// CW_KBM_CMD_CENSUS=1 — log every distinct command id queried on port 0, once, with
+// its name and its live binding record (src1/src2 as token indices — 84 is BUTTON_R1),
+// so a "press X to ..." prompt whose command we don't know can be found by reproducing
+// the prompt and reading which command becomes active and what feeds it. This is the
+// method that settled the photo-camera take-out (see docs/native-kbm-import.md).
+// Cheap: one bit per id, printed once per boot.
+void CmdCensus(uint8_t* base, uint32_t cmd, uint32_t port)
+{
+    if (!getenv("CW_KBM_CMD_CENSUS") || port != 0 || cmd >= kCmdCount)
+        return;
+    static bool seen[320] = {false};
+    if (cmd >= 320 || seen[cmd])
+        return;
+    seen[cmd] = true;
+    const uint32_t namePtr = LoadU32(base, kCmdTable + 4 * cmd);
+    const uint32_t array = LoadU32(base, kBindRecords + 4);
+    const uint32_t rec = array + cmd * 24;
+    fprintf(stderr, "[kbm-census] port0 cmd %u = %-40s src1=%u mode1=%u src2=%u mode2=%u comb=%u\n",
+            cmd, (namePtr >= 0x82000000 && namePtr < 0x82C00000)
+                     ? GuestStr(base, namePtr) : "?",
+            LoadU32(base, rec + 4), LoadU32(base, rec + 8),
+            LoadU32(base, rec + 0xC), LoadU32(base, rec + 0x10),
+            LoadU32(base, rec + 0x14));
+}
+
 // The command-value queries, hooked for the port histogram (trace-only cost).
 PPC_FUNC(sub_827FFD48)
 {
@@ -693,6 +718,7 @@ PPC_FUNC(sub_827FFD48)
     {
         if (ctx.r4.u32 < 16)
             g_queryByPort[0][ctx.r4.u32].fetch_add(1, std::memory_order_relaxed);
+        CmdCensus(base, ctx.r3.u32, ctx.r4.u32);
         DumpQueryHistogram();
     }
     __imp__sub_827FFD48(ctx, base);
@@ -704,6 +730,7 @@ PPC_FUNC(sub_827FFE90)
     {
         if (ctx.r4.u32 < 16)
             g_queryByPort[1][ctx.r4.u32].fetch_add(1, std::memory_order_relaxed);
+        CmdCensus(base, ctx.r3.u32, ctx.r4.u32);
     }
     __imp__sub_827FFE90(ctx, base);
 }

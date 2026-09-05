@@ -133,7 +133,11 @@ BINDINGS = [
     ("COMMAND_PLAYER_OBJECT_PICKUP", "KEY_E",       "PRESSED", "NONE", "NONE", "NONE"),
     ("COMMAND_PLAYER_USE",          "KEY_E",        "PRESSED", "NONE", "NONE", "NONE"),
     ("COMMAND_PLAYER_ITEMS_DROP",   "KEY_DOWN",     "PRESSED", "KEY_X", "PRESSED", "OR"),
-    ("COMMAND_PLAYER_ITEMS_HIDE",   "KEY_UP",       "PRESSED", "KEY_2", "PRESSED", "OR"),
+    # KEY_2 was DR2 PC's second items-hide key; freed 2026-09-05 — 2 now feeds the
+    # pad's RB at the source level (window.cpp, the camera take-out), and a key that
+    # both hid the inventory and took out the camera would do both on one press.
+    # Items-hide keeps arrow-up, the pad's own DPAD_UP parity.
+    ("COMMAND_PLAYER_ITEMS_HIDE",   "KEY_UP",       "PRESSED", "NONE", "NONE", "NONE"),
     ("COMMAND_PLAYER_CALLOUT",      "KEY_Q",        "PRESSED", "NONE", "NONE", "NONE"),
     # --- vehicles (keymap.txt) ---
     ("COMMAND_AI_VEHICLE_ENTER_EXIT", "KEY_E",      "PRESSED", "NONE", "NONE", "NONE"),
@@ -165,6 +169,11 @@ BINDINGS = [
     ("COMMAND_PLAYER_CHARGEATTACK_LONG",  "BUTTON_1", "HELD",  "NONE", "NONE", "NONE"),
     ("COMMAND_PLAYER_RAPID_FIRE_RT", "BUTTON_1",    "HELD",    "NONE", "NONE", "NONE"),
     ("COMMAND_PLAYER_RAPID_FIRE_LT", "BUTTON_2",    "HELD",    "NONE", "NONE", "NONE"),
+    # NOT the camera take-out: this command's padmap binding is BUTTON_L2 (the
+    # over-shoulder aim view), and a 2026-09-05 session briefly bound Shift here on
+    # that mistaken attribution — retracted. The real take-out is the pad's R1,
+    # served at the SOURCE level (window.cpp feeds RB from keys 2/3), not by a
+    # splice. This BUTTON_2-only mousemap line stays unspliced as before.
     ("COMMAND_PLAYER_TOGGLE_ALTERNATE_WEAPON_VIEW", "BUTTON_2", "HELD", "NONE", "NONE", "NONE"),
     ("COMMAND_PLAYER_THROW",        "BUTTON_2",     "HELD",    "BUTTON_1", "PRESSED", "AND"),
     ("COMMAND_PLAYER_THROW_RT",     "BUTTON_2",     "HELD",    "BUTTON_1", "PRESSED", "AND"),
@@ -207,17 +216,22 @@ BINDINGS = [
     ("COMMAND_AI_PUSHABLE_ALTERNATE_CHARGE", "BUTTON_1", "HELD",  "NONE", "NONE", "NONE"),
     ("COMMAND_AI_PUSHABLE_CHARGE",     "KEY_SPACE",    "HELD",    "NONE", "NONE", "NONE"),
     ("COMMAND_PLAYER_PUSH_HAMSTER_BALL", "BUTTON_1",   "PRESSED", "BUTTON_1", "HELD", "OR"),
-    # --- Case West EPILOGUE CAMERA (photography) — commands 306-315, NOT present in
-    #     DR2 PC's keymap/mousemap (they are epilogue-specific), so nothing bound them
-    #     and the in-game "use the camera" prompt did nothing under keyboard (operator,
-    #     2026-09-05). HOLD LEFT SHIFT to raise the camera; the mouse aims (it already
-    #     feeds the right stick); LEFT CLICK takes the picture; the wheel zooms (it maps
-    #     to KEY_3/KEY_1); WASD still walks Chuck via the left stick. NEEDS AN OPERATOR
-    #     PLAY-TEST: the ON/OFF toggle semantics and whether the Shift hold collides with
-    #     the hand-to-hand SHIFT modifier are unverified — see docs.
-    ("COMMAND_EPI_CAMERA_MODE_ON",            "KEY_LSHIFT",         "PRESSED",  "NONE", "NONE", "NONE"),
-    ("COMMAND_EPI_CAMERA_MODE_OFF",           "KEY_LSHIFT",         "RELEASED", "NONE", "NONE", "NONE"),
-    ("COMMAND_EPI_CAMERA_TAKE_PICTURE",       "BUTTON_1",           "PRESSED",  "NONE", "NONE", "NONE"),
+    # --- Case West EPILOGUE CAMERA (photography), commands 306-315, epilogue-specific
+    #     and absent from DR2 PC's maps. The camera is TAKEN OUT while aiming by the
+    #     pad's RB — COMMAND_PLAYER_SWITCH_INTERACTION_MODE1 (225), the shipped
+    #     padmap's only R1-PRESSED entry in the player action table (slot 20 at
+    #     0x82006240) — and that is served at the SOURCE level: window.cpp feeds RB
+    #     from keys 2/3, so no splice appears here. (Two earlier command-level
+    #     attributions were wrong and are retracted: MODE_ON/OFF (306/307) are never
+    #     polled per the CW_KBM_CMD_CENSUS run, and cmd 195 binds L2, the
+    #     over-shoulder view.) Once in the camera view: LEFT CLICK takes the picture
+    #     (the mouse feeds BUTTON_3, the padmap's own take-picture source); the
+    #     wheel zooms (its synthetic KEY_3/KEY_1 taps below — the wheel does NOT
+    #     feed RB, so zooming cannot toggle the camera away; physical 2/3 do, and
+    #     act as RB like the pad); the mouse aims (right stick) and WASD moves
+    #     Chuck (left stick).
+    ("COMMAND_EPI_CAMERA_TAKE_PICTURE",       "BUTTON_3",           "PRESSED",  "NONE", "NONE", "NONE"),
+    ("COMMAND_EPI_CAMERA_ALT_TAKE_PICTURE",   "BUTTON_R2",          "PRESSED",  "NONE", "NONE", "NONE"),
     ("COMMAND_EPI_CAMERA_ZOOM_IN",            "KEY_3",              "HELD",     "NONE", "NONE", "NONE"),
     ("COMMAND_EPI_CAMERA_ZOOM_OUT",           "KEY_1",              "HELD",     "NONE", "NONE", "NONE"),
     ("COMMAND_EPI_CAMERA_AIM_YAW_LEFTRIGHT",  "RIGHT_THUMBSTICK_X", "NONE",     "NONE", "NONE", "NONE"),

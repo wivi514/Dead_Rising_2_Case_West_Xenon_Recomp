@@ -76,3 +76,48 @@ lands. Keyboard drives the game on the first boot of the port.
   pad glyphs; input is unaffected.
 * MOUSE CAMERA defaults OFF (their operator's call so a pad build changes nothing);
   the Visuals panel's MOUSE CAMERA row turns it on, persisted.
+
+## The photo-camera take-out (part 9, 2026-09-05)
+
+**Symptom** (operator): while aiming a gun a prompt asks for the camera take-out; on
+pad it is RB and works; on keyboard no key did anything.
+
+**Two command-level attributions were wrong before the mechanism was found**, both
+recorded here as retractions:
+
+1. `EPI_CAMERA_MODE_ON/OFF` (306/307) — bound Shift to them; the
+   `CW_KBM_CMD_CENSUS` run showed the game never polls either. Their padmap lines
+   (L1 HELD / L1 RELEASED) are a dead earlier design.
+2. cmd 195 `TOGGLE_ALTERNATE_WEAPON_VIEW` — bound Shift to it; its own padmap
+   record reads src1=82 = BUTTON_L2, so it is the over-shoulder view, not RB.
+
+**What settled it, statically, on this image** (the true-or-false kind of fact,
+gotcha "stop refining the estimate"):
+
+* The instruction string is id 0x770 in `str_en.bcs`: *"To go into Camera Mode hold
+  [LTbutton_ig] then press [RBbutton_ig]"* — the take-out is LT-held + RB-pressed.
+* The player action table at `0x82006240` (found via the register-fed query site at
+  `0x8223d614`, which polls `word[0x82006240 + 4*slot]`) carries cmd **225
+  `COMMAND_PLAYER_SWITCH_INTERACTION_MODE1` at slot 20**, and the shipped
+  `data/controls/padmap.txt` binds exactly that command `BUTTON_R1, PRESSED` — the
+  only R1-PRESSED player action in the table. (225 is never an immediate anywhere in
+  the image — the one `li r5,225` at 0x825ff174 is HUD float math — which is why
+  call-site scanning for it finds nothing; the table is the route.)
+
+**The fix needs no attribution at all**, which after two wrong ones is the point:
+`window.cpp`'s reduced merge now feeds the synthetic pad's **RB from keys 2 and 3**
+(and LB from key 1), exactly the channel the mouse buttons already ride. A key press
+is then byte-identical to the pad RB press the operator confirmed works — for the
+take-out and for every other context RB serves (item cycle right, menu tabs, pause
+close). Key-cap coherence: the in-game RB glyph is legended "3", the menu RB glyph
+"2", so both on-screen legends are true; LB's "1" likewise. `KEY_2` was freed from
+`ITEMS_HIDE`'s second slot (arrow-up keeps it, DPAD_UP parity) so one press cannot
+both hide the inventory and take out the camera.
+
+The wheel's synthetic KEY_1/KEY_3 taps deliberately do NOT feed the shoulders, so
+wheel zoom inside camera mode cannot toggle the camera away. Physical 2/3 inside
+camera mode act as RB, like the pad.
+
+**Census tool kept**: `CW_KBM_CMD_CENSUS=1` logs each port-0 command's first poll
+with its name and live binding record (src tokens: 81 L1, 82 L2, 84 R1, 85 R2,
+86 R3) — reproduce a prompt and read which command wakes up and what feeds it.

@@ -1088,6 +1088,24 @@ HostPadState ReadKeyboard()
                 if (mb & SDL_BUTTON(SDL_BUTTON_MIDDLE))
                     s.buttons |= XI_RIGHT_THUMB;
             }
+            // THE SHOULDER KEYS (part 9). The photo-camera take-out while aiming
+            // is the pad's RB — the shipped padmap's own R1-PRESSED player action
+            // (COMMAND_PLAYER_SWITCH_INTERACTION_MODE1, slot 20 of the action
+            // table at 0x82006240) — and nothing keyboard-side fed R1, so the
+            // prompt's key did nothing. Two command-level attributions were wrong
+            // before this (EPI_CAMERA_MODE_ON is never polled; cmd 195 binds L2),
+            // so the fix deliberately needs NO attribution: feed the shoulder
+            // BUTTONS themselves, exactly like the mouse buttons above, and a key
+            // press becomes indistinguishable from the pad press that is known to
+            // work — for every context RB serves (take-out, item cycle, menu
+            // tabs). 3 is the in-game RB key-cap glyph, 2 the menu one, so both
+            // on-screen legends are true; 1 mirrors LB (its glyph in both sets).
+            // Deliberately OUTSIDE the g_relativeMouse gate: the camera take-out
+            // must work with MOUSE CAMERA off too.
+            if (keys[SDL_SCANCODE_1])
+                s.buttons |= XI_LEFT_SHOULDER;
+            if (keys[SDL_SCANCODE_2] || keys[SDL_SCANCODE_3])
+                s.buttons |= XI_RIGHT_SHOULDER;
             return s;
         }
 
