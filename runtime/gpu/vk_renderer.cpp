@@ -164,13 +164,14 @@ constexpr uint32_t kPsConstBytes = 256 * 16;
 // fetch constant, a new cache entry, a new slot — which is why EVERY building whitens
 // on approach while its distant version stays correct.
 //
-// RAISING THIS IS A MITIGATION, NOT THE FIX, and the distinction is the point: a cap
-// is only ever a bigger number, and this one now trades "textures silently turn white"
-// for "the texture working set grows without bound". The real fix is recycling — an
-// LRU over the texture cache with deferred destruction so an in-flight frame cannot
-// lose its image — and it is on the list. What this does buy is a session long enough
-// to find the NEXT defect, and a same-binary way to prove the causal chain end to end:
-// if the buildings stop whitening when the cap goes up, the chain is confirmed.
+// THE REAL FIX IS NOW IN (part 8, 2026-09-05): ReclaimTextureSlot is the LRU the rest
+// of this comment called for — when the heap fills, the least-recently-used slot that
+// no in-flight frame can still reference is evicted (its image retired behind the same
+// fence window as RetiredImage) and handed to the new texture, instead of serving the
+// 1x1 white dummy forever. The operator hit all 65536 slots on a release completion
+// run and everything past that whitened; validated by the crowd route at CW_VK_MAX_-
+// TEXTURES=256 (133 recycles, 0 sync hazards). This cap is now a VRAM ceiling / churn
+// knob, not a correctness limit; CW_VK_NO_TEX_LRU=1 restores the old white-on-full arm.
 //
 // Sized from the DEVICE rather than from a new magic number, clamped to something
 // sane, because "how many sampled images may a shader see" is a property of the host
@@ -3975,6 +3976,12 @@ struct TextureEntry
     // fold bound (`g_texGuardBytes`, which is a separate knob for a separate question).
     uint32_t preSlot = UINT32_MAX;
     uint64_t preFrame = 0;
+    // THE FRAME THIS TEXTURE WAS LAST REQUESTED IN — the LRU recency stamp. Written by
+    // TexFind on every hit and at upload. When the bindless heap fills, the slot
+    // reclaimer evicts the entry with the smallest lastUsedFrame that no in-flight
+    // frame can still reference (see ReclaimTextureSlot); without this a full session
+    // served the 1x1 white dummy for every new texture from the cap onward.
+    uint64_t lastUsedFrame = 0;
 };
 
 // A RESOLVE SNAPSHOT: what one pass left in the EDRAM, kept as a host image under the
@@ -5415,10 +5422,19 @@ size_t PersistSize()
 // The texture cache, through the same seam and for the same reason.
 TextureEntry* TexFind(uint64_t key)
 {
+    TextureEntry* e = nullptr;
     if (!g_flatCacheOff)
-        return R->textures.Find(key);
-    auto it = R->texturesMap.find(key);
-    return it != R->texturesMap.end() ? &it->second : nullptr;
+        e = R->textures.Find(key);
+    else
+    {
+        auto it = R->texturesMap.find(key);
+        e = it != R->texturesMap.end() ? &it->second : nullptr;
+    }
+    // Recency stamp for the LRU reclaimer: a lookup this frame IS a use this frame.
+    // One uint64 store on the ~40-50k/frame lookup path — negligible.
+    if (e)
+        e->lastUsedFrame = R->frame;
+    return e;
 }
 void TexInsert(uint64_t key, TextureEntry&& e)
 {
@@ -8221,6 +8237,87 @@ void DrainRetiredImages()
     }
 }
 
+// CW_VK_NO_TEX_LRU=1 — the control arm: restore the pre-LRU behaviour (a full heap
+// serves the 1x1 white dummy from then on), the same-binary way to reproduce the
+// exhaustion the LRU cures.
+bool g_texLruOff = getenv("CW_VK_NO_TEX_LRU") != nullptr;
+
+// RECLAIM A BINDLESS SLOT by evicting the least-recently-used texture whose slot no
+// in-flight (or in-recording) frame can still reference — the fix the g_maxDescriptors
+// comment called "the LRU this still needs". Slots were handed out monotonically and
+// never recycled, so a full playthrough exhausted the heap and every new texture went
+// white (the operator hit all 65536 on a completion run, 2026-09-05).
+//
+// SAFETY. The reused slot's descriptor is rewritten to the new image immediately, so a
+// frame still in flight that bound the old image through this slot would sample the new
+// one. We therefore only evict entries not touched within framesInFlight+1 frames —
+// exactly the RetiredImage window — which by construction no in-flight frame references.
+// With tens of thousands of slots and only a handful touched per frame, such a victim
+// always exists; if somehow none is safe we return UINT32_MAX and the caller serves
+// white for this one texture (never a use-after-free). The image itself goes through
+// RetireImage (deferred destroy behind the same fence window), never destroyed inline.
+//
+// Cube and 2D are separate slot spaces (different descriptor bindings), so the victim
+// must match the heap being reclaimed (`isCube`).
+uint32_t ReclaimTextureSlot(bool isCube)
+{
+    const uint64_t safeBefore =
+        R->frame > (R->framesInFlight + 1) ? R->frame - (R->framesInFlight + 1) : 0;
+    uint64_t bestFrame = UINT64_MAX;
+    uint32_t bestSlot = UINT32_MAX;
+
+    if (!g_flatCacheOff)
+    {
+        auto& t = R->textures;
+        uint32_t bestIdx = UINT32_MAX;
+        uint64_t bestKey = 0;
+        for (uint32_t i = 0; t.mask && i <= t.mask; ++i)
+        {
+            if (t.gens[i] != t.gen)            // live entries only (== gen, no tomb bit)
+                continue;
+            TextureEntry& e = t.vals[i];
+            if ((e.layers == 6) != isCube || e.slot == 0)
+                continue;
+            if (e.lastUsedFrame > safeBefore)  // still possibly referenced in flight
+                continue;
+            if (e.lastUsedFrame < bestFrame)
+            {
+                bestFrame = e.lastUsedFrame;
+                bestIdx = i;
+                bestSlot = e.slot;
+                bestKey = e.key;
+            }
+        }
+        if (bestIdx == UINT32_MAX)
+            return UINT32_MAX;
+        RetireImage(t.vals[bestIdx].image);
+        t.Erase(bestKey);
+    }
+    else
+    {
+        auto best = R->texturesMap.end();
+        for (auto it = R->texturesMap.begin(); it != R->texturesMap.end(); ++it)
+        {
+            TextureEntry& e = it->second;
+            if ((e.layers == 6) != isCube || e.slot == 0)
+                continue;
+            if (e.lastUsedFrame > safeBefore)
+                continue;
+            if (e.lastUsedFrame < bestFrame)
+            {
+                bestFrame = e.lastUsedFrame;
+                best = it;
+                bestSlot = e.slot;
+            }
+        }
+        if (best == R->texturesMap.end())
+            return UINT32_MAX;
+        RetireImage(best->second.image);
+        R->texturesMap.erase(best);
+    }
+    return bestSlot;
+}
+
 // Copy one resolve snapshot into one FACE of a cube snapshot, in the command buffer
 // given. Both images end back in SHADER_READ_ONLY, which is the layout their descriptors
 // were written with — the snapshot because other passes sample it as an ordinary 2D
@@ -9946,15 +10043,29 @@ uint32_t UploadTexture(uint8_t* base, const uint32_t* regs, uint32_t constIdx,
     // against the heap it was allocated from.
     const bool isCube = layers == 6;
     uint32_t& nextSlot = isCube ? R->nextCubeSlot : R->nextTextureSlot;
-    if (nextSlot >= g_maxDescriptors)
+    uint32_t useSlot;
+    if (nextSlot < g_maxDescriptors)
     {
-        Count(isCube ? "texture: CUBE bindless heap full" : "texture: bindless heap full");
-        return 0;
+        useSlot = nextSlot++;
+    }
+    else
+    {
+        // Heap full: recycle the least-recently-used slot instead of serving white.
+        useSlot = g_texLruOff ? UINT32_MAX : ReclaimTextureSlot(isCube);
+        if (useSlot == UINT32_MAX)
+        {
+            Count(isCube ? "texture: CUBE bindless heap full"
+                         : "texture: bindless heap full");
+            return 0;
+        }
+        Count(isCube ? "texture: CUBE slot recycled (LRU)"
+                     : "texture: slot recycled (LRU)");
     }
 
     TextureEntry entry;
     entry.key = key;
-    entry.slot = nextSlot++;
+    entry.slot = useSlot;
+    entry.lastUsedFrame = R->frame;
     entry.layers = layers;
     // The content this image is about to be built from, alongside the descriptor it is
     // keyed on. See TextureEntry for why the cache needs both.
