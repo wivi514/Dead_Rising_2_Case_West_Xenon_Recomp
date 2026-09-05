@@ -62,7 +62,7 @@ generated key map — see docs/native-kbm-phaseA.md):
                   LT=RMB (aim)              RT=LMB (fire)
   butstart=ENTER  butback=TAB  dpads=arrow keys  R3=MMB (heavy attack)
   analog_move_center=WASD cluster
-  UNPATCHED (no keyboard equivalent bound): L3, y_button_ig.
+  UNPATCHED (no keyboard equivalent bound): L3.
 
 Usage:
     python3 tools/gen_kbm_icons.py             # gates + write the patched bank
@@ -93,6 +93,10 @@ LEGENDS = {
     "x_button": ("key", "X"),
     "x_button_ig": ("mouse", "L"),
     "y_button": ("key", "C"),
+    # In-game Y prompt: the Y hand-to-hand actions are bound to KEY_Q, so the glyph
+    # must read Q (operator saw the Xbox Y here, 2026-09-05). Menu Y (y_button) stays
+    # C, its FRONTEND_Y_BUTTON binding.
+    "y_button_ig": ("key", "Q"),
     "butstart": ("key", "ENTER"),
     "butback": ("key", "TAB"),
     "dpad_up": ("key", "↑"),
@@ -443,6 +447,13 @@ def main():
     # "PRESS START" spelling and NO PRESS\0START id pair (measured; the sibling
     # had both).
     sbank = (REPO / "assets/game/data/frontend/str_en.bcs").read_bytes()
+    # CASE WEST: str_en.bcs is SIZE-PINNED (120,418 bytes) like fecmn.tex — the loader
+    # reads a fixed byte count, and a shorter file blanks ALL UI text (found the hard
+    # way, 2026-09-05). The shipped file is {n; ids; offs; blob} followed by 19,632
+    # bytes of zero padding. The table rebuild below drops that tail, so we pad back
+    # to this pinned size afterwards; the strings live in the head at absolute offsets,
+    # so trailing zeros are inert. Case Zero's bank is NOT pinned, hence no pad there.
+    STR_PIN = len(sbank)
     # Same-length in-place edits. "LEFT STICK " (imported from Case Zero, part 8)
     # is the grapple tutorial ("Wiggle the LEFT STICK [icon] to escape grapples!")
     # — the only occurrence in the bank — reworded for the keyboard reading.
@@ -484,11 +495,19 @@ def main():
     if got != table:
         print("GATE FAILED: rebuilt str bank does not read back", file=sys.stderr)
         sys.exit(1)
+    # Restore the pinned size (the rebuild's blob grew by 1 byte for MASH and dropped
+    # the shipped zero tail). Refuse rather than write a bank the loader would reject.
+    if len(sbank) > STR_PIN:
+        print(f"GATE FAILED: rebuilt str bank {len(sbank)} exceeds the pinned "
+              f"{STR_PIN} — refusing to write", file=sys.stderr)
+        sys.exit(1)
+    sbank = sbank + b"\0" * (STR_PIN - len(sbank))
 
     sout = OUT.parent / "str_en.bcs"
     OUT.parent.mkdir(parents=True, exist_ok=True)
     sout.write_bytes(sbank)
-    print(f"wrote {sout} (2 same-length edits + id 4049 LS->MASH via table rebuild)")
+    print(f"wrote {sout} ({len(sbank)} bytes, pinned; 2 same-length edits + id 4049 "
+          f"LS->MASH via table rebuild)")
 
     swp = bytearray()
     swp += struct.pack("<4sI", b"KBSW", len(swap_entries))

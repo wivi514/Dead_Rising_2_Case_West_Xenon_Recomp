@@ -30,8 +30,8 @@ dead rising 2 PC") transcribed and translated into Case West's vocabulary:
     curve-free — phaseA A.3).
 
 EVERY line is validated against the image's OWN tables before it is emitted —
-command names against the 305-entry table at 0x829DC810, source tokens against
-the 95-entry table at 0x829F3930, modes against the enum at 0x829EF8CC. A line
+command names against the 316-entry table at 0x829EF930, source tokens against
+the 95-entry table at 0x82A0A860, modes against the enum at 0x82A067FC. A line
 that fails validation is a hard error, not a skip: a silently dropped binding is
 a key that does nothing in a session three weeks from now.
 
@@ -54,11 +54,11 @@ IMAGE = REPO / "assets/game/default_image.bin"
 OUT = REPO / "runtime/cpu/kbm_default_map.h"
 
 BASE = 0x82000000
-CMD_TABLE = 0x829DC810
-CMD_COUNT = 305
-TOK_NAMES = 0x829F3930
+CMD_TABLE = 0x829EF930
+CMD_COUNT = 316
+TOK_NAMES = 0x82A0A860
 TOK_COUNT = 95
-MODE_NAMES = 0x829EF8CC
+MODE_NAMES = 0x82A067FC
 MODE_COUNT = 12  # none and not or held pressed released repeat accelrepeat tap1 tap2 quicktimedrelease
 
 # The map. Each entry: (command, src1, mode1, src2, mode2, comb).
@@ -207,6 +207,23 @@ BINDINGS = [
     ("COMMAND_AI_PUSHABLE_ALTERNATE_CHARGE", "BUTTON_1", "HELD",  "NONE", "NONE", "NONE"),
     ("COMMAND_AI_PUSHABLE_CHARGE",     "KEY_SPACE",    "HELD",    "NONE", "NONE", "NONE"),
     ("COMMAND_PLAYER_PUSH_HAMSTER_BALL", "BUTTON_1",   "PRESSED", "BUTTON_1", "HELD", "OR"),
+    # --- Case West EPILOGUE CAMERA (photography) — commands 306-315, NOT present in
+    #     DR2 PC's keymap/mousemap (they are epilogue-specific), so nothing bound them
+    #     and the in-game "use the camera" prompt did nothing under keyboard (operator,
+    #     2026-09-05). HOLD LEFT SHIFT to raise the camera; the mouse aims (it already
+    #     feeds the right stick); LEFT CLICK takes the picture; the wheel zooms (it maps
+    #     to KEY_3/KEY_1); WASD still walks Chuck via the left stick. NEEDS AN OPERATOR
+    #     PLAY-TEST: the ON/OFF toggle semantics and whether the Shift hold collides with
+    #     the hand-to-hand SHIFT modifier are unverified — see docs.
+    ("COMMAND_EPI_CAMERA_MODE_ON",            "KEY_LSHIFT",         "PRESSED",  "NONE", "NONE", "NONE"),
+    ("COMMAND_EPI_CAMERA_MODE_OFF",           "KEY_LSHIFT",         "RELEASED", "NONE", "NONE", "NONE"),
+    ("COMMAND_EPI_CAMERA_TAKE_PICTURE",       "BUTTON_1",           "PRESSED",  "NONE", "NONE", "NONE"),
+    ("COMMAND_EPI_CAMERA_ZOOM_IN",            "KEY_3",              "HELD",     "NONE", "NONE", "NONE"),
+    ("COMMAND_EPI_CAMERA_ZOOM_OUT",           "KEY_1",              "HELD",     "NONE", "NONE", "NONE"),
+    ("COMMAND_EPI_CAMERA_AIM_YAW_LEFTRIGHT",  "RIGHT_THUMBSTICK_X", "NONE",     "NONE", "NONE", "NONE"),
+    ("COMMAND_EPI_CAMERA_AIM_PITCH_UPDOWN",   "RIGHT_THUMBSTICK_Y", "NONE",     "NONE", "NONE", "NONE"),
+    ("COMMAND_EPI_CAMERA_MOVE_PLAYER_LEFTRIGHT",  "LEFT_THUMBSTICK_X", "NONE",  "NONE", "NONE", "NONE"),
+    ("COMMAND_EPI_CAMERA_MOVE_PLAYER_FORWARDBACK","LEFT_THUMBSTICK_Y", "NONE",  "NONE", "NONE", "NONE"),
 ]
 
 
