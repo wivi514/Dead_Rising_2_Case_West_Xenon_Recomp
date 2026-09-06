@@ -266,6 +266,7 @@ add_executable(cw_runtime
     host/host_paths.cpp              # release A.1: every path anchored to the exe
     host/first_run.cpp               # release A.2: what is missing, where it goes
     host/stfs_extract.cpp            # release E (§2.3 step 2): the in-process unpack
+    host/overlay_gen.cpp             # release §0: first-run KB/M overlay generation
     gpu/d3d_draw_stub.cpp
     host/settings.cpp                # the Visuals panel's persistent store (imported from Case Zero part 60)
     host/window.cpp                  # phase 3; compiles to stubs without CW_HAVE_SDL
@@ -291,6 +292,13 @@ if(WIN32)
         target_compile_options(cw_runtime PRIVATE
             "$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/host/win_compat.h>")
     endif()
+endif()
+
+# overlay_gen.cpp uses a TU-internal exception for its gate ladder (caught at its
+# two public entry points). clang-cl and MSVC default exceptions OFF; the flag is
+# scoped to the one file that needs it.
+if(MSVC)
+    set_source_files_properties(host/overlay_gen.cpp PROPERTIES COMPILE_OPTIONS "/EHsc")
 endif()
 
 # D.2's two translation units get their include paths as SOURCE properties, not

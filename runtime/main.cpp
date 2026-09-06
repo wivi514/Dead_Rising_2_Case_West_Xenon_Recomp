@@ -43,6 +43,7 @@
 #include "gpu/vk_renderer.h"
 #include "host/first_run.h"
 #include "host/host_paths.h"
+#include "host/overlay_gen.h"
 #include "host/stfs_extract.h"
 #include "host/settings.h"
 #include "host/window.h"
@@ -216,6 +217,24 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    // Release §0: the overlay generation by hand — what the first-run hook below runs
+    // automatically, exposed for the byte-identity gate against the Python reference
+    // (tools/gen_kbm_icons.py: run it, run this, `diff -r` the trees) and for
+    // regenerating deliberately.
+    if (argc > 1 && strcmp(argv[1], "--gen-overlays") == 0)
+    {
+        HostPaths::Report();
+        std::string err;
+        if (!OverlayGen::Generate(
+                [](const char* label, float) { fprintf(stderr, "[overlay] %s\n", label); },
+                err))
+        {
+            fprintf(stderr, "[overlay] FAILED: %s\n", err.c_str());
+            return 1;
+        }
+        return 0;
+    }
+
     // Where everything is, decided once and printed once. It used to be
     // "../../assets/game/default.xex" — CWD-relative, which is why every recipe in
     // CLAUDE.md begins with `cd runtime/build`. See host/host_paths.h.
@@ -347,6 +366,23 @@ int main(int argc, char** argv)
                         Host_ProgressUpdate(l, total ? float(done) / float(total) : 1.f);
                     });
             }
+        }
+        // Release §0: the KB/M prompt overlay, generated on the player's machine
+        // from their own game data, because it carries Capcom-derived bytes and so
+        // cannot ship in the artifact. Runs whenever an output is missing or was
+        // written by an older generator; CW_NO_OVERLAY_GEN=1 is the off switch.
+        // A failure is loud but not fatal: the VFS then serves the shipped data,
+        // which is degraded (pad prompts) but honest.
+        if (OverlayGen::WantedAtBoot())
+        {
+            if (!progressWindow)
+                progressWindow = Host_ProgressBegin("PREPARING FIRST RUN");
+            std::string err;
+            if (!OverlayGen::Generate(
+                    [](const char* label, float frac) { Host_ProgressUpdate(label, frac); },
+                    err))
+                fprintf(stderr, "[overlay] FAILED: %s — the shipped pad prompts "
+                                "will be used\n", err.c_str());
         }
         if (progressWindow)
             Host_ProgressEnd();
