@@ -93,6 +93,39 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
+# THE RELEASE BUILD TYPE (Case Zero release-plan A.3, imported).
+#
+# `Release` is redefined here, deliberately and loudly, because CMake's default for
+# it would be a PERFORMANCE CHANGE dressed as a packaging decision:
+#
+#   CMake's Release        -O3 -DNDEBUG
+#   ours                   -O2 -g -DNDEBUG, then the debug info split off and the
+#                          shipped binary stripped
+#
+# -O2, NOT -O3: every performance number both ports have recorded was measured at
+# -O2; shipping -O3 would invalidate the corpus for a saving nobody has measured.
+# -g KEPT then SPLIT: the shipped file is stripped, the .debug sits beside it, and
+# crash_report's host pc still addr2lines. And it makes the gate free and decisive:
+# -g does not affect code generation and --strip-debug does not touch .text, so the
+# release .text is BYTE-IDENTICAL to the dev build's —
+# tools/release_text_identity.sh is that check.
+set(CMAKE_CXX_FLAGS_RELEASE "-O2 -g -DNDEBUG"
+    CACHE STRING "Flags used by the CXX compiler during RELEASE builds." FORCE)
+set(CMAKE_C_FLAGS_RELEASE   "-O2 -g -DNDEBUG"
+    CACHE STRING "Flags used by the C compiler during RELEASE builds." FORCE)
+
+# Split the debug info off the shipped executable. Defaults ON for Release and OFF
+# everywhere else, so a developer never has to think about it and a release never
+# has to remember it.
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    set(CW_SPLIT_DEBUG_DEFAULT ON)
+else()
+    set(CW_SPLIT_DEBUG_DEFAULT OFF)
+endif()
+option(CW_SPLIT_DEBUG
+       "Emit cw_runtime.debug and strip the executable (release packaging)"
+       ${CW_SPLIT_DEBUG_DEFAULT})
+
 file(GLOB PPC_SOURCES CONFIGURE_DEPENDS "${PPC_DIR}/*.cpp")
 list(LENGTH PPC_SOURCES PPC_TU_COUNT)
 message(STATUS "Recompiled image: ${PPC_TU_COUNT} translation units")
@@ -174,6 +207,18 @@ endforeach()
 # working, and that is a session wasted. Configure with -DCW_WINDOW=OFF to say
 # "headless on purpose" out loud.
 option(CW_WINDOW "Build the SDL window / present / input seam (phase 3)" ON)
+
+# CW_SDL2_PREFIX — build against the SDL2 from tools/build_sdl2.sh (release builds).
+# Exists because Fedora's libSDL2-2.0.so.0 is `sdl2-compat`, a shim that dlopen()s
+# libSDL3 at run time — invisible to ldd, and Case Zero's first bundle died on it in
+# a clean container. Developing against the system copy stays the default.
+set(CW_SDL2_PREFIX "" CACHE PATH
+    "Prefix of an SDL2 built by tools/build_sdl2.sh (release builds)")
+if(CW_SDL2_PREFIX)
+    list(PREPEND CMAKE_PREFIX_PATH "${CW_SDL2_PREFIX}")
+    message(STATUS "SDL2: ${CW_SDL2_PREFIX} (built from source, not sdl2-compat)")
+endif()
+
 if(CW_WINDOW)
     find_package(SDL2 QUIET)
     if(NOT SDL2_FOUND)
@@ -492,3 +537,48 @@ endforeach()
 # its own: "most" is not "every".
 target_link_options(cw_runtime PRIVATE
     "-Wl,--whole-archive" "$<TARGET_FILE:ppc_image>" "-Wl,--no-whole-archive")
+
+# CW_BUNDLE_RPATH — look for the bundled libraries beside the executable first
+# (Case Zero release-plan A.4, imported). $ORIGIN is resolved by the loader against
+# the executable's own path, so this survives the player unpacking the archive
+# anywhere, and it needs no launcher script and no LD_LIBRARY_PATH — a launcher
+# script is a thing a player can bypass by running the binary directly, and then
+# the bundle silently is not what loads.
+#
+# Defaults ON for Release only. In a dev tree there is no lib/ beside the binary so
+# the entry is never satisfied — harmless, but also an extra variable a measured
+# binary should not carry. NOTE (Case Zero A.3's surprise, kept true here): the
+# RUNPATH string lives in .dynstr, BEFORE .text, so flipping this option relocates
+# the image — hold it matched across any .text-identity comparison.
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    set(CW_BUNDLE_RPATH_DEFAULT ON)
+else()
+    set(CW_BUNDLE_RPATH_DEFAULT OFF)
+endif()
+option(CW_BUNDLE_RPATH "Add $ORIGIN/lib to the executable's RPATH (release packaging)"
+       ${CW_BUNDLE_RPATH_DEFAULT})
+if(CW_BUNDLE_RPATH AND NOT WIN32)
+    # Literal $ORIGIN, escaped so CMake does not try to expand it as a variable.
+    set_target_properties(cw_runtime PROPERTIES
+        BUILD_RPATH "\$ORIGIN/lib"
+        INSTALL_RPATH "\$ORIGIN/lib")
+endif()
+
+if(CW_SPLIT_DEBUG)
+    find_program(CW_OBJCOPY NAMES llvm-objcopy objcopy)
+    if(NOT CW_OBJCOPY)
+        message(FATAL_ERROR
+            "CW_SPLIT_DEBUG is on but neither llvm-objcopy nor objcopy was found.\n"
+            "  Fedora:  sudo dnf install binutils   (or llvm)\n"
+            "Or say -DCW_SPLIT_DEBUG=OFF to ship an unstripped binary on purpose.")
+    endif()
+    message(STATUS "Release packaging: cw_runtime.debug via ${CW_OBJCOPY}")
+    add_custom_command(TARGET cw_runtime POST_BUILD
+        COMMAND ${CW_OBJCOPY} --only-keep-debug
+                $<TARGET_FILE:cw_runtime> $<TARGET_FILE:cw_runtime>.debug
+        COMMAND ${CW_OBJCOPY} --strip-debug $<TARGET_FILE:cw_runtime>
+        COMMAND ${CW_OBJCOPY}
+                --add-gnu-debuglink=$<TARGET_FILE:cw_runtime>.debug
+                $<TARGET_FILE:cw_runtime>
+        COMMENT "Splitting debug info into cw_runtime.debug and stripping the binary")
+endif()
