@@ -2,6 +2,14 @@
 """Generate the keyboard/mouse prompt icons — our own key-cap art in the title's
 own glyph textures (part 92, native-kbm-plan phase D).
 
+AS OF THE GITHUB RELEASE THIS TOOL IS THE REFERENCE, NOT THE ROAD:
+runtime/host/overlay_gen.cpp is a line-for-line C++ port that runs the same
+transforms at a player's first run (a shipped bundle has no Python and must not
+ship the Capcom-derived outputs), and its contract is BYTE IDENTITY with this
+file — `cw_runtime --gen-overlays` + `diff -r` is the gate. If you change ANY
+transform here, port the change, re-export the chips (--export-chips) and bump
+overlay_gen.cpp's kGeneratorVersion in the same commit.
+
 WHY THIS EXISTS. Prompt strings carry inline markup ([@x_button_ig]) that
 resolves to a frontend BITMAP by name, and all 25 pad-glyph bitmaps live in ONE
 bank: data/frontend/fecmn.tex (recon in docs/native-kbm-phaseA.md A.4). With the
@@ -37,10 +45,12 @@ through tools/big_decompress --force (byte identity, gate 3).
 
 THE SIZE PIN: layout.bin fixes data/frontend/fecmn.tex at 501,900 bytes and the
 loader reads by that size, so the patched bank must fit UNDER it and is padded
-to EXACTLY it — one layout record then serves both overlay states. How the
-game reaches the loose file at all: gen_pc_options.py evicts the nested
-preload4.big copy of fecmn.tex (index-hash flip), the same proven road its
-fecmn.big took in part 60.
+to EXACTLY it — one layout record then serves both overlay states. (An earlier
+version of this paragraph said the game only reaches the loose file because
+gen_pc_options.py evicts a nested preload4.big copy — that is a CASE ZERO fact
+that does not transfer: this title reads the frontend banks LOOSE, no
+game_patched layer exists in this tree, and the icons demonstrably render
+without any eviction. Retracted in place, gotcha 13.)
 
 GATES (all run every time, all fatal):
   1. identity: the bank re-packed with ZERO patches must be byte-identical to
@@ -440,6 +450,13 @@ def patch_camera_layout():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--preview", metavar="DIR", help="also write chip PNGs here")
+    ap.add_argument("--export-chips", metavar="DIR",
+                    help="also write each patched glyph's finished texel blob "
+                    "(the tiled, 16-bit-swapped DXT5 bytes — OUR art only, no "
+                    "header and no Capcom byte) as <base>.dxt. These ship in "
+                    "the release artifact so a player's first run can compose "
+                    "them into their own bank without Python or PIL "
+                    "(runtime/host/overlay_gen.cpp)")
     args = ap.parse_args()
 
     data = SRC.read_bytes()
@@ -499,6 +516,10 @@ def main():
             previews.append((base, canvas.copy()))
         raw = hdr + encode_dxt5_tiled(canvas, len(texels) // 16)
         swap_entries.append((base, hdr[:16], texels, raw[48:]))
+        if args.export_chips:
+            cdir = Path(args.export_chips)
+            cdir.mkdir(parents=True, exist_ok=True)
+            (cdir / f"{base}.dxt").write_bytes(raw[48:])
         window = struct.unpack(">I", data[e["rec"][4] + 4:e["rec"][4] + 8])[0]
         pay = make_entry_payload(raw, window)
         # GATE 3: round-trip through the real decompressor.
