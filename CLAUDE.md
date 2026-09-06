@@ -24,7 +24,7 @@ low-risk — the import table says so.
 
 ## Status — and where a new conversation starts
 
-> **THE LIVE HAND-OFF IS `docs/part9-kickoff.md`.** Read it first in a new conversation:
+> **THE LIVE HAND-OFF IS `docs/part11-kickoff.md`.** Read it first in a new conversation:
 > it says what already exists (so it is not rebuilt), names where to start, and lists the
 > gates that are run and owed. When a part ends, write the next `part<N>-kickoff.md`,
 > demote this pointer to it, and refresh the memory directory.
@@ -33,6 +33,21 @@ low-risk — the import table says so.
 > **`docs/part2-kickoff.md` is superseded** and is kept as the cautionary example: its
 > problem statement was false and part 2 refuted it with the measurement that section
 > itself asked for.
+
+## Status: PART 10 BUILT AND GATED THE RELEASE (2026-09-05)
+
+**Both v1.0.0 artifacts exist and passed their gates** — see
+`docs/release-github-plan.md` (the plan + execution record) and
+`docs/part11-kickoff.md` (what remains: the operator's test sittings on both
+platforms, an optional prewarm re-harvest, then tag + Release + visibility
+flip). Highlights: `runtime/host/overlay_gen.{h,cpp}` (first-run KB/M overlay
+generation, byte-identical to `gen_kbm_icons.py` — this port needs NO
+game_patched layer, its Visuals panel is a code hook), the packaging/gate
+scripts and CI imported from Case Zero, the public README at the root (dev
+README → `docs/dev-readme-day1.md`), the Windows leg built on czwin at
+`C:\cw` (sharing `C:\cz`'s toolchain), and three found-and-fixed defects:
+the cz-recomp/cw-recomp shared pipeline-cache dir, LoadShaders' CWD-only
+shader-cache fallback in a shipped tree, and the memmem/readlink POSIX-isms.
 
 ## Status: PART 8 LANDED THE PARTS 83-93 IMPORT (2026-09-03)
 

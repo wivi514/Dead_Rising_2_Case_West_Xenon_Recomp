@@ -63,7 +63,9 @@ test sitting.**
   - `release_text_identity.sh`: **.text 36,556,402 bytes, byte-identical**
     between matched RelWithDebInfo and Release configures.
   - `release_package_linux.sh`: `dist/CaseWestRecomp-linux-x86_64.tar.zst`,
-    26 MB, sha256 `c1d81f87…` (full hash in release-notes-v1.0.0.md).
+    26 MB — rebuilt once after the czwin POSIX fixes (they move .text), final
+    sha256 `f7f76eb3…` (full hashes in release-notes-v1.0.0.md), the container
+    gate re-run PASSED on the rebuilt bundle.
   - `release_gate_clean_container.sh`: **GATE PASSED** — bundle self-resolves,
     --smoke in-container, DXC dlopen translates, and the whole first-run flow:
     in-process extract (305 files, 1,216,219,768 bytes), disc prebuild

@@ -1,9 +1,12 @@
 # Release notes — v1.0.0 (DRAFT until the operator's test sittings pass)
 
 **This is the text to paste into the GitHub Release body** (everything below the
-`---`). Drafted 2026-09-05 in the release session; the checksums are refreshed
-whenever an artifact is rebuilt — if either is EVER rebuilt, refresh its hash
-here before attaching. Windows hash lands when the czwin package is pulled back.
+`---`). Drafted 2026-09-05 in the release session; both artifacts are built,
+gated (Linux: text identity + container GATE PASSED; Windows: staged --smoke)
+and sit in `dist/` with the checksums below — the Windows zip was pulled back
+from czwin and hash-verified on arrival. The checksums are refreshed whenever
+an artifact is rebuilt — if either is EVER rebuilt, refresh its hash here
+before attaching.
 
 ---
 
@@ -97,6 +100,6 @@ Also released: the sibling port,
 ### Checksums (SHA-256)
 
 ```
-c1d81f875da1a199b22a65635b9977dc9a488fd964d1331cc21a48dfc023e40b  CaseWestRecomp-linux-x86_64.tar.zst
-PENDING-WINDOWS-BUILD                                             CaseWestRecomp-windows-x86_64.zip
+f7f76eb3d929ff2c8729269def46f587c0e0e283c604123ff5e75ae479faf28e  CaseWestRecomp-linux-x86_64.tar.zst
+dcac8ca166a0bcd3ce989f45a2b12b5f54dca9febf3252d76d3acf3a8506dfd8  CaseWestRecomp-windows-x86_64.zip
 ```
