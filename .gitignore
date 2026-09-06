@@ -33,3 +33,13 @@ tools/__pycache__/
 # Commands section of CLAUDE.md.
 runtime/build-o3/
 assets/game_kbm/
+
+# Release packaging outputs and locally built bundled deps (see the same block in
+# the Case Zero repo): `dist/` is the packaged tree; `thirdparty/{sdl2,ffmpeg-lgpl}`
+# are rebuilt with tools/build_sdl2.sh / tools/build_ffmpeg_lgpl.sh; the extra
+# runtime/build-* trees are the release and matched-identity configures.
+/dist/
+/thirdparty/sdl2/
+/thirdparty/ffmpeg-lgpl/
+build-release/
+build-relid/
