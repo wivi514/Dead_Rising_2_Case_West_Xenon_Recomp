@@ -121,3 +121,48 @@ camera mode act as RB, like the pad.
 **Census tool kept**: `CW_KBM_CMD_CENSUS=1` logs each port-0 command's first poll
 with its name and live binding record (src tokens: 81 L1, 82 L2, 84 R1, 85 R2,
 86 R3) — reproduce a prompt and read which command wakes up and what feeds it.
+
+## The camera-mode HUD glyph bar (part 9, 2026-09-05)
+
+**Symptom** (operator, with an F9 of the bar): once the camera is out, the bottom
+prompt bar read **[X] TAKE PICTURE · [↵] ZOOM OUT · [ESC] ZOOM IN** — the shared
+MENU face-button glyphs — while the actual keyboard controls are LEFT CLICK (take
+picture) and the WHEEL / number keys 1 and 3 (zoom).
+
+**Why the glyphs were wrong, and why the atlas can't just be relabelled.** The
+layout `data/frontend/ingame.big : cameraview.txt` (a plain-text `cFEScreen
+hud_camera`, two camera UIs — Chuck and Frank) hard-codes each prompt's glyph:
+`callout_X File="x_button"`, `callout_A File="a_button"`, `callout_B
+File="b_button"`. Those are the MENU glyph variants, which our overlay legends
+X / Enter / Esc for their menu meaning (Select / Confirm / Back) — correct in
+menus, wrong here. The fecmn glyph atlas has only 21 controller-button icons and
+**no mouse or scroll icon**, and every icon is shared across contexts, so no icon
+can be relabelled to "LMB"/"wheel" without corrupting the menus or gameplay
+prompts that use it.
+
+**The fix retargets the camera bar's glyphs (only) at the `_ig` variants whose
+existing legends are already truthful for the keyboard — no relabel:**
+
+    x_button  -> x_button_ig   (mouse-L)  : take picture = LEFT CLICK
+    a_button  -> LBbutton_ig   ("1")      : zoom out     = key 1
+    b_button  -> RBbutton_ig   ("3")      : zoom in      = key 3
+
+Zoom is bound to `KEY_1`/`KEY_3` in `kbm_default_map.h`, so "1"/"3" are true
+(the wheel also zooms but has no glyph in the shipped atlas, so the number keys
+are the truthful icon). Take-picture's `x_button_ig` is correct for BOTH devices
+(mouse-L on keyboard, Xbox-X on pad — pad take-picture is X).
+
+**How it ships.** `tools/gen_kbm_icons.py` now also repacks `ingame.big` into the
+KB overlay (`assets/game_kbm/data/frontend/ingame.big`), reusing
+`gen_pc_options.py`'s `.big` read/write + LZX-chunk encoder, with an identity-repack
+gate and a `big_decompress` round-trip gate. The VFS serves the KB overlay **only
+while native KB/M is the input path** (`vfs.cpp`), so a pad-only build
+(`CW_NO_NATIVE_KBM=1`) is untouched. `CW_NO_KB_PROMPTS=1` restores the shipped
+menu-glyph bar with the keyboard live.
+
+**Documented caveat (niche hybrid):** a pad used *while native KB/M is enabled*
+would see the LB/RB icons for zoom, but pad zoom is A/B — the icons follow the
+keyboard binding, not the pad's. Accepted: the operator's path is pure KB/M, and a
+pad player disables native KB/M. There is no single icon correct for both a
+keyboard (key 1) and a pad (button A) because the atlas has one bitmap per glyph
+and the device-follow swap cannot tell a menu context from a camera context.

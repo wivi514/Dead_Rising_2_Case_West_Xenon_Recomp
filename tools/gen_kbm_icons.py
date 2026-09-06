@@ -357,6 +357,86 @@ def decompress_entry(payload):
     return out
 
 
+# ---- the in-game camera bar (ingame.big / cameraview.txt) -------------------
+#
+# THE EPILOGUE-CAMERA HUD BAR draws three button prompts — TAKE PICTURE, ZOOM IN,
+# ZOOM OUT — and the layout (data/frontend/ingame.big : cameraview.txt) hard-codes
+# their glyphs as the MENU face-button icons x_button / a_button / b_button. Our
+# overlay legends those as X / Enter / Esc (their menu meaning: Select / Confirm /
+# Back), so the camera bar read "X take picture, Enter/Esc zoom" while the actual
+# keyboard controls are LEFT CLICK (take picture) and the WHEEL or number keys 1/3
+# (zoom) — the operator's report, 2026-09-05, confirmed by an F9 of the bar.
+#
+# The glyph atlas has no mouse or scroll icon, and those three menu glyphs are
+# shared with every real menu bar, so they cannot be relabelled. The fix retargets
+# the camera bar (only) at the _ig glyph variants whose EXISTING legends are already
+# truthful for the keyboard — no relabel:
+#     x_button  -> x_button_ig   (mouse-L)  : take picture = LEFT CLICK
+#     a_button  -> LBbutton_ig   ("1")      : zoom out     = key 1  (also wheel)
+#     b_button  -> RBbutton_ig   ("3")      : zoom in      = key 3  (also wheel)
+# Zoom is bound to KEY_1/KEY_3 in kbm_default_map.h, so "1"/"3" are correct; the
+# wheel has no glyph in the shipped atlas, so the number keys are the truthful icon.
+# cameraview.txt carries TWO camera UIs (Chuck and Frank) — both bars are patched.
+#
+# This lands in the game_kbm overlay, which the VFS serves ONLY while native KB/M
+# is the input path (vfs.cpp), so a pad build is untouched. Caveat, documented in
+# docs/native-kbm-import.md: a pad used WHILE native KB/M is enabled would see the
+# LB/RB icons for zoom (pad zoom is A/B) — a niche hybrid, not the pad-only path.
+def patch_camera_layout():
+    import importlib.util as _ilu2
+    _s = _ilu2.spec_from_file_location(
+        "gen_pc_options", Path(__file__).resolve().parent / "gen_pc_options.py")
+    _g = _ilu2.module_from_spec(_s)
+    _s.loader.exec_module(_g)
+
+    src = REPO / "assets/game/data/frontend/ingame.big"
+    raw, data_start, names_off, entries = _g.read_big(str(src))
+
+    # GATE: identity repack of the untouched archive must be byte-exact.
+    tmp_ident = tempfile.NamedTemporaryFile(suffix=".big", delete=False).name
+    _g.write_big(tmp_ident, raw, data_start, names_off, [dict(e) for e in entries])
+    if Path(tmp_ident).read_bytes() != raw:
+        print("GATE FAILED: ingame.big identity repack is not byte-identical — "
+              "refusing to patch the camera layout", file=sys.stderr)
+        sys.exit(1)
+    Path(tmp_ident).unlink()
+
+    cam = next(e for e in entries if e["name"] == "cameraview.txt")
+    dec = _g.decompress_entry(cam["stored"])
+    if len(dec) != cam["size2"]:
+        print(f"GATE FAILED: cameraview.txt decompressed to {len(dec)} != "
+              f"{cam['size2']}", file=sys.stderr)
+        sys.exit(1)
+    subs = ((b'File="x_button"', b'File="x_button_ig"'),
+            (b'File="a_button"', b'File="LBbutton_ig"'),
+            (b'File="b_button"', b'File="RBbutton_ig"'))
+    for old, new in subs:
+        if dec.count(old) != 2:      # Chuck + Frank
+            print(f"GATE FAILED: cameraview.txt holds {dec.count(old)} of "
+                  f"{old!r}, expected 2 (Chuck + Frank bars) — layout moved",
+                  file=sys.stderr)
+            sys.exit(1)
+        dec = dec.replace(old, new)
+
+    pay = _g.lzx_encode_stream(dec)
+    _g.verify_fake_lzx(pay, dec)     # round-trips through tools/big_decompress
+    cam["stored"] = pay
+    cam["size2"] = len(dec)
+
+    out = REPO / "assets/game_kbm/data/frontend/ingame.big"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    _g.write_big(str(out), raw, data_start, names_off, entries)
+    # verify nothing else moved and the tokens landed
+    _, _, _, ent2 = _g.read_big(str(out))
+    changed = sum(1 for a, b in zip(entries, ent2)
+                  if a["name"] != "cameraview.txt" and a["stored"] != b["stored"])
+    if changed:
+        print(f"GATE FAILED: {changed} non-camera entries changed", file=sys.stderr)
+        sys.exit(1)
+    print(f"wrote {out} ({out.stat().st_size} bytes; camera bar glyphs "
+          f"-> x_button_ig/LBbutton_ig/RBbutton_ig, both Chuck+Frank bars)")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--preview", metavar="DIR", help="also write chip PNGs here")
@@ -519,6 +599,8 @@ def main():
     (OUT.parent.parent.parent / "glyph_swap.bin").write_bytes(bytes(swp))
     print(f"wrote {OUT.parent.parent.parent / 'glyph_swap.bin'} "
           f"({len(swp)} bytes, {len(swap_entries)} glyphs, both art sets)")
+
+    patch_camera_layout()
 
     out = rebuild(data, entries, patches)
     # THE SIZE PIN (see the module comment): the loader reads this file at
