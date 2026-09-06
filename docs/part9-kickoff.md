@@ -40,6 +40,37 @@ Any picture complaint bisects on the newest command-buffer-rearranging default f
 See imported-fixes §5's addendum — filled from `tools/cw_trace_band.py` over the
 part-8 chains (`p8_parrec_on` / `p8_parrec_off`, binary sha `8eb792bfb41bd48e`).
 
+## 1b. WHAT PART 9 HAS DONE SO FAR (operator-driven KB/M polish, 2026-09-05)
+
+All three landed and pushed (`112d47a..c1ce181`); this is candidate 1 from §2
+("Operator play space — KB/M feel") playing out exactly as predicted.
+
+1. **Photo-camera take-out on keyboard** (`6043013`). The "press RB to take out the
+   camera" prompt while aiming did nothing on keyboard. It is the pad's R1
+   (action-table slot 20 at `0x82006240` = cmd 225 `SWITCH_INTERACTION_MODE1`,
+   padmap R1-PRESSED; prompt string 0x770 says "hold LT, press RB"). Two
+   command-level attributions were wrong first (306/307 never polled; 195 binds
+   L2) — both retracted in `docs/native-kbm-import.md`. The fix is
+   attribution-free: `window.cpp`'s reduced merge feeds XInput RB from keys 2/3
+   (LB from 1), the same channel the mouse buttons ride, so a keypress is
+   identical to the pad press that works.
+
+2. **Camera-mode HUD glyphs corrected** (`4532e50`). The bar read menu X/↵/ESC
+   while the controls are LMB + wheel/keys 1,3. The atlas has no mouse/scroll
+   icon and the three glyphs are menu-shared, so they can't be relabelled;
+   instead the layout `ingame.big : cameraview.txt` (both Chuck+Frank UIs) is
+   retargeted at the `_ig` variants already legended truthfully — `x_button_ig`
+   (mouse-L), `LBbutton_ig` ("1"), `RBbutton_ig` ("3"). Shipped as a
+   `gen_kbm_icons.py` overlay repack of ingame.big (identity + round-trip gates),
+   served only while native KB/M is active. **Method: HUD prompt glyphs live in
+   the frontend LAYOUT files, not the atlas or code.**
+
+3. **Mouse camera ALWAYS ON** (`c1ce181`). Imported Case Zero's release-session
+   change: the MOUSE CAMERA toggle is retired, capture follows window focus alone
+   (`window.cpp` wantRel), the Visuals panel drops that row (8→7), `mouse_cam` is
+   a retired settings key, and `native_kbm.cpp`'s direct-camera hook gates on
+   `MouseDeviceActive()` alone. `docs/imported-fixes.md` has the row.
+
 ## 2. WHERE PART 9 STARTS
 
 **Ask the operator.** The obvious candidates, none pre-chosen:
