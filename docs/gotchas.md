@@ -3233,3 +3233,34 @@ rather than merely larger — which is a different claim, and only a repeat run 
 **How this was nearly missed:** the operator asked *"did you put the thing to catch
 shader in before you launched it?"* — and the answer was no. The launch that preceded
 that question had the dump off, and would have thrown away everything it saw.
+
+## 325. A TRANSPLANTED PORT INHERITS THE SIBLING'S RUNTIME PATHS, AND TWO PORTS THEN SHARE ONE CACHE IN SILENCE
+
+The pipeline cache and its pre-warm key file live in a per-user directory that the
+transplant carried across verbatim: `~/.cache/cz-recomp`, the SIBLING's name. Inside
+it, the file is keyed on the shader-cache DIRECTORY's name — `shader_spv` in both
+trees — so the two ports did not merely share a directory, they shared **one file
+each**. Every Case West dev session on this machine wrote its pipeline keys into Case
+Zero's file and read Case Zero's back; the sibling's release-day gate runs then
+overwrote the lot, and when the release seed was harvested only **9 of 406 keys**
+resolved against this title's shader cache.
+
+Nothing failed. It cannot fail loudly by construction: a Vulkan pipeline cache is
+driver-validated (foreign blobs are declined, not obeyed), and the pre-warm skips keys
+whose shader hashes it does not know. The cost is silent — a cold start that should
+have been warm, and every pre-warm A/B on this machine measuring a cache the other
+port had just rewritten.
+
+**This is gotcha 3 in its third dress** (see also the sibling-constants trap: a copied
+TOOL carries the sibling's magic numbers). The first two dresses were analysis tools
+and generated config. This one is *state at run time*, which is worse in one specific
+way: a tool's wrong constant is visible in its own source, while a shared directory is
+visible only on a machine that happens to run both ports — i.e. exactly the
+development machine, and nowhere in CI, in a container, or on a player's PC.
+
+**The rule when transplanting:** grep the new runtime for the sibling's prefix in
+STRING LITERALS, not just in identifiers — cache directories, registry keys, settings
+file names, temp paths, window titles, save locations, environment prefixes. The
+compiler renames nothing inside quotes. And when two things must be distinct per
+title, key them on something the title owns (its own name), never on a path component
+both titles happen to spell the same way.
