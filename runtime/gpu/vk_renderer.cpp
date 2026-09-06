@@ -6890,7 +6890,15 @@ void CreatePipelineCache(const std::filesystem::path& dir)
 #endif
         else
             base = std::filesystem::temp_directory_path(ec);
-        base /= "cz-recomp";
+        // cw-recomp, NOT the sibling's cz-recomp (found during release packaging,
+        // 2026-09-05): the file inside is keyed on the SHADER CACHE directory's
+        // name, which is `shader_spv` in both ports' trees, so on a machine with
+        // both titles the two runtimes silently shared one pipeline cache and one
+        // pre-warm key file — every CW dev session on this box mixed its keys into
+        // Case Zero's. Harmless to correctness (the cache is driver-validated and
+        // the pre-warm skips unknown shader hashes) but a measurement pollutant
+        // and wrong for a shipped build next to an installed Case Zero.
+        base /= "cw-recomp";
         std::filesystem::create_directories(base, ec);
         R->pipeCachePath = (base / ("pipeline_" + dir.filename().string() + ".bin")).string();
     }
