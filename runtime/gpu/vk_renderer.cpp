@@ -12,10 +12,6 @@
 
 #include <vulkan/vulkan.h>
 
-#ifndef _WIN32
-#include <unistd.h>   // one readlink("/proc/self/exe") in the shader-cache fallback
-#endif
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -7419,22 +7415,20 @@ bool LoadShaders()
         dir = env;
     else
     {
+        // HostPaths::ShaderCache() FIRST and it is the one that matters — it is
+        // anchored to the executable, so it is right from any working directory and
+        // in a shipped tree (Case Zero release-plan A.1; this call site kept the
+        // pre-A.1 walk through the part-8 merge and the Windows build named it:
+        // the old fourth candidate was a readlink("/proc/self/exe") open-coded,
+        // Linux-only — in a shipped bundle the cache was only found when the CWD
+        // happened to be the bundle root). The CWD-relative candidates below are
+        // kept only because recorded recipes pass odd working directories.
         std::vector<std::filesystem::path> candidates = {
+            HostPaths::ShaderCache(),
             "../../assets/shader_spv", // CWD = runtime/build/
             "../assets/shader_spv",    // CWD = runtime/
             "assets/shader_spv",       // CWD = repo root
         };
-        char exe[4096];
-        const ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
-        if (n > 0)
-        {
-            exe[n] = '\0';
-            candidates.push_back(std::filesystem::path(exe)
-                                     .parent_path()
-                                     .parent_path()
-                                     .parent_path() /
-                                 "assets" / "shader_spv");
-        }
         std::error_code ec;
         for (const auto& c : candidates)
             if (std::filesystem::is_directory(c, ec))

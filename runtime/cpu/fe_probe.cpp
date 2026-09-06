@@ -95,6 +95,31 @@
 namespace
 {
 
+// memmem is a GNU extension the Windows CRT lacks (the czwin release build named
+// all three callers below). Same code on both platforms — the memchr-skip +
+// memcmp shape native_kbm.cpp's FindBytes uses — with memmem's void* signature
+// so the call sites read unchanged. Probe-path only, never per frame.
+const void* FeFindBytes(const void* hayV, size_t hayLen,
+                        const void* needleV, size_t needleLen)
+{
+    const uint8_t* hay = static_cast<const uint8_t*>(hayV);
+    const uint8_t* needle = static_cast<const uint8_t*>(needleV);
+    if (needleLen == 0 || hayLen < needleLen)
+        return nullptr;
+    const uint8_t* p = hay;
+    const uint8_t* end = hay + hayLen - needleLen + 1;
+    while (p < end)
+    {
+        p = static_cast<const uint8_t*>(std::memchr(p, needle[0], size_t(end - p)));
+        if (!p)
+            return nullptr;
+        if (std::memcmp(p, needle, needleLen) == 0)
+            return p;
+        ++p;
+    }
+    return nullptr;
+}
+
 // The ctors and the 0x1CC accessors that used to sit in this list moved into the
 // three-class vtable census below, where their counts come back CLASS-FILTERED.
 // The intern function 0x827815D0 moved to its own hook below (round 6): it still
@@ -1831,7 +1856,7 @@ void FeProbe_Report()
                 size_t len = r.second - r.first;
                 while (len >= nlen && hits.size() < 8)
                 {
-                    const void* m = memmem(p, len, needle, nlen);
+                    const void* m = FeFindBytes(p, len, needle, nlen);
                     if (!m)
                         break;
                     hits.push_back(uint32_t(uintptr_t(m) - uintptr_t(b3)));
@@ -1854,7 +1879,7 @@ void FeProbe_Report()
                     size_t len = r.second - r.first;
                     while (len >= 4 && nptr < 6)
                     {
-                        const void* m = memmem(p, len, ptr, 4);
+                        const void* m = FeFindBytes(p, len, ptr, 4);
                         if (!m)
                             break;
                         std::fprintf(stderr, " 0x%08X",
@@ -1886,7 +1911,7 @@ void FeProbe_Report()
                         size_t len = r.second - r.first;
                         while (len >= 4 && npp < 8)
                         {
-                            const void* m = memmem(p, len, pptr, 4);
+                            const void* m = FeFindBytes(p, len, pptr, 4);
                             if (!m)
                                 break;
                             std::fprintf(stderr, " 0x%08X",
