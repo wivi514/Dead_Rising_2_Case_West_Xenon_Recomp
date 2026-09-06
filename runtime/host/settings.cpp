@@ -25,9 +25,10 @@ struct State
     int rtShadows = 0;          // 0 = none (default), 1/2/3 = RT LOW/MED/HIGH.
                                 // Non-zero REPLACES the raster cascade (part 64,
                                 // operator's spec).
-    bool mouseCam = false;      // mouse -> right-stick camera (part 91). OFF by
-                                // default so a pad player's build changes nothing.
     int mouseSens = 5;          // 1..10, the panel's MOUSE SENS row.
+                                // (mouse_cam retired 2026-09-05: the mouse camera
+                                //  is always on, so there is no longer a toggle to
+                                //  store — see window.cpp's wantRel.)
 };
 
 // The frame-cap values the panel offers. A set rather than a range because the vblank
@@ -73,11 +74,10 @@ void SaveLocked()
             "fov=%d\n"             // field-of-view adjustment in degrees, -10..+30, 0 = OG
             "aspect=%d\n"          // 0 = 16:9, 1 = 21:9 (applies at next launch)
             "rt_shadows=%d\n"     // 0 = OG, 1 = RT LOW (needs a ray-query device)
-            "mouse_cam=%d\n"      // 1 = mouse drives the camera (part 91)
             "mouse_sens=%d\n",    // 1..10
             int(g_state.displayMode), g_state.resW, g_state.resH, g_state.renderScale,
             g_state.vsync ? 1 : 0, g_state.shadowTier, g_state.fpsCap, g_state.fov,
-            g_state.aspect, g_state.rtShadows, g_state.mouseCam ? 1 : 0,
+            g_state.aspect, g_state.rtShadows,
             g_state.mouseSens);
     fclose(f);
 }
@@ -134,8 +134,9 @@ void Settings_Load(const std::string& path)
             g_state.shadowTier = int(v);
         else if (!strcmp(key, "rt_shadows") && v >= 0 && v <= 1)
             g_state.rtShadows = int(v);
-        else if (!strcmp(key, "mouse_cam"))
-            g_state.mouseCam = v != 0;
+        // mouse_cam: retired key (the mouse camera is always on now); an old file
+        // carrying it parses as an ignored unknown, the contract every retired key
+        // gets — no branch, so it falls through to the trailing "unknown key".
         else if (!strcmp(key, "mouse_sens") && v >= 1 && v <= 10)
             g_state.mouseSens = int(v);
         else if (!strcmp(key, "aspect") && v >= 0 && v <= 1)
@@ -274,19 +275,6 @@ void Settings_SetFov(int deg)
     SaveLocked();
     // Applied LIVE: the renderer re-reads the value once per frame (the shadow-tier
     // pattern) in FovHalfRadThisFrame, vk_renderer.cpp.
-}
-
-bool Settings_MouseCam()
-{
-    std::lock_guard<std::mutex> lock(g_mutex);
-    return g_state.mouseCam;
-}
-
-void Settings_SetMouseCam(bool on)
-{
-    std::lock_guard<std::mutex> lock(g_mutex);
-    g_state.mouseCam = on;
-    SaveLocked();
 }
 
 int Settings_MouseSens()

@@ -429,3 +429,30 @@ Case Zero's working tree also carries **uncommitted part-47 performance work** o
 (a three-way split of the `record` profiler phase, and a four-lane `GuardFold`). **Not
 imported**: it is unfinished, it is performance rather than correctness, and this port has no
 performance measurements of its own to justify it yet. Revisit when Case Zero commits it.
+
+## Mouse camera ALWAYS ON (part 9, 2026-09-05) — from Case Zero's release session
+
+**Source**: Case Zero retired its `mouse_cam` toggle ("the mouse camera is always
+on now") — settings.cpp's retired-key comment and window.cpp's focus-only `wantRel`.
+**Landed here**: operator instruction 2026-09-05, "put the mouse always on from Case
+Zero in here."
+
+The mouse camera no longer needs the Visuals MOUSE CAMERA row switched on; capture
+follows window **focus** alone (released while a panel wants a visible cursor or
+focus leaves — a pad player who never moves the mouse feeds zero deltas, so a pad
+build is unchanged). Changes, mirroring Case Zero:
+
+* `runtime/host/window.cpp` — `wantRel` drops `Settings_MouseCam()`; the Visuals
+  panel loses its MOUSE CAMERA row (8 rows → 7, panel height 460 → 420); the
+  keyboard-help line and the part-91 comment updated.
+* `runtime/cpu/pc_options_cw.cpp` — the host-panel input handler drops the MOUSE
+  CAMERA case (case 6), MOUSE SENS becomes case 6, nav modulo 8 → 7.
+* `runtime/host/settings.{cpp,h}` — `mouse_cam` is a retired key (an old settings
+  file carrying it parses as an ignored unknown); the `mouseCam` field,
+  `Settings_MouseCam`/`Settings_SetMouseCam`, and the save-line are gone.
+* `runtime/cpu/native_kbm.cpp` — the direct-camera hook (`sub_82470DC0`) gates on
+  `NativeKbm_Active() && MouseDeviceActive()` alone, no longer on the toggle.
+
+The MOUSE SENS row and `mouse_sens` persistence are unchanged. No env-var control
+was added (Case Zero didn't); `CW_NO_NATIVE_KBM=1` still disables the whole KB/M
+path including the mouse.

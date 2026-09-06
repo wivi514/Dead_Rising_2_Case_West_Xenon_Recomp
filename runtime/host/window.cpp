@@ -435,8 +435,9 @@ bool g_keyboardFocus = true;
 // no bindings, no key-name table, no prompt icons in 12,481 archive entries. So the
 // mouse lives HERE, at the same host seam the keyboard fallback has always used:
 // relative-mode deltas become right-stick deflection (velocity-scaled, EMA-smoothed),
-// LMB = X (attack), RMB = RT (aim), MMB = Y, and the side buttons LB/RB. Off unless
-// the panel's MOUSE CAMERA row says on, so a pad player's build changes nothing.
+// LMB = X (attack), RMB = RT (aim), MMB = Y, and the side buttons LB/RB. ALWAYS ON
+// now (the MOUSE CAMERA toggle is retired, 2026-09-05): capture follows window focus,
+// so a pad player who never moves the mouse feeds zero deltas and nothing changes.
 // Deltas are accumulated by the event loop and consumed by ReadKeyboard — both on
 // the window thread, the atomics are belt and braces.
 std::atomic<int> g_mouseDX{ 0 }, g_mouseDY{ 0 };
@@ -552,9 +553,9 @@ const char* Glyph(char c)
 template <typename Rect>
 void EmitSettingsOverlay(int w, int h, Rect&& rect)
 {
-    const int panelW = 640, panelH = 460;   // 460: eight rows — part 91 added the
-                                            // MOUSE CAMERA pair (part 64 had merged
-                                            // the RT tiers INTO the shadow row)
+    const int panelW = 640, panelH = 420;   // 420: seven rows — the MOUSE CAMERA
+                                            // toggle is retired (mouse always on),
+                                            // leaving the MOUSE SENS row of part 91
     const int panelX = (w - panelW) / 2, panelY = (h - panelH) / 2 - 30;
     if (panelW <= 0 || panelH <= 0)
         return;
@@ -641,18 +642,17 @@ void EmitSettingsOverlay(int w, int h, Rect&& rect)
     // the mouse is host-made (window.cpp's ReadKeyboard) and these are its knobs.
     char sensName[4];
     snprintf(sensName, sizeof sensName, "%d", Settings_MouseSens());
-    const char* rows[8][2] = {
+    const char* rows[7][2] = {
         { "RESOLUTION", resName },
         { "DISPLAY MODE", kModeNames[int(Settings_DisplayMode()) % 3] },
         { "VSYNC", kOnOff[Settings_VSync() ? 1 : 0] },
         { "SHADOW QUALITY", kShadowRow[shadowRow % 3] },
         { "FRAME CAP", capName },
         { "FIELD OF VIEW", fovName },
-        { "MOUSE CAMERA", kOnOff[Settings_MouseCam() ? 1 : 0] },
         { "MOUSE SENS", sensName },
     };
     const int sel = Settings_OverlaySelection();
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 7; ++i)
     {
         const int y = panelY + 86 + i * 40;
         if (i == sel)
@@ -831,7 +831,7 @@ void PrintKeyMap()
         fprintf(stderr, "  %s=%s", k.keyName, k.padName);
     fprintf(stderr, "\n[host] keyboard -> sticks:  WASD=left stick  IJKL=right stick  "
                     "1/3=LT/RT  (positions, not letters — ZQSD on AZERTY)\n");
-    fprintf(stderr, "[host] mouse (when MOUSE CAMERA is ON in Visuals): camera=right "
+    fprintf(stderr, "[host] mouse (always on): camera=right "
                     "stick  LMB=X  RMB=RT  MMB=Y  side=LB/RB\n");
     fprintf(stderr, "[host] the window must have keyboard FOCUS for any of this to "
                     "reach the guest.\n");
@@ -2363,8 +2363,14 @@ void Host_WindowRun()
         // a panel wants a visible cursor context or focus leaves. State-change
         // only: SDL_SetRelativeMouseMode is not free.
         {
+            // ALWAYS ON (operator instruction, 2026-09-05, matching Case Zero's
+            // release-session change): the MOUSE CAMERA toggle is retired and
+            // capture follows FOCUS alone — released the moment a panel wants a
+            // visible cursor or focus leaves, and a pad player who never moves the
+            // mouse feeds zero deltas either way. State-change only:
+            // SDL_SetRelativeMouseMode is not free.
             const bool wantRel =
-                Settings_MouseCam() && g_keyboardFocus &&
+                g_keyboardFocus &&
                 !g_debugOverlayVisible.load(std::memory_order_acquire) &&
                 !Settings_OverlayVisible();
             if (wantRel != g_relativeMouse)

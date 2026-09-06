@@ -92,10 +92,8 @@ void Settings_SetFov(int deg);
 // leftovers only (a MOUSE SENSITIVITY row in options_pc.txt, `always_show_mouse` in
 // the image, handlers compiled out per part 60's verb-hash proof) and zero KB/M
 // prompt icons — so the mouse is host-made: window.cpp turns relative deltas into
-// right-stick camera (LMB=X, RMB=RT, MMB=Y, X1/X2=LB/RB) behind these two knobs.
-// OFF by default so a pad player's build changes nothing.
-bool Settings_MouseCam();
-void Settings_SetMouseCam(bool on);
+// right-stick camera (LMB=X, RMB=RT, MMB=Y, X1/X2=LB/RB). ALWAYS ON now (the
+// MOUSE CAMERA toggle is retired, 2026-09-05); only the sensitivity knob remains.
 int  Settings_MouseSens();    // 1..10, default 5
 void Settings_SetMouseSens(int s);
 void Settings_SetRtShadows(int tier);

@@ -751,7 +751,7 @@ PPC_FUNC(sub_82470DC0)
     __imp__sub_82470DC0(ctx, base);
     // The camera state can live in the physical-alias heap (calibration saw it at
     // 0xA6CCD418), so the upper bound is generous — reject only a wild pointer.
-    if (!NativeKbm_Active() || !MouseDeviceActive() || !Settings_MouseCam() ||
+    if (!NativeKbm_Active() || !MouseDeviceActive() ||
         cam < 0x10000 || cam >= 0xF0000000)
         return;
     int dx = 0, dy = 0;
