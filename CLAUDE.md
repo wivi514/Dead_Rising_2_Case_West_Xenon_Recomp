@@ -89,12 +89,15 @@ stack gone the 26k-line renderer merge had ZERO conflicts). What is now default:
   address re-derived on this image (`docs/native-kbm-import.md`; shape-matching
   method recorded there). First boot: 93 bindings, 0 bad, 86 spliced. Key-cap prompt
   icons + PRESS ENTER + device-follow serve from the `assets/game_kbm/` overlay
-  (regenerate: `python3 tools/gen_kbm_icons.py`). **MOUSE CAMERA is a Visuals-panel
-  row and defaults OFF** — the mouse looks around only when it is on (the operator's
-  first report of "mouse didn't work" was exactly this; their settings now carry
-  `mouse_cam=1`).
+  (regenerate: `python3 tools/gen_kbm_icons.py`). ~~**MOUSE CAMERA is a
+  Visuals-panel row and defaults OFF**~~ — **SUPERSEDED by part 9 (`c1ce181`): the
+  toggle is RETIRED and the mouse camera is ALWAYS ON**, capture following window
+  focus alone. `mouse_cam` is a retired settings key. (Kept struck through rather
+  than deleted because the operator's first "mouse didn't work" report was the old
+  default, and that story explains why the toggle went away.)
 - **Live resolution apply** — the Visuals row steps a PENDING value, X applies at the
-  frame boundary. Panel is 8 rows now (…, MOUSE CAMERA, MOUSE SENS).
+  frame boundary. Panel is **7 rows** (RESOLUTION / DISPLAY MODE / VSYNC / SHADOW
+  QUALITY / FRAME CAP / FIELD OF VIEW / MOUSE SENS) since the MOUSE CAMERA row went.
 - **The release infrastructure**: in-process shader translation
   (`cw_runtime --translate-shaders`, byte-identity gate vs the Python cache PASSED
   480/480 here), first-boot disc shader prebuild, exe-anchored paths, in-process
