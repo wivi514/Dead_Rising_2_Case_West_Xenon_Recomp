@@ -106,6 +106,6 @@ Also released: the sibling port,
 ### Checksums (SHA-256)
 
 ```
-e438b1510ad4c31ca1f196c8eca6b0e8a8eb6b2e287462e8daa96ed97acbcd92  CaseWestRecomp-linux-x86_64.tar.zst
-e0cf2d62f49e320b5cc5d918fe16b1f6e5e4a5d0e4fccabc64e685b313221d11  CaseWestRecomp-windows-x86_64.zip
+4d3e5005d494460932b284c93c9c058eac39f125baa1e331c52afaa9216a4f15  CaseWestRecomp-linux-x86_64.tar.zst
+9b90771843f1b5a9cdede7e045ae13a2bc363a1238ac42a0ff5b9caebe2c3318  CaseWestRecomp-windows-x86_64.zip
 ```

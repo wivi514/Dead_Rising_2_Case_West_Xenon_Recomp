@@ -17,12 +17,12 @@ execution record, which is most of what part 10 did.
   (eight fixes, `docs/imported-fixes.md` §6 — the semaphore boot hang, the AMD
   depth format, the worker floor, the self-firing firearm, async pipelines,
   the pre-warm union, EXIT GAME, MASH in every language).
-* `dist/CaseWestRecomp-linux-x86_64.tar.zst` — 26 MB, sha256 `e438b151…`.
+* `dist/CaseWestRecomp-linux-x86_64.tar.zst` — 26 MB, sha256 `4d3e5005…`.
   Gated: `.text` identity between matched configures; clean-container GATE
   PASSED **including the whole first-run flow** (in-process extract of the real
   package, 1,322-shader disc prebuild, overlay generation byte-identical to
   the Python reference, boot, honest refusal).
-* `dist/CaseWestRecomp-windows-x86_64.zip` — 21 MB, sha256 `e0cf2d62…`. Built
+* `dist/CaseWestRecomp-windows-x86_64.zip` — 21 MB, sha256 `9b907718…`. Built
   on czwin (C:\cw tree, sharing C:\cz's toolchain/deps); staged exe passed
   `--smoke`; pulled back and hash-verified on arrival.
 * `docs/release-notes-v1.0.0.md` is the paste-ready Release body with both
@@ -57,6 +57,29 @@ execution record, which is most of what part 10 did.
 re-run the gates (text identity + container on Linux; staged --smoke on
 Windows), refresh both hashes in the notes. Case Zero went through four such
 rounds on release day; the machinery makes each ~15 minutes.
+
+## 2a. THE AMD MACHINE IS SET UP AND THE RELEASE RUNS THERE (2026-09-06)
+
+**czamd** (`192.168.0.60`, Windows 10 Pro, Radeon RX 6600, user `lisab`) now
+carries a ready-to-play install at **`C:\Users\lisab\cw\CaseWestRecomp\`** —
+the gated v1.0.0 zip, unpacked, with the operator's own package already
+extracted and all 1,322 shaders built. Just run `cw_runtime.exe` there.
+
+It has NO toolchain (no compiler, CMake, git or Vulkan SDK) and nothing was
+built on it — a Windows binary is portable and what that machine offers is its
+GPU. Installing a toolchain there is a multi-GB change to a machine that is not
+the dev box; say so before doing it.
+
+What running there already proved (`docs/imported-fixes.md` §6 addendum): the
+whole first-run flow on a machine with no dev tree (the one check the packaging
+script says it cannot make), the AMD depth fallback firing on the device's own
+answer, the worker floor giving that 6-core CPU 3 workers instead of 1, and
+75,770 log lines with zero faults. It also FOUND the false "saving will fail"
+message (`a3d8eb3`).
+
+**Still owed there: a windowed, interactive run** — everything above was
+headless over SSH. A GUI launch needs the interactive session (Case Zero used a
+`schtasks` task for this on czwin).
 
 ## 2b. WHAT THE SITTING SHOULD NOW ALSO CHECK (new, from the fix round)
 

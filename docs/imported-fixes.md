@@ -493,3 +493,51 @@ path including the mouse.
 * **`082fff5` uncapped mouse-look** — that is Case Zero re-deriving **our** feature on their image, with their addresses. Nothing flows back.
 * **`a1bdff6` gas-station rooftop / texture-LOD thumbnail** — a Case Zero LOCATION and a Case Zero asset hash. The mechanism may generalise and may even touch the operator's parked minor-visual list; not hunted, because that list is theirs to open.
 * **The part-99/100 kernel probes** (`CZ_APC_TRACE`, `CZ_KOBJ_DUMP`, `CZ_KCALL_WHO` milestones, the streaming listeners) — diagnostics built to find the boot hang whose FIX we took. Worth having if a player reports a hang; not needed to ship.
+
+### Addendum — the AMD machine, and what running there found (2026-09-06)
+
+The operator pointed this session at **czamd** (`192.168.0.60`, Windows 10 Pro,
+**Radeon RX 6600**, 6 physical cores) — the machine Case Zero's boot hang and
+AMD depth bug were found on. It has **no toolchain at all** (no compiler, CMake,
+git or Vulkan SDK), so nothing was built there: a Windows x86-64 binary is
+portable, and what that machine uniquely offers is its **GPU**. The gated
+`CaseWestRecomp-windows-x86_64.zip` was transferred (hash verified on arrival),
+unpacked, given the operator's own package, and run.
+
+**This is the check `release_package_windows.ps1` says it cannot make** — the
+first-run flow on a machine with no dev tree — and it passed end to end:
+
+* `[extract] done: 305 files, 1216219768 bytes` — the in-process STFS unpack;
+* `[prebuild] 1322 translated, 0 already present, 0 failed` — DXC on AMD;
+* overlay generation ran and the VFS served the generated banks (no Python on
+  that machine, which is the whole point of the §0 road);
+* boot to the title screen, polling input, **75,770 log lines with zero faults,
+  zero unsupported packets/formats/imports, zero VK_ERROR, zero semaphore
+  refusals**.
+
+**The two fixes that had never run on AMD both fired, on the device's own
+answer rather than a poison:**
+
+```
+[vk] device: AMD Radeon(TM) Graphics (Vulkan 1.4.315)
+[vk] EDRAM depth format: D24_UNORM_S8_UINT is NOT sampleable on this device
+     (AMD) - using D32_SFLOAT_S8_UINT so depth resolves are readable
+[threads] machine: 6 physical cores, 12 logical cpus -> budget 3 workers
+     (reserve 2, committed 3, floor 3@6c/2@4c, cap 6)
+```
+
+The depth line is the §6 import validated on the hardware it was written for —
+without it this machine would have had undefined depth resolves. The threads
+line is the core floor doing its job on a real player-class CPU: **that machine
+would have got 1 worker** under the old formula.
+
+**And running there found a defect nothing else would have** — a first boot
+announced `saves live in ... (COULD NOT BE CREATED - saving will fail)` while
+the directory had in fact been created. One shared `std::error_code`: the
+migration block's `is_directory(oldRoot, ec)` overwrites the create result, and
+a fresh install never HAS an old save tree, so **every clean first boot claimed
+saving was broken**. Fixed in `a3d8eb3`, with the message now reporting the
+directory's real state and a negative control proving it can still fire. **Case
+Zero has the same bug character for character** — and since they shipped a
+release with a genuine Windows save failure, this is precisely the sentence
+someone hunting that would grep for.

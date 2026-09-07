@@ -65,7 +65,7 @@ test sitting.**
   - `release_package_linux.sh`: `dist/CaseWestRecomp-linux-x86_64.tar.zst`,
     26 MB. REBUILT TWICE: once after the czwin POSIX fixes, and again on
     2026-09-06 to carry the parts 98-101 fix round (imported-fixes §6) —
-    final sha256 `e438b151…`, `.text` 36,577,074 bytes identical between
+    final sha256 `4d3e5005…`, `.text` 36,577,074 bytes identical between
     matched configures, container gate PASSED on the final bundle.
   - `release_gate_clean_container.sh`: **GATE PASSED** — bundle self-resolves,
     --smoke in-container, DXC dlopen translates, and the whole first-run flow:
