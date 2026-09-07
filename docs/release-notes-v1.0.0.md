@@ -1,13 +1,23 @@
-# Release notes — v1.0.0 (DRAFT until the operator's test sittings pass)
+# Release notes — v1.0.0 (FINAL)
 
 **This is the text to paste into the GitHub Release body** (everything below the
-`---`). Drafted 2026-09-05 in the release session; both artifacts are built,
-gated (Linux: text identity + container GATE PASSED; Windows: staged --smoke)
-and sit in `dist/` with the checksums below — the Windows zip was pulled back
-from czwin and hash-verified on arrival. The checksums are refreshed whenever
-an artifact is rebuilt — if either is EVER rebuilt, refresh its hash here
-before attaching.
+`---`). Binaries are commit `c2ce144`; the last source change is `a3d8eb3`.
 
+Beyond the port itself this carries the pre-release fix round imported from the
+sibling (`docs/imported-fixes.md` §6): the semaphore boot hang, the AMD EDRAM
+depth auto-negotiation, the worker-budget core floor, the self-firing firearm
+(RMB aims with LT, not RT), async pipeline creation with the pre-warm chain,
+the pre-warm seed union, EXIT GAME quitting to the desktop, MASH in every
+language bank — plus the false "saving will fail" message found by running the
+artifact on the AMD machine.
+
+**Operator-tested 2026-09-06: "Tested and pretty good."** Verified on NVIDIA
+(the dev box + the Alienware) and on **AMD** (Radeon RX 6600, Windows 10) where
+the whole first-run flow ran on a machine with no dev tree at all.
+
+**The release is frozen at the tag**: if either artifact is EVER rebuilt,
+refresh its hash below before attaching. Both artifacts and a SHA256SUMS file
+are staged at `~/Release/Case West/1.0.0/`.
 ---
 
 Play **Dead Rising 2: Case West** — the Xbox 360 exclusive epilogue to Dead
