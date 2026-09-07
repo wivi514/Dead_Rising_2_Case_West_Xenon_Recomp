@@ -30,6 +30,15 @@ execution record, which is most of what part 10 did.
   `docs/dev-readme-day1.md`). CI is in (`.github/workflows/build.yml`) — its
   FIRST live runs trigger on part 10's pushes; check the Actions tab.
 
+## 1b. THE SITTINGS ARE DONE AND THE RELEASE IS STAGED (2026-09-06)
+
+Operator: **"Tested and pretty good."** Tag `v1.0.0` pushed at `9ef2ef1`;
+artifacts + SHA256SUMS + paste-ready notes staged at
+`~/Release/Case West/1.0.0/`. **All that remains is their GitHub clicks**
+(draft the release on the existing tag, paste the notes, attach the two files,
+publish, flip visibility). §2 below is kept for the mechanics and for whatever
+a later fix round needs.
+
 ## 2. WHAT PART 11 IS: the operator's test sittings, then the three clicks
 
 1. **Windows sitting (zero setup).** The play copy is fully staged ON THE

@@ -90,6 +90,28 @@ is preserved verbatim at `docs/dev-readme-day1.md`. CI imported
 (`.github/workflows/build.yml` + `tools/ci/` patches — byte-identical to Case
 Zero's, same pinned bases, one local patch set serves both ports).
 
+## §5b OPERATOR-ACCEPTED AND STAGED (2026-09-06)
+
+Their verdict after playing the artifacts: **"Tested and pretty good."** That
+answers the §3.1/§3.2 sittings as a formal gate — as Case Zero's "we really got
+all the fix" did there.
+
+**The release is staged for upload at `~/Release/Case West/1.0.0/`**, matching
+their Case Zero 1.0.1 layout:
+
+```
+CaseWestRecomp-linux-x86_64.tar.zst    4d3e5005…   (54 entries, tar-verified)
+CaseWestRecomp-windows-x86_64.zip      9b907718…   (43 entries, unzip -t clean)
+SHA256SUMS                                          (sha256sum -c: both OK)
+release-notes-v1.0.0.md                             (paste-ready below its ---)
+```
+
+**The tag `v1.0.0` is created and pushed** at commit `9ef2ef1`. What remains is
+the operator's own three clicks: Releases → Draft a new release → choose the
+existing tag v1.0.0, title "Dead Rising 2: Case West — Native PC Port v1.0.0",
+paste the notes body, attach the two artifacts, publish; then Settings →
+Change visibility → Public (CI green at the release commit first).
+
 ## §5 Publish — what remains, in order
 
 0. **DONE 2026-09-06: the parts 98-101 fix round** (operator: *"Case Zero did a
