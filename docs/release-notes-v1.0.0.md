@@ -44,7 +44,8 @@ these downloads — the game runs from your own copy of the XBLA package.
    unpacked folder's `assets/package/`, or just drag it onto the launcher.
 3. Run `cw_runtime.exe` (Windows) or `./cw_runtime` (Linux). The first run
    sets everything up by itself under a progress bar — unpacks your package,
-   prepares all 1,322 shaders (~10 s), and generates the key-prompt assets
+   prepares all 1,322 shaders (a few seconds — 7.5 s on a 16-thread desktop),
+   and generates the key-prompt assets
    from your data. Later launches start straight into the game.
 
 Saves and settings live outside the game folder (Windows:

@@ -40,7 +40,8 @@ project is not affiliated with, or endorsed by, Capcom or Microsoft.
    drag the file onto the launcher window in step 4).
 4. **Run the game** — `cw_runtime.exe` on Windows, `./cw_runtime` on Linux.
    The first run sets everything up by itself under a progress bar: it unpacks
-   your package, prepares the game's 1,322 shaders (~10 seconds), and generates
+   your package, prepares the game's 1,322 shaders (7.5 s on a 16-thread
+   desktop, longer on fewer cores — it uses all of them), and generates
    the keyboard prompt art from your data. Later launches go straight into the
    game.
 
