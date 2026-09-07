@@ -879,13 +879,47 @@ struct Semaphore final : KernelObject
         return STATUS_SUCCESS;
     }
 
-    uint32_t Release(uint32_t releaseCount)
+    // NT semantics: a release past the limit FAILS with STATUS_SEMAPHORE_LIMIT_EXCEEDED,
+    // the count unchanged and the out-parameter unwritten. The first version ignored
+    // `maximum` and let the count grow unbounded, which breaks the invariant the title's
+    // job scheduler is built on — count == queued work, capped at the limit the guest
+    // asked for, and every one of this title's NtCreateSemaphore calls passes
+    // maximum=0x10 (measured, capture A1). The guest's own release wrapper is Win32
+    // ReleaseSemaphore: it checks the status and SetLastError()s a failure, so the limit
+    // is part of the protocol, not a formality.
+    //
+    // IMPORTED from Case Zero d78ebf6 (their part 100), where an unbounded count was the
+    // BOOT HANG on the operator's second machine: a loader kick loop released a work
+    // semaphore at 660k/s and inflated it to 66 million. Our implementation was theirs,
+    // character for character, so the defect was ours too — untriggered here only
+    // because nobody has booted this port on that machine yet (gotcha 3: an absence is a
+    // fact about what was looked at).
+    // Refusals are COUNTED and the first one is announced. Case Zero's version returns
+    // the status silently; an arm with no counter cannot be shown to have engaged
+    // (gotcha 151), and if a player's machine ever drives a semaphore to its limit that
+    // is the single most interesting line in their log. `CW_NO_SEM_LIMIT=1` is the
+    // same-binary control arm — the old unbounded behaviour, for bisecting a hang
+    // against this change.
+    uint32_t Release(uint32_t releaseCount, uint32_t* previous)
     {
         std::lock_guard lock(m);
-        const uint32_t previous = count;
+        static const bool noLimit = getenv("CW_NO_SEM_LIMIT") != nullptr;
+        if (!noLimit && maximum && count + releaseCount > maximum)
+        {
+            static std::atomic<uint64_t> refused{0};
+            if (refused.fetch_add(1) == 0)
+                fprintf(stderr, "[kernel] NtReleaseSemaphore refused: count %u + %u would "
+                                "pass the guest's own maximum %u — returning "
+                                "STATUS_SEMAPHORE_LIMIT_EXCEEDED, as NT does "
+                                "(CW_NO_SEM_LIMIT=1 restores the unbounded behaviour)\n",
+                        count, releaseCount, maximum);
+            return STATUS_SEMAPHORE_LIMIT_EXCEEDED;
+        }
+        if (previous)
+            *previous = count;
         count += releaseCount;
         cv.notify_all();
-        return previous;
+        return STATUS_SUCCESS;
     }
 };
 
@@ -1130,7 +1164,10 @@ static uint32_t NtReleaseSemaphore_x(Semaphore* sem, uint32_t releaseCount,
             *previousCount = 0;
         return STATUS_INVALID_HANDLE;
     }
-    const uint32_t previous = sem->Release(releaseCount);
+    uint32_t previous = 0;
+    const uint32_t status = sem->Release(releaseCount, &previous);
+    if (status != STATUS_SUCCESS)
+        return status;
     if (previousCount)
         *previousCount = static_cast<int32_t>(previous);
     return STATUS_SUCCESS;
