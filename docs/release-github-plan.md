@@ -63,9 +63,10 @@ test sitting.**
   - `release_text_identity.sh`: **.text 36,556,402 bytes, byte-identical**
     between matched RelWithDebInfo and Release configures.
   - `release_package_linux.sh`: `dist/CaseWestRecomp-linux-x86_64.tar.zst`,
-    26 MB — rebuilt once after the czwin POSIX fixes (they move .text), final
-    sha256 `f7f76eb3…` (full hashes in release-notes-v1.0.0.md), the container
-    gate re-run PASSED on the rebuilt bundle.
+    26 MB. REBUILT TWICE: once after the czwin POSIX fixes, and again on
+    2026-09-06 to carry the parts 98-101 fix round (imported-fixes §6) —
+    final sha256 `e438b151…`, `.text` 36,577,074 bytes identical between
+    matched configures, container gate PASSED on the final bundle.
   - `release_gate_clean_container.sh`: **GATE PASSED** — bundle self-resolves,
     --smoke in-container, DXC dlopen translates, and the whole first-run flow:
     in-process extract (305 files, 1,216,219,768 bytes), disc prebuild
@@ -91,8 +92,11 @@ Zero's, same pinned bases, one local patch set serves both ports).
 
 ## §5 Publish — what remains, in order
 
-1. **Windows package** off the czwin build; pull the zip back; checksum into
-   the release notes.
+0. **DONE 2026-09-06: the parts 98-101 fix round** (operator: *"Case Zero did a
+   bunch of important fixes we should add to v1.0.0"*). Eight fixes, one commit
+   each, each gated; both artifacts rebuilt and re-gated on top. Full evidence
+   in `docs/imported-fixes.md` §6.
+1. ~~**Windows package** off the czwin build~~ — DONE (twice).
 2. **The operator's test sittings, both platforms** (the §9.8 lesson: a bundle
    save round-trip and a KB/M-from-the-bundle sitting are the two owed
    verifications; the first-run flow from a bare bundle + their package is the

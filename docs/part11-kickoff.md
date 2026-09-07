@@ -13,12 +13,16 @@ execution record, which is most of what part 10 did.
 
 ## 1. WHERE THE RELEASE STANDS: both artifacts BUILT AND GATED, publish awaits the operator
 
-* `dist/CaseWestRecomp-linux-x86_64.tar.zst` — 26 MB, sha256 `f7f76eb3…`.
+* **BOTH REBUILT 2026-09-06 to carry the Case Zero parts 98-101 fix round**
+  (eight fixes, `docs/imported-fixes.md` §6 — the semaphore boot hang, the AMD
+  depth format, the worker floor, the self-firing firearm, async pipelines,
+  the pre-warm union, EXIT GAME, MASH in every language).
+* `dist/CaseWestRecomp-linux-x86_64.tar.zst` — 26 MB, sha256 `e438b151…`.
   Gated: `.text` identity between matched configures; clean-container GATE
   PASSED **including the whole first-run flow** (in-process extract of the real
   package, 1,322-shader disc prebuild, overlay generation byte-identical to
   the Python reference, boot, honest refusal).
-* `dist/CaseWestRecomp-windows-x86_64.zip` — 21 MB, sha256 `dcac8ca1…`. Built
+* `dist/CaseWestRecomp-windows-x86_64.zip` — 21 MB, sha256 `e0cf2d62…`. Built
   on czwin (C:\cw tree, sharing C:\cz's toolchain/deps); staged exe passed
   `--smoke`; pulled back and hash-verified on arrival.
 * `docs/release-notes-v1.0.0.md` is the paste-ready Release body with both
@@ -53,6 +57,18 @@ execution record, which is most of what part 10 did.
 re-run the gates (text identity + container on Linux; staged --smoke on
 Windows), refresh both hashes in the notes. Case Zero went through four such
 rounds on release day; the machinery makes each ~15 minutes.
+
+## 2b. WHAT THE SITTING SHOULD NOW ALSO CHECK (new, from the fix round)
+
+The fix round added behaviour that only a human can confirm, and each is one
+minute of play:
+1. **Aim a firearm with RMB and do not fire** — the self-firing assault rifle
+   was the sibling's headline bug and the same mapping was here. Then fire with
+   LMB, and throw something (hold RMB, click).
+2. **EXIT GAME → YES** should quit to the desktop (it did nothing before).
+3. **The photo camera** still takes out with 2/3 while RMB is held — the fix
+   removed a 70 ms trigger stagger that this path used to depend on.
+4. Anything on a non-English language: the struggle prompt should read MASH.
 
 ## 3. FOUND-AND-FIXED IN PART 10 (beyond the release machinery itself)
 

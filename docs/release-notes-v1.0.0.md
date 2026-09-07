@@ -64,6 +64,12 @@ them. A README inside the bundle covers troubleshooting.
   the console's hardware loop behaviour.
 - **Built for marathon sessions**: texture memory recycles over a full
   playthrough — no whitening or slow degradation on long runs.
+- **A pre-release fix round** carried over from the sibling port: firearms no
+  longer fire themselves while you aim with the right mouse button, EXIT GAME
+  quits to the desktop, pipelines build in the background instead of freezing
+  the frame that needs them, mid-range CPUs get real worker threads, AMD GPUs
+  get a depth format they can actually sample, and the struggle prompt reads
+  MASH in every language the game ships.
 - Under the hood: 58,345 PowerPC functions statically recompiled to native
   code, the 360 GPU's command stream executed on Vulkan 1.3, Bink video
   through the game's own decoder, and a first run that builds everything it
@@ -100,6 +106,6 @@ Also released: the sibling port,
 ### Checksums (SHA-256)
 
 ```
-f7f76eb3d929ff2c8729269def46f587c0e0e283c604123ff5e75ae479faf28e  CaseWestRecomp-linux-x86_64.tar.zst
-dcac8ca166a0bcd3ce989f45a2b12b5f54dca9febf3252d76d3acf3a8506dfd8  CaseWestRecomp-windows-x86_64.zip
+e438b1510ad4c31ca1f196c8eca6b0e8a8eb6b2e287462e8daa96ed97acbcd92  CaseWestRecomp-linux-x86_64.tar.zst
+e0cf2d62f49e320b5cc5d918fe16b1f6e5e4a5d0e4fccabc64e685b313221d11  CaseWestRecomp-windows-x86_64.zip
 ```

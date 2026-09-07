@@ -456,3 +456,40 @@ build is unchanged). Changes, mirroring Case Zero:
 The MOUSE SENS row and `mouse_sens` persistence are unchanged. No env-var control
 was added (Case Zero didn't); `CW_NO_NATIVE_KBM=1` still disables the whole KB/M
 path including the mouse.
+
+---
+
+## §6 — Case Zero parts 98-101: the pre-release fix round (2026-09-06)
+
+| | |
+|---|---|
+| **Imported** | 2026-09-06 (part 10, the release part), eight separate commits |
+| **Source** | Case Zero `55a9d4e`, `0c50a4d`, `49c895c`, `684bff1`, `aea4292`, `42d558d`, `d78ebf6`, `cc05d05`, `0fbc8db`, `95611b9` — their parts 98-101, i.e. everything behind their v1.0.1 |
+| **Why now** | The operator's call: *"Case Zero did a bunch of important fixes we should add to v1.0.0."* Our v1.0.0 artifacts existed but predated all of it |
+| **Method** | Per-fix, one commit each, each gated separately. The async-pipeline trio applied as one patch (`git apply`, zero conflicts); everything else hand-ported with the defect **re-measured on this image first** |
+| **Re-measured here?** | **YES for every one that could be** — see the per-row evidence below |
+
+### What came across, and what proved it here
+
+| fix | source | the defect here | gate run here |
+|---|---|---|---|
+| **NtReleaseSemaphore honours `maximum`** | `d78ebf6` | **Present, identical code.** Their unbounded count WAS a boot hang on a second machine (66 M releases against a guest maximum of 0x10). Our `Semaphore::Release` was theirs character for character | Headless boot reaches the title and keeps polling; 0 refusals in normal play; **POISON control** (maximum forced to 1) fires the branch and returns cleanly (gotcha 30). Added beyond theirs: a counted, announced refusal and `CW_NO_SEM_LIMIT=1` as the control arm |
+| **EDRAM depth auto-negotiation** | `0fbc8db` | **Present.** AMD does not advertise SAMPLED_IMAGE for D24S8, so a sampled depth resolve is UNDEFINED there. This port has only ever run on NVIDIA — the AMD path is untested here and taken on their evidence, but the query is the device's own answer | RTX 3070 still picks D24_UNORM_S8_UINT, no warning; `CW_VK_DEPTH_FLOAT=1` picks D32F and boots; **POISON control** inverting the sampleable test fires the AMD branch. The snapshot dump is format-aware with it |
+| **Worker-budget core floor** | `cc05d05` | **Present.** The bare formula gave a 6-core machine 1 worker and a 4-core 0 | Verified by affinity mask, matching their table: 4c→2 (was 0), 6c→3 (was 1), 8c→3 unchanged |
+| **RMB aims with LT, not RT** | `684bff1` | **Present** — the self-firing firearm. **Re-measured on THIS image** (`CW_KBM_TRACE=1 CW_KBM_CMD_CENSUS=1` over a gameplay route, read with the guest's own combiner enum `C_AND=1 C_OR=3`): `RAPID_FIRE_RT = X HELD **OR** R2 HELD`, so RMB's R2 satisfied it continuously | build + `--smoke`; **behaviour owed to the operator** (a mouse button cannot be synthesised headlessly). The 70 ms trigger stagger is deleted with it, which also makes the camera's "hold LT, press RB" instant |
+| **Async pipeline creation** (+ pre-warm chaining, two-tier FIFO) | `55a9d4e` `0c50a4d` `49c895c` | **Present** — pipelines were created on the frame thread on a miss. Worth MORE here than there: our shipped seed is 134 keys against their 1,365 | Route with it ON: engages, 18.5 M draws, HUD intact; `CW_VK_SYNC_PIPELINE=1` control: 0 async lines; **13 draws of 18.5 M** deferred, honestly counted; validation exactly the standing 6 `topology-08773`. **No frame-time delta claimed** — the two route runs differ 1.8% in draws, above the 1.40% floor, so they are not matched arms |
+| **Pre-warm seed unioned, not shadowed** | `95611b9` | **Present.** A session that parks early saved a tiny per-user file that hid the shipped seed forever after | Demonstrated rather than argued: a boot printed `128 per-user + shipped seed -> 134 keys after union`, and that same short run then saved a **32-key** file — exactly what would have shadowed the seed under the old code |
+| **EXIT GAME quits to desktop** | `aea4292` | **Present** — `XamLoaderLaunchTitle` was an honest-failure stub, so the menu item did nothing. Both exits now share one sequence (dump counters, save the pipeline cache, `_Exit`) | build + `--smoke`; `import_stubs.cpp` REGENERATED (77 stubs, 170 real), not hand-edited. Menu path owed to the sitting |
+| **MASH in every language bank** | `42d558d` | **Present and BIGGER here**: we ship **eight** banks, not six, and the overlay carried only `str_en.bcs` | Byte-identity gate re-run across all eight outputs: Python reference vs `--gen-overlays`, only the version stamp differs. `kGeneratorVersion` 1→2 |
+
+### Measured differences from the sibling, recorded so nobody assumes
+
+* **Eight string banks, not six** — and two are not what a naive loop expects. `str_id.bcs` is an **identifier** bank (id 4049 reads `IDS_HUD_LS`, a QA aid with no prose), and `str_lg.bcs` has **zero tail slack** (its blob fills the 120,418-byte pin exactly), so MASH's extra byte cannot fit. Both are skipped **by their own evidence** — a value check and a pin check — not by a hardcoded name list. Six banks are written. `fr` ships `LS` without the trailing space, the same quirk they found.
+* **`padmap.txt` is EMPTY on this image** (4 bytes, decompresses to 0), so the bindings had to be read from the live records rather than a file — which is what the census instrument is for.
+
+### Not imported from this range, and why
+
+* **`42f99bc` skip-intro-logos** and **`e1da647` subtitle language selection** — launcher FEATURES, not fixes. Both need this title's own data re-measured (`intro.txt` exists in our `fecmn.big`; the language IDs differ with eight banks). Deferred deliberately, not forgotten.
+* **`082fff5` uncapped mouse-look** — that is Case Zero re-deriving **our** feature on their image, with their addresses. Nothing flows back.
+* **`a1bdff6` gas-station rooftop / texture-LOD thumbnail** — a Case Zero LOCATION and a Case Zero asset hash. The mechanism may generalise and may even touch the operator's parked minor-visual list; not hunted, because that list is theirs to open.
+* **The part-99/100 kernel probes** (`CZ_APC_TRACE`, `CZ_KOBJ_DUMP`, `CZ_KCALL_WHO` milestones, the streaming listeners) — diagnostics built to find the boot hang whose FIX we took. Worth having if a player reports a hang; not needed to ship.
