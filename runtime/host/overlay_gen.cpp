@@ -1051,63 +1051,95 @@ void GenerateKbmLayer(const Paths& p,
     if (progress)
         progress("PREPARING KEY PROMPTS - STRINGS", 0.78f);
 
-    // THE STRING BANK — Case West's variant, and both differences from Case Zero
-    // are measured facts recorded in the Python: (1) this title reads str_en.bcs
-    // LOOSE from the disc tree, so the source is the shipped bank, not a patched
-    // layer; (2) the bank is SIZE-PINNED (the loader reads a fixed byte count and
-    // a shorter file blanks ALL UI text), so after the id-4049 table rebuild the
-    // bank is padded back to exactly the shipped size. It ships ONE "PRESS START"
-    // spelling and NO PRESS\0START id pair (the sibling had both).
+    // THE STRING BANKS — Case West's variant, and every difference from Case Zero
+    // is a measured fact recorded in the Python reference: (1) this title reads the
+    // banks LOOSE from the disc tree, so the source is the shipped bank, not a
+    // patched layer; (2) every bank is SIZE-PINNED (the loader reads a fixed byte
+    // count and a shorter file blanks ALL UI text), so after the id-4049 table
+    // rebuild each bank is padded back to exactly its shipped size; (3) en ships ONE
+    // "PRESS START" spelling and NO PRESS\0START id pair (the sibling had both).
+    //
+    // ALL EIGHT banks are visited: the id-4049 LS->MASH rewrite is MECHANICS, not
+    // prose, so it belongs in every language a player can pick. The English-literal
+    // edits stay en-only — translating PRESS START / LEFT STICK is a content
+    // decision the operator owns. Two banks are skipped by their own evidence
+    // rather than by a special case: `id` is an IDENTIFIER bank (id 4049 reads
+    // "IDS_HUD_LS", a QA aid with no prose in it), and `lg` has zero tail slack, so
+    // MASH's extra byte cannot fit under the pin.
     {
-        const Bytes shipped = ReadFileBytes(p.game / "data" / "frontend" / "str_en.bcs");
-        const size_t strPin = shipped.size();
-        Bytes sbank = shipped;
-        struct Edit
+        const fs::path frontend = p.game / "data" / "frontend";
+        std::vector<std::string> langs;
         {
-            const char* oldB;
-            size_t oldLen;
-            const char* newB;
-        };
-        const Edit edits[] = {
-            {"PRESS START\0", 12, "PRESS ENTER\0"},
-            {"LEFT STICK ", 11, "A / D KEYS "},
-        };
-        for (const Edit& ed : edits)
-        {
-            size_t count = 0, at = 0;
-            for (size_t s = 0; s + ed.oldLen <= sbank.size(); ++s)
-                if (std::memcmp(sbank.data() + s, ed.oldB, ed.oldLen) == 0)
-                {
-                    ++count;
-                    at = s;
-                }
-            if (count != 1)
-                Refuse("str_en.bcs holds " + std::to_string(count) + " of a title "
-                       "string expected exactly once — refusing the KB edit");
-            std::memcpy(sbank.data() + at, ed.newB, ed.oldLen);
+            std::error_code ec;
+            for (const auto& e : fs::directory_iterator(frontend, ec))
+            {
+                const std::string f = e.path().filename().string();
+                if (f.size() > 8 && f.compare(0, 4, "str_") == 0 &&
+                    f.rfind(".bcs") == f.size() - 4)
+                    langs.push_back(f.substr(4, f.size() - 8));
+            }
+            std::sort(langs.begin(), langs.end());   // the Python's sorted() order
         }
-        // IDS_HUD_LS (id 4049) labels ONLY the struggle prompt; MASH does not fit
-        // the shipped 3-byte "LS " in place, so the table is rebuilt in shipped id
-        // order with the one string swapped, verified by reading it back.
-        std::vector<uint32_t> idOrder;
-        std::map<uint32_t, Bytes> table = ParseBcs(sbank, "str_en.bcs", &idOrder);
-        const Bytes ls = {'L', 'S', ' '};
-        if (table.count(4049) == 0 || table[4049] != ls)
-            Refuse("str_en.bcs: string id 4049 is not 'LS ' — the bank layout "
-                   "moved; refusing to rewrite");
-        table[4049] = Bytes{'M', 'A', 'S', 'H'};
-        Bytes rebuilt = BuildBcs(idOrder, table); // keep the shipped id order
-        if (ParseBcs(rebuilt, "str_en.bcs (rebuilt)") != table)
-            Refuse("rebuilt str_en.bcs does not read back");
-        // Restore the pinned size. Refuse rather than write a bank the loader
-        // would reject; the strings live in the head at absolute offsets, so
-        // trailing zeros are inert.
-        if (rebuilt.size() > strPin)
-            Refuse("str_en.bcs GATE FAILED: rebuilt bank " +
-                   std::to_string(rebuilt.size()) + " exceeds the pinned " +
-                   std::to_string(strPin) + " — refusing to write");
-        rebuilt.insert(rebuilt.end(), strPin - rebuilt.size(), 0);
-        WriteFileBytes(p.kbm / "data" / "frontend" / "str_en.bcs", rebuilt);
+        bool wroteEn = false;
+        for (const std::string& lang : langs)
+        {
+            const Bytes shipped = ReadFileBytes(frontend / ("str_" + lang + ".bcs"));
+            const size_t strPin = shipped.size();
+            Bytes sbank = shipped;
+            if (lang == "en")
+            {
+                struct Edit
+                {
+                    const char* oldB;
+                    size_t oldLen;
+                    const char* newB;
+                };
+                const Edit edits[] = {
+                    {"PRESS START\0", 12, "PRESS ENTER\0"},
+                    {"LEFT STICK ", 11, "A / D KEYS "},
+                };
+                for (const Edit& ed : edits)
+                {
+                    size_t count = 0, at = 0;
+                    for (size_t x = 0; x + ed.oldLen <= sbank.size(); ++x)
+                        if (std::memcmp(sbank.data() + x, ed.oldB, ed.oldLen) == 0)
+                        {
+                            ++count;
+                            at = x;
+                        }
+                    if (count != 1)
+                        Refuse("str_en.bcs holds " + std::to_string(count) + " of a "
+                               "title string expected exactly once — refusing the KB "
+                               "edit");
+                    std::memcpy(sbank.data() + at, ed.newB, ed.oldLen);
+                }
+            }
+            // IDS_HUD_LS (id 4049) labels ONLY the struggle prompt; MASH does not fit
+            // the shipped 2-3 byte value in place, so the table is rebuilt in the
+            // shipped id order and every id verified to read back.
+            std::vector<uint32_t> idOrder;
+            std::map<uint32_t, Bytes> table =
+                ParseBcs(sbank, ("str_" + lang + ".bcs").c_str(), &idOrder);
+            const Bytes lsSpace = {'L', 'S', ' '};
+            const Bytes lsBare = {'L', 'S'};
+            auto it = table.find(4049);
+            if (it == table.end() || (it->second != lsSpace && it->second != lsBare))
+                continue;   // the identifier bank: no stick label, nothing to rewrite
+            table[4049] = Bytes{'M', 'A', 'S', 'H'};
+            Bytes rebuilt = BuildBcs(idOrder, table);   // keep the shipped id order
+            if (ParseBcs(rebuilt, "rebuilt") != table)
+                Refuse("rebuilt str_" + lang + ".bcs does not read back");
+            if (rebuilt.size() > strPin)
+                continue;   // no tail slack (lg): the loader would reject it
+            rebuilt.insert(rebuilt.end(), strPin - rebuilt.size(), 0);
+            WriteFileBytes(p.kbm / "data" / "frontend" / ("str_" + lang + ".bcs"),
+                           rebuilt);
+            if (lang == "en")
+                wroteEn = true;
+        }
+        if (!wroteEn)
+            Refuse("str_en.bcs was not written — the English bank is the one this "
+                   "overlay cannot do without");
     }
 
     // glyph_swap.bin: the device-follow sidecar, PAD texels from the player's own
@@ -1157,8 +1189,9 @@ void GenerateKbmLayer(const Paths& p,
 // art change (re-export tools/release/kbm_chips with gen_kbm_icons.py
 // --export-chips in the same commit): a shipped update must not keep serving a
 // player's stale banks (the gotcha-13 shape, on disk).
-constexpr int kGeneratorVersion = 1; // 1: first Case West generator (26 glyphs,
+constexpr int kGeneratorVersion = 2; // 1: first Case West generator (26 glyphs,
                                      //    camera bar, pinned str_en.bcs)
+                                     // 2: id-4049 MASH in every language bank
 
 fs::path StampPath(const Paths& p)
 {
@@ -1186,7 +1219,8 @@ bool OutputsCurrent(const Paths& p)
 
     const fs::path wanted[] = {
         p.kbm / "data" / "frontend" / "fecmn.tex",
-        p.kbm / "data" / "frontend" / "str_en.bcs",
+        p.kbm / "data" / "frontend" / "str_en.bcs",   // the other language banks
+                                                     // ride the version stamp
         p.kbm / "data" / "frontend" / "ingame.big",
         p.kbm / "glyph_swap.bin",
     };

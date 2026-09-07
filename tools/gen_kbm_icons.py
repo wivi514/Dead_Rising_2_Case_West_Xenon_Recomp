@@ -542,73 +542,100 @@ def main():
     # replacements are SAME-LENGTH in-place edits of the game_patched bank (the
     # str banks are layout-pinned like everything else), served from this
     # overlay only while the keyboard is the input path.
-    # CASE WEST: the string bank is read LOOSE from the disc tree (this title
-    # opens game:\\data\\frontend\\str_en.bcs directly — measured at boot, unlike
-    # Case Zero where only the game_patched copy was live), and it ships ONE
-    # "PRESS START" spelling and NO PRESS\0START id pair (measured; the sibling
-    # had both).
-    sbank = (REPO / "assets/game/data/frontend/str_en.bcs").read_bytes()
-    # CASE WEST: str_en.bcs is SIZE-PINNED (120,418 bytes) like fecmn.tex — the loader
-    # reads a fixed byte count, and a shorter file blanks ALL UI text (found the hard
-    # way, 2026-09-05). The shipped file is {n; ids; offs; blob} followed by 19,632
-    # bytes of zero padding. The table rebuild below drops that tail, so we pad back
-    # to this pinned size afterwards; the strings live in the head at absolute offsets,
-    # so trailing zeros are inert. Case Zero's bank is NOT pinned, hence no pad there.
-    STR_PIN = len(sbank)
-    # Same-length in-place edits. "LEFT STICK " (imported from Case Zero, part 8)
-    # is the grapple tutorial ("Wiggle the LEFT STICK [icon] to escape grapples!")
-    # — the only occurrence in the bank — reworded for the keyboard reading.
-    for old, new in ((b"PRESS START\x00", b"PRESS ENTER\x00"),
-                     (b"LEFT STICK ", b"A / D KEYS ")):
-        n = sbank.count(old)
-        if n != 1:
-            print(f"GATE FAILED: str_en.bcs holds {n} of {old!r}, expected 1",
+    # THE STRING BANKS. All EIGHT language banks ship here (en es fr id it ja ko
+    # lg) and the id-4049 LS->MASH rewrite is MECHANICS, not prose, so it lands in
+    # every bank that can take it — a player who picks another language should not
+    # get the pad wording back on the struggle prompt (Case Zero 42d558d made the
+    # same call for their six). The ENGLISH-LITERAL edits stay en-only: translating
+    # PRESS START / LEFT STICK is a content decision the operator owns.
+    #
+    # CASE WEST: the banks are read LOOSE from the disc tree (this title opens
+    # game:\\data\\frontend\\str_*.bcs directly — measured at boot, unlike Case Zero
+    # where only the game_patched copy was live), and en ships ONE "PRESS START"
+    # spelling and NO PRESS\0START id pair (measured; the sibling had both).
+    #
+    # EVERY bank is SIZE-PINNED at 120,418 bytes — the loader reads a fixed byte
+    # count and a shorter file blanks ALL UI text (found the hard way, 2026-09-05).
+    # The shipped file is {n; ids; offs; blob} plus a zero tail; the table rebuild
+    # drops that tail, so we pad back to the pinned size. The strings live in the
+    # head at absolute offsets, so trailing zeros are inert.
+    #
+    # MEASURED over all eight banks (2026-09-06), which is why the loop is
+    # tolerant where it is and strict where it matters:
+    #   en es it ja ko lg  id 4049 = b"LS "     fr = b"LS" (no trailing space)
+    #   id                 id 4049 = b"IDS_HUD_LS" — an IDENTIFIER bank (it holds
+    #                      the id names as text, a QA aid), so it is skipped: there
+    #                      is no prose in it to fix.
+    #   lg                 has ZERO tail slack (head_end == the pin exactly), so
+    #                      MASH's +1 byte cannot fit and it is skipped by the pin
+    #                      check rather than by a special case.
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    langs = sorted(q.name[4:-4] for q in
+                   (REPO / "assets/game/data/frontend").glob("str_*.bcs"))
+    wrote = []
+    for lang in langs:
+        src = REPO / "assets/game/data/frontend" / f"str_{lang}.bcs"
+        sbank = src.read_bytes()
+        STR_PIN = len(sbank)
+        n_en = 0
+        if lang == "en":
+            # Same-length in-place edits. "LEFT STICK " (imported from Case Zero,
+            # part 8) is the grapple tutorial ("Wiggle the LEFT STICK [icon] to
+            # escape grapples!") — the only occurrence in the bank.
+            for old, new_ in ((b"PRESS START\x00", b"PRESS ENTER\x00"),
+                              (b"LEFT STICK ", b"A / D KEYS ")):
+                c = sbank.count(old)
+                if c != 1:
+                    print(f"GATE FAILED: str_en.bcs holds {c} of {old!r}, "
+                          f"expected 1", file=sys.stderr)
+                    sys.exit(1)
+                sbank = sbank.replace(old, new_)
+                n_en += 1
+
+        # IDS_HUD_LS (id 4049) labels ONLY the struggle prompt, and MASH does not
+        # fit the shipped 2-3 byte value in place, so the table is rebuilt in the
+        # shipped id order and every id verified to read back.
+        n = struct.unpack_from("<I", sbank, 0)[0]
+        ids = list(struct.unpack_from(f"<{n}I", sbank, 4))
+        offs = list(struct.unpack_from(f"<{n}I", sbank, 4 + 4 * n))
+        table = {ids[k]: sbank[offs[k]:sbank.index(b"\0", offs[k])] for k in range(n)}
+        cur = table.get(4049)
+        if cur not in (b"LS ", b"LS"):
+            # Not a refusal: the identifier bank legitimately holds a name here.
+            print(f"  str_{lang}.bcs: id 4049 reads {cur!r}, not a stick label — "
+                  f"skipped (no prose to rewrite)")
+            continue
+        table[4049] = b"MASH"
+        header = 4 + 8 * n
+        blob = bytearray()
+        new_offs = []
+        for i in ids:                      # keep the shipped id order
+            new_offs.append(header + len(blob))
+            blob += table[i] + b"\0"
+        sbank = (struct.pack("<I", n) + struct.pack(f"<{n}I", *ids) +
+                 struct.pack(f"<{n}I", *new_offs) + bytes(blob))
+        got = {ids[k]: sbank[new_offs[k]:sbank.index(b"\0", new_offs[k])]
+               for k in range(n)}
+        if got != table:
+            print(f"GATE FAILED: rebuilt str_{lang}.bcs does not read back",
                   file=sys.stderr)
             sys.exit(1)
-        sbank = sbank.replace(old, new)
-
-    # IDS_HUD_LS (id 4049) labels ONLY the struggle prompt and the operator wants
-    # it to read MASH, which does not fit the shipped 3-byte "LS " in place. The
-    # .bcs is {u32 n; u32 ids[n]; u32 offs[n]; NUL-terminated strings} and is NOT
-    # size-pinned, so rebuild the bank with the one string swapped and verify every
-    # id reads back. (Ported from Case Zero; confirmed here: id 4049 == b"LS ",
-    # the header is 4+8n and offs[0] lands exactly there.)
-    n = struct.unpack_from("<I", sbank, 0)[0]
-    ids = list(struct.unpack_from(f"<{n}I", sbank, 4))
-    offs = list(struct.unpack_from(f"<{n}I", sbank, 4 + 4 * n))
-    table = {ids[k]: sbank[offs[k]:sbank.index(b"\0", offs[k])] for k in range(n)}
-    if table.get(4049) != b"LS ":
-        print(f"GATE FAILED: string id 4049 reads {table.get(4049)!r}, "
-              f"expected b'LS ' — the bank layout moved; refusing to rewrite",
-              file=sys.stderr)
+        if len(sbank) > STR_PIN:
+            # lg lands here: its blob already fills the pin exactly, so MASH's
+            # extra byte has nowhere to go. Skipping is correct and stated; a
+            # bank longer than the pin is one the loader would reject.
+            print(f"  str_{lang}.bcs: rebuilt {len(sbank)} exceeds the pinned "
+                  f"{STR_PIN} (no tail slack) — skipped")
+            continue
+        sbank = sbank + b"\0" * (STR_PIN - len(sbank))
+        (OUT.parent / f"str_{lang}.bcs").write_bytes(sbank)
+        wrote.append(f"{lang}{'+2edits' if n_en else ''}")
+    if "en" not in "".join(wrote):
+        print("GATE FAILED: str_en.bcs was not written — the English bank is the "
+              "one this overlay cannot do without", file=sys.stderr)
         sys.exit(1)
-    table[4049] = b"MASH"
-    header = 4 + 8 * n
-    blob = bytearray()
-    new_offs = []
-    for i in ids:                      # keep the shipped id order
-        new_offs.append(header + len(blob))
-        blob += table[i] + b"\0"
-    sbank = (struct.pack("<I", n) + struct.pack(f"<{n}I", *ids) +
-             struct.pack(f"<{n}I", *new_offs) + bytes(blob))
-    got = {ids[k]: sbank[new_offs[k]:sbank.index(b"\0", new_offs[k])]
-           for k in range(n)}
-    if got != table:
-        print("GATE FAILED: rebuilt str bank does not read back", file=sys.stderr)
-        sys.exit(1)
-    # Restore the pinned size (the rebuild's blob grew by 1 byte for MASH and dropped
-    # the shipped zero tail). Refuse rather than write a bank the loader would reject.
-    if len(sbank) > STR_PIN:
-        print(f"GATE FAILED: rebuilt str bank {len(sbank)} exceeds the pinned "
-              f"{STR_PIN} — refusing to write", file=sys.stderr)
-        sys.exit(1)
-    sbank = sbank + b"\0" * (STR_PIN - len(sbank))
-
-    sout = OUT.parent / "str_en.bcs"
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    sout.write_bytes(sbank)
-    print(f"wrote {sout} ({len(sbank)} bytes, pinned; 2 same-length edits + id 4049 "
-          f"LS->MASH via table rebuild)")
+    print(f"wrote {len(wrote)} string banks, pinned, id 4049 LS->MASH: "
+          f"{' '.join(wrote)}")
 
     swp = bytearray()
     swp += struct.pack("<4sI", b"KBSW", len(swap_entries))
