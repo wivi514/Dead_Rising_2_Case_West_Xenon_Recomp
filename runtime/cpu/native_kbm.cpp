@@ -55,9 +55,18 @@
 //          on-demand evaluator passes source values straight through, which is
 //          what frees the camera from the stick's turn-rate ceiling (DR2 PC's
 //          MOUSE_RAW wiring, phaseA A.3).
-//        - mouse buttons -> the pad's own sources (left=BUTTON_3/X = attack,
-//          right=BUTTON_R2 = aim, middle=BUTTON_R3 = heavy attack/cam reset —
-//          DR2 PC's mousemap semantics through the pad's own bindings).
+//        - mouse buttons -> left=BUTTON_3/X = attack, right=BUTTON_L2 = aim,
+//          middle=BUTTON_R3 = heavy attack/cam reset (DR2 PC's mousemap
+//          semantics through the pad's own bindings).
+//          RIGHT WAS BUTTON_R2 UNTIL 2026-09-06 and that was the self-firing
+//          firearm: R2 is the FIRE side, not the aim side — measured on this
+//          image (RAPID_FIRE_RT = X HELD *OR* R2 HELD, so R2 held alone empties
+//          an automatic), and operator-verified on a physical pad in Case Zero
+//          (their 684bff1). L2 is the aim/hold modifier here, which the
+//          epilogue camera's own "hold LT, press RB" prompt also says.
+//          NOTE: these buttons do NOT ride g_mouseButtons — that store has no
+//          reader in this port. They reach the guest through window.cpp's
+//          XInput merge, the same channel part 9's keys 2/3 -> RB use.
 //      The conversion rewrites every source every tick, so every override is
 //      self-healing: stop writing and the pad's own values are back next tick.
 //

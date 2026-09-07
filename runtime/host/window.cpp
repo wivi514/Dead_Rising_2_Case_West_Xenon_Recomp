@@ -1061,30 +1061,31 @@ HostPadState ReadKeyboard()
                 const uint32_t mb = SDL_GetMouseState(nullptr, nullptr);
                 if (mb & SDL_BUTTON(SDL_BUTTON_LEFT))
                     s.buttons |= XI_X;
-                {
-                    // BOTH triggers ride RMB: gun aim is the R2 source, and
-                    // THROWING a held item needs the L2 source held (stock
-                    // padmap: PLAYER_THROW = X pressed while BUTTON_L2 held —
-                    // the throw tutorial's LT glyph). But they must NOT rise
-                    // in the same instant: PLAYER_THROW_RT is "R2 PRESSED
-                    // while L2 held", and simultaneous edges tripped it — the
-                    // operator's item flew the moment RMB went down. So the
-                    // aim trigger leads and the throw-enable trigger joins
-                    // 70 ms later, the way a pad hand naturally staggers them;
-                    // the throw itself is LMB (X), like DR2 PC.
-                    static uint32_t rmbSince = 0;
-                    if (mb & SDL_BUTTON(SDL_BUTTON_RIGHT))
-                    {
-                        const uint32_t now = SDL_GetTicks();
-                        if (!rmbSince)
-                            rmbSince = now;
-                        s.rightTrigger = 255;
-                        if (now - rmbSince >= 70)
-                            s.leftTrigger = 255;
-                    }
-                    else
-                        rmbSince = 0;
-                }
+                // RMB = LEFT trigger ONLY. Aim on the shipped pad is LT; R2 is
+                // the FIRE side. MEASURED ON THIS IMAGE with CW_KBM_TRACE=1
+                // CW_KBM_CMD_CENSUS=1 over a gameplay route, and read with the
+                // guest's own combiner enum (C_AND=1, C_OR=3, native_kbm.cpp):
+                //     PLAYER_FIRE_WEAPON     X PRESSED  OR  R2 PRESSED
+                //     PLAYER_RAPID_FIRE_RT   X HELD     OR  R2 HELD
+                //     PLAYER_THROW           X PRESSED AND  L2 HELD
+                //     PLAYER_THROW_RT        R2 PRESSED AND L2 HELD
+                // The part-8 import believed R2 was the aim source and held
+                // BOTH triggers here (with a 70 ms stagger so the R2 edge would
+                // not trip PLAYER_THROW_RT), which held the FIRE trigger
+                // through every aim: RAPID_FIRE_RT's OR-with-HELD is satisfied
+                // by R2 alone, so an automatic empties itself while aiming,
+                // while a semi-auto — edge-fired — never shows it. Case Zero's
+                // operator reproduced exactly that (their part 99, 684bff1:
+                // assault rifle only, never on a physical pad holding LT).
+                // LMB's X already covers everything R2 did: fire (X PRESSED),
+                // auto fire (X HELD) and throw (X PRESSED while L2 held), and
+                // with no mouse-side R2 edge at all the THROW_RT misfire the
+                // stagger existed for is structurally impossible — so the
+                // stagger goes with it. It also makes the epilogue camera's
+                // "hold LT, press RB" prompt reachable instantly rather than
+                // 70 ms after RMB goes down (part 9's keys 2/3 feed RB below).
+                if (mb & SDL_BUTTON(SDL_BUTTON_RIGHT))
+                    s.leftTrigger = 255;
                 if (mb & SDL_BUTTON(SDL_BUTTON_MIDDLE))
                     s.buttons |= XI_RIGHT_THUMB;
             }
@@ -1174,7 +1175,8 @@ HostPadState ReadKeyboard()
             if (mb & SDL_BUTTON(SDL_BUTTON_LEFT))
                 s.buttons |= XI_X;
             if (mb & SDL_BUTTON(SDL_BUTTON_RIGHT))
-                s.rightTrigger = 255;
+                s.leftTrigger = 255;   // LT = aim (R2 here is the FIRE trigger;
+                                       // see the native block above)
             if (mb & SDL_BUTTON(SDL_BUTTON_MIDDLE))
                 s.buttons |= XI_Y;
             if (mb & SDL_BUTTON(SDL_BUTTON_X1))
