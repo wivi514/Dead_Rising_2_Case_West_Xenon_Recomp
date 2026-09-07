@@ -453,8 +453,18 @@ void ContentSetRootFromGameDir(const std::string& gameDir)
         g_saveRoot = env;
     else
         g_saveRoot = HostPaths::SavedGames() / "default";
+    // THE CREATE RESULT GETS ITS OWN VARIABLE, and that is not style (found on the
+    // AMD test machine, 2026-09-06). This used to share one `ec` with everything
+    // below it, and the migration block's `is_directory(oldRoot, ec)` SETS ec when
+    // there is no old save tree — which is every fresh install. The final line then
+    // read that stale error and announced "COULD NOT BE CREATED — saving will fail"
+    // on a machine whose save directory had been created perfectly well. A
+    // diagnostic that cries wolf about SAVING is worse than none: the sibling port
+    // shipped a release with a genuine Windows save bug, and this message is exactly
+    // what someone hunting it would grep for.
+    std::error_code createEc;
+    std::filesystem::create_directories(g_saveRoot, createEc);
     std::error_code ec;
-    std::filesystem::create_directories(g_saveRoot, ec);
 
     // MIGRATION, once: an existing install has its saves at the old location and
     // must not appear to have lost them. Copy (never move — the old tree stays as a
@@ -497,8 +507,14 @@ void ContentSetRootFromGameDir(const std::string& gameDir)
         }
     }
 
+    // Report the DIRECTORY'S state, not a stale error code: create_directories
+    // reports no error when the directory already existed, and an is_directory
+    // check is the thing the next line actually depends on.
+    std::error_code checkEc;
+    const bool haveDir = std::filesystem::is_directory(g_saveRoot, checkEc);
     KLOG("content: saves live in %s%s\n", g_saveRoot.string().c_str(),
-         ec ? " (COULD NOT BE CREATED — saving will fail)" : "");
+         haveDir ? "" : (createEc ? " (COULD NOT BE CREATED — saving will fail)"
+                                  : " (MISSING — saving will fail)"));
 }
 
 std::filesystem::path ContentSettingsDir()
