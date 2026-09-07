@@ -30,6 +30,34 @@ execution record, which is most of what part 10 did.
   `docs/dev-readme-day1.md`). CI is in (`.github/workflows/build.yml`) — its
   FIRST live runs trigger on part 10's pushes; check the Actions tab.
 
+## 1a. PART 11 IS NOW: WAIT FOR PLAYER ISSUES (operator, 2026-09-06)
+
+Their words: *"I am done for now awaiting people issue."* The release is staged
+and tagged; the next work is REACTIVE — whatever the first issue reports say
+once it is public. Nothing in the backlog should be started speculatively.
+
+**When an issue does arrive, the machinery is all in place and warm:**
+* the picture-bisection order is `CW_VK_MSAA=1` → `CW_VK_NO_PAR_RECORD=1` →
+  `CW_VK_NO_DEFERRED_CLEAR=1` → `CW_NO_KB_PROMPTS=1` (bundle README has it too,
+  so a reporter can run the arms themselves);
+* new arms from the fix round worth knowing: `CW_NO_SEM_LIMIT=1` (semaphore
+  limit), `CW_VK_SYNC_PIPELINE=1` (async pipelines off),
+  `CW_VK_DEPTH_FLOAT=1` (force D32F), `CW_WORKERS=N` (worker budget);
+* three machines are ready: this box, czwin (`C:\cw`, full toolchain) and
+  czamd ([[the-amd-test-machine]] — RX 6600, Windows 10, ready-to-play install);
+* a fix round is ~15 minutes of machinery: one commit per change, rebuild both
+  artifacts, re-gate (text identity + container on Linux, staged --smoke on
+  Windows), refresh the hashes in the notes AND the staged `SHA256SUMS`.
+
+**A RICHER PRE-WARM SEED IS ALREADY COMMITTED AND WAITING.** The operator's
+capture session harvested **688 keys** (against the shipped 134), all
+resolvable, now in `tools/release/prewarm.keys`. It is deliberately NOT in the
+staged v1.0.0 artifacts — those stay exactly as tested — so **the very next
+artifact build ships it for free** and first-session stutter drops without
+anyone doing anything. Re-harvest again after any long sitting: the per-user
+file at `~/.cache/cw-recomp/pipeline_shader_spv.bin.keys` is REWRITTEN each
+session, so a good harvest is perishable.
+
 ## 1b. THE SITTINGS ARE DONE AND THE RELEASE IS STAGED (2026-09-06)
 
 Operator: **"Tested and pretty good."** Tag `v1.0.0` pushed at `9ef2ef1`;
