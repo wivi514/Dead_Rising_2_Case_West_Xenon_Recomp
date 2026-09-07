@@ -34,6 +34,24 @@ low-risk — the import table says so.
 > problem statement was false and part 2 refuted it with the measurement that section
 > itself asked for.
 
+## Status: v1.0.0 IS STAGED AND TAGGED — AWAITING PLAYER ISSUES (2026-09-06)
+
+**The operator's standing instruction: _"I am done for now awaiting people
+issue."_** The next work is REACTIVE; do not start backlog items speculatively.
+Read `docs/part11-kickoff.md` §1a first — it lists the bisection arms, the three
+ready test machines and the ~15-minute fix-round recipe.
+
+Release state: both artifacts operator-accepted ("Tested and pretty good"),
+tag `v1.0.0` pushed, and everything for upload staged at
+`~/Release/Case West/1.0.0/` (artifacts, SHA256SUMS, paste-ready notes, and an
+r/deadrising post draft). Only the operator's own GitHub clicks remain.
+
+Before that, **Case Zero's parts 98-101 fix round was imported** — eight fixes,
+every defect present here in identical code, `docs/imported-fixes.md` §6 — and
+the result was verified on a Radeon RX 6600 (Windows 10), which also exposed a
+save diagnostic that lied on every clean first boot. A **688-key pre-warm seed**
+is committed for the next artifact build.
+
 ## Status: PART 10 BUILT AND GATED THE RELEASE (2026-09-05)
 
 **Both v1.0.0 artifacts exist and passed their gates** — see
