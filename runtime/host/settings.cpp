@@ -29,6 +29,12 @@ struct State
                                 // (mouse_cam retired 2026-09-05: the mouse camera
                                 //  is always on, so there is no longer a toggle to
                                 //  store — see window.cpp's wantRel.)
+    int language = 1;           // Xbox console-language ID (1=en 2=ja 4=fr 5=es
+                                // 6=it 7=ko — the six PROSE banks the disc carries;
+                                // str_id/str_lg are not languages). Read ONCE at
+                                // boot by the two HLE sites (A1: one
+                                // ExGetXConfigSetting(3,9)), so the pre-boot
+                                // launcher is its home (part 11, from CZ part 99).
 };
 
 // The frame-cap values the panel offers. A set rather than a range because the vblank
@@ -74,11 +80,12 @@ void SaveLocked()
             "fov=%d\n"             // field-of-view adjustment in degrees, -10..+30, 0 = OG
             "aspect=%d\n"          // 0 = 16:9, 1 = 21:9 (applies at next launch)
             "rt_shadows=%d\n"     // 0 = OG, 1 = RT LOW (needs a ray-query device)
-            "mouse_sens=%d\n",    // 1..10
+            "mouse_sens=%d\n"     // 1..10
+            "language=%d\n",      // Xbox ID: 1=en 2=ja 4=fr 5=es 6=it 7=ko
             int(g_state.displayMode), g_state.resW, g_state.resH, g_state.renderScale,
             g_state.vsync ? 1 : 0, g_state.shadowTier, g_state.fpsCap, g_state.fov,
             g_state.aspect, g_state.rtShadows,
-            g_state.mouseSens);
+            g_state.mouseSens, g_state.language);
     fclose(f);
 }
 
@@ -139,6 +146,17 @@ void Settings_Load(const std::string& path)
         // gets — no branch, so it falls through to the trailing "unknown key".
         else if (!strcmp(key, "mouse_sens") && v >= 1 && v <= 10)
             g_state.mouseSens = int(v);
+        else if (!strcmp(key, "language"))
+        {
+            // Only the six IDs whose banks the disc carries. 3 (de) and 8 (zh)
+            // exist as Xbox IDs but have no str_*.bcs here — clamp loudly rather
+            // than hand the guest a language it will fall back from silently.
+            if (v == 1 || v == 2 || (v >= 4 && v <= 7))
+                g_state.language = int(v);
+            else
+                fprintf(stderr, "[settings] language=%ld is not one the disc ships "
+                                "(1/2/4/5/6/7) — using ENGLISH\n", v);
+        }
         else if (!strcmp(key, "aspect") && v >= 0 && v <= 1)
             legacyAspect = int(v);
         else if (!strcmp(key, "fps_cap"))
@@ -287,6 +305,19 @@ void Settings_SetMouseSens(int s)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_state.mouseSens = s < 1 ? 1 : (s > 10 ? 10 : s);
+    SaveLocked();
+}
+
+int Settings_Language()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_state.language;
+}
+
+void Settings_SetLanguage(int id)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_state.language = (id == 1 || id == 2 || (id >= 4 && id <= 7)) ? id : 1;
     SaveLocked();
 }
 

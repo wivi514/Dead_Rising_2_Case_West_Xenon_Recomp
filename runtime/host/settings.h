@@ -96,6 +96,15 @@ void Settings_SetFov(int deg);
 // MOUSE CAMERA toggle is retired, 2026-09-05); only the sensitivity knob remains.
 int  Settings_MouseSens();    // 1..10, default 5
 void Settings_SetMouseSens(int s);
+
+// SUBTITLE/UI LANGUAGE (part 11, imported from Case Zero's part 99 and re-measured
+// on this image): the Xbox console-language ID both HLE sites (ExGetXConfigSetting
+// 3/9 and XGetLanguage) answer with. The disc ships six prose banks — 1=en 2=ja
+// 4=fr 5=es 6=it 7=ko — and the setter clamps to those. Read ONCE by the guest at
+// boot (A1), so only the launcher offers it; a live in-game row would silently not
+// apply. CW_LANGUAGE=N (dev arm) wins over this.
+int  Settings_Language();
+void Settings_SetLanguage(int id);
 void Settings_SetRtShadows(int tier);
 int  Settings_ShadowRow();      // 0..2 raster, 3..5 RT (parked; see settings.cpp)
 void Settings_SetShadowRow(int row);
