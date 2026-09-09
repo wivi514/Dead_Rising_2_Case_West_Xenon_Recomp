@@ -85,6 +85,9 @@ game folder at any time without losing progress.
 - **MSAA 2x anti-aliasing** by default, a settings launcher, and a pipeline
   pre-warm plus background pipeline building, so even a first session plays
   smoothly instead of hitching the first time it sees something new.
+- **Subtitle language from the launcher** — English, French, Italian, Spanish,
+  Japanese or Korean, the six the game ships. It is read once at boot, so pick
+  it before pressing PLAY.
 - **Real Xbox 360 audio** (XMA) through ffmpeg — music, speech, effects, and
   the console's hardware loop behaviour.
 - **Built for long sessions**: texture memory recycles over a full playthrough

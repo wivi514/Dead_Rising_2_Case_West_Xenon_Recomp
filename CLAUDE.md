@@ -52,6 +52,12 @@ the result was verified on a Radeon RX 6600 (Windows 10), which also exposed a
 save diagnostic that lied on every clean first boot. A **688-key pre-warm seed**
 is committed for the next artifact build.
 
+**Post-tag, unreleased (2026-09-09, part 11):** the launcher gained a **SUBTITLES**
+row (Case Zero's part-99 language selection, mapping re-measured here —
+`docs/imported-fixes.md` §7, `CW_LANGUAGE=N` the dev arm) and its header no
+longer says CASE ZERO. Both wait for the next artifact build; the operator's
+per-language eye pass is owed.
+
 ## Status: PART 10 BUILT AND GATED THE RELEASE (2026-09-05)
 
 **Both v1.0.0 artifacts exist and passed their gates** — see

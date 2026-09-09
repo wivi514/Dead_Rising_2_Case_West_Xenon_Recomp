@@ -142,6 +142,20 @@ minute of play:
 * **memmem on Windows**: portable FindBytes in `native_kbm.cpp` (their
   d125ec2 imported) and `fe_probe.cpp` (our own file, three callers).
 
+## 3a. DONE IN PART 11 SO FAR (2026-09-09) — post-tag, NOT in the staged artifacts
+
+* **SUBTITLES row in the launcher** (`c00f5cd`, `docs/imported-fixes.md` §7):
+  Case Zero's part-99 language selection, with the ID→bank mapping re-measured on
+  this image (1=en 2=ja 4=fr 5=es 6=it 7=ko; 3 and 8 fall back to en). New
+  `language=` key in `cw_settings.txt`; `CW_LANGUAGE=N` is the dev arm. Gates run:
+  one bank per boot, persisted path, loud clamp, A1 kernel-order diff identical to
+  the English control. **Owed: the operator's eye pass** (each language to the
+  title, one subtitled cinematic; ja/ko glyphs unproven).
+* **Launcher header said CASE ZERO** (`644c9b7`) — a sibling string literal,
+  player-visible in v1.0.0. Fixed.
+* Both ride the NEXT artifact build with the 688-key seed; the staged v1.0.0
+  stays exactly as tested.
+
 ## 4. THE BACKLOG OTHERWISE (carried from part 9, unchanged)
 
 1. Game-side FOV — recipe transfers, addresses do not.

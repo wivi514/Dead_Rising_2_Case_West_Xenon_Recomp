@@ -489,7 +489,7 @@ path including the mouse.
 
 ### Not imported from this range, and why
 
-* **`42f99bc` skip-intro-logos** and **`e1da647` subtitle language selection** — launcher FEATURES, not fixes. Both need this title's own data re-measured (`intro.txt` exists in our `fecmn.big`; the language IDs differ with eight banks). Deferred deliberately, not forgotten.
+* **`42f99bc` skip-intro-logos** and **`e1da647` subtitle language selection** — launcher FEATURES, not fixes. Both need this title's own data re-measured (`intro.txt` exists in our `fecmn.big`; the language IDs differ with eight banks). Deferred deliberately, not forgotten. **UPDATE 2026-09-09: `e1da647` is now imported — §7 below, with the mapping re-measured here (it did NOT differ: eight banks on disk, but the guest's ID table addresses the same six). `42f99bc` stays deferred.**
 * **`082fff5` uncapped mouse-look** — that is Case Zero re-deriving **our** feature on their image, with their addresses. Nothing flows back.
 * **`a1bdff6` gas-station rooftop / texture-LOD thumbnail** — a Case Zero LOCATION and a Case Zero asset hash. The mechanism may generalise and may even touch the operator's parked minor-visual list; not hunted, because that list is theirs to open.
 * **The part-99/100 kernel probes** (`CZ_APC_TRACE`, `CZ_KOBJ_DUMP`, `CZ_KCALL_WHO` milestones, the streaming listeners) — diagnostics built to find the boot hang whose FIX we took. Worth having if a player reports a hang; not needed to ship.
@@ -541,3 +541,80 @@ directory's real state and a negative control proving it can still fire. **Case
 Zero has the same bug character for character** — and since they shipped a
 release with a genuine Windows save failure, this is precisely the sentence
 someone hunting that would grep for.
+
+## §7 — Case Zero part 99: subtitle language from the launcher (2026-09-09, part 11)
+
+| | |
+|---|---|
+| **Imported** | 2026-09-09 (part 11), commit `c00f5cd` |
+| **Source** | Case Zero `e1da647` (their part 99; the companion `42d558d` — MASH in every bank — was already here as §6's last row) |
+| **Why now** | Operator: *"Add localization subtitle to the launcher like how case zero did."* |
+| **Method** | Hand-ported (four files, same shape as theirs), with the ID→bank mapping **re-derived on this image** before the launcher row was ordered |
+| **Re-measured here?** | **YES** — the whole point. §6 had deferred it precisely because the mapping was not known to transfer |
+
+### What it is
+
+Both HLE sites that answer the console language — `ExGetXConfigSetting(3, 9)`
+and `XGetLanguage` — hardcoded English (`1`). They now answer from one
+`CwLanguage()` helper (`runtime/kernel/imports.cpp`) that reads the new persisted
+`language` key in `cw_settings.txt` (the Xbox ID; default 1), with `CW_LANGUAGE=N`
+the dev arm that wins over the file. The launcher gained a **SUBTITLES** row
+(ENGLISH / FRANCAIS / ITALIANO / ESPANOL / JAPANESE / KOREAN — ASCII, the 5x7
+launcher font has neither accents nor CJK; the in-game text is what gets
+localized). The settings loader clamps an unshipped ID to English **loudly**.
+
+There is deliberately no in-game Visuals row: A1 shows the title asking setting 9
+**once, at boot** (capture line 5861), so a live row would silently not apply.
+The launcher runs before the guest and is the only honest home.
+
+### What proved it here
+
+* **The mapping experiment** (the sibling's §1.1, repeated on this image): one
+  headless boot per `CW_LANGUAGE=N`, N=1..8, with `CW_FILE_TRACE=1`. Every run
+  opened exactly ONE `str_XX.bcs`, always at `NtCreateFile #40`:
+
+  | ID | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+  |---|---|---|---|---|---|---|---|---|
+  | bank | en | ja | **en** | fr | es | it | ko | **en** |
+
+  3 (German) and 8 (Chinese) are Xbox IDs with no bank on this disc and fall back
+  to English, so the launcher offers six. The image's own suffix table at
+  `0x8206CFC4` reads `ko ja lg es it fr en` and the format string `%s/str_%s%s`
+  is at `0x820BD107` — recorded, not used: the mapping came from the experiment.
+* **The persisted path, not just the env**: `language=4` written into
+  `cw_settings.txt` with no env set opened `str_fr.bcs`; `language=3` printed
+  `[settings] language=3 is not one the disc ships (1/2/4/5/6/7) — using ENGLISH`
+  and opened `str_en.bcs`. The operator's settings file was restored byte-identical
+  (sha256 checked) afterwards.
+* **The kernel-order gate**: `tools/kernel_call_diff.py` against A1 for the
+  `language=4` boot and for a same-binary English control — the two reports are
+  identical except for the log filename. The setting changes a VALUE, not the call
+  sequence.
+* **The overlay interaction**: the ja and fr boots both served their bank from the
+  KB-PROMPT overlay (`assets/game_kbm/data/frontend/str_{ja,fr}.bcs`), so a
+  non-English player gets the MASH rewrite §6 already put in every bank.
+
+### Measured differences from the sibling
+
+None in the mapping. The disk has **eight** banks here against their six, but
+the guest's ID table names the same six languages; `str_id` and `str_lg` are not
+reachable through a console-language ID. Same file number (#40) is a coincidence
+of a shared boot order, not a claim.
+
+### Found beside it
+
+The launcher header and the debug-menu heading still read **CASE ZERO** — a
+sibling string literal the transplant's `CZ_`→`CW_` rename gate never covered
+(it checked instruments, not display strings). Fixed in `644c9b7`, its own commit.
+Gotcha 325's class: grep transplanted code for the sibling's string literals.
+
+### Still owed
+
+* **The eye pass** — one launcher pick per language to the title screen and one
+  subtitled cinematic (the New Game intro is Bink with subtitles). ja/ko glyph
+  completeness is *likely* (`arialko.bcf` / `arialutf.bcf` ship in
+  `data/system/{480,720}/`) but unproven here as it was unproven there.
+* **Unreleased**: this lands AFTER the v1.0.0 tag. It ships with the next artifact
+  build alongside the 688-key pre-warm seed. Neither is in the staged artifacts.
+* `42f99bc` (skip-intro-logos) remains deferred — different mechanism (a data
+  patch on `intro.txt`), needs its own recon here.
