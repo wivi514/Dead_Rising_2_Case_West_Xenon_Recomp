@@ -728,7 +728,7 @@ void EmitDebugOverlay(int w, int h, Rect&& rect)   // rect(x,y,w,h,r,g,b,a)
         }
     };
 
-    text(44, 42, "CASE ZERO DEBUG MENU", 3, 255, 255, 255);
+    text(44, 42, "CASE WEST DEBUG MENU", 3, 255, 255, 255);
     text(44, 70, "UP/DOWN SELECT  ENTER USE  LEFT/RIGHT EDIT  F4 CLOSE", 2, 145, 205, 255);
 
     const size_t rows = panelH > 120 ? size_t((panelH - 110) / 18) : 0;
@@ -1523,7 +1523,7 @@ bool Host_RunLauncher()
         // ---- draw ----
         SDL_SetRenderDrawColor(ren, 20, 22, 26, 255);
         SDL_RenderClear(ren);
-        LauncherText(ren, 24, 20, "DEAD RISING 2 - CASE ZERO", 3, 245, 235, 200);
+        LauncherText(ren, 24, 20, "DEAD RISING 2 - CASE WEST", 3, 245, 235, 200);
         LauncherText(ren, 24, 52, "UP/DOWN SELECT   LEFT/RIGHT CHANGE   ENTER PLAY", 2,
                      130, 130, 140);
         for (int i = 0; i < kRows; ++i)
