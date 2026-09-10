@@ -964,3 +964,71 @@ recognise its own regions, because two languages' id tables agree past 4 KB).
 **Nothing else is outstanding.** Every other commit in every range is either imported,
 inapplicable by construction, or flowed the other way (three sibling commits are imports
 FROM this port).
+
+## §12 — the ultrawide CULLING fix: game-side fov (2026-09-10, operator-verified)
+
+| | |
+|---|---|
+| **Imported** | 2026-09-10, commit `5467a3e` |
+| **Source** | Case Zero's `cpu/camera_fov.cpp` (their parts 62 and 108) — the MECHANISM only |
+| **Why now** | Operator: *"For the culling in ultrawide we fixed that in case zero can you get it."* §11 had just named this as the one remaining absence with a player-visible consequence |
+| **Re-measured here?** | **Every address. None of theirs exists here** — this is derivation, not transcription |
+
+### The defect
+
+The renderer's composite patch widens what is DRAWN at 21:9 (and what is drawn tall in
+16:10 narrow mode), but the title's own CPU culling kept testing against the frustum the
+GAME believes it has, which is 16:9. The flanks therefore showed regions the game thought
+were off-screen, and scenery popped in and out there. Projection patching cannot reach it;
+the game has to be handed a wider fov.
+
+### How the three addresses were derived
+
+| what | here | Case Zero | how |
+|---|---|---|---|
+| named-property binder | `sub_8236F648` | `sub_82375518` | the FOV_* registration walk at `0x82462384..0x824623CC` calls thunk `0x82395A88`, which tail-calls it |
+| camera param getter | `sub_8246D1A0` | `sub_8246BF48` | its 28-byte accessor shape occurs EXACTLY ONCE in the image; no direct callers (vtable-only) |
+| the fov CALL SITE | `0x8246F730` | `0x8246E31C` | a runtime census — it cannot come from static reading |
+
+**The struct offsets are identical on both titles** — FOV_Min/+0x15C, FOV_Max/+0x160,
+FOV_Default/+0x164, FOV_Rate/+0x168 — which is the cross-check that the registration walk
+found the right object, not a lookalike.
+
+**And the site is confirmed by two independent instruments**, which is what makes it a
+measurement rather than a guess. The census printed exactly one distinct site:
+
+```
+[fovparam] lr=8246F730 this=A5AD5AC4 value=43.000000
+```
+
+and the OTHER hook — the property binder — printed `"FOV" obj=A5AD5930 count=1
+field=A5AD5AD8`. `A5AD5AD8` is `this+0x14`, the very field that site reads. The authored
+43.0 is the value the sibling measured for the same asset.
+
+### What it does
+
+At 3440x1440 the substitution hands the game **55.79°** in place of 43.0 (factor 1.3438):
+the angle whose 16:9 frustum covers the 21:9 view exactly. The renderer narrows the
+projection back, so the picture is unchanged while the culling covers all of it. **16:9
+with the slider at 0 is untouched by construction** — the block is skipped unless the
+slider is non-zero or the aspect factor is not 1.
+
+The field is STATE, not a constant: the authored value is captured the first time the site
+fires for an object and base+N is enforced absolutely, never restored, because the game
+writes its own smoothed fov back through the same node — their first form compounded to
+the 120° clamp in seconds.
+
+### Gates
+
+* **The operator, on their own 3440x1440 display: "Seems to be working perfectly."**
+* Engagement line at ultrawide; `CW_NO_GAME_FOV=1` is the control arm and announces itself.
+* 16:9 default: the substitution does not run.
+
+**NOT measured headlessly, and the reason is recorded rather than papered over**: the only
+scene reachable without the operator is the ANIMATED title screen, and the replay route is
+stale (§8), so a draw-count comparison between arms would not be matched arms. Two runs
+were taken and DISCARDED for exactly that reason — they reached different scenes, and the
+per-window numbers would have supported either conclusion. Their own culling evidence
+(draws 4,984 -> 5,309 at 43->60°) stands as the mechanism's proof on the sibling.
+
+**Backlog item 1 is closed.** The remaining deferred item is skip-intro-logos.
