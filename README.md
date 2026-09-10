@@ -89,6 +89,9 @@ game folder at any time without losing progress.
 - **MSAA 2x anti-aliasing** by default, a settings launcher, and a pipeline
   pre-warm plus background pipeline building, so even a first session plays
   smoothly instead of hitching the first time it sees something new.
+- **The launcher works on a controller as well as a keyboard** — D-pad or left
+  stick to move, A to select, START to play, B to quit — and lists the 21:9 and
+  16:10 sizes alongside the 16:9 ones.
 - **Subtitle language from the launcher** — English, French, Italian, Spanish,
   Japanese or Korean, the six the game ships. It is read once at boot, so pick
   it before pressing PLAY.

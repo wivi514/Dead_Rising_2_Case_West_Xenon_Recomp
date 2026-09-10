@@ -8,7 +8,8 @@
 What the next build carries beyond v1.0.0, in the order it landed:
 * the 688-key pre-warm seed (part 10's harvest, committed and waiting);
 * the launcher SUBTITLES row and the CASE ZERO header fix (part 11, §7);
-* everything in §8 — the fix round below.
+* everything in §8 — the fix round below;
+* the launcher round in §9 — the pad, the 21:9 rungs, and the clipped footer.
 
 **Owed before this ships**: the operator's play sitting (vibration, the MSAA row, a
 16:10 mode if a display offers one, keyboard Q on a Y prompt, the mouse wheel), the
@@ -67,6 +68,12 @@ shader cache are reused.
   desktop's icon).
 - **Subtitle language from the launcher** — English, French, Italian, Spanish, Japanese
   or Korean (pick it before PLAY; it is read once at boot).
+- **The launcher takes a controller.** D-pad or left stick to move, A to select, START to
+  play from any row, B to quit — so a machine with no keyboard to hand is no longer stuck
+  at the first window. The launcher also lists the **21:9 sizes** (2560x1080, 3440x1440,
+  3840x1600), which is how you turn on ultrawide rendering without editing anything, and
+  its window is tall enough again to show the line telling you where to drop your game
+  file.
 
 ### Linux
 
