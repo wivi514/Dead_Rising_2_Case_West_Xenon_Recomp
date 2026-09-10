@@ -612,9 +612,12 @@ Gotcha 325's class: grep transplanted code for the sibling's string literals.
 
 * ~~**The eye pass**~~ — **OPERATOR-CONFIRMED 2026-09-09 ("Yeah it works")**: a
   launcher session picked FRANCAIS, the run opened `str_fr.bcs` and nothing else,
-  the setting persisted as `language=4`, zero faults in the log. Not yet looked at:
-  ja/ko glyph completeness (*likely* — `arialko.bcf` / `arialutf.bcf` ship in
-  `data/system/{480,720}/` — but still unproven, as it was in the sibling).
+  the setting persisted as `language=4`, zero faults in the log. **Then KOREAN and
+  JAPANESE, one launcher session each (same day): "korean sign worked well",
+  "Japanese also works"** — each run opened only its own bank, zero faults. The
+  CJK glyph question the sibling left open is CLOSED here: `arialko.bcf` /
+  `arialutf.bcf` in `data/system/{480,720}/` render them. Three of six languages
+  eyeballed; fr/ko/ja cover both font paths (Latin and CJK).
 * **Unreleased**: this lands AFTER the v1.0.0 tag. It ships with the next artifact
   build alongside the 688-key pre-warm seed. Neither is in the staged artifacts.
 * `42f99bc` (skip-intro-logos) remains deferred — different mechanism (a data
