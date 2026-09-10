@@ -111,6 +111,13 @@ void Settings_SetMouseSens(int s);
 // boot (A1), so only the launcher offers it; a live in-game row would silently not
 // apply. CW_LANGUAGE=N (dev arm) wins over this.
 int  Settings_Language();
+// The language this RUN actually uses: CW_LANGUAGE wins over the file, exactly as the
+// kernel's ExGetXConfigSetting(3,9) answers it. ONE implementation, because two of them
+// drift: the string-follow in cpu/native_kbm.cpp reads the same bank the guest loaded,
+// and when this lived only inside imports.cpp it read the FILE while a CW_LANGUAGE run
+// loaded a different bank — the swap then located a bank whose regions it could not
+// recognise and (correctly) wrote nothing. Cached on first call, like the kernel's was.
+int  Settings_EffectiveLanguage();
 void Settings_SetLanguage(int id);
 void Settings_SetRtShadows(int tier);
 int  Settings_ShadowRow();      // 0..2 raster, 3..5 RT (parked; see settings.cpp)

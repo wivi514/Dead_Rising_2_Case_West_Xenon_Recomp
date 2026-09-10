@@ -1119,6 +1119,157 @@ bool LoadGlyphSwap()
     return true;
 }
 
+// ---- THE PROMPT'S WORDING FOLLOWS THE DEVICE TOO (imported from Case Zero 74ab694) --
+//
+// WHY. The kbm overlay rewrites four KEYBOARD wordings into the string bank —
+// "PRESS START"->"PRESS ENTER" twice, the grapple tutorial's "LEFT STICK "->
+// "A / D KEYS ", and id 4049's "LS "->"MASH" — and the bank is chosen once at BOOT.
+// So the part-92 device-follow was flipping the GLYPH ART both ways while the LABELS
+// stayed keyboard forever: their operator was grabbed by a zombie while playing on the
+// pad and the struggle prompt said MASH. Same overlay here, same defect — and this port
+// never had the fix, because it landed in the sibling BETWEEN the two commit ranges
+// this port imported (after their part 93, before their part 98).
+//
+// HOW. The loaded bank is located in guest memory by its own first 64 bytes and
+// confirmed against a 4 KB header (stale-checked on every flip, like the texels), and
+// each region is rewritten IN PLACE at its file offset after verifying it currently
+// reads one of the two known variants — the glyph swap's refuse-unknown discipline.
+// Every pair is the same length, so no swap can run into the next string; the one
+// unequal pair, MASH(5) vs "LS "(4), lives in a 5-byte region whose last byte is NUL
+// in both variants.
+//
+// HONEST LIMITATION (theirs, and it holds here): a widget copies its TEXT when it is
+// built, so a flip takes effect on the NEXT build of a prompt or screen, not one
+// already on screen. Prompts are built per use, so the label matches the device that
+// triggered it — which is the case that matters.
+//
+// DIFFERENT FROM THEIRS: they open `str_en.bcs` unconditionally. This port picks the
+// bank for the SELECTED LANGUAGE (part 11's launcher row), because opening the English
+// bank on a French session would locate nothing and silently follow no strings. The
+// three English wordings above are only rewritten in the English bank by the overlay
+// generator, so on another language they are simply not found — each says so once and
+// stays as booted, which is the same honest degradation their code already has. Id
+// 4049 is rewritten in EVERY bank, so the struggle label follows the device in all of
+// them, which is the one that provoked the fix.
+struct SwapString
+{
+    const char* what;
+    uint32_t off;                    // offset of the region inside the bank file
+    std::vector<uint8_t> kb, pad;    // both variants, same region length
+};
+std::vector<SwapString> g_swapStrings;
+std::vector<uint8_t> g_bankFp;       // first 64 bytes: the in-memory locator
+std::vector<uint8_t> g_bankHdr;      // first 4096: hit confirmation / stale check
+std::vector<uint32_t> g_bankAddrs;
+
+// The overlay bank for the language this session booted with. The mapping is the one
+// MEASURED on this image in part 11 (docs/imported-fixes.md §7); anything else is
+// English, exactly as the settings loader clamps it.
+const char* StrBankSuffix()
+{
+    switch (Settings_EffectiveLanguage())
+    {
+        case 2:  return "ja";
+        case 4:  return "fr";
+        case 5:  return "es";
+        case 6:  return "it";
+        case 7:  return "ko";
+        default: return "en";
+    }
+}
+
+bool LoadStrSwap()
+{
+    const std::string name = std::string("str_") + StrBankSuffix() + ".bcs";
+    const auto path = HostPaths::Root() / "assets/game_kbm/data/frontend" / name;
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f)
+        return false;
+    const std::streamsize sz = f.tellg();
+    if (sz < 4096)
+        return false;
+    std::vector<uint8_t> bank(static_cast<size_t>(sz), 0);
+    f.seekg(0);
+    f.read(reinterpret_cast<char*>(bank.data()), sz);
+    if (!f)
+        return false;
+
+    // The same-length wordings, located by searching for the KEYBOARD bytes — each
+    // must occur exactly once. A count of 0 is the normal answer in a non-English
+    // bank (the generator only rewrites these three in English); any other count
+    // means the bank moved under us. Either way that string just does not follow,
+    // and the line says which.
+    struct Pair { const char* what; const char* kb; const char* pad; size_t len; };
+    const Pair pairs[] = {
+        { "title PRESS/ENTER pair", "PRESS\0ENTER\0", "PRESS\0START\0", 12 },
+        { "PRESS ENTER",            "PRESS ENTER\0",  "PRESS START\0",  12 },
+        { "grapple tutorial",       "A / D KEYS ",    "LEFT STICK ",    11 },
+    };
+    for (const Pair& p : pairs)
+    {
+        size_t count = 0;
+        const uint8_t* hit = nullptr;
+        const uint8_t* from = bank.data();
+        size_t left = bank.size();
+        while (const uint8_t* h = FindBytes(from, left,
+                   reinterpret_cast<const uint8_t*>(p.kb), p.len))
+        {
+            ++count;
+            hit = h;
+            left -= size_t(h - from) + 1;
+            from = h + 1;
+        }
+        if (count != 1)
+        {
+            fprintf(stderr, "[kbm] string-follow: %s occurs %zu times in %s "
+                            "(expected 1) — that string stays as booted\n",
+                    p.what, count, name.c_str());
+            continue;
+        }
+        SwapString s;
+        s.what = p.what;
+        s.off = uint32_t(hit - bank.data());
+        s.kb.assign(p.kb, p.kb + p.len);
+        s.pad.assign(p.pad, p.pad + p.len);
+        g_swapStrings.push_back(std::move(s));
+    }
+
+    // Id 4049 (the struggle label) through the bank's OWN id table — exact, not a
+    // search. The generator rebuilt the table with "MASH\0", so the region is 5 bytes
+    // and the console's own wording fits inside it with NUL padding.
+    const uint32_t n = *reinterpret_cast<const uint32_t*>(bank.data());
+    if (bank.size() >= 4 + 8ull * n)
+    {
+        const uint32_t* ids = reinterpret_cast<const uint32_t*>(bank.data() + 4);
+        const uint32_t* offs = reinterpret_cast<const uint32_t*>(bank.data() + 4 + 4ull * n);
+        for (uint32_t k = 0; k < n; ++k)
+            if (ids[k] == 4049)
+            {
+                if (offs[k] + 5 <= bank.size() &&
+                    memcmp(bank.data() + offs[k], "MASH\0", 5) == 0)
+                {
+                    SwapString s;
+                    s.what = "struggle label MASH/LS";
+                    s.off = offs[k];
+                    s.kb.assign({'M', 'A', 'S', 'H', 0});
+                    s.pad.assign({'L', 'S', ' ', 0, 0});
+                    g_swapStrings.push_back(std::move(s));
+                }
+                else
+                    fprintf(stderr, "[kbm] string-follow: id 4049 is not MASH in %s — "
+                                    "the label stays as booted\n", name.c_str());
+                break;
+            }
+    }
+    if (g_swapStrings.empty())
+        return false;
+    g_bankFp.assign(bank.begin(), bank.begin() + 64);
+    g_bankHdr.assign(bank.begin(), bank.begin() + 4096);
+    fprintf(stderr, "[kbm] string-follow: %zu wording(s) in %s follow the device\n",
+            g_swapStrings.size(), name.c_str());
+    return true;
+}
+
 // Locate every in-memory copy of each glyph's TEXELS. Measured live (part 92
 // round 4, process_vm_readv over a gameplay run): the decoded glyph textures
 // sit PAGE-ALIGNED and HEADERLESS in the physical arena, byte-identical to the
@@ -1133,6 +1284,68 @@ static const Range kScanRanges[] = {
     { 0x40000000u, 0x7FE00000u },   // large-page virtual
     { 0x00010000u, 0x40000000u },   // small-page virtual
 };
+
+// The string bank, unlike the textures, is a file read into a HEAP allocation, so it
+// is scanned in every range (the physOnly economy is a texture fact). One 64-byte
+// needle over the arenas, each hit confirmed by the 4 KB header.
+void ScanForStrBank(uint8_t* base)
+{
+    if (g_swapStrings.empty())
+        return;
+    g_bankAddrs.clear();
+    const auto t0 = std::chrono::steady_clock::now();
+    // The physical arena first, and the two virtual ranges only if it held nothing:
+    // the title's heap lives in the physical arena, and part 107 measured the
+    // three-range sweep at 11 s of a core with nothing in the last two.
+    for (const Range& r : kScanRanges)
+    {
+        if (r.lo != 0xA0000000u && !g_bankAddrs.empty())
+            break;
+        const uint8_t* p = base + r.lo;
+        size_t left = r.hi - r.lo;
+        while (left >= g_bankHdr.size())
+        {
+            const uint8_t* hit = FindBytes(p, left, g_bankFp.data(), g_bankFp.size());
+            if (!hit)
+                break;
+            const size_t remain = size_t(base + r.hi - hit);
+            // The 4 KB header is NOT enough on its own: the id tables of two
+            // language banks can agree for far longer than that, and a run with
+            // CW_LANGUAGE set located the wrong one this way. Require that every
+            // region we intend to write currently reads one of ITS OWN two
+            // variants — the same refuse-unknown rule the write applies.
+            bool regionsAgree = remain >= g_bankHdr.size() &&
+                                memcmp(hit, g_bankHdr.data(), g_bankHdr.size()) == 0;
+            if (regionsAgree)
+                for (const SwapString& str : g_swapStrings)
+                {
+                    const uint8_t* at = hit + str.off;
+                    if (memcmp(at, str.kb.data(), str.kb.size()) != 0 &&
+                        memcmp(at, str.pad.data(), str.pad.size()) != 0)
+                    {
+                        regionsAgree = false;
+                        break;
+                    }
+                }
+            if (regionsAgree)
+            {
+                g_bankAddrs.push_back(uint32_t(hit - base));
+                fprintf(stderr, "[kbm] device-follow scan: string bank at %08X\n",
+                        uint32_t(hit - base));
+            }
+            left = remain - 1;
+            p = hit + 1;
+        }
+    }
+    fprintf(stderr, "[kbm] device-follow scan: string-bank pass %zu found in %.1f ms\n",
+            g_bankAddrs.size(),
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count());
+    if (g_bankAddrs.empty())
+        fprintf(stderr, "[kbm] device-follow scan: string bank NOT found — prompt "
+                        "wording stays as booted this round\n");
+}
+
 
 // The discriminating slice: the first 64-aligned offset where the two art sets
 // differ. Returns SIZE_MAX when the sets are identical (nothing to swap).
@@ -1306,7 +1519,7 @@ void DeviceWorker(uint8_t* base)
             std::this_thread::sleep_for(std::chrono::milliseconds(60));
             continue;
         }
-        auto swapAll = [&](size_t& wrote, size_t& stale) {
+        auto swapAll = [&](size_t& wrote, size_t& strWrote, size_t& stale) {
             for (SwapGlyph& g : g_swapGlyphs)
             {
                 auto it = g.addrs.begin();
@@ -1327,6 +1540,30 @@ void DeviceWorker(uint8_t* base)
                     ++it;
                 }
             }
+            // The wordings, in every located copy of the bank. Same discipline as
+            // the texels: a region that reads NEITHER variant means the allocation
+            // was reused, so the whole copy is dropped and rescanned.
+            auto ba = g_bankAddrs.begin();
+            while (ba != g_bankAddrs.end())
+            {
+                if (memcmp(base + *ba, g_bankHdr.data(), g_bankHdr.size()) != 0)
+                {
+                    ba = g_bankAddrs.erase(ba);
+                    ++stale;
+                    continue;
+                }
+                for (const SwapString& str : g_swapStrings)
+                {
+                    uint8_t* at = base + *ba + str.off;
+                    if (memcmp(at, str.kb.data(), str.kb.size()) != 0 &&
+                        memcmp(at, str.pad.data(), str.pad.size()) != 0)
+                        continue;              // not one of ours: leave it alone
+                    const auto& v = want == DEV_PAD ? str.pad : str.kb;
+                    memcpy(at, v.data(), v.size());
+                    ++strWrote;
+                }
+                ++ba;
+            }
         };
         // Swap the KNOWN copies first — the flip must be instant. Rescans for
         // unlocated glyphs run AFTER, rate-limited to one per 20 s and to the
@@ -1334,9 +1571,9 @@ void DeviceWorker(uint8_t* base)
         // gigabytes on EVERY flip whenever one glyph stayed unlocated, and
         // alternating devices in play turned that into a constant memory storm
         // — the operator's sub-30-fps report.
-        size_t wrote = 0, stale = 0;
-        swapAll(wrote, stale);
-        bool anyMissing = false;
+        size_t wrote = 0, strWrote = 0, stale = 0;
+        swapAll(wrote, strWrote, stale);
+        bool anyMissing = !g_swapStrings.empty() && g_bankAddrs.empty();
         for (const SwapGlyph& g : g_swapGlyphs)
             if (g.addrs.empty())
             {
@@ -1363,11 +1600,13 @@ void DeviceWorker(uint8_t* base)
             lastScan = std::chrono::steady_clock::now();
             fprintf(stderr, "[kbm] device-follow scan: END, %.3f s\n",
                     std::chrono::duration<double>(lastScan - t0).count());
-            swapAll(wrote, stale);              // newly-found copies get the art now
+            if (g_bankAddrs.empty())
+                ScanForStrBank(base);           // heap-resident: all ranges
+            swapAll(wrote, strWrote, stale);    // newly-found copies get the art now
         }
         applied = want;
-        fprintf(stderr, "[kbm] prompt art -> %s (%zu copies swapped%s)\n",
-                want == DEV_PAD ? "PAD" : "KEYBOARD", wrote,
+        fprintf(stderr, "[kbm] prompt art -> %s (%zu copies swapped, %zu wording(s)%s)\n",
+                want == DEV_PAD ? "PAD" : "KEYBOARD", wrote, strWrote,
                 stale ? ", stale addresses dropped" : "");
     }
 }
@@ -1386,12 +1625,18 @@ void NativeKbm_NoteDeviceInput(bool pad)
     {
         if (!g_deviceWorkerUp.exchange(true, std::memory_order_acq_rel))
         {
-            if (!LoadGlyphSwap())
-            {
+            const bool haveGlyphs = LoadGlyphSwap();
+            if (!haveGlyphs)
                 fprintf(stderr, "[kbm] glyph_swap.bin missing/bad — prompt art "
                                 "stays as booted\n");
+            // The wordings are independent of the art: a bank without the texel
+            // sidecar still follows the device, and vice versa.
+            const bool haveStrings = LoadStrSwap();
+            if (!haveStrings)
+                fprintf(stderr, "[kbm] string-follow: no overlay string bank — "
+                                "prompt wording stays as booted\n");
+            if (!haveGlyphs && !haveStrings)
                 return;
-            }
             std::thread(DeviceWorker, g_memory.base).detach();
         }
     }

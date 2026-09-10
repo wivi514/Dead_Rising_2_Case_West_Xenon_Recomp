@@ -2456,18 +2456,20 @@ GUEST_FUNCTION_STUB(__imp__KeUnlockL2)
 // the ID->bank mapping on this image (docs/imported-fixes.md §7).
 static uint32_t CwLanguage()
 {
+    // The resolution itself lives in host/settings.cpp so the KB/M string-follow reads
+    // the same answer (it has to open the same bank the guest loads). This keeps the
+    // announcement, which is the kernel's to make.
     static const uint32_t lang = [] {
+        const int v = Settings_EffectiveLanguage();
         if (const char* env = getenv("CW_LANGUAGE"))
         {
-            const long v = strtol(env, nullptr, 10);
-            if (v >= 1 && v <= 8)
-            {
-                fprintf(stderr, "[kernel] CW_LANGUAGE=%ld: console language forced\n", v);
-                return uint32_t(v);
-            }
-            fprintf(stderr, "[kernel] CW_LANGUAGE=%s is not 1..8 — ignored\n", env);
+            const long e = strtol(env, nullptr, 10);
+            if (e >= 1 && e <= 8)
+                fprintf(stderr, "[kernel] CW_LANGUAGE=%ld: console language forced\n", e);
+            else
+                fprintf(stderr, "[kernel] CW_LANGUAGE=%s is not 1..8 — ignored\n", env);
         }
-        return uint32_t(Settings_Language());
+        return uint32_t(v);
     }();
     return lang;
 }

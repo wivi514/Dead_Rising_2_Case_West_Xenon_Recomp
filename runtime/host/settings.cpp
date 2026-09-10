@@ -332,6 +332,22 @@ int Settings_Language()
     return g_state.language;
 }
 
+int Settings_EffectiveLanguage()
+{
+    static const int lang = [] {
+        if (const char* env = getenv("CW_LANGUAGE"))
+        {
+            const long v = strtol(env, nullptr, 10);
+            if (v >= 1 && v <= 8)
+                return int(v);
+            // The complaint is the kernel's to print (it says the same thing once);
+            // here the file's value simply stands.
+        }
+        return Settings_Language();
+    }();
+    return lang;
+}
+
 void Settings_SetLanguage(int id)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
