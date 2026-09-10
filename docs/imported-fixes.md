@@ -904,3 +904,63 @@ mount a double-click takes.
 **Still owed for v1.0.1**: the Windows leg on czwin (nothing here can build it), and the
 operator's play sitting. Neither is a Deck item. **And no Deck has run this** — every row
 above is a cause removed, not a success observed.
+
+## §11 — the pre-release completeness audit (2026-09-10)
+
+The operator's instruction: *"Make sure everything is good from case zero before we
+release v1.0.1."* Not a commit sweep this time — commit sweeps are what let the defect
+below hide — but four checks that come at it from different directions.
+
+**1. Every file.** Sixteen files exist in the sibling's runtime and not here. All
+sixteen are deliberate: `boot_skip` (deferred), `camera_fov` (backlog item 1),
+`shadow_distance` (below), `guest_probe`/`debug_tunables`/`d3d_hooks`/`d3d_draw`
+(port-pending per-title RE), `pc_options.{cpp,h}` (we have `pc_options_cw`),
+`pit_gravel_tex.h` and the four `rt_*` files (a Case Zero asset; ray tracing).
+
+**2. Every arm.** 458 `CW_*` names in their runtime against 412 here. All 46 absent ones
+fall in four groups and every group is intentional: ray tracing (40), the golden texture
+store (6 — a store this port never took), the parked shadow-distance experiment (2), and
+per-title probes including the native-options experiment. **`CW_VK_NO_DECK_SKIP` is not
+what it looks like**: it is the gas-station rooftop DECK, a Case Zero location keyed on a
+Case Zero shader hash, not the Steam Deck.
+
+**3. Every range boundary.** This port imported the sibling in ranges, and the ranges do
+not meet. Each junction checked for runtime commits that fell between:
+
+| junction | verdict |
+|---|---|
+| the RT era (`5b9fbba..ef52c7b`) | three non-RT commits, all the game-side FOV/culling work — the renderer half is here, the CPU half is `camera_fov.cpp`, backlog item 1 |
+| parts 72-81 into `adca819` | that IS §4's own range; the release A.1-A.4 infrastructure is here |
+| `ecb6775..55a9d4e` | **THE GAP THAT MATTERED — see below** |
+| `55a9d4e..95611b9` | fully accounted for: §6's list, §7's language row, the deferred skip-intro toggle, and the part-99/100 boot-hang probes |
+
+**4. The one that was actually missing.** `74ab694` — the prompt WORDING device-follow —
+landed at their part 97, between the range this port took at their part 93 and the range
+that resumed at their part 98. Nothing was skipped on purpose; the ranges simply did not
+meet there. The defect was live here in identical form: **on a controller, the struggle
+prompt said MASH**. Fixed in `db1bab5`, with two divergences their version needed here
+(the bank follows the SELECTED LANGUAGE — the operator's own setting is Japanese, so
+their hardcoded `str_en.bcs` would have followed nothing — and a located bank must
+recognise its own regions, because two languages' id tables agree past 4 KB).
+
+### Checked and deliberately NOT taken
+
+* **`shadow_distance.cpp`** — CLAUDE.md's backlog item 4 said to watch for this landing.
+  **It has landed, and it does not work**: their own header calls it "a NON-WORKING
+  experiment", two hook targets tried, scaling the globals did not move the shadows,
+  operator-confirmed, shipped off and bit-identical. Nine per-title addresses for a
+  feature that does nothing. **Backlog item 4 is closed by this, not deferred.**
+* **The golden texture store's part-102/104 refinements** — a store this port never had.
+* **Skip-intro-logos (`42f99bc`)** — still deferred; a data patch on this title's own
+  `intro.txt`, which needs its own recon here.
+* **`camera_fov.cpp`** — backlog item 1, and the honest statement is that this is NEW
+  per-title reverse engineering, not an import: two hooked functions and several data
+  addresses, none of which exist at those addresses here. **Consequence while it is
+  absent**: at 21:9 and 16:10 the renderer widens what is DRAWN but the game still CULLS
+  to its own 16:9 frustum, so objects at the extreme flanks can pop. v1.0.0 has this too;
+  it is a standing limitation, not a regression.
+* **The part-99/100 kernel probes** — diagnostics for a boot hang whose FIX is here.
+
+**Nothing else is outstanding.** Every other commit in every range is either imported,
+inapplicable by construction, or flowed the other way (three sibling commits are imports
+FROM this port).
