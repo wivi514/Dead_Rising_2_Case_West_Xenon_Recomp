@@ -170,6 +170,16 @@ minute of play:
   (`tools/release_build_oldbase.sh` — `podman tag cz-oldbase:jammy
   cw-oldbase:jammy` first), then v1.0.1 (`docs/release-notes-v1.0.1.md`).
 
+## 3g. THE ULTRAWIDE CULLING FIX IS IN AND OPERATOR-VERIFIED (`imported-fixes.md` §12)
+
+`5467a3e` — the game-side fov substitution, Case Zero's mechanism with all three
+addresses derived here (binder `sub_8236F648`, param getter `sub_8246D1A0`, call site
+`0x8246F730` found by census and confirmed by a second instrument). At 3440x1440 the
+game is handed 55.79 deg for 43.0, so it CULLS to the width it renders. **Operator on
+their own ultrawide: "Seems to be working perfectly."** 16:9 is untouched.
+**Backlog item 1 closed**; skip-intro-logos is the only deferred item left.
+The pre-warm seed also grew 688 -> 898 keys from that session (`c463848`).
+
 ## 3f. THE PRE-RELEASE AUDIT IS DONE (`imported-fixes.md` §11)
 
 Four checks — every file, every arm, every range boundary, then the gap they exposed.
