@@ -60,6 +60,34 @@ void Host_RequestDebugMenu() { g_debugMenuPressed.store(true, std::memory_order_
 void Host_RequestSnapDump() { g_snapDumpPressed.store(true, std::memory_order_release); }
 void Host_RequestBurstDump() { g_burstDumpPressed.store(true, std::memory_order_release); }
 
+// The window's pending follow-size, one word so a torn W/H pair cannot exist between
+// the pump (producer) and the window thread (consumer). 0 = nothing pending.
+std::atomic<uint64_t> g_pendingWindowRes{ 0 };
+void Host_WindowFollowInternalRes(uint32_t w, uint32_t h)
+{
+    if (w && h)
+        g_pendingWindowRes.store((uint64_t(w) << 32) | h, std::memory_order_release);
+}
+
+// The pad's wanted motor state, one word: bit 32 = "a request has been made" (so a
+// title asking for 0/0 after 0/0 is distinguishable from silence), bits 16..31 the
+// left (low-frequency) motor, bits 0..15 the right (high-frequency) one. Newest wins:
+// the title writes the CURRENT state, not a queue of effects, so a pair overwritten
+// before the window thread saw it was already stale on the console too. Pad 1 has no
+// physical controller (it is the keyboard), so its requests are counted and dropped.
+std::atomic<uint64_t> g_padRumble{ 0 };
+std::atomic<uint32_t> g_padRumbleOtherPad{ 0 };
+void Host_PadRumble(uint32_t userIndex, uint16_t leftMotor, uint16_t rightMotor)
+{
+    if (userIndex != 0)
+    {
+        g_padRumbleOtherPad.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    g_padRumble.store((uint64_t(1) << 32) | (uint64_t(leftMotor) << 16) | rightMotor,
+                      std::memory_order_release);
+}
+
 // F7 — MARK THE FRAME TRACE. The operator plays, feels a stutter, and presses this; the
 // renderer stamps the current frame number into the trace and the log.
 //
@@ -117,6 +145,10 @@ bool Host_ProgressBegin(const char*) { return false; }
 void Host_ProgressUpdate(const char*, float) {}
 void Host_ProgressEnd() {}
 bool Host_RunLauncher() { return true; }
+void Host_DiagVideo()
+{
+    fprintf(stderr, "[diag] sdl: built with -DCW_WINDOW=OFF — no SDL in this binary\n");
+}
 void Host_Present(uint32_t, uint32_t, uint32_t) {}
 void Host_PresentPixels(const uint8_t*, uint32_t, uint32_t) {}
 void Host_WindowRun() {}
@@ -155,6 +187,8 @@ int Host_DisplayModeList(uint32_t*, int) { return 0; }
 #include "../cpu/gap_probe.h"
 #include "../cpu/fe_probe.h"
 #include "host_paths.h"
+#include "log_file.h"
+#include "png_icon.h"
 #include "settings.h"
 #include "../cpu/native_kbm.h"
 #include "stfs_extract.h"
@@ -271,7 +305,8 @@ void PublishDisplaySize()
     // The mode list, refreshed whenever the desktop size changed (first publish
     // included). SDL reports one entry per (size, refresh, format); the menu wants
     // distinct sizes, so dedupe. Modes the renderer cannot express (odd widths,
-    // sub-720 heights, narrower than 16:9 — the 4:3 and 5:4 legacy modes) are
+    // sub-720 heights, narrower than 16:10 — the 4:3 and 5:4 legacy modes; 16:10
+    // itself is narrow mode since part 108) are
     // filtered here so the panel never offers a row it cannot honor.
     if (ow != uint32_t(mode.w) || oh != uint32_t(mode.h))
     {
@@ -306,6 +341,76 @@ void PublishDisplaySize()
     }
 }
 
+// Size a WINDOWED window to the internal resolution. WINDOW THREAD ONLY, like
+// ApplyDisplayModeNow below and for the same reason. Three cases decline, each with a
+// line saying why, because a resize that silently did not happen looks like the
+// setting did not apply:
+//   * CW_WINDOW_SIZE / CW_WINDOW_MAXIMIZED — a measurement pinned the window (the same
+//     rule Host_WindowInit applies to the persisted display mode);
+//   * borderless or exclusive fullscreen — the display sizes the window, and the
+//     internal resolution is scaled into it (that is the whole point of the setting);
+//   * a MAXIMIZED window — the player asked the window manager for that shape, and
+//     un-maximising it under them is a different instruction from the one given.
+// The size is clamped to the display's USABLE bounds (the desktop minus panels and
+// docks, per SDL) keeping the aspect, because a 3440x1440 internal resolution on a
+// 3440x1440 desktop must not produce a window whose title bar is off the screen.
+// `why` names the caller in the log line.
+void ApplyWindowFollowRes(uint32_t w, uint32_t h, const char* why)
+{
+    if (!g_window || !w || !h)
+        return;
+    if (getenv("CW_WINDOW_SIZE") || getenv("CW_WINDOW_MAXIMIZED"))
+    {
+        fprintf(stderr, "[host] window follow %ux%u (%s): NOT applied — CW_WINDOW_SIZE/"
+                        "CW_WINDOW_MAXIMIZED pin the window for this run\n", w, h, why);
+        return;
+    }
+    const Uint32 flags = SDL_GetWindowFlags(g_window);
+    if (flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP))
+    {
+        fprintf(stderr, "[host] window follow %ux%u (%s): not applied — the window is "
+                        "fullscreen and the display sizes it\n", w, h, why);
+        return;
+    }
+    if (flags & SDL_WINDOW_MAXIMIZED)
+    {
+        fprintf(stderr, "[host] window follow %ux%u (%s): not applied — the window is "
+                        "maximised; un-maximise it to have it follow the resolution\n",
+                w, h, why);
+        return;
+    }
+    int tw = int(w), th = int(h);
+    const int display = SDL_GetWindowDisplayIndex(g_window);
+    SDL_Rect usable{};
+    if (SDL_GetDisplayUsableBounds(display < 0 ? 0 : display, &usable) == 0 &&
+        usable.w > 0 && usable.h > 0)
+    {
+        // Leave room for the window manager's own decorations — SDL's usable bounds
+        // exclude panels, not the title bar. 48 px is a guess that errs safe; being a
+        // few pixels smaller than the display is invisible, being larger is not.
+        const int maxW = usable.w, maxH = std::max(64, usable.h - 48);
+        if (tw > maxW || th > maxH)
+        {
+            const double s = std::min(double(maxW) / tw, double(maxH) / th);
+            tw = std::max(64, int(tw * s) & ~1);
+            th = std::max(64, int(th * s) & ~1);
+            fprintf(stderr, "[host] window follow %ux%u (%s): larger than display %d's "
+                            "usable %dx%d — sized to %dx%d instead (same aspect)\n",
+                    w, h, why, display < 0 ? 0 : display, usable.w, usable.h, tw, th);
+        }
+    }
+    int cw = 0, ch = 0;
+    SDL_GetWindowSize(g_window, &cw, &ch);
+    if (cw == tw && ch == th)
+        return;
+    SDL_SetWindowSize(g_window, tw, th);
+    SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED_DISPLAY(display < 0 ? 0 : display),
+                          SDL_WINDOWPOS_CENTERED_DISPLAY(display < 0 ? 0 : display));
+    fprintf(stderr, "[host] window follow (%s): %dx%d -> %dx%d, re-centred — the "
+                    "swapchain must follow\n", why, cw, ch, tw, th);
+    PublishDrawableSize();
+}
+
 // Apply a display mode to the live window. WINDOW THREAD ONLY (the SDL rule this
 // whole file exists to keep): Host_WindowInit calls it once after creation for the
 // persisted mode, and the loop calls it when the PC options screen changes the
@@ -319,8 +424,15 @@ void ApplyDisplayModeNow(CzDisplayMode m)
     switch (m)
     {
         case CzDisplayMode::Windowed:
+        {
             SDL_SetWindowFullscreen(g_window, 0);
+            // SDL restores the pre-fullscreen size, which is whatever the window was
+            // before — not necessarily the resolution applied while fullscreen.
+            uint32_t rw = 0, rh = 0;
+            Settings_InternalRes(rw, rh);
+            ApplyWindowFollowRes(rw, rh, "display mode -> windowed");
             break;
+        }
         case CzDisplayMode::Borderless:
             SDL_SetWindowFullscreen(g_window, SDL_WINDOW_FULLSCREEN_DESKTOP);
             break;
@@ -553,9 +665,11 @@ const char* Glyph(char c)
 template <typename Rect>
 void EmitSettingsOverlay(int w, int h, Rect&& rect)
 {
-    const int panelW = 640, panelH = 420;   // 420: seven rows — the MOUSE CAMERA
-                                            // toggle is retired (mouse always on),
-                                            // leaving the MOUSE SENS row of part 91
+    const int panelW = 640, panelH = 460;   // 460: eight rows — MSAA joined in part
+                                            // 108; the MOUSE CAMERA toggle is retired
+                                            // (always on); MOUSE SENS stays (part 64
+                                            // had merged the RT tiers INTO the shadow
+                                            // row)
     const int panelX = (w - panelW) / 2, panelY = (h - panelH) / 2 - 30;
     if (panelW <= 0 || panelH <= 0)
         return;
@@ -642,17 +756,27 @@ void EmitSettingsOverlay(int w, int h, Rect&& rect)
     // the mouse is host-made (window.cpp's ReadKeyboard) and these are its knobs.
     char sensName[4];
     snprintf(sensName, sizeof sensName, "%d", Settings_MouseSens());
-    const char* rows[7][2] = {
+    // MSAA (part 108): the persisted setting, starred while it differs from the
+    // sample count THIS run renders with — it applies at the next launch, and the
+    // star is what keeps "shown" and "running" apart, as the resolution row's does.
+    const int msaaSet = Settings_Msaa();
+    const int msaaRun = VkRenderer_MsaaSamples();
+    const bool msaaPending = msaaRun && (msaaSet ? msaaSet : 1) != msaaRun;
+    char msaaName[8];
+    snprintf(msaaName, sizeof msaaName, "%s%s",
+             msaaSet == 0 ? "OFF" : msaaSet == 2 ? "2X" : "4X", msaaPending ? " *" : "");
+    const char* rows[8][2] = {
         { "RESOLUTION", resName },
         { "DISPLAY MODE", kModeNames[int(Settings_DisplayMode()) % 3] },
         { "VSYNC", kOnOff[Settings_VSync() ? 1 : 0] },
         { "SHADOW QUALITY", kShadowRow[shadowRow % 3] },
+        { "MSAA", msaaName },
         { "FRAME CAP", capName },
         { "FIELD OF VIEW", fovName },
         { "MOUSE SENS", sensName },
     };
     const int sel = Settings_OverlaySelection();
-    for (int i = 0; i < 7; ++i)
+    for (int i = 0; i < 8; ++i)
     {
         const int y = panelY + 86 + i * 40;
         if (i == sel)
@@ -677,6 +801,8 @@ void EmitSettingsOverlay(int w, int h, Rect&& rect)
     text(panelX + 20, panelY + panelH - 30,
          resPending
              ? "PRESS X TO APPLY THE NEW RESOLUTION"
+         : msaaPending
+             ? "MSAA APPLIES AT THE NEXT LAUNCH"
          : rtWhy == 3
              ? "RESOLUTION: X APPLIES LIVE - RT SHADOWS ARE OFF IN THIS BUILD"
          : rtWhy == 1
@@ -862,6 +988,102 @@ void CloseController(SDL_JoystickID which)
     SDL_GameControllerClose(g_controller);
     g_controller = nullptr;
     g_controllerId = -1;
+}
+
+// DRIVE THE MOTORS (part 108). Window thread only — SDL_GameControllerRumble writes
+// the device through the joystick layer, which is not thread-safe against the
+// polling in this loop.
+//
+// The state machine is deliberately small: `last` is the pair the device was last
+// told, and `lastIssue` when. A CHANGE is issued immediately. A held non-zero pair is
+// re-issued every 250 ms because SDL's rumble is a timed effect and XInput's is a
+// level — the title sets 40%/0% and expects it to stay until it says otherwise
+// (sub_825D7AC8 is a plain "set the current state" wrapper). A 700 ms duration on
+// each issue is long enough that a missed refresh (a loop turn stalled on a
+// swapchain rebuild, say) does not read as a dropped effect, and short enough that
+// a title that stops calling us — a crash, a pause — leaves a pad that goes quiet on
+// its own rather than one buzzing until unplugged.
+//
+// The driver's answer is checked on EVERY issue, not just the first: a pad that
+// supports rumble on one backend (hidraw) and not another (the kernel xpad driver
+// with ff disabled) reports it at the call, and a `-1` that prints once per
+// distinct answer is how the log says which case a player's "no vibration" is.
+// "yes"/"NO" for the log lines below; the query is SDL 2.0.18+, and a build against
+// an older SDL says so rather than guessing.
+const char* HasRumbleStr(SDL_GameController* c)
+{
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+    return SDL_GameControllerHasRumble(c) ? "yes" : "NO";
+#else
+    (void)c;
+    return "unknown (SDL < 2.0.18)";
+#endif
+}
+
+uint16_t g_rumbleLastL = 0, g_rumbleLastR = 0;
+bool     g_rumbleEverIssued = false;
+int      g_rumbleLastRc = 0;
+std::chrono::steady_clock::time_point g_rumbleLastIssue{};
+uint64_t g_rumbleIssues = 0, g_rumbleRequests = 0;
+bool     g_rumbleOff = false, g_rumbleTrace = false;
+
+void IssueRumble(uint16_t l, uint16_t r, const char* why)
+{
+    if (!g_controller)
+        return;
+    const int rc = SDL_GameControllerRumble(g_controller, l, r, 700);
+    ++g_rumbleIssues;
+    if (!g_rumbleEverIssued || rc != g_rumbleLastRc)
+    {
+        // Once per distinct driver answer, so a pad that starts refusing mid-run is
+        // reported, and a pad that never worked is reported exactly once.
+        fprintf(stderr, "[host] rumble: %s -> SDL_GameControllerRumble(%u, %u) = %d%s%s "
+                        "(has-rumble: %s)\n", why, l, r, rc, rc ? ": " : "",
+                rc ? SDL_GetError() : "",
+                HasRumbleStr(g_controller));
+    }
+    g_rumbleEverIssued = true;
+    g_rumbleLastRc = rc;
+    g_rumbleLastL = l;
+    g_rumbleLastR = r;
+    g_rumbleLastIssue = std::chrono::steady_clock::now();
+    if (g_rumbleTrace)
+        fprintf(stderr, "[rumble] %s L=%u R=%u rc=%d\n", why, l, r, rc);
+}
+
+void PumpRumble()
+{
+    if (g_rumbleOff)
+        return;
+    const uint64_t word = g_padRumble.exchange(0, std::memory_order_acq_rel);
+    if (word)
+    {
+        ++g_rumbleRequests;
+        const uint16_t l = uint16_t(word >> 16), r = uint16_t(word);
+        // The request is traced BEFORE the controller check, so a run with no pad
+        // attached can still witness that the title drives the motors — the
+        // question a headless or pad-less box can answer, and the one that
+        // separates "the title never asks" from "the pad never moves". Traced on
+        // CHANGE only: the title sets its state every frame (20,000 identical 0/0
+        // requests in a 3-minute run), and a trace that prints each is unreadable.
+        static uint16_t tracedL = 0xFFFF, tracedR = 0xFFFF;
+        if (g_rumbleTrace && (l != tracedL || r != tracedR))
+        {
+            tracedL = l; tracedR = r;
+            fprintf(stderr, "[rumble] request #%llu L=%u R=%u%s\n",
+                    (unsigned long long)g_rumbleRequests, l, r,
+                    g_controller ? "" : " (no controller attached)");
+        }
+        if (!g_rumbleEverIssued || l != g_rumbleLastL || r != g_rumbleLastR)
+            IssueRumble(l, r, "change");
+    }
+    // A held level outlives SDL's timed effect only if we keep telling the device.
+    if (g_rumbleEverIssued && (g_rumbleLastL || g_rumbleLastR))
+    {
+        const auto since = std::chrono::steady_clock::now() - g_rumbleLastIssue;
+        if (since >= std::chrono::milliseconds(250))
+            IssueRumble(g_rumbleLastL, g_rumbleLastR, "refresh");
+    }
 }
 
 // A keyboard axis is a pair of keys, and the value it produces is FULL SCALE.
@@ -1288,6 +1510,7 @@ void Shutdown(const char* why)
     // actually has to fire for the next launch to be warm.
     ::VkRenderer_SavePipelineCache();
     fflush(nullptr);
+    LogFile::Flush(2000); // the log file's tail, before an exit that skips every destructor
     // _Exit, not exit: guest threads are still running recompiled code against guest
     // memory, and running static destructors underneath them would turn an ordinary
     // quit into a crash report about a subsystem that was working.
@@ -1310,12 +1533,149 @@ std::string g_progTitle;
 uint32_t g_progLastDraw = 0;
 } // namespace
 
+
+// THE WINDOW ICON (part 104, operator request): the title's own 64x64 dashboard tile,
+// read from the player's unpacked game (host/png_icon.h says why it is read and never
+// shipped). Applied to every window this module creates; a missing or refused file leaves
+// SDL's default in place. SDL copies the pixels, so the surface is freed at once.
+static void ApplyGameIcon(SDL_Window* win)
+{
+    if (!win) return;
+    const PngIcon::Image& tile = PngIcon::GameTile();
+    if (tile.rgba.empty()) return;
+    SDL_Surface* s = SDL_CreateRGBSurfaceWithFormatFrom(
+        const_cast<uint8_t*>(tile.rgba.data()), int(tile.width), int(tile.height), 32,
+        int(tile.width) * 4, SDL_PIXELFORMAT_RGBA32);
+    if (!s) return;
+    SDL_SetWindowIcon(win, s);
+    SDL_FreeSurface(s);
+    // SDL2's Wayland backend has no SetWindowIcon (the protocol lets a compositor take the
+    // icon from the app-id's .desktop entry instead; SDL3 grew xdg-toplevel-icon), so on a
+    // Wayland session this call is a no-op and the line below says so rather than letting
+    // "the icon did not change" be read as a decoder failure. X11 and Windows honour it.
+    static bool said = false;
+    if (!said)
+    {
+        said = true;
+        if (const char* drv = SDL_GetCurrentVideoDriver(); drv && strcmp(drv, "wayland") == 0)
+            fprintf(stderr, "[icon] the wayland video driver takes no window icon (SDL2); "
+                            "the title bar keeps the compositor's default here\n");
+    }
+}
+
+// PREFER WAYLAND WHEN THE SESSION OFFERS IT (part 104). Real SDL2 — the bundled one since
+// part 82 — tries x11 before wayland on a Wayland desktop, where sdl2-compat/SDL3 (the
+// dev box's) tries wayland first. On this box (NVIDIA, XWayland) the x11 path presented
+// at EXACTLY 1.0 fps: the published v1.0.1 Linux bundle measured 1.0 fps on its default
+// driver and 224 fps with SDL_VIDEODRIVER=wayland, and the dev binary read the same both
+// ways, so it is the path and not the build (phase5-notes §6eu §5). The hint is a comma
+// list SDL2 >= 2.0.22 walks in order: a Wayland session whose wayland driver fails falls
+// back to x11 as before, and an X11 session (no WAYLAND_DISPLAY) is untouched. A player's
+// own SDL_VIDEODRIVER wins — an environment variable outranks a default-priority hint —
+// and the game window's "up on SDL video driver" line says which one took. Idempotent, so
+// it is called at every SDL video init site rather than at one that may not be first.
+//
+// EXCEPT UNDER GAMESCOPE (part 105, docs/steam-deck-plan.md §3 item 4). The Steam
+// Deck's Game Mode — and any `gamescope -- game` session — is a Wayland compositor that
+// presents games through XWayland; its X11 path is the one every Steam title takes and
+// the one Valve tests. The 1 fps defect above is an NVIDIA + desktop-XWayland case, so
+// on a gamescope session the hint is NOT set and SDL2's default order (x11 first)
+// stands. gamescope names itself three ways depending on version and launcher:
+// GAMESCOPE_WAYLAND_DISPLAY in the game's environment, and "gamescope" in
+// XDG_CURRENT_DESKTOP or XDG_SESSION_DESKTOP; any one of them is enough.
+//
+// MEASURED ON THIS BOX (part 105, gamescope 3.16.23 nested on KDE Wayland, NVIDIA):
+// gamescope also REMOVES WAYLAND_DISPLAY and SDL_VIDEODRIVER from the child's
+// environment (`gamescope -- env` shows neither), so the part-104 hint could never
+// have fired under it and a player's SDL_VIDEODRIVER never reaches the game there —
+// x11 through XWayland is the only path gamescope offers, and it presented at the
+// title screen at ~165 fps here (6,645 frames in ~40 s), not the desktop-XWayland 1 fps.
+// The check below therefore changes no behaviour under gamescope; it exists so the
+// log STATES the path and the reason, which a Deck report needs.
+static bool UnderGamescope()
+{
+    if (const char* g = getenv("GAMESCOPE_WAYLAND_DISPLAY"); g && *g)
+        return true;
+    for (const char* var : { "XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP" })
+        if (const char* v = getenv(var); v && strstr(v, "gamescope"))
+            return true;
+    return false;
+}
+
+static void PreferWaylandWhenOffered()
+{
+#if !defined(_WIN32) && !defined(__APPLE__)
+    static bool said = false;
+    if (getenv("SDL_VIDEODRIVER"))
+        return; // the player's own choice; nothing to add
+    if (UnderGamescope())
+    {
+        if (!said)
+            fprintf(stderr, "[host] gamescope session detected — SDL's default video-driver "
+                            "order stands (x11 through XWayland, the path Steam titles take; "
+                            "gamescope clears WAYLAND_DISPLAY and SDL_VIDEODRIVER from the "
+                            "game's environment, so it is the only path offered here)\n");
+        said = true;
+        return;
+    }
+    if (const char* wl = getenv("WAYLAND_DISPLAY"); wl && *wl)
+        SDL_SetHint(SDL_HINT_VIDEODRIVER, "wayland,x11");
+#endif
+}
+
+// `cw_runtime --diag`'s SDL half (part 105): the library's version, every video driver
+// it was built with, the one that takes on this session with the same hint logic the
+// game uses, and each display's desktop mode. Tears the subsystem down again; nothing
+// else in the process is touched.
+void Host_DiagVideo()
+{
+    const char* T = "[diag] sdl:";
+    SDL_version compiled, linked;
+    SDL_VERSION(&compiled);
+    SDL_GetVersion(&linked);
+    fprintf(stderr, "%s compiled against %u.%u.%u, running %u.%u.%u (%s)\n", T,
+            compiled.major, compiled.minor, compiled.patch, linked.major, linked.minor,
+            linked.patch, SDL_GetRevision());
+    fprintf(stderr, "%s video drivers built in:", T);
+    for (int i = 0; i < SDL_GetNumVideoDrivers(); i++)
+        fprintf(stderr, " %s", SDL_GetVideoDriver(i));
+    fprintf(stderr, "\n");
+    PreferWaylandWhenOffered();
+    if (const char* h = SDL_GetHint(SDL_HINT_VIDEODRIVER))
+        fprintf(stderr, "%s video-driver hint: %s\n", T, h);
+    if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0)
+    {
+        fprintf(stderr, "%s SDL video init FAILED: %s — no window can open on this "
+                        "session\n", T, SDL_GetError());
+        return;
+    }
+    fprintf(stderr, "%s video driver that took: %s\n", T, SDL_GetCurrentVideoDriver());
+    const int n = SDL_GetNumVideoDisplays();
+    fprintf(stderr, "%s %d display%s\n", T, n, n == 1 ? "" : "s");
+    for (int i = 0; i < n; i++)
+    {
+        SDL_DisplayMode m{};
+        SDL_GetDesktopDisplayMode(i, &m);
+        SDL_Rect r{};
+        SDL_GetDisplayBounds(i, &r);
+        float ddpi = 0;
+        SDL_GetDisplayDPI(i, &ddpi, nullptr, nullptr);
+        fprintf(stderr, "%s   [%d] %s: desktop %dx%d @ %d Hz, bounds %d,%d %dx%d, %d modes, "
+                        "dpi %.0f\n", T, i, SDL_GetDisplayName(i), m.w, m.h, m.refresh_rate,
+                r.x, r.y, r.w, r.h, SDL_GetNumDisplayModes(i), ddpi);
+    }
+    fprintf(stderr, "%s game controllers: %d joystick%s seen at init\n", T,
+            SDL_NumJoysticks(), SDL_NumJoysticks() == 1 ? "" : "s");
+    SDL_QuitSubSystem(SDL_INIT_VIDEO);
+}
+
 bool Host_ProgressBegin(const char* title)
 {
     if (getenv("CW_NO_WINDOW"))
         return false;
     if (g_progWindow)
         return true;
+    PreferWaylandWhenOffered();
     if (!SDL_WasInit(SDL_INIT_VIDEO) && SDL_InitSubSystem(SDL_INIT_VIDEO) != 0)
     {
         fprintf(stderr, "[host] progress window: SDL video init failed (%s) — "
@@ -1327,6 +1687,7 @@ bool Host_ProgressBegin(const char* title)
                                     640, 200, SDL_WINDOW_ALLOW_HIGHDPI);
     if (!g_progWindow)
         return false;
+    ApplyGameIcon(g_progWindow);
     g_progRenderer = SDL_CreateRenderer(g_progWindow, -1, 0);
     if (!g_progRenderer)
     {
@@ -1409,11 +1770,13 @@ void Host_ProgressEnd()
 // the same StfsExtract the automatic first run uses.
 namespace
 {
-// The resolutions the launcher cycles through: the common 16:9 ladder, filtered by
-// the same validity rule the settings system enforces. The display's own size is
-// appended when it is not already present, so "native" is always reachable.
+// The resolutions the launcher cycles through: the common 16:9 ladder plus the
+// 16:10 sizes (part 108: the Steam Deck's 1280x800 and the desktop 16:10 modes),
+// filtered by the same validity rule the settings system enforces. The display's own
+// size is appended when it is not already present, so "native" is always reachable.
 const uint32_t kLauncherRes[][2] = {
-    { 1280, 720 }, { 1600, 900 }, { 1920, 1080 }, { 2560, 1440 }, { 3840, 2160 },
+    { 1280, 720 },  { 1280, 800 },  { 1600, 900 },  { 1920, 1080 }, { 1920, 1200 },
+    { 2560, 1440 }, { 2560, 1600 }, { 3840, 2160 },
 };
 
 void LauncherText(SDL_Renderer* r, int tx, int ty, const std::string& str, int scale,
@@ -1439,6 +1802,7 @@ bool Host_RunLauncher()
 {
     if (getenv("CW_NO_WINDOW"))
         return true;
+    PreferWaylandWhenOffered();
     if (!SDL_WasInit(SDL_INIT_VIDEO) && SDL_InitSubSystem(SDL_INIT_VIDEO) != 0)
     {
         fprintf(stderr, "[launcher] SDL video init failed (%s) — continuing without\n",
@@ -1463,6 +1827,7 @@ bool Host_RunLauncher()
                                        720, 420, SDL_WINDOW_ALLOW_HIGHDPI);
     if (!win)
         return true;
+    ApplyGameIcon(win);
     SDL_Renderer* ren = SDL_CreateRenderer(win, -1, 0);
     if (!ren)
     {
@@ -1507,6 +1872,8 @@ bool Host_RunLauncher()
         char fovBuf[16];
         snprintf(fovBuf, sizeof fovBuf, "+%d", Settings_Fov());
         static const char* kShadowNames[] = { "LOW", "MEDIUM", "HIGH" };
+        static const char* kMsaaNames[] = { "OFF", "2X", "4X" };
+        const int msaaIdx = Settings_Msaa() == 0 ? 0 : Settings_Msaa() == 2 ? 1 : 2;
         static const char* kDispNames[] = { "WINDOW", "BORDERLESS", "FULLSCREEN" };
         // The six Xbox language IDs whose prose banks the disc carries, in the order
         // MEASURED ON THIS IMAGE (part 11: one CW_LANGUAGE=N + CW_FILE_TRACE=1 boot
@@ -1527,6 +1894,7 @@ bool Host_RunLauncher()
             { "RESOLUTION", resBuf },
             { "VSYNC", Settings_VSync() ? "ON" : "OFF" },
             { "SHADOWS", kShadowNames[Settings_ShadowTier() % 3] },
+            { "MSAA", kMsaaNames[msaaIdx] },
             { "FPS CAP", Settings_FpsCap() ? fpsBuf : "OFF" },
             { "FOV", Settings_Fov() ? fovBuf : "DEFAULT" },
             { "SUBTITLES", kLangNames[langIdx] },
@@ -1668,6 +2036,14 @@ bool Host_RunLauncher()
                     break;
                 case 5:
                 {
+                    // MSAA (part 108): OFF/2X/4X, the launcher being the natural
+                    // home of a next-launch setting.
+                    static const int kMsaa[] = { 0, 2, 4 };
+                    Settings_SetMsaa(kMsaa[(msaaIdx + dir + 3) % 3]);
+                    break;
+                }
+                case 6:
+                {
                     static const int caps[] = { 0, 30, 60, 120 };
                     int cur = 0;
                     for (int i = 0; i < 4; ++i)
@@ -1676,10 +2052,10 @@ bool Host_RunLauncher()
                     Settings_SetFpsCap(caps[(cur + dir + 4) % 4]);
                     break;
                 }
-                case 6:
+                case 7:
                     Settings_SetFov(std::clamp(Settings_Fov() + dir * 5, 0, 20));
                     break;
-                case 7:
+                case 8:
                     Settings_SetLanguage(kLangIds[(langIdx + dir + 6) % 6]);
                     break;
                 }
@@ -1719,6 +2095,7 @@ bool Host_WindowInit()
     // SDL call — `main()` calls this at line 310 and does not spawn the guest thread
     // until line 338.
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+    PreferWaylandWhenOffered();
 
     if (getenv("CW_NO_WINDOW"))
     {
@@ -1807,6 +2184,37 @@ bool Host_WindowInit()
     // and one at 100%, so a logical size means two different pixel counts depending on
     // where the window lands.
     int startW = kDefaultWidth, startH = kDefaultHeight;
+    // A WINDOWED window opens at the persisted internal resolution (part 108) — the
+    // same rule the live apply follows — clamped to display 0's usable bounds with the
+    // aspect kept, so a resolution larger than the desktop opens as the largest window
+    // that fits rather than one whose title bar is off the screen. CW_WINDOW_SIZE and
+    // CW_WINDOW_MAXIMIZED win below, exactly as they do over the display mode.
+    if (!getenv("CW_WINDOW_SIZE") && !getenv("CW_WINDOW_MAXIMIZED") &&
+        Settings_DisplayMode() == CzDisplayMode::Windowed)
+    {
+        uint32_t rw = 0, rh = 0;
+        Settings_InternalRes(rw, rh);
+        if (rw && rh)
+        {
+            int tw = int(rw), th = int(rh);
+            SDL_Rect usable{};
+            if (SDL_GetDisplayUsableBounds(0, &usable) == 0 && usable.w > 0 && usable.h > 0)
+            {
+                const int maxW = usable.w, maxH = std::max(64, usable.h - 48);
+                if (tw > maxW || th > maxH)
+                {
+                    const double s = std::min(double(maxW) / tw, double(maxH) / th);
+                    tw = std::max(64, int(tw * s) & ~1);
+                    th = std::max(64, int(th * s) & ~1);
+                }
+            }
+            startW = tw;
+            startH = th;
+            fprintf(stderr, "[host] windowed: opening at %dx%d for internal resolution "
+                            "%ux%u%s\n", startW, startH, rw, rh,
+                    (startW != int(rw) || startH != int(rh)) ? " (clamped to the display's usable bounds)" : "");
+        }
+    }
     if (const char* ws = getenv("CW_WINDOW_SIZE"))
     {
         int w = 0, h = 0;
@@ -1864,6 +2272,7 @@ bool Host_WindowInit()
         SDL_Quit();
         return false;
     }
+    ApplyGameIcon(g_window);
 
     // The persisted EXCLUSIVE fullscreen upgrades the borderless creation flag here,
     // once the window exists to measure its display against (see the flags comment).
@@ -1970,8 +2379,8 @@ bool Host_WindowInit()
     PublishDrawableSize();
     PublishDisplaySize();
 
-    fprintf(stderr, "[host] window %dx%d up on SDL video driver '%s'.\n", kDefaultWidth,
-            kDefaultHeight, SDL_GetCurrentVideoDriver());
+    fprintf(stderr, "[host] window %dx%d up on SDL video driver '%s'.\n", startW,
+            startH, SDL_GetCurrentVideoDriver());
     // The startup message states which of the two present modes this run is in,
     // because a stale claim here is worse than none: this line said "THE WINDOW IS
     // EXPECTED TO BE BLANK: there is no renderer until phase 5" for two sessions after
@@ -1991,6 +2400,31 @@ bool Host_WindowInit()
         OpenController(i);
     if (!g_controller)
         fprintf(stderr, "[host] no game controller attached; keyboard only.\n");
+
+    // Rumble (part 108): the off switch, the trace, and the positive control.
+    g_rumbleOff = getenv("CW_NO_RUMBLE") != nullptr;
+    g_rumbleTrace = getenv("CW_RUMBLE_TRACE") != nullptr;
+    if (g_rumbleOff)
+        fprintf(stderr, "[host] rumble: OFF (CW_NO_RUMBLE) — the title's motor requests "
+                        "are consumed and discarded, as before part 108.\n");
+    else if (getenv("CW_RUMBLE_TEST"))
+    {
+        // One pulse, both motors at half, before any guest input exists. If the pad
+        // does not move here the fault is below us (the pad, SDL's backend, the
+        // kernel driver's force-feedback), and no title-side question is worth
+        // asking; if it does, and the game is silent, the request never left the
+        // guest — check the title's own DISABLE VIBRATION option first.
+        if (g_controller)
+        {
+            const int rc = SDL_GameControllerRumble(g_controller, 32768, 32768, 500);
+            fprintf(stderr, "[host] rumble: CW_RUMBLE_TEST pulse (32768/32768, 500 ms) "
+                            "-> %d%s%s (has-rumble: %s)\n", rc, rc ? ": " : "",
+                    rc ? SDL_GetError() : "",
+                    HasRumbleStr(g_controller));
+        }
+        else
+            fprintf(stderr, "[host] rumble: CW_RUMBLE_TEST — no controller to pulse.\n");
+    }
     return true;
 }
 
@@ -2340,6 +2774,14 @@ void Host_WindowRun()
         if (const int pending = Settings_ConsumePendingDisplayMode(); pending >= 0)
             ApplyDisplayModeNow(CzDisplayMode(pending));
 
+        // The renderer applied a new internal resolution (the panel's X press, or the
+        // CW_VK_LIVE_RES_TEST arm) — a windowed window follows it (part 108).
+        if (const uint64_t wh = g_pendingWindowRes.exchange(0, std::memory_order_acq_rel))
+            ApplyWindowFollowRes(uint32_t(wh >> 32), uint32_t(wh), "resolution applied");
+
+        // The title's rumble state, from XamInputSetState (part 108).
+        PumpRumble();
+
         // CW_WINDOW_RESIZE_AT=SECS:WxH — THE POSITIVE CONTROL FOR THE SWAPCHAIN REBUILD.
         //
         // The rebuild path fires when the window's drawable size changes, and no headless
@@ -2595,11 +3037,14 @@ void Host_WindowRun()
                 std::lock_guard<std::mutex> lock(g_frameMutex);
                 rendering = g_havePixels;
             }
-            char title[192];
-            snprintf(title, sizeof(title),
-                     "Dead Rising 2: Case West — %s — %llu frames, %.1f fps",
-                     rendering ? "rendering" : "no renderer (CW_VKDRAW=1 to enable)",
-                     (unsigned long long)presented, fps);
+            // The game's name and the frame rate, nothing else (operator request, part
+            // 104): the "no renderer (CW_VKDRAW=1 to enable)" reminder that used to sit
+            // here was a dev-tree message in a player's title bar — the shipped
+            // cw_defaults.env turns the renderer on, and the log still says which arm
+            // is running.
+            (void)rendering;
+            char title[128];
+            snprintf(title, sizeof(title), "Dead Rising 2: Case West — %.1f fps", fps);
             SDL_SetWindowTitle(g_window, title);
         }
     }

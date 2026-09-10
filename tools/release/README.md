@@ -37,11 +37,13 @@ story as the game directs).
 2. Press PLAY.
 3. The first run sets everything up, once, with progress shown as it goes:
    * unpacks the package (~1.2 GB in, ~1.2 GB out),
-   * prepares the game's shaders from its own disc data,
+   * prepares the game's shaders from its own disc data (pixel shaders, and the
+     vertex shaders through `vs_recipes.bin`),
    * generates the key-prompt assets from your own game data,
-   * warms up as you play — entering a new area for the first time may translate a
-     few more shaders on the fly (a fraction of a second each; the log says
-     `first-sight translation` when it happens).
+   * builds the graphics pipelines in the background while the game starts, so
+     the first session plays like the second. A place no one has recorded yet may
+     still translate a shader on the fly (a fraction of a second, in the
+     background; the log says `first-sight translation` when it happens).
 4. Subsequent launches skip all of that and start straight into the game.
 
 Settings (resolution, display mode, shadows, anti-aliasing) are in the in-game
@@ -94,8 +96,14 @@ steps run again — your saves are unaffected, they live in the saved-games loca
 above. Deleting THAT folder removes your saves and settings; the game never does this
 itself.
 
-**A log of everything** is printed to the terminal; when reporting a problem, run from
-a terminal and include the output.
+**A log of everything** is written to `cw_runtime.log` next to the game folder's
+`assets/` (for the AppImage: next to the `.AppImage` file), and the previous run's log
+is kept as `cw_runtime.log.1`. When reporting a problem, attach that file. To describe
+your machine — OS, GPU, driver, which Vulkan features it has, which display driver the
+window uses — run `cw_runtime --diag` (Windows: `cw_runtime.exe --diag` from a command
+prompt): it prints one line per fact, writes the same to `cw_diag.txt`, and exits.
+Paste both into the issue. Say what you SAW — "closed after the progress bar", "black
+window", "slow" — rather than "didn't work"; the log usually says the rest.
 
 ## What is in this bundle
 

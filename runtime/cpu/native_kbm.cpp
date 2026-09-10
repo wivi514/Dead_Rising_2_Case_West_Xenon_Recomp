@@ -108,6 +108,7 @@
 #include "../host/settings.h"
 #include "kbm_default_map.h"
 #include "native_kbm.h"
+#include "thread_budget.h"
 #include "ppc_recomp_shared.h"
 
 extern "C" PPC_FUNC(__imp__sub_827FFD48);
@@ -119,13 +120,25 @@ namespace
 {
 
 // memmem is a GNU extension the Windows CRT lacks, and the scan below is the one
-// caller in the runtime (Case Zero's first czwin build failed on exactly this
-// line — their d125ec2). Same code on both platforms on purpose (an #ifdef'd
-// glibc memmem would make the two legs scan differently): skip to the needle's
-// first byte with memchr — for texel data the first byte is selective — then one
-// memcmp. Called on device changes and rescans, never per frame.
-const uint8_t* FindBytes(const uint8_t* hay, size_t hayLen,
-                         const uint8_t* needle, size_t needleLen)
+// caller in the runtime. Same code on both platforms on purpose (an #ifdef'd
+// glibc memmem would make the two legs scan differently). Called on device changes
+// and rescans, never per frame.
+//
+// PART 107 RETRACTION, IN PLACE. The first version skipped to the needle's first
+// byte with memchr — "for texel data the first byte is selective" — then ran one
+// memcmp per hit. The first byte is NOT selective: a `perf record` of the crowd route
+// under the 4-core stand-in found this worker the BUSIEST THREAD IN THE PROCESS,
+// 99.4% of a core, 70% memcmp + 17% memchr, and the log placed the sweep's end 150 s
+// after the first input poll — window 17 of 20 on a 196 s run, window 23 of 38 on
+// part 106's baselines. The crowd frame dropped ~0.9 ms (17.4-17.9 -> 16.6-16.9 ms)
+// the moment it ended. So every crowd number since part 92 was taken with a memory
+// sweep running on a core beside the pump, and the 4-core stand-in's "contention"
+// carried it too. The legacy finder stays behind CW_KBM_SCAN_LEGACY=1 as the
+// same-binary control arm; the default anchors memchr on the needle's RAREST byte
+// (below), and the glyphs are found by a 64-aligned multi-probe pass before any
+// per-probe sweep runs at all (ScanAligned64).
+const uint8_t* FindBytesLegacy(const uint8_t* hay, size_t hayLen,
+                               const uint8_t* needle, size_t needleLen)
 {
     if (needleLen == 0 || hayLen < needleLen)
         return nullptr;
@@ -138,6 +151,60 @@ const uint8_t* FindBytes(const uint8_t* hay, size_t hayLen,
             return nullptr;
         if (std::memcmp(p, needle, needleLen) == 0)
             return p;
+        ++p;
+    }
+    return nullptr;
+}
+
+bool ScanLegacy()
+{
+    static const bool legacy = getenv("CW_KBM_SCAN_LEGACY") != nullptr;
+    return legacy;
+}
+
+// The default finder: memchr on the needle's RAREST byte, then one memcmp per hit.
+// The legacy version anchored on the FIRST byte, which for texel and header data is
+// usually 0x00 or 0xFF and hits every few bytes; Horspool was tried in between and
+// measured 0.2-0.4 GB/s on the same data (texel bytes defeat its skip table). The
+// anchor is chosen by counting the needle's own bytes — the byte value that occurs
+// once in the needle and is neither 0x00 nor 0xFF is very unlikely to be dense in the
+// haystack — and memchr runs at memory speed, so a 512 MB range costs tens of
+// milliseconds against 137 s for the first version. The heuristic can only cost
+// speed, never a hit: every candidate is still confirmed by a full memcmp.
+const uint8_t* FindBytes(const uint8_t* hay, size_t hayLen,
+                         const uint8_t* needle, size_t needleLen)
+{
+    if (ScanLegacy())
+        return FindBytesLegacy(hay, hayLen, needle, needleLen);
+    if (needleLen == 0 || hayLen < needleLen)
+        return nullptr;
+    unsigned hist[256] = { 0 };
+    for (size_t i = 0; i < needleLen; ++i)
+        ++hist[needle[i]];
+    size_t anchor = 0;
+    unsigned best = ~0u;
+    for (size_t i = 0; i < needleLen; ++i)
+    {
+        const uint8_t c = needle[i];
+        // 0x00 and 0xFF are the two values dense in almost any binary haystack; give
+        // them a penalty so they win only when the needle has nothing else.
+        const unsigned score = hist[c] + ((c == 0x00 || c == 0xFF) ? 64u : 0u);
+        if (score < best)
+        {
+            best = score;
+            anchor = i;
+        }
+    }
+    const uint8_t a = needle[anchor];
+    const uint8_t* p = hay + anchor;
+    const uint8_t* end = hay + hayLen - needleLen + anchor + 1;   // one past the last anchor
+    while (p < end)
+    {
+        p = static_cast<const uint8_t*>(std::memchr(p, a, size_t(end - p)));
+        if (!p)
+            return nullptr;
+        if (std::memcmp(p - anchor, needle, needleLen) == 0)
+            return p - anchor;
         ++p;
     }
     return nullptr;
@@ -612,17 +679,56 @@ void PostConversionFeed(PPCContext& ctx, uint8_t* base, uint32_t obj)
 
     // Key sources from the event queue — the same SetSource calls the title's
     // own (dormant) keystroke handler makes, including the modifier pairs.
+    // A TAP MUST STRADDLE TWO TICKS (part 108, the public "mouse wheel takes two
+    // notches per item" report). This feed drains the whole queue every tick and
+    // writes LEVELS, so a press and its release queued between two ticks — which is
+    // what a wheel notch is (NativeKbm_MouseWheel pushes both at once), and what
+    // CW_KBM_TEST_KEYS pushes — set the source to 1 and back to 0 inside one tick,
+    // and the title, which reads the level once per tick, never sees the press.
+    // Whether a notch registered was then a race with the tick boundary. So: a
+    // release for a key pressed EARLIER IN THE SAME BATCH is carried to the next
+    // tick. A human tap (50 ms+) never fits in a 9 ms tick, so keyboard keys are
+    // unaffected in practice. `CW_KBM_NO_TAP_SPLIT=1` is the control arm;
+    // `CW_KBM_WHEEL_TRACE=1` prints the wheel events and what each tick fed.
+    static const bool noSplit = getenv("CW_KBM_NO_TAP_SPLIT") != nullptr;
+    static const bool wheelTrace = getenv("CW_KBM_WHEEL_TRACE") != nullptr;
+    static std::deque<Keystroke> carry;            // releases held for the next tick
+    static uint64_t tickNo = 0;
+    ++tickNo;
     std::deque<Keystroke> events;
     {
         std::lock_guard<std::mutex> lock(g_queueMutex);
         events.swap(g_srcQueue);
     }
+    if (!carry.empty())
+    {
+        events.insert(events.begin(), carry.begin(), carry.end());
+        carry.clear();
+    }
+    bool pressedThisBatch[256] = {};
     for (const Keystroke& ks : events)
     {
         if (ks.flags & 0x0004)
             continue;                              // repeat: level unchanged
         const bool down = (ks.flags & 0x0001) != 0;
+        if (!noSplit && ks.vk < 256)
+        {
+            if (down)
+                pressedThisBatch[ks.vk] = true;
+            else if (pressedThisBatch[ks.vk])
+            {
+                carry.push_back(ks);               // its press was this tick: release next tick
+                if (wheelTrace && (ks.vk == 0x31 || ks.vk == 0x33 || ks.vk == 0x51))
+                    fprintf(stderr, "[wheel] tick %llu: vk=%02X release CARRIED to the next tick\n",
+                            (unsigned long long)tickNo, ks.vk);
+                continue;
+            }
+        }
         const uint16_t src = ks.vk < 256 ? g_vkToSrc[ks.vk] : 0;
+        if (wheelTrace && (ks.vk == 0x31 || ks.vk == 0x33 || ks.vk == 0x51))
+            fprintf(stderr, "[wheel] tick %llu: vk=%02X %s -> source %u%s\n",
+                    (unsigned long long)tickNo, ks.vk, down ? "DOWN" : "up", src,
+                    live ? "" : " (not live: dropped)");
         if (src && live)
             SetSource(ctx, base, obj, src, down ? 1.0f : 0.0f, 0.0f);
         SetSource(ctx, base, obj, kSrcLShift, (ks.flags & 0x8) ? 1.0f : 0.0f, 0.0f);
@@ -631,6 +737,38 @@ void PostConversionFeed(PPCContext& ctx, uint8_t* base, uint32_t obj)
         SetSource(ctx, base, obj, kSrcRCtrl, (ks.flags & 0x10) ? 1.0f : 0.0f, 0.0f);
         SetSource(ctx, base, obj, kSrcLAlt, (ks.flags & 0x20) ? 1.0f : 0.0f, 0.0f);
         SetSource(ctx, base, obj, kSrcRAlt, (ks.flags & 0x20) ? 1.0f : 0.0f, 0.0f);
+    }
+
+    // A KEY AS A PAD FACE BUTTON (part 108, the operator's "tell the survivor to wait
+    // here" report — and the reason two earlier fixes did nothing). The title's bind
+    // record holds TWO sources. CALL_SURVIVOR_GOTO_POINT's padmap record is already
+    // full (BUTTON_4 PRESSED AND BUTTON_L2 HELD), so the mousemap's key line for it
+    // is SKIPPED at splice time ("no free slot") whatever it says, and Q while aiming
+    // fell through to CALLOUT, whose record had a free slot for the key. Rewriting
+    // the map cannot reach it. What can: the key drives the BUTTON the in-game art
+    // already promises it is — our chips draw the Y button as Q — so Q is written
+    // as the controller's BUTTON_4 source and every padmap line that reads Y works
+    // on the keyboard exactly as on the pad: the aim + Y goto, the QTE's Y, the
+    // workbench pickup, the dialog dismiss. ON EDGES ONLY: the previous version
+    // wrote the mouse buttons as sources every tick, and its steady 0 for the
+    // right button fought the pad's own left trigger tick by tick — the operator's
+    // "aiming with the controller aims and stops aiming repeatedly". The mouse needs
+    // no such feed at all: its buttons already reach these sources through the
+    // XInput merge. CW_KBM_NO_KEY_BUTTONS=1 is the control arm.
+    {
+        static const bool off = getenv("CW_KBM_NO_KEY_BUTTONS") != nullptr;
+        static int srcB4 = -2;
+        if (srcB4 == -2)
+        {
+            srcB4 = LookupName(base, kTokenNames, kTokenCount, "BUTTON_4");
+            fprintf(stderr, "[kbm] Q drives the controller's BUTTON_4 source (edges only): "
+                            "token %d%s\n", srcB4, off ? " (CW_KBM_NO_KEY_BUTTONS=1: not fed)" : "");
+        }
+        if (!off && live && srcB4 > 0)
+            for (const Keystroke& ks : events)
+                if (ks.vk == 0x51 && !(ks.flags & 0x0004))
+                    SetSource(ctx, base, obj, uint32_t(srcB4),
+                              (ks.flags & 0x0001) ? 1.0f : 0.0f, 0.0f);
     }
 
     // SECOND ITERATION: the stick/button/camera writes that used to live here
@@ -996,27 +1134,138 @@ static const Range kScanRanges[] = {
     { 0x00010000u, 0x40000000u },   // small-page virtual
 };
 
+// The discriminating slice: the first 64-aligned offset where the two art sets
+// differ. Returns SIZE_MAX when the sets are identical (nothing to swap).
+size_t DiscriminatingOffset(const SwapGlyph& g)
+{
+    size_t po = 0;
+    while (po + 64 <= g.kbTex.size() &&
+           memcmp(g.kbTex.data() + po, g.padTex.data() + po, 64) == 0)
+        po += 64;
+    return po + 64 > g.kbTex.size() ? SIZE_MAX : po;
+}
+
+// Confirm a candidate slice hit at `hit` (the slice sits `po` bytes into the
+// texture) by a FULL compare against either art set, and record it once.
+bool ConfirmGlyphAt(uint8_t* base, SwapGlyph& g, size_t po, const uint8_t* hit)
+{
+    if (size_t(hit - base) < po)
+        return false;
+    const uint8_t* texBase = hit - po;
+    if (memcmp(texBase, g.kbTex.data(), g.kbTex.size()) != 0 &&
+        memcmp(texBase, g.padTex.data(), g.padTex.size()) != 0)
+        return false;
+    const uint32_t addr = uint32_t(texBase - base);
+    for (uint32_t a2 : g.addrs)
+        if (a2 == addr)
+            return false;
+    g.addrs.push_back(addr);
+    return true;
+}
+
+// ONE pass over a range for EVERY unlocated glyph at once, testing only 64-byte-
+// ALIGNED windows (part 107). The decoded glyph textures sit PAGE-ALIGNED in the
+// physical arena (measured, part 92 round 4 — see the comment above kScanRanges),
+// and each discriminating slice is a 64-aligned offset into its texture, so every
+// real hit is 64-aligned. Each window costs one 8-byte load and one table probe:
+// the physical arena is 8 M windows, tens of milliseconds, where the per-probe
+// sweeps below cost 52 x 512 MB (150 s with the legacy finder, 67 s with Horspool
+// — texel data defeats its skip table). The per-probe sweep stays as the FALLBACK
+// for any glyph this pass does not find, so an unaligned copy costs seconds, not
+// the feature; the log says which pass found what.
+size_t ScanAligned64(uint8_t* base, const Range& r, std::vector<size_t>& glyphIdx,
+                     const std::vector<size_t>& po)
+{
+    struct Probe { uint64_t key; const uint8_t* bytes; size_t glyph; };
+    std::vector<Probe> probes;
+    for (size_t gi : glyphIdx)
+    {
+        const SwapGlyph& g = g_swapGlyphs[gi];
+        for (const uint8_t* b : { g.kbTex.data() + po[gi], g.padTex.data() + po[gi] })
+        {
+            uint64_t k;
+            memcpy(&k, b, 8);
+            probes.push_back({ k, b, gi });
+        }
+    }
+    // 256 buckets on a multiplicative hash of the first eight bytes; chains are tiny.
+    std::vector<uint16_t> head(256, 0xFFFF), next(probes.size(), 0xFFFF);
+    auto bucket = [](uint64_t k) { return unsigned((k * 0x9E3779B97F4A7C15ull) >> 56); };
+    for (size_t i = 0; i < probes.size(); ++i)
+    {
+        const unsigned b = bucket(probes[i].key);
+        next[i] = head[b];
+        head[b] = uint16_t(i);
+    }
+    size_t found = 0;
+    const uint8_t* p = base + r.lo;
+    const uint8_t* end = base + r.hi - 64;
+    for (; p <= end; p += 64)
+    {
+        uint64_t k;
+        memcpy(&k, p, 8);
+        for (uint16_t i = head[bucket(k)]; i != 0xFFFF; i = next[i])
+        {
+            if (probes[i].key != k || memcmp(p, probes[i].bytes, 64) != 0)
+                continue;
+            SwapGlyph& g = g_swapGlyphs[probes[i].glyph];
+            if (ConfirmGlyphAt(base, g, po[probes[i].glyph], p))
+                ++found;
+        }
+    }
+    return found;
+}
+
 void ScanForGlyphs(uint8_t* base, bool physOnly)
 {
     size_t found = 0;
-    for (SwapGlyph& g : g_swapGlyphs)
+    std::vector<size_t> po(g_swapGlyphs.size(), SIZE_MAX);
+    for (size_t gi = 0; gi < g_swapGlyphs.size(); ++gi)
+        po[gi] = DiscriminatingOffset(g_swapGlyphs[gi]);
+
+    // Pass 1 (default): the aligned multi-probe sweep over the physical arena, which
+    // is where every copy has ever been found. CW_KBM_SCAN_LEGACY=1 skips it, so the
+    // control arm is the whole original algorithm and not just its finder.
+    if (!ScanLegacy())
     {
-        if (!g.addrs.empty())
+        std::vector<size_t> want;
+        for (size_t gi = 0; gi < g_swapGlyphs.size(); ++gi)
+            if (g_swapGlyphs[gi].addrs.empty() && po[gi] != SIZE_MAX)
+                want.push_back(gi);
+        if (!want.empty())
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            size_t hits = 0;
+            for (const Range& r : kScanRanges)
+                if (r.lo == 0xA0000000u)
+                    hits = ScanAligned64(base, r, want, po);
+            size_t located = 0;
+            for (size_t gi : want)
+                located += !g_swapGlyphs[gi].addrs.empty();
+            fprintf(stderr, "[kbm] device-follow scan: aligned pass located %zu of %zu "
+                            "glyphs (%zu copies) in %.1f ms\n",
+                    located, want.size(), hits,
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count());
+            found += hits;
+        }
+    }
+
+    // Pass 2: the per-probe sweep, for whatever pass 1 did not find (everything, on
+    // the legacy arm).
+    for (size_t gi = 0; gi < g_swapGlyphs.size(); ++gi)
+    {
+        SwapGlyph& g = g_swapGlyphs[gi];
+        if (!g.addrs.empty() || po[gi] == SIZE_MAX)
             continue;
-        // the discriminating slice: first 64-aligned offset where the sets differ
-        size_t po = 0;
-        while (po + 64 <= g.kbTex.size() &&
-               memcmp(g.kbTex.data() + po, g.padTex.data() + po, 64) == 0)
-            po += 64;
-        if (po + 64 > g.kbTex.size())
-            continue;                      // sets identical?! nothing to swap
+        const size_t slice = po[gi];
         for (const Range& r : kScanRanges)
         {
             if (physOnly && r.lo != 0xA0000000u)
                 continue;      // rescans sweep only where the copies really live
             const uint8_t* lo = base + r.lo;
             const size_t len = r.hi - r.lo;
-            for (const uint8_t* probe : { g.kbTex.data() + po, g.padTex.data() + po })
+            for (const uint8_t* probe : { g.kbTex.data() + slice, g.padTex.data() + slice })
             {
                 const uint8_t* p = lo;
                 size_t left = len;
@@ -1025,23 +1274,8 @@ void ScanForGlyphs(uint8_t* base, bool physOnly)
                     const uint8_t* hit = FindBytes(p, left, probe, 64);
                     if (!hit)
                         break;
-                    if (size_t(hit - base) >= po)
-                    {
-                        const uint8_t* texBase = hit - po;
-                        if (memcmp(texBase, g.kbTex.data(), g.kbTex.size()) == 0 ||
-                            memcmp(texBase, g.padTex.data(), g.padTex.size()) == 0)
-                        {
-                            const uint32_t addr = uint32_t(texBase - base);
-                            bool known = false;
-                            for (uint32_t a2 : g.addrs)
-                                known |= a2 == addr;
-                            if (!known)
-                            {
-                                g.addrs.push_back(addr);
-                                ++found;
-                            }
-                        }
-                    }
+                    if (ConfirmGlyphAt(base, g, slice, hit))
+                        ++found;
                     const size_t adv = size_t(hit - p) + 64;
                     p += adv;
                     left -= adv;
@@ -1060,6 +1294,9 @@ void ScanForGlyphs(uint8_t* base, bool physOnly)
 
 void DeviceWorker(uint8_t* base)
 {
+    // Below the pump and the workers: this thread's work is a memory sweep and a
+    // handful of memcpys, none of it on the frame path (part 107).
+    ThreadBudget_SetLowPriority(true);
     int applied = -1;                 // force the first apply
     for (;;)
     {
@@ -1113,9 +1350,19 @@ void DeviceWorker(uint8_t* base)
             (lastScan == std::chrono::steady_clock::time_point{} ||
              now - lastScan > std::chrono::seconds(20)))
         {
+            // Timed and printed: the sweep's length is its price, and part 107 found
+            // the first version's at 150 s (see FindBytes). A scan is announced at
+            // its START too, so a log can place it against the [fps] windows.
+            fprintf(stderr, "[kbm] device-follow scan: START (%s finder, %s)\n",
+                    ScanLegacy() ? "legacy first-byte memchr+memcmp"
+                                 : "aligned pass + rarest-byte memchr",
+                    scannedOnce ? "physical arena only" : "every range");
+            const auto t0 = std::chrono::steady_clock::now();
             ScanForGlyphs(base, scannedOnce);   // full sweep once, then physical-only
             scannedOnce = true;
             lastScan = std::chrono::steady_clock::now();
+            fprintf(stderr, "[kbm] device-follow scan: END, %.3f s\n",
+                    std::chrono::duration<double>(lastScan - t0).count());
             swapAll(wrote, stale);              // newly-found copies get the art now
         }
         applied = want;
@@ -1306,8 +1553,15 @@ void NativeKbm_MouseButtons(uint32_t mask)
 void NativeKbm_MouseWheel(int steps)
 {
     // DR2 PC's mousemap pairs every wheel binding with KEY_1/KEY_3 alternates;
-    // the map binds those keys, so a wheel step is a key tap.
+    // the map binds those keys, so a wheel step is a key tap. The tap's press and
+    // release are queued together; the per-tick feed carries the release to the
+    // tick after the press (see the feed) — before that, both landed in one tick
+    // and the title saw no press at all on about every other notch.
     const uint16_t vk = steps > 0 ? 0x33 : 0x31;   // '3' up / '1' down
+    static const bool wheelTrace = getenv("CW_KBM_WHEEL_TRACE") != nullptr;
+    if (wheelTrace)
+        fprintf(stderr, "[wheel] SDL wheel steps=%d -> %d tap(s) of vk=%02X\n", steps,
+                std::abs(steps), vk);
     for (int i = std::abs(steps); i > 0; --i)
     {
         NativeKbm_PushKey(vk, 0, true, false, 0);

@@ -24,6 +24,10 @@
 //   1. $CW_ROOT, if set. Used verbatim. If it does not exist we say so and CARRY ON
 //      with the fallback rather than silently ignoring it — an override that is
 //      quietly dropped is worse than one that fails.
+//   1b. $APPIMAGE, when the executable lives inside $APPDIR (part 104): the directory
+//      BESIDE the .AppImage file. An AppImage's executable is a read-only mount that
+//      moves every launch, so the walk below cannot be the answer there; the file the
+//      player launched is the one fixed point. RootSource() reports "appimage".
 //   2. Walk up from the executable's own directory, at most kMaxWalk levels, and take
 //      the first directory that contains an `assets` subdirectory. This covers BOTH
 //      layouts with one rule:
@@ -49,7 +53,7 @@ const std::filesystem::path& ExeDir();
 // The installation root, resolved as above. Cached; the first call decides.
 const std::filesystem::path& Root();
 
-// How Root() was decided — "CW_ROOT", "assets-walk" or "exe-dir". For the log line and
+// How Root() was decided — "CW_ROOT", "appimage", "assets-walk" or "exe-dir". For the log line and
 // for anything that wants to refuse when the root was merely guessed.
 const char* RootSource();
 
@@ -62,6 +66,7 @@ std::filesystem::path Game();         // <root>/assets/game      the unpacked pa
 std::filesystem::path GameXex();      // <root>/assets/game/default.xex
 std::filesystem::path SaveDir();      // <root>/assets/save
 std::filesystem::path ShaderCache();  // <root>/assets/shader_spv
+std::filesystem::path VsRecipes();    // <exe>/vs_recipes.bin, else <root>/tools/release/
 
 // THE PER-USER SAVED-GAMES FOLDER (part 86, operator decision after a repackage wiped
 // the play copy: player data must live where no tool that touches the install tree

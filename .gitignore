@@ -43,3 +43,10 @@ assets/game_kbm/
 /thirdparty/ffmpeg-lgpl/
 build-release/
 build-relid/
+
+# The runtime log tee and --diag report (Case Zero part 105, imported part 11) land beside
+# the data root, which for a dev tree is the repo root.
+/cw_runtime.log
+/cw_runtime.log.1
+/cw_diag.txt
+/cw_diag.txt.1

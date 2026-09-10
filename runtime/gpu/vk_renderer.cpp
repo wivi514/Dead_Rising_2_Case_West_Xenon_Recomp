@@ -1,9 +1,11 @@
 #include "vk_renderer.h"
+#include "../cpu/fence_wait.h"
 
 #include "pm4.h"
 #include "pump_stats.h"
 #include "shader_translator.h"
 #include "drawid_ps_spv.h"
+#include "null_ps_spv.h"   // CW_VK_NULL_PS (part 106's measurement arm)
 #include "xenos.h"
 #include "../host/host_paths.h"
 #include "../host/settings.h"
@@ -26,6 +28,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -1355,7 +1358,7 @@ void InternalRes(uint32_t& w, uint32_t& h)
         return;
     uint32_t bw = 0, bh = 0;
     // CW_VK_RES=WxH — any resolution the store validates (even width, H 720..2880,
-    // at least 16:9). The old integer-multiple forms still parse, so every recipe
+    // at least 16:10 since part 108). The old integer-multiple forms still parse, so every recipe
     // in the docs is unchanged.
     if (const char* r = Env("CW_VK_RES"))
     {
@@ -1375,7 +1378,7 @@ void InternalRes(uint32_t& w, uint32_t& h)
         }
         else
             fprintf(stderr, "[vk] CW_VK_RES=%s is not a resolution this renderer can "
-                            "produce (even width, height 720..2880, at least 16:9) — "
+                            "produce (even width, height 720..2880, at least 16:10) — "
                             "IGNORED, rendering at 1280x720.\n", r);
     }
     if (!bw)
@@ -1478,8 +1481,20 @@ inline bool WideMode()
     InternalRes(w, h);
     return uint64_t(w) * 9 > uint64_t(h) * 16;
 }
+// NARROWER than 16:9 (part 108: the Steam Deck's 1280x800 and the 16:10 desktop
+// modes). Exact comparison for the same reason: 16:9 stays on the untouched path.
+inline bool NarrowMode()
+{
+    uint32_t w, h;
+    InternalRes(w, h);
+    return uint64_t(w) * 9 < uint64_t(h) * 16;
+}
+// 0 = 16:9, 1 = wide, 2 = narrow — the patch memo's key byte and every gate below.
+inline uint8_t AspectPatchMode() { return WideMode() ? 1 : NarrowMode() ? 2 : 0; }
+inline bool AspectPatchActive() { return AspectPatchMode() != 0; }
 // The horizontal fov factor the wide frame carries relative to 16:9 at the same
-// height: k = (W/1280) / (H/720) = 9W/16H. 1.0 at 16:9 by construction.
+// height: k = (W/1280) / (H/720) = 9W/16H. 1.0 at 16:9 by construction; BELOW 1 in
+// narrow mode, where every use below reads it as the vertical factor's reciprocal.
 inline float WideFovFactor()
 {
     uint32_t w, h;
@@ -1547,7 +1562,17 @@ inline int SceneXformForm(const uint32_t* c, float& bEff)
                m[r * 4 + 2] * m[s * 4 + 2];
     };
     const float n3sq = dot3(3, 3);
-    if (std::fabs(n3sq - 1.0f) > 0.004f)     // unit view row; orthos/affines are 0
+    // 0.01, not 0.004 (part 108, item 0ad): the DOOR TRANSITION camera's view row has
+    // norm 1.0024 (n3sq 1.0048) — the title scales that camera's view by a quarter of
+    // a percent — and at 0.004 every world draw of the transition read "not a scene
+    // transform", the wide patch never ran, and the whole doorway rendered as the
+    // 16:9 frustum stretched to 21:9 until the roaming camera (norm 1.0000 exactly)
+    // came back on the first movement. 1,161 of 1,161 world draws xf=0 in the
+    // stretched F9, 1,153 of 1,153 xf=2 after the step. Orthos and affines read 0
+    // here and the cube faces fail the 9/16 ratio below, so the wider band admits
+    // nothing new. CW_VK_XFORM_STRICT=1 restores 0.004, the control arm.
+    static const float unitSlack = Env("CW_VK_XFORM_STRICT") ? 0.004f : 0.01f;
+    if (std::fabs(n3sq - 1.0f) > unitSlack)  // unit view row; orthos/affines are 0
         return 0;
     const float n0 = std::sqrt(dot3(0, 0)), n1 = std::sqrt(dot3(1, 1));
     if (!(n0 > 0.0f) || !(n1 > 0.0f))
@@ -1584,25 +1609,45 @@ inline int SceneXformForm(const uint32_t* c, float& bEff)
 // crucially one whose visible region the game's frustum always covers, so the
 // pre-existing cutscene flank gap closes too. Row1 scales WHOLE (translation
 // component included — row1 = B * v1-with-translation).
+//
+// NARROW MODE (part 108, 16:10 — the Steam Deck's own panel) IS THE SAME DESIGN WITH
+// THE AXES SWAPPED, and k < 1 there. RAW form: MULTIPLY B (the y scale) by k — the
+// 16:9 frame occupies the central 9/10 of the height at full width, so the UI is
+// letterboxed rather than cropped at the flanks, and a frontend scene reveals a band
+// at top and bottom the way wide mode reveals the flanks. COMPOSITE form: DIVIDE ROW0
+// BY k (narrow the horizontal back) — the game-side substitution widens the roaming
+// camera by 1/k in tan space, so the horizontal returns to the 16:9 fov and the
+// vertical keeps the extra 1/k: a vert-plus picture whose visible region the game's
+// widened frustum covers exactly. Cameras that are NOT widened (cutscenes) come out as
+// a constant-VERTICAL crop, again inside their own 16:9 frustum. Proportions are
+// aspect-correct either way: on a W x H surface with a 16:9 projection the picture is
+// stretched vertically by 1/k, and scaling x by 1/k or y by k both undo it.
 inline int PatchWideProjection(uint32_t* c)
 {
     float bEff;
     const int form = SceneXformForm(c, bEff);
     if (form == 0)
         return 0;
+    const float k = WideFovFactor();
+    const bool narrow = k < 1.0f;
     if (form == 1)
     {
+        // Raw: wide divides A (x scale, c[0]); narrow multiplies B (y scale, c[5]).
+        const int at = narrow ? 5 : 0;
         float a;
-        memcpy(&a, c, 4);
-        a /= WideFovFactor();
-        memcpy(c, &a, 4);
+        memcpy(&a, c + at, 4);
+        a = narrow ? a * k : a / k;
+        memcpy(c + at, &a, 4);
         return 1;
     }
+    // Composite: wide multiplies row1 by k; narrow divides row0 by k. Whole rows,
+    // translation included.
+    const int row = narrow ? 0 : 4;
     float m[4];
-    memcpy(m, c + 4, sizeof m);
+    memcpy(m, c + row, sizeof m);
     for (int i = 0; i < 4; i++)
-        m[i] *= WideFovFactor();
-    memcpy(c + 4, m, sizeof m);
+        m[i] = narrow ? m[i] / k : m[i] * k;
+    memcpy(c + row, m, sizeof m);
     return 2;
 }
 
@@ -1707,6 +1752,33 @@ inline void FovCensus(const uint32_t* c, uint32_t depthControl)
                   : std::array<uint32_t, 5>{ 0xC0320051u, 0, 0, 0,
                                              depthControl & 0x6 };
     std::lock_guard<std::mutex> lock(mu);
+    // The COMPOSITE's fov over time (part 108, item 0ad): composites aggregate under
+    // one marker above, so a camera class with a different fov — the door transition
+    // camera — was invisible to this census. Print when the composite's bEff CHANGES
+    // by more than 0.5% from the last one printed, at most 20 lines a second (the
+    // roaming camera smooths its fov during an aim, which would otherwise be a line
+    // per draw). A door that renders at the wrong ratio should show up here as a
+    // bEff the roaming camera never carries.
+    if (form == 2)
+    {
+        static float lastB = 0.0f;
+        static double secStart = 0.0;
+        static int linesThisSec = 0;
+        if (std::fabs(bEff - lastB) > 0.005f * std::max(bEff, 1e-6f))
+        {
+            const double t = std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (t - secStart >= 1.0) { secStart = t; linesThisSec = 0; }
+            if (linesThisSec < 20)
+            {
+                ++linesThisSec;
+                fprintf(stderr, "[fov-composite] bEff %.4f -> %.4f (vfov %.2f -> %.2f deg)\n",
+                        lastB, bEff, lastB > 0 ? 2.0 * std::atan(1.0 / lastB) * 57.29578 : 0.0,
+                        2.0 * std::atan(1.0 / bEff) * 57.29578);
+            }
+            lastB = bEff;
+        }
+    }
     const bool fresh = ++seen[key] == 1;
     ++calls;
     if (fresh)
@@ -2809,6 +2881,11 @@ struct Buffer
     VkDeviceAddress address = 0;
     uint8_t* mapped = nullptr;
     VkDeviceSize size = 0;
+    // For a DEVICE-LOCAL twin of a host buffer with identical offsets (the stream store
+    // mirror, part 106): the HOST buffer's mapping, so the few CPU readers of a stream
+    // (`StreamLoc::bytes()`) read the bytes the twin was copied from rather than
+    // dereferencing memory that has no mapping at all.
+    uint8_t* shadowMapped = nullptr;
 };
 
 // Where UploadStream put a stream's bytes. Two buffers are now possible — the per-frame
@@ -2821,7 +2898,10 @@ struct StreamLoc
     VkDeviceSize at = 0;
     bool ok() const { return buf != nullptr; }
     VkBuffer handle() const { return buf->buffer; }
-    uint8_t* bytes() const { return buf->mapped + at; }
+    uint8_t* bytes() const
+    {
+        return (buf->mapped ? buf->mapped : buf->shadowMapped) + at;
+    }
     VkDeviceAddress address() const { return buf->address + at; }
     VkDeviceSize capacity() const { return buf->size; }
 };
@@ -3546,6 +3626,8 @@ uint64_t g_texDecMipChkNs = 0;   // the mostly-empty and endpoint-luma guards
 uint64_t g_texDecScanNs = 0;     // the all-black and uniform-block content scans
 uint64_t g_texDecGuardNs = 0;    // TextureGuard over the SOURCE, for the cache entry
 uint64_t g_texDecImageNs = 0;    // CreateImage (VkImage + view + allocation) + NameImage
+uint64_t g_texDecGoldenNs = 0;   // the golden store: store/serve + (part 102) the queue push.
+                                 // Named because it was the 79.9% RESIDUAL on czamd
 // How many units the base level untiled, so the base column can be quoted per unit —
 // a millisecond total cannot distinguish "the loop is slow" from "there are a lot of units".
 uint64_t g_texDecBaseUnits = 0;
@@ -4420,6 +4502,30 @@ struct Renderer
     // and being thrown away at the frame boundary.
     Buffer persist;
     VkDeviceSize persistCursor = 0;
+    // THE STORE'S DEVICE-LOCAL MIRROR (part 106). Part 106's decomposition put ~4.5 ms
+    // of the crowd's 8.9 ms device frame at 1080p in the VERTEX FETCH: the store above
+    // is host memory, so every vertex and index of every draw crossed PCIe, every frame,
+    // for every tile and cascade pass. `CW_VK_VRAM_STREAMS=1` (a host-visible VRAM heap)
+    // read the GPU frame at 4.4 ms — but that heap is Resizable BAR, which a GTX 1060
+    // does not have, and its write-combined CPU stores are what lost part 73 its wall
+    // time. So the shippable form is a twin: same size, same offsets, plain VRAM, no
+    // mapping. The CPU keeps writing the host store exactly as before (cached writes);
+    // the ranges it wrote this frame are copied host -> mirror by ONE vkCmdCopyBuffer
+    // at the start of the NEXT frame's command buffer (~0.2 MB a frame once the store
+    // is warm), and a draw binds the mirror for any slot whose copy is already recorded
+    // ahead of it, the host store otherwise (its first frame). The ping-pong twins
+    // (`PersistEntry::alt`) make this race-free by the same argument that makes them
+    // safe for the host store: a slot rewritten in frame W is read from the mirror only
+    // by frames > W, whose command buffers carry its copy ahead of their draws, and a
+    // slot cannot be rewritten again until the frame that last read it has retired.
+    // CW_VK_NO_STORE_MIRROR=1 is the same-binary control arm (the part-105 renderer).
+    Buffer persistDev;
+    std::vector<VkBufferCopy> mirrorPending;
+    // Bumped once per BeginFrame AFTER the pending copies are recorded. An entry stamps
+    // the generation it was written in; a hit reads the mirror iff that stamp is older
+    // than the current one — i.e. its copy sits in this or an earlier command buffer.
+    uint64_t mirrorGen = 1;
+    uint64_t mirrorCopies = 0, mirrorBytes = 0, mirrorHitsDev = 0, mirrorHitsHost = 0;
     // Raised when a persistent allocation did not fit; acted on at the frame boundary,
     // which is the only place the buffer is provably not being read by the GPU.
     VkDeviceSize persistWant = 0;
@@ -4441,6 +4547,7 @@ struct Renderer
         // thousands, so allocating a twin for every entry would double the store to
         // protect 1% of it.
         VkDeviceSize alt = VkDeviceSize(-1);
+        uint64_t mirrorSeq = 0;  // `mirrorGen` when `at` was last written (part 106)
         uint64_t guard = 0;      // StreamGuard over the guest bytes when it was copied
         uint64_t lastFrame = 0;  // for the age report; not an eviction policy yet
         uint32_t bytes = 0;
@@ -4783,7 +4890,9 @@ struct Renderer
     // VkRenderer_Init on purpose: a table whose "empty" value is not zero and whose
     // filling lives somewhere else is a bug waiting for the day someone adds a second
     // construction site. This one cannot be constructed uninitialised.
-    static constexpr uint32_t kSamplerSpecs = 512;
+    // 9 filter bits (part 41) + 3 clamp-x + 3 clamp-y bits (part 108): the fetch
+    // constant's address modes are part of the spec now. 32,768 slots of int32.
+    static constexpr uint32_t kSamplerSpecs = 1u << 15;
     std::vector<int32_t> samplerBySpec =
         std::vector<int32_t>(kSamplerSpecs, -1);
     uint32_t samplerCount = 1;
@@ -4813,6 +4922,12 @@ struct Renderer
     // The draw-ID pass: the substitute fragment module, and the frame it is armed for
     // (0 = disarmed, which is every frame unless CW_VK_DRAW_ID is set and F9 pressed).
     VkShaderModule drawIdModule = VK_NULL_HANDLE;
+    // CW_VK_NULL_PS=1 (part 106): the do-nothing fragment module bound in place of
+    // EVERY translated pixel shader — the "everything but pixel shading" arm of the
+    // GPU decomposition. See tools/null_ps.hlsl.
+    VkShaderModule nullPsModule = VK_NULL_HANDLE;
+    // pipelineStatisticsQuery was present and enabled (CW_VK_GPU_STATS needs it).
+    bool pipeStats = false;
     // ARMED AS A FLAG, NOT AS A FRAME NUMBER, and that is the whole lesson of building
     // this: `R->frame` is incremented by the SWAP, so the draws of a frame are recorded
     // while the counter still holds the previous frame's value. Arming "frame + 1" from
@@ -5105,6 +5220,11 @@ enum GpCls : uint16_t
     kGpPass1,         // exactly one draw
     kGpPassSmall,     // 2..255
     kGpPassBig,       // >= 256 — the crowd
+    // THE SHADOW CASCADE (part 106): any render scope whose draws bound the 1040-pitch
+    // shadow surface (IsShadowSurface), whatever its draw count. Split out because a
+    // GTX-1060 budget has to know whether the cascade is a tenth of the frame or half of
+    // it, and by draw count alone it hides inside ">=256" next to the scene.
+    kGpPassShadow,
     kGpResolveCopy,   // vkCmdCopyImage: EDRAM -> the resolve snapshot
     kGpResolveClear,  // the title's own clear bits, honoured as vkCmdClear*Image
     kGpPresent,       // the swapchain blit, the letterbox clear and the F4 overlay
@@ -5126,6 +5246,7 @@ enum GpCls : uint16_t
 // measured it and it is free", which is a different claim from "it was not running".
 const char* const kGpNames[kGpClasses] = {
     "pass: 0 draws",   "pass: 1 draw",   "pass: 2-255 draws", "pass: >=256 draws",
+    "pass: shadow cascade",
     "resolve copy",    "resolve clear",  "present blit",      "present readback",
     "cube face refresh", "snapshot views", "pass-begin barriers", "resolve barriers",
 };
@@ -5145,7 +5266,8 @@ constexpr uint32_t kGpQueriesPerSlot = 2048;
 // shader or pass overhead on a 96x45 bloom target. A millisecond total cannot tell those
 // apart; an extent census can, and it is the same shape as `base untile: ns/unit` (§6ds §10)
 // — a total divided by the work it covers is what stops an argument.
-struct GpSeg { uint32_t q0, q1; uint16_t cls; uint64_t ext; };
+// `sq` is the pass's PIPELINE-STATISTICS query (CW_VK_GPU_STATS, part 106), or ~0u.
+struct GpSeg { uint32_t q0, q1; uint16_t cls; uint64_t ext; uint32_t sq; };
 VkQueryPool g_gpPool = VK_NULL_HANDLE;
 std::vector<GpSeg> g_gpSegs[kMaxFramesInFlight];
 uint32_t g_gpNext[kMaxFramesInFlight] = {};
@@ -5170,7 +5292,7 @@ uint64_t g_gpClearFullPixels = 0, g_gpClearScopedPixels = 0, g_gpClearN = 0;
 // map lookup per pass in an instrumented one. Held as (count, ns) so the table can be read
 // as "N passes of this size, X us each" rather than as a share.
 struct GpExtentStat { uint64_t n = 0, ns = 0, draws = 0; };
-std::map<uint64_t, GpExtentStat> g_gpExtents[4];   // indexed by kGpPassEmpty..kGpPassBig
+std::map<uint64_t, GpExtentStat> g_gpExtents[5];   // indexed by kGpPassEmpty..kGpPassShadow
 // The render scope currently open, if any. One at a time by construction: BeginRendering
 // early-returns when a scope is already open and EndRendering when none is.
 int g_gpPassSeg = -1;
@@ -5189,6 +5311,52 @@ uint32_t g_gpPassDraws = 0;
 // this path).
 uint64_t g_gpPassExt = 0;
 uint64_t g_gpPassExtPx = 0;
+// Did any draw of the open scope bind the shadow surface? Set on the per-draw path under
+// the same `g_gpPassSeg >= 0` guard as the extent, folded into the class at close.
+bool g_gpPassShadow = false;
+
+// THE PIPELINE-STATISTICS CENSUS (CW_VK_GPU_STATS=1, part 106). A GPU millisecond says
+// how long a pass took; it cannot say whether the pass was vertex work, pixel work, or
+// neither. The device can: a VK_QUERY_TYPE_PIPELINE_STATISTICS query around a render
+// scope counts the primitives assembled, the vertex-shader invocations, the primitives
+// that survived clipping and the FRAGMENT-SHADER INVOCATIONS — and fragment invocations
+// divided by the internal resolution's pixel count is the overdraw factor, the one
+// number that separates "the shaders are expensive" from "we shade the screen nine
+// times". Accumulated per pass class next to the timing, printed with it.
+//
+// One query per pass, begun and ended inside the pump's own command buffer, which is why
+// the arm forces the SERIAL recorder: a query cannot span command buffers, and under
+// parallel record a pass's draws live in worker chunks the pump never sees. The GPU
+// work is identical in both recorders (same draws, same order — the order gate proves
+// it), so the census is honest about the frame even though its wall time is the
+// part-88 recorder's.
+constexpr uint32_t kStQueriesPerSlot = 256;
+constexpr uint32_t kStCounters = 6;
+const char* const kStNames[kStCounters] = {
+    "IA vertices", "IA primitives", "VS invocations", "clip invocations",
+    "clip primitives", "FS invocations",
+};
+VkQueryPool g_stPool = VK_NULL_HANDLE;
+uint32_t g_stNext[kMaxFramesInFlight] = {};
+uint64_t g_stSum[kGpClasses][kStCounters] = {};
+uint64_t g_stN[kGpClasses] = {};
+uint64_t g_stOverflow = 0, g_stBadRead = 0;
+
+bool GpuStatsOn()
+{
+    static const bool on = EnvOn("CW_VK_GPU_STATS");
+    return on;
+}
+// CW_VK_SCISSOR_1PX (part 106), read once at renderer init; see DoDraw for the arm.
+bool g_scissor1px = false;
+// CW_VK_TRI1=1 (part 106): every draw issues at most its FIRST PRIMITIVE (3 indices).
+// Every bind, every push constant, every pipeline switch and every pass stays; the
+// vertex and index FETCH traffic and the vertex shading collapse to ~nothing. What the
+// device frame reads under it is the per-draw front-end cost of ~9,000 draws — the
+// third of the three arms that decompose the title's passes (with NULL_PS and
+// SCISSOR_1PX). Never a mode; the picture is garbage by design.
+bool g_tri1 = false;
+inline uint32_t DrawCountArm(uint32_t n) { return (g_tri1 && n > 3) ? 3u : n; }
 
 bool GpuPassesOn()
 {
@@ -5210,7 +5378,7 @@ int GpuSegBegin()
     }
     const uint32_t q = slot * kGpQueriesPerSlot + g_gpNext[slot]++;
     vkCmdWriteTimestamp(R->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_gpPool, q);
-    g_gpSegs[slot].push_back(GpSeg{ q, ~0u, uint16_t(kGpClasses), 0 });
+    g_gpSegs[slot].push_back(GpSeg{ q, ~0u, uint16_t(kGpClasses), 0, ~0u });
     return int(g_gpSegs[slot].size()) - 1;
 }
 
@@ -5409,6 +5577,117 @@ void PersistClear()
 {
     R->persistCache.Clear();
     R->persistCacheMap.clear();
+    R->mirrorPending.clear();
+}
+
+// Forward declarations for the store mirror (part 106); both are defined further down.
+bool CreateBuffer(Buffer& b, VkDeviceSize size, VkBufferUsageFlags usage,
+                  VkMemoryPropertyFlags props, bool deviceAddress,
+                  const char* vramName = nullptr);
+VkBufferUsageFlags PersistUsage();
+
+// Queue a host-store range for the mirror and stamp the entry (part 106).
+inline void MirrorMark(Renderer::PersistEntry& e, VkDeviceSize at, VkDeviceSize bytes)
+{
+    if (!R->persistDev.buffer)
+        return;
+    e.mirrorSeq = R->mirrorGen;
+    if (at + bytes <= R->persistDev.size)
+        R->mirrorPending.push_back(VkBufferCopy{ at, at, bytes });
+}
+
+// Which buffer a persist HIT binds: the mirror when its copy of this slot is already in
+// the queue ahead of this draw, the host store otherwise.
+inline StreamLoc PersistHitLoc(const Renderer::PersistEntry& e)
+{
+    if (R->persistDev.buffer && e.mirrorSeq < R->mirrorGen &&
+        e.at + e.bytes <= R->persistDev.size)
+    {
+        ++R->mirrorHitsDev;
+        return StreamLoc{ &R->persistDev, e.at };
+    }
+    ++R->mirrorHitsHost;
+    return StreamLoc{ &R->persist, e.at };
+}
+
+// Create (or re-create, after a growth) the mirror at the store's size, or as much of
+// it as a quarter of the device-local heap allows, or not at all — every outcome is
+// printed, because a performance number from an unknown memory placement is not
+// comparable with anything (the rule the arena's own line follows).
+void CreateStoreMirror()
+{
+    if (R->persistDev.buffer)
+    {
+        vkDestroyBuffer(R->device, R->persistDev.buffer, nullptr);
+        vkFreeMemory(R->device, R->persistDev.memory, nullptr);
+        R->persistDev = Buffer{};
+    }
+    R->mirrorPending.clear();
+    static const bool off = EnvOn("CW_VK_NO_STORE_MIRROR");
+    if (off || !R->persistOn || !R->persist.buffer)
+    {
+        if (off)
+            fprintf(stderr, "[vk] CW_VK_NO_STORE_MIRROR=1 — the stream store stays in "
+                            "system RAM and the GPU fetches every vertex over PCIe (the "
+                            "part-105 renderer, same binary)\n");
+        return;
+    }
+    VkDeviceSize heapBytes = 0;
+    for (uint32_t h = 0; h < R->memProps.memoryHeapCount; ++h)
+        if (R->memProps.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            heapBytes = std::max(heapBytes, R->memProps.memoryHeaps[h].size);
+    VkDeviceSize want = R->persist.size;
+    // A quarter of the largest device-local heap at most: the textures, the EDRAM
+    // stand-in and the driver's own allocations share it, and a mirror that pages is a
+    // regression wearing an optimisation's name. A smaller mirror is still a mirror —
+    // slots past its end simply stay on the host path.
+    while (want > heapBytes / 4 && want > (64ull << 20))
+        want /= 2;
+    if (!CreateBuffer(R->persistDev, want, PersistUsage() | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, /*deviceAddress=*/true,
+                      "cross-frame stream store MIRROR"))
+    {
+        R->persistDev = Buffer{};
+        fprintf(stderr, "[vk] the stream store mirror could not be allocated in video "
+                        "memory — the GPU reads the store from system RAM this run\n");
+        return;
+    }
+    R->persistDev.shadowMapped = R->persist.mapped;
+    fprintf(stderr,
+            "[vk] stream store MIRROR: %llu MB of the %llu MB store twinned in video "
+            "memory (device-local heap %llu MB); draws bind the mirror once a slot's "
+            "copy is queued ahead of them. CW_VK_NO_STORE_MIRROR=1 is the control arm\n",
+            (unsigned long long)(R->persistDev.size >> 20),
+            (unsigned long long)(R->persist.size >> 20),
+            (unsigned long long)(heapBytes >> 20));
+}
+
+// Record this frame's host -> mirror copies at the top of the frame's command buffer
+// (no rendering instance is open here, which vkCmdCopyBuffer requires), then bump the
+// generation so this frame's hits on those slots bind the mirror.
+void MirrorFlush()
+{
+    if (R->persistDev.buffer && !R->mirrorPending.empty())
+    {
+        const std::vector<VkBufferCopy>& v = R->mirrorPending;
+        for (size_t i = 0; i < v.size(); i += 4096)
+            vkCmdCopyBuffer(R->cmd, R->persist.buffer, R->persistDev.buffer,
+                            uint32_t(std::min<size_t>(4096, v.size() - i)), v.data() + i);
+        VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
+                           VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(R->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                                 VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             0, 1, &mb, 0, nullptr, 0, nullptr);
+        R->mirrorCopies += v.size();
+        for (const VkBufferCopy& c : v)
+            R->mirrorBytes += c.size;
+        R->mirrorPending.clear();
+    }
+    ++R->mirrorGen;
 }
 size_t PersistSize()
 {
@@ -5556,7 +5835,8 @@ VkMemoryPropertyFlags ReadbackMemoryProps()
 // `gotDeviceLocal`, whether the preference was actually honoured — never inferred from
 // the request, because the whole point is that it can fail.
 uint32_t FindMemoryTypePreferDevice(uint32_t typeBits, VkMemoryPropertyFlags props,
-                                    VkDeviceSize size, bool* gotDeviceLocal)
+                                    VkDeviceSize size, bool* gotDeviceLocal,
+                                    bool storeOnlyArm)
 {
     *gotDeviceLocal = false;
     // AN ARM, NOT THE DEFAULT, and deliberately so. The placement is a one-line
@@ -5569,7 +5849,18 @@ uint32_t FindMemoryTypePreferDevice(uint32_t typeBits, VkMemoryPropertyFlags pro
     // swapchain took the same route in part 54 and became the default on a measurement,
     // not on an argument.
     static const bool vram = EnvOn("CW_VK_VRAM_STREAMS");
-    if (vram)
+    // CW_VK_VRAM_STORE=1 (part 106): the SPLIT. Part 73's arm put the per-frame arena AND
+    // the cross-frame store in video memory and lost 14% of WALL time in a CPU-bound
+    // regime, because the arena carries ~8 KB of shader constants per draw — written
+    // once, read once — and write-combined PCIe writes of those cost the CPU more than
+    // the GPU saved (gotcha 363). The STORE is the opposite shape: written 0.2 MB a
+    // frame (only streams whose content changed), read ~100 MB a frame by the vertex
+    // fetch across every tile and cascade pass. Part 106's census put the crowd's device
+    // frame at ~2 ns per vertex invocation with NO fragments, ten times the vertex
+    // throughput — the GPU is fetching its geometry over PCIe. This arm moves ONLY the
+    // store; the arena stays where the CPU writes it cheaply.
+    static const bool vramStore = EnvOn("CW_VK_VRAM_STORE");
+    if (vram || (vramStore && storeOnlyArm))
     {
         const uint32_t t =
             FindMemoryType(typeBits, props | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -5595,7 +5886,7 @@ uint32_t FindMemoryTypePreferDevice(uint32_t typeBits, VkMemoryPropertyFlags pro
 
 bool CreateBuffer(Buffer& b, VkDeviceSize size, VkBufferUsageFlags usage,
                   VkMemoryPropertyFlags props, bool deviceAddress,
-                  const char* vramName = nullptr)
+                  const char* vramName)
 {
     b.size = size;
     VkBufferCreateInfo ci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
@@ -5608,7 +5899,8 @@ bool CreateBuffer(Buffer& b, VkDeviceSize size, VkBufferUsageFlags usage,
     vkGetBufferMemoryRequirements(R->device, b.buffer, &req);
     bool inVram = false;
     const uint32_t type =
-        vramName ? FindMemoryTypePreferDevice(req.memoryTypeBits, props, req.size, &inVram)
+        vramName ? FindMemoryTypePreferDevice(req.memoryTypeBits, props, req.size, &inVram,
+                                              strcmp(vramName, "cross-frame stream store") == 0)
                  : FindMemoryType(req.memoryTypeBits, props);
     if (type == UINT32_MAX)
     {
@@ -5618,13 +5910,19 @@ bool CreateBuffer(Buffer& b, VkDeviceSize size, VkBufferUsageFlags usage,
     if (vramName)
     {
         const uint32_t heap = R->memProps.memoryTypes[type].heapIndex;
+        // "VIDEO MEMORY" is a fact about the TYPE chosen, not about which preference
+        // chose it: a plain DEVICE_LOCAL request (the store mirror) lands in VRAM without
+        // going through the ReBAR arm, and printed "system RAM" until part 106.
+        inVram = (R->memProps.memoryTypes[type].propertyFlags &
+                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
         fprintf(stderr,
                 "[vk] %s: %llu MB in %s (memory type %u, heap %u of %llu MB)%s\n",
                 vramName, (unsigned long long)(size >> 20),
                 inVram ? "VIDEO MEMORY" : "system RAM", type, heap,
                 (unsigned long long)(R->memProps.memoryHeaps[heap].size >> 20),
                 inVram ? "" : " — CW_VK_VRAM_STREAMS=1 puts geometry in VRAM where a "
-                              "CPU-writable device-local heap is big enough");
+                              "CPU-writable device-local heap is big enough "
+                              "(CW_VK_VRAM_STORE=1: the cross-frame store only)");
     }
 
     VkMemoryAllocateFlagsInfo flags{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
@@ -5929,15 +6227,25 @@ VkFormat EdramDepthFormat()
 // D24_UNORM_S8_UINT is the historical default and the format every NVIDIA test used,
 // but AMD does not advertise SAMPLED_IMAGE for it (the hardware stores depth as D32
 // internally), so on AMD a sampled depth resolve — a depth snapshot bound through the
-// bindless heap — would be UNDEFINED rather than merely wrong. When the default format
-// is not sampleable we fall back to D32_SFLOAT_S8_UINT, which AMD does support sampled
-// and which is ALSO the more faithful match to Xenos float depth (see EdramDepthFormat's
-// comment above and CW_VK_DEPTH_FLOAT). NVIDIA keeps D24_UNORM_S8_UINT and is unchanged.
-// CW_VK_DEPTH_FLOAT still forces float everywhere.
-//
-// This port has only ever run on NVIDIA, so the AMD path is untested HERE and is taken
-// on the sibling's evidence — but the query is the device's own answer, not a guess, and
-// the alternative is undefined behaviour on every AMD player's machine.
+// bindless heap, or the RT depth input — would be UNDEFINED rather than merely wrong.
+// When the default format is not sampleable we fall back to D32_SFLOAT_S8_UINT, which
+// AMD does support sampled and which is ALSO the more faithful match to Xenos float
+// depth (see EdramDepthFormat's comment and CW_VK_DEPTH_FLOAT). NVIDIA keeps
+// D24_UNORM_S8_UINT and is unchanged. CW_VK_DEPTH_FLOAT still forces float everywhere.
+// The decision without the side effects: what the format WOULD be on this device and
+// why. `--diag` prints it for a device it never creates (part 105).
+static VkFormat PickEdramDepthFormat(VkPhysicalDevice phys, bool* d24Sampleable)
+{
+    VkFormatProperties fp{};
+    vkGetPhysicalDeviceFormatProperties(phys, VK_FORMAT_D24_UNORM_S8_UINT, &fp);
+    const bool ok = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
+    if (d24Sampleable)
+        *d24Sampleable = ok;
+    if (EnvOn("CW_VK_DEPTH_FLOAT"))
+        return VK_FORMAT_D32_SFLOAT_S8_UINT;
+    return ok ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D32_SFLOAT_S8_UINT;
+}
+
 void ChooseEdramDepthFormat(VkPhysicalDevice phys)
 {
     if (EnvOn("CW_VK_DEPTH_FLOAT"))
@@ -5946,9 +6254,9 @@ void ChooseEdramDepthFormat(VkPhysicalDevice phys)
         fprintf(stderr, "[vk] EDRAM depth format: D32_SFLOAT_S8_UINT (CW_VK_DEPTH_FLOAT)\n");
         return;
     }
-    VkFormatProperties fp{};
-    vkGetPhysicalDeviceFormatProperties(phys, VK_FORMAT_D24_UNORM_S8_UINT, &fp);
-    if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
+    bool d24 = false;
+    PickEdramDepthFormat(phys, &d24);
+    if (d24)
     {
         g_edramDepthFormat = VK_FORMAT_D24_UNORM_S8_UINT;
         fprintf(stderr, "[vk] EDRAM depth format: D24_UNORM_S8_UINT\n");
@@ -6211,6 +6519,207 @@ VkDeviceSize PersistAlloc(VkDeviceSize bytes, VkDeviceSize align = 16)
     }
     R->persistCursor = at + bytes;
     return at;
+}
+
+// ===================================================================================
+// Device requirements — ONE table, read by bring-up and by `--diag` (part 105,
+// docs/steam-deck-plan.md §3 item 3)
+// ===================================================================================
+//
+// Until part 105 the required features were assignments into three request structs,
+// and a device lacking any one of them failed at vkCreateDevice with "VkResult -7" —
+// one line, no name, and the same line for every missing feature. Nobody on this
+// project has run the renderer on RADV (the Steam Deck's driver, and the prime suspect
+// for v1.0.1 failing there on both builds), so the first RADV report needed to NAME
+// the feature, not the VkResult. The table below is that name: each entry says where
+// the feature lives, whether the renderer can run without it, and what it is for —
+// and the same table drives `cw_runtime --diag`, so a player can print the verdict
+// without a game boot.
+//
+// REQUIRED means a missing feature ends bring-up with the feature named. OPTIONAL means
+// it is requested when present and its absence is a named log line — and the three
+// that were required before part 105 without a consumer are now optional:
+// fillModeNonSolid (every pipeline's polygonMode is FILL), depthClamp (no pipeline
+// enables it), and nothing else. shaderInt64 stays REQUIRED on evidence: a part-105
+// census of the built cache found the Int64 capability in 450 of 450 translated
+// shaders (the raw-address constant loads), so a device without it cannot run one draw.
+struct DeviceCaps
+{
+    VkPhysicalDeviceProperties props{};
+    VkPhysicalDeviceDriverProperties driver{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES
+    };
+    VkPhysicalDeviceFeatures2 f2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+    VkPhysicalDeviceVulkan12Features v12{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES
+    };
+    VkPhysicalDeviceVulkan13Features v13{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES
+    };
+    std::vector<VkExtensionProperties> exts;
+    bool haveDriverProps = false;
+
+    bool HasExt(const char* name) const
+    {
+        for (const auto& e : exts)
+            if (!strcmp(e.extensionName, name))
+                return true;
+        return false;
+    }
+};
+
+static void QueryDeviceCaps(VkPhysicalDevice phys, DeviceCaps& c)
+{
+    vkGetPhysicalDeviceProperties(phys, &c.props);
+    // The 1.2/1.3 structs are only valid to chain on a device that reports that
+    // version; on an older device they stay zeroed, which reads as "absent" below —
+    // the honest answer, since the renderer needs them through the core structs.
+    const bool has12 = c.props.apiVersion >= VK_API_VERSION_1_2;
+    const bool has13 = c.props.apiVersion >= VK_API_VERSION_1_3;
+    if (has12)
+    {
+        VkPhysicalDeviceProperties2 p2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+        p2.pNext = &c.driver;
+        vkGetPhysicalDeviceProperties2(phys, &p2);
+        c.haveDriverProps = true;
+    }
+    c.f2.pNext = nullptr;
+    c.v12.pNext = nullptr;
+    c.v13.pNext = nullptr;
+    if (has13)
+    {
+        c.v13.pNext = c.f2.pNext;
+        c.f2.pNext = &c.v13;
+    }
+    if (has12)
+    {
+        c.v12.pNext = c.f2.pNext;
+        c.f2.pNext = &c.v12;
+    }
+    vkGetPhysicalDeviceFeatures2(phys, &c.f2);
+    uint32_t n = 0;
+    vkEnumerateDeviceExtensionProperties(phys, nullptr, &n, nullptr);
+    c.exts.resize(n);
+    vkEnumerateDeviceExtensionProperties(phys, nullptr, &n, c.exts.data());
+}
+
+enum class FeatWhere { Core, V12, V13 };
+struct FeatureReq
+{
+    const char* name;
+    FeatWhere where;
+    size_t offset;
+    bool required;
+    const char* why;
+};
+#define CW_FEAT(where, strct, field, req, why)                                         \
+    { #field, FeatWhere::where, offsetof(strct, field), req, why }
+static const FeatureReq kFeatureReqs[] = {
+    CW_FEAT(V12, VkPhysicalDeviceVulkan12Features, bufferDeviceAddress, true,
+            "the translated shaders load constants through raw 64-bit addresses"),
+    CW_FEAT(V12, VkPhysicalDeviceVulkan12Features, descriptorIndexing, true,
+            "the bindless texture/sampler heaps"),
+    CW_FEAT(V12, VkPhysicalDeviceVulkan12Features, runtimeDescriptorArray, true,
+            "the bindless heaps are unsized arrays in the shaders"),
+    CW_FEAT(V12, VkPhysicalDeviceVulkan12Features, descriptorBindingPartiallyBound, true,
+            "heap slots are bound as textures arrive"),
+    CW_FEAT(V12, VkPhysicalDeviceVulkan12Features, descriptorBindingUpdateUnusedWhilePending,
+            true, "heap slots are written while a frame is in flight"),
+    CW_FEAT(V12, VkPhysicalDeviceVulkan12Features, descriptorBindingSampledImageUpdateAfterBind,
+            true, "the texture heap is updated after the set is bound"),
+    CW_FEAT(V12, VkPhysicalDeviceVulkan12Features, descriptorBindingVariableDescriptorCount,
+            true, "the heap's size comes from the device, not the layout"),
+    CW_FEAT(V12, VkPhysicalDeviceVulkan12Features, shaderSampledImageArrayNonUniformIndexing,
+            true, "a draw's texture index is a per-draw constant"),
+    CW_FEAT(V13, VkPhysicalDeviceVulkan13Features, dynamicRendering, true,
+            "no render-pass objects; the EDRAM target is one image"),
+    CW_FEAT(Core, VkPhysicalDeviceFeatures, shaderInt64, true,
+            "the Int64 capability is in 450 of 450 translated shaders (part 105 census)"),
+    CW_FEAT(Core, VkPhysicalDeviceFeatures, independentBlend, true,
+            "per-render-target blend state, as Xenos has"),
+    CW_FEAT(Core, VkPhysicalDeviceFeatures, textureCompressionBC, true,
+            "the title's DXT1/3/5 textures are uploaded as BC"),
+    CW_FEAT(Core, VkPhysicalDeviceFeatures, samplerAnisotropy, false,
+            "distance filtering stays trilinear without it (part 41)"),
+    CW_FEAT(Core, VkPhysicalDeviceFeatures, occlusionQueryPrecise, false,
+            "CW_VK_RT_COVERAGE cannot report sample counts without it"),
+    CW_FEAT(Core, VkPhysicalDeviceFeatures, pipelineStatisticsQuery, false,
+            "CW_VK_GPU_STATS (the per-pass vertex/fragment invocation census) needs it"),
+    CW_FEAT(Core, VkPhysicalDeviceFeatures, shaderClipDistance, false,
+            "an XE_USER_CLIP_PLANES shader cache cannot run without it"),
+    CW_FEAT(Core, VkPhysicalDeviceFeatures, fillModeNonSolid, false,
+            "no consumer: every pipeline's polygonMode is FILL"),
+    CW_FEAT(Core, VkPhysicalDeviceFeatures, depthClamp, false,
+            "no consumer: no pipeline enables depth clamp"),
+};
+#undef CW_FEAT
+
+static VkBool32& FeatSlot(FeatWhere w, size_t off, VkPhysicalDeviceFeatures2& f2,
+                          VkPhysicalDeviceVulkan12Features& v12,
+                          VkPhysicalDeviceVulkan13Features& v13)
+{
+    char* base = w == FeatWhere::Core ? reinterpret_cast<char*>(&f2.features)
+                 : w == FeatWhere::V12 ? reinterpret_cast<char*>(&v12)
+                                       : reinterpret_cast<char*>(&v13);
+    return *reinterpret_cast<VkBool32*>(base + off);
+}
+static VkBool32 FeatHave(const DeviceCaps& c, const FeatureReq& r)
+{
+    DeviceCaps& m = const_cast<DeviceCaps&>(c); // read-only use of the slot helper
+    return FeatSlot(r.where, r.offset, m.f2, m.v12, m.v13);
+}
+
+// Walk the table against a device: set every PRESENT feature in the request structs,
+// collect the missing REQUIRED ones by name, and print each missing optional one. The
+// verdict (missing.empty()) is the same whether bring-up or --diag asked.
+static void EvaluateRequirements(const DeviceCaps& c, VkPhysicalDeviceFeatures2& reqF2,
+                                 VkPhysicalDeviceVulkan12Features& req12,
+                                 VkPhysicalDeviceVulkan13Features& req13,
+                                 std::vector<const char*>& missing, const char* tag,
+                                 bool listAll)
+{
+    for (const FeatureReq& r : kFeatureReqs)
+    {
+        const bool have = FeatHave(c, r) == VK_TRUE;
+        if (have)
+            FeatSlot(r.where, r.offset, reqF2, req12, req13) = VK_TRUE;
+        else if (r.required)
+            missing.push_back(r.name);
+        if (listAll)
+            fprintf(stderr, "%s   %-48s %-8s %s — %s\n", tag, r.name,
+                    have ? "present" : "ABSENT", r.required ? "REQUIRED" : "optional",
+                    r.why);
+        else if (!have)
+            fprintf(stderr, "%s device lacks %s (%s) — %s\n", tag, r.name,
+                    r.required ? "REQUIRED" : "optional", r.why);
+    }
+}
+
+static const char* DeviceTypeName(VkPhysicalDeviceType t)
+{
+    switch (t)
+    {
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: return "discrete GPU";
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return "integrated GPU";
+    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: return "virtual GPU";
+    case VK_PHYSICAL_DEVICE_TYPE_CPU: return "CPU (software)";
+    default: return "other";
+    }
+}
+
+// One line per fact about the device's driver, the same text at bring-up and in
+// --diag: "AMD open-source driver 24.1.2 (Mesa)" is the line that separates a RADV
+// report from an AMDVLK one, and it was never printed before part 105.
+static void PrintDriverLine(const DeviceCaps& c, const char* tag)
+{
+    if (c.haveDriverProps)
+        fprintf(stderr, "%s driver: %s — %s (driver id %d), conformance %u.%u.%u.%u\n", tag,
+                c.driver.driverName, c.driver.driverInfo, int(c.driver.driverID),
+                c.driver.conformanceVersion.major, c.driver.conformanceVersion.minor,
+                c.driver.conformanceVersion.subminor, c.driver.conformanceVersion.patch);
+    else
+        fprintf(stderr, "%s driver: (device is below Vulkan 1.2; no driver properties)\n",
+                tag);
 }
 
 // ===================================================================================
@@ -6483,29 +6992,56 @@ bool CreateDevice()
         }
     }
 
-    // The three features the translated shaders cannot run without, requested
-    // explicitly so a device that lacks one fails HERE with a name rather than at the
-    // first draw with a device-lost:
-    //   bufferDeviceAddress — the shaders load constants through raw 64-bit addresses
-    //   descriptorIndexing  — the bindless texture/sampler heaps
-    //   dynamicRendering    — no render-pass objects; the target is one image
+    // THE REQUIRED-FEATURE TABLE (part 105). Every feature the renderer needs is
+    // queried first and requested only when present; a missing REQUIRED one ends
+    // bring-up HERE with its name and the driver's, where before it was a bare
+    // "vkCreateDevice failed: VkResult -7". See kFeatureReqs above for the list and
+    // the reason each is required or optional.
+    DeviceCaps caps;
+    QueryDeviceCaps(R->physical, caps);
+    PrintDriverLine(caps, "[vk]");
+    if (caps.props.apiVersion < VK_API_VERSION_1_3)
+    {
+        fprintf(stderr, "[vk] this device reports Vulkan %u.%u.%u and the renderer needs "
+                        "1.3 (dynamic rendering, the 1.2 descriptor-indexing set). A newer "
+                        "driver is the only fix; running without a renderer.\n",
+                VK_VERSION_MAJOR(caps.props.apiVersion),
+                VK_VERSION_MINOR(caps.props.apiVersion),
+                VK_VERSION_PATCH(caps.props.apiVersion));
+        return false;
+    }
     VkPhysicalDeviceVulkan12Features v12{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES
     };
-    v12.bufferDeviceAddress = VK_TRUE;
-    v12.descriptorIndexing = VK_TRUE;
-    v12.runtimeDescriptorArray = VK_TRUE;
-    v12.descriptorBindingPartiallyBound = VK_TRUE;
-    v12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
-    v12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
-    v12.descriptorBindingVariableDescriptorCount = VK_TRUE;
-    v12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
-
     VkPhysicalDeviceVulkan13Features v13{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES
     };
-    v13.dynamicRendering = VK_TRUE;
     v13.pNext = &v12;
+    VkPhysicalDeviceFeatures2 f2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+    f2.pNext = &v13;
+    {
+        std::vector<const char*> missing;
+        EvaluateRequirements(caps, f2, v12, v13, missing, "[vk]", /*listAll=*/false);
+        if (!missing.empty())
+        {
+            std::string list;
+            for (const char* m : missing)
+                list += std::string(list.empty() ? "" : ", ") + m;
+            fprintf(stderr, "[vk] THIS DEVICE CANNOT RUN THE RENDERER — missing REQUIRED "
+                            "Vulkan feature%s: %s (device %s, %s). `cw_runtime --diag` "
+                            "prints the whole table; running without a renderer.\n",
+                    missing.size() == 1 ? "" : "s", list.c_str(), caps.props.deviceName,
+                    caps.haveDriverProps ? caps.driver.driverInfo : "driver unknown");
+            return false;
+        }
+        // ANISOTROPIC FILTERING (part 41 item 1). Xenos filters up to 16:1 and the
+        // fetch constants carry a per-texture aniso field; the sampler decides whether
+        // to USE it (CW_VK_NO_ANISO acts there). The limit is read here because the
+        // table only says present/absent.
+        if (f2.features.samplerAnisotropy)
+            R->anisoLimit = props.limits.maxSamplerAnisotropy;
+        R->pipeStats = f2.features.pipelineStatisticsQuery == VK_TRUE;
+    }
 
     // RAY TRACING IS NOT PORTED — so the device does not ask for its extensions.
     //
@@ -6533,53 +7069,6 @@ bool CreateDevice()
         asFeat.pNext = v13.pNext;
         rqFeat.pNext = &asFeat;
         v13.pNext = &rqFeat;
-    }
-
-    VkPhysicalDeviceFeatures2 f2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
-    f2.pNext = &v13;
-    f2.features.shaderInt64 = VK_TRUE;
-    f2.features.independentBlend = VK_TRUE;
-    f2.features.fillModeNonSolid = VK_TRUE;
-    f2.features.depthClamp = VK_TRUE;
-    f2.features.textureCompressionBC = VK_TRUE;
-    // ANISOTROPIC FILTERING (part 41 item 1). Xenos filters up to 16:1 and the fetch
-    // constants carry a per-texture aniso field; until part 41 both samplers were
-    // plain trilinear, so every grazing-angle surface — the whole road at distance —
-    // went to mush well before the horizon. The feature is enabled whenever the
-    // device has it (the sampler decides whether to USE it, which is where
-    // CW_VK_NO_ANISO acts); asked for blindly it would fail device creation on a
-    // device that lacks it, so it is checked first and its absence is a named
-    // configuration fact, not a silent picture change.
-    {
-        VkPhysicalDeviceFeatures haveF{};
-        vkGetPhysicalDeviceFeatures(R->physical, &haveF);
-        if (haveF.samplerAnisotropy)
-        {
-            f2.features.samplerAnisotropy = VK_TRUE;
-            R->anisoLimit = props.limits.maxSamplerAnisotropy;
-        }
-        else
-            fprintf(stderr, "[vk] device lacks samplerAnisotropy — distance "
-                            "filtering stays trilinear on this device\n");
-        // USER CLIP PLANES (part 57): a shader cache built with XE_USER_CLIP_PLANES
-        // exports six ClipDistance values, and a pipeline whose VS declares the
-        // built-in needs this feature whether or not any plane is enabled that draw.
-        // Same pattern as anisotropy: ask only if the device has it, and name its
-        // absence out loud, because on such a device the clip-plane cache would fail
-        // pipeline creation rather than silently not clip.
-        // Precise occlusion queries — CW_VK_RT_COVERAGE's sample counts (part 64).
-        // Asked for only when the device has it; its absence is a named fact, not
-        // a silently meaningless percentage.
-        if (haveF.occlusionQueryPrecise)
-            f2.features.occlusionQueryPrecise = VK_TRUE;
-        else
-            fprintf(stderr, "[vk] device lacks occlusionQueryPrecise — "
-                            "CW_VK_RT_COVERAGE cannot report sample counts\n");
-        if (haveF.shaderClipDistance)
-            f2.features.shaderClipDistance = VK_TRUE;
-        else
-            fprintf(stderr, "[vk] device lacks shaderClipDistance — an "
-                            "XE_USER_CLIP_PLANES shader cache cannot run on it\n");
     }
     // CW_VK_ROBUST=1 — bound out-of-range buffer reads instead of undefined behaviour.
     // A Xenos vfetch past a stream's declared size returns ZERO (the fetch-constant
@@ -6690,36 +7179,55 @@ bool CreateDevice()
     // created with this sample count in InitCommon, every draw pipeline states it, and
     // it cannot change for the run (the persistent EDRAM is one image). N in {2,4};
     // clamped DOWN to what framebufferColor & framebufferDepth both support, falling
-    // back to 1x — the same renderer as CW_VK_MSAA unset, bit for bit — and every
-    // outcome prints, because an arm whose engagement is silent cannot be shown to
-    // have engaged (gotcha 151).
+    // back to 1x, and every outcome prints, because an arm whose engagement is silent
+    // cannot be shown to have engaged (gotcha 151).
+    //
+    // **DEFAULT 2x AS OF PART 93 (operator decision).** Unset = 2x; the price is
+    // measured, not guessed (+0.85 ms GPU at 1440p, frame time unmoved — plan §9),
+    // which is what lets a default ship here where the CLAUDE.md rule warns against
+    // an unmeasured one. **`CW_VK_MSAA=0` (or `=1`) is the single-sample control
+    // arm** — the pre-part-93 renderer bit for bit, the baseline every earlier A/B was
+    // taken against — so any picture or perf complaint bisects with it FIRST. An
+    // invalid value warns and falls back to the 2x default rather than to 1x, so a
+    // typo never silently disables AA.
+    // THE SETTING (part 108): the panel's MSAA row and the launcher's persist
+    // `msaa=` in cw_settings.txt (default 2, the part-93 decision), and that is what
+    // an unset CW_VK_MSAA reads. The env arm still wins outright, so a measurement
+    // recipe cannot be silently overridden by whatever the menu last wrote — the
+    // same precedence every other setting has. Next launch only, for the reason the
+    // comment above gives; the panel says so.
     {
-        // 2x IS THE DEFAULT (the operator's Case Zero part-93 verdict: works as
-        // game-wide AA, +0.85 ms GPU at 3440x1440 there, picture inside the null).
-        // CW_VK_MSAA=0 or =1 is the single-sample control arm — first in any
-        // picture bisection. An invalid value warns and falls to the 2x default,
-        // never silently to 1x (a control arm must be chosen, not stumbled into).
         const char* msaaEnv = Env("CW_VK_MSAA");
-        long msaaReq = msaaEnv ? strtol(msaaEnv, nullptr, 10) : 2;
+        const int msaaSetting = Settings_Msaa();
+        long msaaReq = msaaEnv ? strtol(msaaEnv, nullptr, 10) : msaaSetting;
         if (msaaEnv && msaaReq != 0 && msaaReq != 1 && msaaReq != 2 && msaaReq != 4)
         {
-            fprintf(stderr, "[vk] CW_VK_MSAA=%s is not 0/1/2/4 — using the 2x "
-                            "default (CW_VK_MSAA=0 is the single-sample control)\n",
-                    msaaEnv);
-            msaaReq = 2;
+            fprintf(stderr, "[vk] CW_VK_MSAA=%s is not 0/1/2/4 — IGNORED, using the "
+                            "setting (%dx; CW_VK_MSAA=0 is the single-sample control)\n",
+                    msaaEnv, msaaSetting ? msaaSetting : 1);
+            msaaReq = msaaSetting;
         }
         if (msaaReq == 0 || msaaReq == 1)
-            fprintf(stderr, "[vk] CW_VK_MSAA=%ld — EDRAM is SINGLE-SAMPLE by request "
-                            "(the pre-import control arm; the default is 2x)\n",
-                    msaaReq);
+            fprintf(stderr, "[vk] %s — EDRAM is SINGLE-SAMPLE by request "
+                            "(the pre-part-93 control arm; the default is 2x)\n",
+                    msaaEnv ? "CW_VK_MSAA=0" : "msaa=0 in cw_settings.txt");
         if (msaaReq == 2 || msaaReq == 4)
         {
             const VkSampleCountFlags supported =
                 props.limits.framebufferColorSampleCounts &
                 props.limits.framebufferDepthSampleCounts;
-            uint32_t n = uint32_t(msaaReq);
-            while (n > 1 && !(supported & n))
-                n >>= 1;
+            // The request first, then the OTHER count the renderer supports. Until
+            // part 105 this only halved (4 -> 2 -> 1), so a device with 4x and no 2x
+            // (Mesa's lavapipe reports exactly that) was refused with a message saying
+            // "neither 4x nor 2x" — false for 4x. Going UP costs more per frame than
+            // the 2x default, and the clamp line below says so when it happens.
+            uint32_t n = 0;
+            for (uint32_t c : { uint32_t(msaaReq), msaaReq == 2 ? 4u : 2u })
+                if (supported & c)
+                {
+                    n = c;
+                    break;
+                }
             // SAMPLE_ZERO depth resolve is mandatory in Vulkan 1.2+, but "mandatory"
             // is a spec claim and this is a gate: ask the device rather than assume,
             // and refuse loudly if it declines (gotcha 5 — never guess).
@@ -6751,12 +7259,16 @@ bool CreateDevice()
             {
                 R->msaaSamples = VkSampleCountFlagBits(n);
                 if (uint32_t(msaaReq) != n)
-                    fprintf(stderr, "[vk] CW_VK_MSAA=%ld clamped to %ux by the "
-                                    "device's framebuffer limits\n", msaaReq, n);
-                fprintf(stderr, "[vk] CW_VK_MSAA — EDRAM is MULTISAMPLED at %ux "
-                                "(resolves at RB_COPY; SAMPLE_ZERO depth resolve). "
-                                "CW_VK_MSAA=1 is the single-sample control arm (2x is the default).\n",
-                        n);
+                    fprintf(stderr, "[vk] CW_VK_MSAA=%ld is not a framebuffer sample count "
+                                    "this device offers (colour %#x, depth %#x) — using "
+                                    "%ux instead\n", msaaReq,
+                            unsigned(props.limits.framebufferColorSampleCounts),
+                            unsigned(props.limits.framebufferDepthSampleCounts), n);
+                fprintf(stderr, "[vk] %s — EDRAM is MULTISAMPLED at %ux "
+                                "(resolves at RB_COPY; SAMPLE_ZERO depth resolve)%s. "
+                                "CW_VK_MSAA=0 is the single-sample control arm.\n",
+                        msaaEnv ? "CW_VK_MSAA" : "msaa in cw_settings.txt", n,
+                        msaaEnv ? "" : msaaSetting == 2 ? " [the 2x default]" : "");
                 if (R->rtEnabled)
                 {
                     // The RT factor pass samples R->depth through an ordinary 2D view,
@@ -7058,6 +7570,8 @@ namespace pipelinejit
 extern std::vector<PipelineKey> prewarmWaiting;
 bool ChainOn();
 void OnShaderArrived(uint64_t hash);
+// Part 102: queue one seed key on the spare tier unless it is built or already queued.
+bool EnqueueSeed(const PipelineKey& key, const ShaderMeta& vs, const ShaderMeta& ps);
 } // namespace pipelinejit
 
 constexpr uint32_t kPrewarmMagic = 0x5750435A;   // 'ZCPW'
@@ -7237,8 +7751,22 @@ void PrewarmPipelines()
         fprintf(stderr, "[vk] pipeline pre-warm: no per-user key file yet — seeding "
                         "from the shipped %s\n", shipped.c_str());
 
+    // ASYNC BY DEFAULT SINCE PART 102. The boot warm was synchronous — "at load, where
+    // a player expects to wait" — and that was priced when the seed could only build the
+    // keys whose shaders the cache held. Two things changed the price: part 102's
+    // vertex recipes let session ONE hold every shader, so the loop now builds all
+    // 1,365 keys at boot instead of ~750; and a fresh DRIVER cache makes each create
+    // 28 ms here (NVIDIA) and 118 ms on czamd (part 101 addendum: 1,168 x 118 ms =
+    // 138 s of black screen), against 0.1 ms warm. 1,365 x 28 ms = 38 s measured on
+    // this box before the first frame. So the keys go to the async worker's SPARE tier
+    // instead — the same machinery the chain uses — and the boot proceeds; a draw that
+    // arrives before its pipeline is built promotes it to the urgent tier and is
+    // skipped until then (counted: "pipeline: speculative build promoted by a draw" is
+    // the seed arriving too late). CW_VK_SYNC_PREWARM=1 is the control arm: the
+    // synchronous boot warm exactly as parts 83-101 shipped it.
+    const bool asyncWarm = pipelinejit::ChainOn() && !EnvOn("CW_VK_SYNC_PREWARM");
     const auto t0 = std::chrono::steady_clock::now();
-    uint32_t made = 0, missingShader = 0, failed = 0;
+    uint32_t made = 0, missingShader = 0, failed = 0, queued = 0;
     for (const PipelineKey& key : keys)
     {
         auto vs = R->shadersMap.find(key.vsHash);
@@ -7258,6 +7786,12 @@ void PrewarmPipelines()
             ++missingShader;
             continue;
         }
+        if (asyncWarm)
+        {
+            if (pipelinejit::EnqueueSeed(key, vs->second, ps->second))
+                ++queued;
+            continue;
+        }
         if (GetPipeline(key, vs->second, ps->second) == VK_NULL_HANDLE)
             ++failed;
         else
@@ -7265,6 +7799,12 @@ void PrewarmPipelines()
     }
     const double ms = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - t0).count();
+    if (asyncWarm)
+        fprintf(stderr,
+                "[vk] pipeline pre-warm: %u of %u queued to the background worker (async "
+                "boot warm, part 102; CW_VK_SYNC_PREWARM=1 is the synchronous arm)\n",
+                queued, uint32_t(keys.size()));
+    else
     fprintf(stderr,
             "[vk] pipeline pre-warm: %u of %u created in %.0f ms (%.2f ms each)"
             "%s%s — this is the stutter that would otherwise have happened DURING play\n",
@@ -7430,6 +7970,10 @@ void OnFirstBind(uint32_t type, uint64_t hash, const uint8_t* code, uint32_t siz
     {
         workerUp = true;
         std::thread(Worker).detach();
+        ThreadBudget_Note("translate", 1,
+                          "first-sight shader translation; blocked except while a shader "
+                          "outside the cache is being translated");
+        ThreadBudget_Report();
     }
     inFlight.fetch_add(1);
     {
@@ -10863,7 +11407,8 @@ static PipelineBuildResult BuildPipelineObject(const PipelineKey& key, const Sha
     // same vertex input, same depth test and write, same cull — so the ID image has the
     // SAME VISIBILITY as the picture it is explaining. Change any of that and the map
     // stops describing the frame it is supposed to describe.
-    stages[1].module = (key.passFlags & kPassDrawId) ? R->drawIdModule
+    stages[1].module = R->nullPsModule ? R->nullPsModule
+                       : (key.passFlags & kPassDrawId) ? R->drawIdModule
                        : (key.passFlags & kPassRtShadow) && ps.moduleRt ? ps.moduleRt
                                                                        : ps.module;
     stages[1].pName = "main";
@@ -11040,15 +11585,34 @@ bool ChainOn()
 
 void Worker()
 {
+    // PRIORITY FOLLOWS THE TIER (part 103 item 4a). A SPARE job is the speculative
+    // warm — nobody is waiting for it, and on a cold driver cache it is 155 ms of pure
+    // compiler time per key on czamd, 1,339 keys, four of these threads: for the first
+    // minute of a session one they were runnable alongside the pump, the guest's two
+    // busy threads and the guard workers on six physical cores, and the operator felt
+    // that as stutter. Below normal, the scheduler hands the core to the game whenever
+    // it wants one and the warm takes what is left. An URGENT job is a draw being skipped
+    // RIGHT NOW, so it runs at normal priority: yielding it would trade the stutter for
+    // longer pop-in. The switch is a syscall per job against a 0.2-155 ms build.
+    bool lowNow = false;
     for (;;)
     {
         Job job;
+        bool urgent = false;
         {
             std::unique_lock<std::mutex> lk(mx);
             cv.wait(lk, [] { return !queueUrgent.empty() || !queueSpare.empty(); });
-            std::deque<Job>& q = queueUrgent.empty() ? queueSpare : queueUrgent;
+            urgent = !queueUrgent.empty();
+            std::deque<Job>& q = urgent ? queueUrgent : queueSpare;
             job = std::move(q.front());
             q.pop_front();
+        }
+        if (lowNow == urgent)
+        {
+            lowNow = !urgent;
+            if (ThreadBudget_SetLowPriority(lowNow))
+                COUNT(lowNow ? "pipeline: worker dropped to LOW priority for a spare job"
+                             : "pipeline: worker raised to NORMAL priority for an urgent job");
         }
         Done d;
         d.key = job.key;
@@ -11072,13 +11636,50 @@ void Enqueue(const PipelineKey& key, const ShaderMeta& vs, const ShaderMeta& ps,
     if (!workerUp)
     {
         workerUp = true;
-        std::thread(Worker).detach();
+        // SEVERAL WORKERS SINCE PART 102, because the async boot warm queues the whole
+        // 1,365-key seed here and one worker on a fresh driver cache drains it in ~37 s
+        // (28 ms a create on NVIDIA, 118 on czamd's AMD) — the seed finished at 40-48 s
+        // on the outdoor route with the DebugJump landing at 35 s, and 46 keys were
+        // promoted by draws that got there first. BuildPipelineObject is written for
+        // concurrent callers (its statics are mutexed; a default VkPipelineCache is
+        // internally synchronized). These threads sit blocked on the condition variable
+        // except while a pipeline is actually being created, which is exactly when the
+        // frame thread would otherwise stall — so they are sized from the machine
+        // rather than taken from the busy-thread budget (thread_budget.h), like the one
+        // first-sight translation worker before them: physical cores minus two,
+        // clamped to 1..4. CW_VK_PIPELINE_WORKERS=N overrides; =1 is the pre-part-102
+        // count.
+        unsigned n = 1;
+        if (const char* v = getenv("CW_VK_PIPELINE_WORKERS"); v && *v)
+            n = std::max(1u, unsigned(strtoul(v, nullptr, 10)));
+        else
+        {
+            const unsigned phys = ThreadBudget_PhysicalCores();
+            n = phys > 2 ? std::min(4u, phys - 2) : 1u;
+        }
+        for (unsigned i = 0; i < n; i++)
+            std::thread(Worker).detach();
+        fprintf(stderr, "[vk] async pipeline: %u worker thread(s) (%s; CW_VK_PIPELINE_WORKERS=N "
+                        "overrides)\n",
+                n, getenv("CW_VK_PIPELINE_WORKERS") ? "env" : "physical cores - 2, 1..4");
+        ThreadBudget_Note("pipeline", n,
+                          "blocked except while creating a pipeline; BELOW_NORMAL priority "
+                          "for the speculative warm, normal for a draw's own key");
+        ThreadBudget_Report();
     }
     {
         std::lock_guard<std::mutex> lk(mx);
         (urgent ? queueUrgent : queueSpare).push_back({ key, vs, ps });
     }
     cv.notify_one();
+}
+
+bool EnqueueSeed(const PipelineKey& key, const ShaderMeta& vs, const ShaderMeta& ps)
+{
+    if (R->pipelines.count(key) || pending.count(key))
+        return false;
+    Enqueue(key, vs, ps, /*urgent=*/false);
+    return true;
 }
 
 // Pump thread, from the skip site: a draw is skipping on this key RIGHT NOW and the
@@ -11098,6 +11699,10 @@ void Promote(const PipelineKey& key)
         {
             queueUrgent.push_back(std::move(*it));
             queueSpare.erase(it);
+            // The seed (or the chain) guessed right but built too late: a draw got
+            // here first. The exit dump's count of these is how far the async boot
+            // warm is behind the title on this machine.
+            Count("pipeline: speculative build promoted by a draw");
             break;
         }
 }
@@ -11389,8 +11994,9 @@ void GrowArenaIfNeeded()
 // here.
 VkBufferUsageFlags PersistUsage()
 {
+    // TRANSFER_SRC: the host store is the source of the mirror's copies (part 106).
     return VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
            (R->rtEnabled
                 ? VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
                 : 0u);
@@ -11448,6 +12054,7 @@ void PersistMaintenance()
             const uint64_t fr0 = CycNow();
             vkDestroyBuffer(R->device, old.buffer, nullptr);
             vkFreeMemory(R->device, old.memory, nullptr);
+            CreateStoreMirror();   // the twin follows the store's size (device is idle)
             growFreeNs = CycNow() - fr0;
             const uint64_t growNs = CycNow() - growT0;
             g_persistGrowNs += growNs;
@@ -12092,6 +12699,64 @@ void BeginFrame()
             g_gpFrameOf[R->frameSlot] = R->frame;
             g_gpPassSeg = -1;
         }
+        // THE PIPELINE-STATISTICS POOL (CW_VK_GPU_STATS, part 106): rides on the
+        // per-region split (a stats query is attached to a timing segment), so it needs
+        // CW_VK_GPU_PASSES too and says so rather than silently counting nothing.
+        if (GpuStatsOn() && !g_stPool && g_gpPool)
+        {
+            static bool said = false;
+            if (!R->pipeStats)
+            {
+                if (!said)
+                    fprintf(stderr, "[vk] CW_VK_GPU_STATS: this device has no "
+                                    "pipelineStatisticsQuery — the invocation census "
+                                    "is unavailable\n");
+                said = true;
+            }
+            else if (R->parRec)
+            {
+                if (!said)
+                    fprintf(stderr, "[vk] CW_VK_GPU_STATS: parallel record is ON and a "
+                                    "query cannot span its worker chunks — the census "
+                                    "is OFF (this should have forced the serial arm; "
+                                    "report it)\n");
+                said = true;
+            }
+            else
+            {
+                VkQueryPoolCreateInfo qi{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+                qi.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
+                qi.queryCount = kMaxFramesInFlight * kStQueriesPerSlot;
+                qi.pipelineStatistics =
+                    VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT |
+                    VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_PRIMITIVES_BIT |
+                    VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT |
+                    VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT |
+                    VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT |
+                    VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT;
+                if (vkCreateQueryPool(R->device, &qi, nullptr, &g_stPool) != VK_SUCCESS)
+                {
+                    g_stPool = VK_NULL_HANDLE;
+                    fprintf(stderr, "[vk] CW_VK_GPU_STATS: query pool creation FAILED — "
+                                    "the invocation census is unavailable\n");
+                }
+                else
+                    fprintf(stderr, "[vk] CW_VK_GPU_STATS: per-pass pipeline statistics "
+                                    "ARMED (%u queries x %u slots; %ux%u internal "
+                                    "pixels is the overdraw denominator)\n",
+                            kStQueriesPerSlot, kMaxFramesInFlight, g_internalW.load(),
+                            g_internalH.load());
+            }
+        }
+        if (g_stPool)
+        {
+            vkCmdResetQueryPool(R->cmd, g_stPool, R->frameSlot * kStQueriesPerSlot,
+                                kStQueriesPerSlot);
+            g_stNext[R->frameSlot] = 0;
+        }
+        // The store mirror's copies for what last frame wrote (part 106) — here, at the
+        // top of the frame, before any rendering instance is open.
+        MirrorFlush();
     }
     // The arena is GROWN at the end of a frame, in `GrowArenaIfNeeded` — not here. What
     // remains here is the reset, which is the cheap half and has to be per frame. With
@@ -12253,6 +12918,23 @@ void BeginRendering()
     g_gpPassDraws = 0;
     g_gpPassExt = 0;
     g_gpPassExtPx = 0;
+    g_gpPassShadow = false;
+    // The pass's pipeline-statistics query, inside the rendering instance the segment
+    // is inside (a query begun inside an instance must end inside the same one — it
+    // does, in EndRendering, before the segment closes). Serial recorder only, by the
+    // pool's own creation rule.
+    if (g_gpPassSeg >= 0 && g_stPool && !R->parRec)
+    {
+        const uint32_t slot = R->frameSlot;
+        if (g_stNext[slot] < kStQueriesPerSlot)
+        {
+            const uint32_t q = slot * kStQueriesPerSlot + g_stNext[slot]++;
+            vkCmdBeginQuery(R->cmd, g_stPool, q, 0);
+            g_gpSegs[slot][g_gpPassSeg].sq = q;
+        }
+        else
+            ++g_stOverflow;
+    }
 }
 
 void EndRendering()
@@ -12277,7 +12959,13 @@ void EndRendering()
     if (g_gpPassSeg >= 0)
     {
         const uint32_t d = g_gpPassDraws;
-        GpuSegEnd(g_gpPassSeg, d == 0   ? kGpPassEmpty
+        {
+            const uint32_t sq = g_gpSegs[R->frameSlot][g_gpPassSeg].sq;
+            if (sq != ~0u && g_stPool)
+                vkCmdEndQuery(R->cmd, g_stPool, sq);
+        }
+        GpuSegEnd(g_gpPassSeg, g_gpPassShadow ? kGpPassShadow
+                               : d == 0   ? kGpPassEmpty
                                : d == 1 ? kGpPass1
                                : d < 256 ? kGpPassSmall
                                          : kGpPassBig,
@@ -13373,9 +14061,23 @@ int RetireOldestFrame()
                         g_gpNs[sg.cls] += ns;
                         ++g_gpN[sg.cls];
                         attrib += ns;
+                        if (sg.sq != ~0u && g_stPool)
+                        {
+                            uint64_t st[kStCounters] = {};
+                            if (vkGetQueryPoolResults(R->device, g_stPool, sg.sq, 1,
+                                                      sizeof st, st, sizeof st,
+                                                      VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+                            {
+                                for (uint32_t k = 0; k < kStCounters; ++k)
+                                    g_stSum[sg.cls][k] += st[k];
+                                ++g_stN[sg.cls];
+                            }
+                            else
+                                ++g_stBadRead;
+                        }
                         // The extent census (part 79 item 2). Render scopes only, and only
                         // where an extent was recorded — a pass with no draws never set one.
-                        if (sg.cls <= kGpPassBig && sg.ext)
+                        if (sg.cls <= kGpPassShadow && sg.ext)
                         {
                             GpExtentStat& e = g_gpExtents[sg.cls][sg.ext];
                             ++e.n;
@@ -13713,7 +14415,7 @@ StreamLoc UploadStream(uint8_t* base, uint32_t va, uint64_t bytes, uint32_t endi
                 ++R->persistStats.hits;
                 R->persistStats.hitBytes += bytes;
                 copied = false;
-                loc = StreamLoc{ &R->persist, e.at };
+                loc = PersistHitLoc(e);
             }
             else
             {
@@ -13779,6 +14481,7 @@ StreamLoc UploadStream(uint8_t* base, uint32_t va, uint64_t bytes, uint32_t endi
                     e.guard = guard;
                     ++R->persistStats.stale;
                     R->persistStats.staleBytes += bytes;
+                    MirrorMark(e, e.at, bytes);
                     loc = StreamLoc{ &R->persist, e.at };
                 }
                 else
@@ -13806,6 +14509,7 @@ StreamLoc UploadStream(uint8_t* base, uint32_t va, uint64_t bytes, uint32_t endi
                 e.bytes = uint32_t(bytes);
                 e.preSlot = slot;
                 e.preFrame = R->frame + 1;
+                MirrorMark(e, at, bytes);
                 PersistInsert(key, e);
                 ++R->persistStats.fills;
                 R->persistStats.fillBytes += bytes;
@@ -14435,9 +15139,20 @@ void BindIndexBufferCached(VkBuffer buffer, VkDeviceSize offset, VkIndexType typ
 // non-zero aniso field). So the fetch constant's own fields are honoured, one
 // VkSampler per distinct spec, created on first sight and cached for the process.
 //
-// Address modes stay REPEAT in this change ON PURPOSE: the clamp fields are a
-// separate experiment (the cyan edge fringes, part41-kickoff item 5) with its own
-// prediction, and bundling them here would make the two inseparable.
+// Address modes stayed REPEAT from part 41 to part 108 ON PURPOSE — "the clamp
+// fields are a separate experiment (the cyan edge fringes, part41-kickoff item 5)"
+// — and that experiment was never run. THE OPERATOR'S 2026-09-09 REPORT IS ITS
+// SYMPTOM (open-items 0ae): a light's glow at one edge of the screen appears at the
+// OPPOSITE edge, and on the title screen a zombie leaving one side shows in the
+// corner of the other. A screen-space blur that samples past the edge of a
+// full-screen texture with REPEAT reads the far edge — with the CLAMP the fetch
+// constant asked for, it reads the edge texel. So dword0's clamp_x/clamp_y (3 bits
+// each, bits 10..12 and 13..15) are honoured as of part 108, as part of the sampler
+// key: 0 wrap, 1 mirror, 2 clamp-to-last-texel, 3 mirror-once-last-texel (served as
+// clamp-to-edge: identical inside [0,1]), 4/5 clamp/mirror-once to HALF border and
+// 6/7 to border (all four served as clamp-to-border, transparent black — the 360's
+// border colour field is not decoded; counted). `CW_VK_NO_FETCH_CLAMP=1` is the
+// same-binary control arm (every sampler REPEAT, the part-41..107 renderer).
 //
 // CW_VK_NO_FETCH_SAMPLERS=1 is the whole-feature arm (every fetch reads sampler 0,
 // the part-40 renderer, same binary). CW_VK_ANISO=N caps the degree; =0 keeps the
@@ -14449,7 +15164,11 @@ static uint32_t SamplerIndexForFetch(const uint32_t* regs, uint32_t constIdx)
     if (off)
         return 0;
     const uint32_t d3 = regs[xenos::kFetchConstantBase + constIdx * 6 + 3];
-    const uint32_t key = (d3 >> 19) & 0x1FF;          // mag:2 min:2 mip:2 aniso:3
+    const uint32_t d0 = regs[xenos::kFetchConstantBase + constIdx * 6 + 0];
+    static const bool noClamp = EnvOn("CW_VK_NO_FETCH_CLAMP");
+    const uint32_t clampX = noClamp ? 0 : (d0 >> 10) & 7;
+    const uint32_t clampY = noClamp ? 0 : (d0 >> 13) & 7;
+    const uint32_t key = ((d3 >> 19) & 0x1FF) | (clampX << 9) | (clampY << 12);
     if (R->samplerBySpec[key] >= 0)
         return uint32_t(R->samplerBySpec[key]);
     if (R->samplerCount >= g_maxDescriptors)
@@ -14473,9 +15192,24 @@ static uint32_t SamplerIndexForFetch(const uint32_t* regs, uint32_t constIdx)
     si.minFilter = mn == 0 ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
     si.mipmapMode = mip == 0 ? VK_SAMPLER_MIPMAP_MODE_NEAREST
                              : VK_SAMPLER_MIPMAP_MODE_LINEAR;
-    si.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    si.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    auto addressMode = [](uint32_t clamp) {
+        switch (clamp)
+        {
+            case 0: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+            case 1: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+            case 2: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            case 3: Count("sampler: mirror-once served as clamp-to-edge");
+                    return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            case 4: case 5:
+                    Count("sampler: half-border clamp served as clamp-to-border");
+                    return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+            default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+        }
+    };
+    si.addressModeU = addressMode(clampX);
+    si.addressModeV = addressMode(clampY);
     si.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    si.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     si.maxLod = VK_LOD_CLAMP_NONE;
     static const int cap = Env("CW_VK_ANISO") ? atoi(Env("CW_VK_ANISO")) : 16;
     if (an >= 2 && an <= 5 && cap > 0 && R->anisoLimit > 0.0f)
@@ -14504,10 +15238,14 @@ static uint32_t SamplerIndexForFetch(const uint32_t* regs, uint32_t constIdx)
     R->samplerBySpec[key] = int32_t(idx);
     // One line per DISTINCT spec for the process — a handful, and each is the
     // engagement evidence the census can be checked against.
+    static const char* const kClampName[8] = { "wrap", "mirror", "clamp", "mirror1",
+                                               "halfborder", "mirror1-halfborder",
+                                               "border", "mirror1-border" };
     fprintf(stderr, "[vk] sampler #%u: mag=%u min=%u mip=%u anisoField=%u -> "
-                    "maxAniso %.0f\n",
+                    "maxAniso %.0f  clamp x=%s y=%s%s\n",
             idx, mag, mn, mip, an,
-            si.anisotropyEnable ? si.maxAnisotropy : 0.0f);
+            si.anisotropyEnable ? si.maxAnisotropy : 0.0f, kClampName[clampX],
+            kClampName[clampY], noClamp ? " (CW_VK_NO_FETCH_CLAMP: forced wrap)" : "");
     return idx;
 }
 
@@ -16060,7 +16798,7 @@ void VerticalWasteCensus(const uint32_t* vsWindow, const ShaderMeta& vs,
     uint32_t scratch[16];
     memcpy(scratch, vsWindow, sizeof scratch);
     PatchFovProjection(scratch, FovHalfRadThisFrame());
-    if (WideMode())
+    if (AspectPatchActive())
         PatchWideProjection(scratch);
     float m[16];
     memcpy(m, scratch, sizeof m);
@@ -17173,7 +17911,7 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
             int fovForm = 0, wideForm = 0;
             bool memoServed = false;
             const float fovNow = FovHalfRadThisFrame();
-            const uint8_t wideNow = WideMode() ? 1 : 0;
+            const uint8_t wideNow = AspectPatchMode();   // 0 / 1 wide / 2 narrow
             if (!patchInPlace && !NoPatchMemo())
             {
                 for (int way = 0; way < 4; ++way)
@@ -17259,8 +17997,20 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
             }
             switch (wideForm)
             {
-                case 1: COUNT("draw: raw projection widened to 21:9"); break;
-                case 2: COUNT("draw: COMPOSITE viewproj widened to 21:9"); break;
+                // Two labels per form since part 108: the counter names which mode
+                // fired, so a 16:10 run cannot report itself as "widened to 21:9".
+                case 1:
+                    if (NarrowMode())
+                        COUNT("draw: raw projection letterboxed to 16:10 (narrow)");
+                    else
+                        COUNT("draw: raw projection widened to 21:9");
+                    break;
+                case 2:
+                    if (NarrowMode())
+                        COUNT("draw: COMPOSITE viewproj vert-plus to 16:10 (narrow)");
+                    else
+                        COUNT("draw: COMPOSITE viewproj widened to 21:9");
+                    break;
             }
             if (!patchInPlace)
             {
@@ -17284,7 +18034,7 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
                     uint32_t want[16];
                     memcpy(want, dst, sizeof want);   // the arena's own c0..c3
                     PatchFovProjection(want, FovHalfRadThisFrame());
-                    if (WideMode())
+                    if (AspectPatchActive())
                         PatchWideProjection(want);
                     if (g_patchSrcVerifyPoison)
                         want[0] ^= 0x40000000u;
@@ -17338,7 +18088,7 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
             // same order, or the verifier would report every patched projection as a
             // memo defect.
             PatchFovProjection(scratch.data(), FovHalfRadThisFrame());
-            if (WideMode())
+            if (AspectPatchActive())
                 PatchWideProjection(scratch.data());
             if (g_constMemoVerifyPoison)
             {
@@ -17624,6 +18374,24 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     // the same failure the comment above describes, one field over.
     char psbindLine[8192];
     bool psbindFull = false;
+    // THE TRANSFORM FORM PER DRAW (part 108, item 0ad): what SceneXformForm makes of
+    // this draw's raw c0..c3 — 0 unrecognized (not patched), 1 raw projection, 2
+    // view-projection composite — with the row norms, so a frame that renders
+    // STRETCHED can be read draw by draw: recognized-and-patched draws cannot be
+    // stretched by the wide patch, so a stretched frame whose world draws all read
+    // xf=2 indicts something after the classifier, and one reading xf=0 with a unit
+    // row3 names a camera the classifier rejects (its norms say why).
+    int xfForm = -1; float xfB = 0.0f, xfN0 = 0.0f, xfN1 = 0.0f, xfN3 = 0.0f;
+    if (drawCensus || burstCensus)
+    {
+        const uint32_t* c0 = &regs[xenos::kAluConstantBase];
+        xfForm = SceneXformForm(c0, xfB);
+        float m[16];
+        memcpy(m, c0, sizeof m);
+        xfN0 = std::sqrt(m[0]*m[0] + m[1]*m[1] + m[2]*m[2]);
+        xfN1 = std::sqrt(m[4]*m[4] + m[5]*m[5] + m[6]*m[6]);
+        xfN3 = std::sqrt(m[12]*m[12] + m[13]*m[13] + m[14]*m[14]);
+    }
     // The pass's WRITE state belongs on this line too. "colour = f(constants,
     // textures)" is only true of a draw that writes its colour at all: an empty
     // RB_COLOR_MASK makes a pipeline that discards every channel, and its output is
@@ -17636,7 +18404,8 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
         (drawCensus || burstCensus)
             ? snprintf(psbindLine, sizeof psbindLine,
                        "draw %llu verts=%u prim=%u vs=%016llx ps=%016llx mask=%X "
-                       "blend=%08X po=%u/%g/%g su=%08X dc=%08X sr=%08X cl=%08X ucp=%g/%g/%g/%g",
+                       "blend=%08X po=%u/%g/%g su=%08X dc=%08X sr=%08X cl=%08X ucp=%g/%g/%g/%g"
+                       " xf=%d bEff=%.4f n0=%.4f n1=%.4f n3=%.4f",
                        (unsigned long long)R->drawsThisFrame, draw.indexCount, draw.primType,
                        (unsigned long long)vsBind.hash, (unsigned long long)psBind.hash,
                        regs[xenos::kRbColorMask] & 0xF, regs[xenos::kRbBlendControl0],
@@ -17688,7 +18457,8 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
                        // than a body cut, and the whole clip-plane theory needs
                        // re-examining before a line of shader work is done for it.
                        F32(regs[xenos::kPaClUcp0X]), F32(regs[xenos::kPaClUcp0X + 1]),
-                       F32(regs[xenos::kPaClUcp0X + 2]), F32(regs[xenos::kPaClUcp0X + 3]))
+                       F32(regs[xenos::kPaClUcp0X + 2]), F32(regs[xenos::kPaClUcp0X + 3]),
+                       xfForm, xfB, xfN0, xfN1, xfN3)
         : psbind ? snprintf(psbindLine, sizeof psbindLine,
                             "[psbind] frame=%llu ps=%016llx mask=%X blend=%08X",
                             (unsigned long long)R->frame,
@@ -18493,7 +19263,7 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
                 const float ucpFovHalf = FovHalfRadThisFrame();
                 float ucpBEff = 0.0f;
                 const int ucpForm =
-                    (WideMode() || ucpFovHalf != 0.0f)
+                    (AspectPatchActive() || ucpFovHalf != 0.0f)
                         ? SceneXformForm(
                               &regs[xenos::kAluConstantBase + memoVsBase * 4],
                               ucpBEff)
@@ -18522,6 +19292,18 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
                         else
                             p[1] /= WideFovFactor();
                         COUNT("draw: user clip plane compensated for the wide "
+                              "projection");
+                    }
+                    else if (NarrowMode())
+                    {
+                        // The axes swapped (part 108): raw form scales oPos.y by k
+                        // -> plane.y by 1/k; composite scales oPos.x by 1/k ->
+                        // plane.x by k.
+                        if (ucpForm == 1)
+                            p[1] /= WideFovFactor();
+                        else
+                            p[0] *= WideFovFactor();
+                        COUNT("draw: user clip plane compensated for the narrow "
                               "projection");
                     }
                 }
@@ -18856,6 +19638,14 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
         scissor.extent = { PassX(std::min(winX1, R->edramWidth) - winX, passW),
                            PassY(std::min(winY1, R->edramHeight) - winY, passH) };
     }
+    // CW_VK_SCISSOR_1PX=1 (part 106): every draw's scissor collapsed to one pixel at
+    // its own origin. Vertex shading, primitive assembly, clipping and the per-draw
+    // fixed cost all stay; only the fragments go. The complement of CW_VK_NULL_PS, and
+    // with it the two arms bracket what the title's passes are made of. Never a mode.
+    // A plain global set once at init, not a function-local static: a static-init guard
+    // load on the per-draw path is the shape gotcha 453 is about.
+    if (g_scissor1px)
+        scissor.extent = { 1, 1 };
 
     // CW_VK_VIEWPORT_TRACE=1 — every DISTINCT viewport setup, once each. A per-draw
     // trace of 1.1 M draws is unreadable and a per-frame one hides the outlier that
@@ -19969,15 +20759,15 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
             cap.ib = R->arena.buffer;
             cap.io = at;
             cap.it = VK_INDEX_TYPE_UINT32;
-            cap.drawCount = expandedCount;
+            cap.drawCount = DrawCountArm(expandedCount);
             cap.baseVertex = rectSynth ? 0 : indxOffset;
         }
         else
         {
             BindIndexBufferCached(R->arena.buffer, at, VK_INDEX_TYPE_UINT32);
             if (!NoDriverRecord())
-                vkCmdDrawIndexed(R->cmd, expandedCount, 1, 0, rectSynth ? 0 : indxOffset,
-                                 0);
+                vkCmdDrawIndexed(R->cmd, DrawCountArm(expandedCount), 1, 0,
+                                 rectSynth ? 0 : indxOffset, 0);
             else
                 ++g_noDriverRecordSkipped;
         }
@@ -20050,14 +20840,14 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
             cap.ib = loc.handle();
             cap.io = loc.at;
             cap.it = itype;
-            cap.drawCount = draw.indexCount;
+            cap.drawCount = DrawCountArm(draw.indexCount);
             cap.baseVertex = indxOffset;
         }
         else
         {
             BindIndexBufferCached(loc.handle(), loc.at, itype);
             if (!NoDriverRecord())
-                vkCmdDrawIndexed(R->cmd, draw.indexCount, 1, 0, indxOffset, 0);
+                vkCmdDrawIndexed(R->cmd, DrawCountArm(draw.indexCount), 1, 0, indxOffset, 0);
             else
                 ++g_noDriverRecordSkipped;
         }
@@ -20072,11 +20862,11 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
         if (capturing)
         {
             cap.ib = VK_NULL_HANDLE;
-            cap.drawCount = draw.indexCount;
+            cap.drawCount = DrawCountArm(draw.indexCount);
             cap.baseVertex = indxOffset;
         }
         else if (!NoDriverRecord())
-            vkCmdDraw(R->cmd, draw.indexCount, 1, uint32_t(indxOffset), 0);
+            vkCmdDraw(R->cmd, DrawCountArm(draw.indexCount), 1, uint32_t(indxOffset), 0);
         else
             ++g_noDriverRecordSkipped;
         COUNT("draw: auto-index");
@@ -20280,16 +21070,23 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     // The pass's EXTENT, for part 79 item 2's census. Guarded on `g_gpPassSeg`, which is
     // -1 unless CW_VK_GPU_PASSES is on AND a segment is open — a plain global compare, not
     // a static-init guard, so an ordinary run pays one predictable branch here.
+    // The draw's OWN scissor, not `R->bound.scissor`: under parallel record (part 89)
+    // the capture path never writes `R->bound`, so this read 0x0 on every draw and the
+    // extent census printed NOTHING for every run since — a blind instrument that
+    // looked like an empty table (gotcha 3). Found in part 106 when the 1080p census
+    // was needed; the serial recorder binds the same rectangle, so both arms agree.
     if (g_gpPassSeg >= 0)
     {
-        const uint64_t px = uint64_t(R->bound.scissor.extent.width) *
-                            uint64_t(R->bound.scissor.extent.height);
+        const uint64_t px = uint64_t(scissor.extent.width) *
+                            uint64_t(scissor.extent.height);
         if (px > g_gpPassExtPx)
         {
             g_gpPassExtPx = px;
-            g_gpPassExt = (uint64_t(R->bound.scissor.extent.width) << 32) |
-                          R->bound.scissor.extent.height;
+            g_gpPassExt = (uint64_t(scissor.extent.width) << 32) |
+                          scissor.extent.height;
         }
+        if (IsShadowSurface(regs))
+            g_gpPassShadow = true;
     }
     R->verticesThisPass += draw.indexCount;
 }
@@ -21804,6 +22601,7 @@ bool InitCommon()
             R->persistOn = false;
         }
     }
+    CreateStoreMirror();
 
     // Two samplers, and one global choice per draw is a stated simplification: the
     // fetch constant carries per-texture filter and address modes that this does not
@@ -21849,6 +22647,25 @@ bool InitCommon()
             R->drawIdModule = VK_NULL_HANDLE;
             fprintf(stderr, "[vk] the draw-ID shader module failed to create — "
                             "CW_VK_DRAW_ID will not work this run\n");
+        }
+        // CW_VK_NULL_PS=1 (part 106): every translated pixel shader replaced by the
+        // do-nothing fragment stage — the "everything but pixel shading" arm of the GPU
+        // decomposition (tools/null_ps.hlsl). Created only when asked, and the line
+        // below is the engagement evidence; the picture is garbage by design.
+        if (EnvOn("CW_VK_NULL_PS"))
+        {
+            smi.codeSize = sizeof kNullPixelShaderSpv;
+            smi.pCode = kNullPixelShaderSpv;
+            if (vkCreateShaderModule(R->device, &smi, nullptr, &R->nullPsModule) != VK_SUCCESS)
+            {
+                R->nullPsModule = VK_NULL_HANDLE;
+                fprintf(stderr, "[vk] CW_VK_NULL_PS: the null fragment module failed to "
+                                "create — the arm is NOT engaged\n");
+            }
+            else
+                fprintf(stderr, "[vk] CW_VK_NULL_PS=1 — EVERY pixel shader is the "
+                                "do-nothing fragment stage this run (a GPU measurement "
+                                "arm; the picture is garbage by design)\n");
         }
     }
 
@@ -22028,6 +22845,11 @@ bool InitCommon()
             fprintf(stderr, "[vk] parallel record OFF: no worker pool "
                             "(CW_WORKERS=0 or CW_VK_NO_PARALLEL_GUARD) — the serial "
                             "path is the control arm, not a degraded mode\n");
+        else if (GpuStatsOn())
+            fprintf(stderr, "[vk] parallel record OFF: CW_VK_GPU_STATS is set and a "
+                            "pipeline-statistics query cannot span the worker chunks "
+                            "— the census runs on the serial recorder (same draws, "
+                            "same order; the wall time is the part-88 recorder's)\n");
         else
         {
             R->parRec = true;
@@ -22047,6 +22869,14 @@ bool InitCommon()
         fprintf(stderr, "[vk] CW_VK_NO_PAR_RECORD=1 — parallel record OFF (the "
                         "part-88 serial recorder, same binary)\n");
     g_bindRunCensus = EnvOn("CW_VK_BIND_RUN_CENSUS");
+    g_scissor1px = EnvOn("CW_VK_SCISSOR_1PX");
+    g_tri1 = EnvOn("CW_VK_TRI1");
+    if (g_tri1)
+        fprintf(stderr, "[vk] CW_VK_TRI1=1 — every draw issues at most its first primitive "
+                        "this run (a GPU measurement arm; the picture is garbage by design)\n");
+    if (g_scissor1px)
+        fprintf(stderr, "[vk] CW_VK_SCISSOR_1PX=1 — every draw's scissor is 1x1 this run "
+                        "(a GPU measurement arm; the picture is garbage by design)\n");
     g_guardCensus = EnvOn("CW_VK_GUARD_CENSUS");
     g_noBindBatch = EnvOn("CW_VK_NO_BIND_BATCH");
     g_verifyBindBatch = EnvOn("CW_VK_VERIFY_BIND_BATCH");
@@ -22550,6 +23380,34 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
                         double(p99Us) / 1000.0, double(worstUs) / 1000.0,
                         n > 1 ? 100.0 * double(overTwice) / double(n - 1) : 0.0,
                         (unsigned long long)frames, elapsed, dMed, dMin, dMax);
+                // Part 107 item 2: the Draw Thread's fence wait, per window, beside
+                // the frame rate it is meant to move — so a plain crowd run (no phase
+                // profiler) still says whether the park ENGAGED and how each episode
+                // ended. A run whose parks all end in timeouts has a wake predicate that
+                // never fires; a run with no parks at all has a wait that never waits.
+                {
+                    static FenceWaitStats lastRw;
+                    const FenceWaitStats rw = FenceWait_Stats();
+                    const double inv = 1.0 / double(frames);
+                    fprintf(stderr,
+                            "[fencewait] per frame: body %.1f | ready %.1f | spin-resolved "
+                            "%.1f | parks %.1f (woken %.1f timeouts %.1f MISSED %.1f eagain %.1f) | "
+                            "contended %.1f passthrough %.1f | stores seen %.1f wakes %.1f%s\n",
+                            double(rw.bodyCalls - lastRw.bodyCalls) * inv,
+                            double(rw.readyAtEntry - lastRw.readyAtEntry) * inv,
+                            double(rw.spinResolved - lastRw.spinResolved) * inv,
+                            double(rw.parks - lastRw.parks) * inv,
+                            double(rw.parkWoken - lastRw.parkWoken) * inv,
+                            double(rw.parkTimeouts - lastRw.parkTimeouts) * inv,
+                            double(rw.parkMissed - lastRw.parkMissed) * inv,
+                            double(rw.parkEagain - lastRw.parkEagain) * inv,
+                            double(rw.contended - lastRw.contended) * inv,
+                            double(rw.passthrough - lastRw.passthrough) * inv,
+                            double(rw.storeChecks - lastRw.storeChecks) * inv,
+                            double(rw.wakeCalls - lastRw.wakeCalls) * inv,
+                            FenceWait_Enabled() ? "" : " [CW_FENCE_PARK=0: spinning]");
+                    lastRw = rw;
+                }
                 windowStart = now;
                 frames = 0;
                 frameUs.clear();
@@ -23859,8 +24717,12 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
             std::filesystem::create_directories(snapDir, ec);
         }
         bool wroteOne = false;
-        for (const auto& [dest, snap] : R->snapshots)
+        for (const auto& [dest, snapBinding] : R->snapshots)
         {
+            // A plain reference for the lambda below: capturing a structured binding is
+            // C++20 (P1091) but clang 15 — the release's old-base compiler — rejects it,
+            // and this was the one line in the tree that did so (part 104).
+            const auto& snap = snapBinding;
             const size_t n = size_t(snap.image.width) * snap.image.height * 4;
             if (n > R->readback.size)
                 continue;
@@ -24345,6 +25207,37 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
                     frames ? double(dMidwalk) / double(frames) : 0.0,
                     (unsigned long long)dHeldFast,
                     frames ? double(dHeldFast) / double(frames) : 0.0);
+
+            // Part 107 item 2: the Draw Thread's fence wait, parked. Every episode
+            // is classified, so "the park never engaged" (all readyAtEntry / spin) and
+            // "the wake predicate never fires" (parks == timeouts) are both visible
+            // here rather than inferred from a frame time (gotcha 151). The first draft
+            // watched the read pointer instead of the fence word and this line is
+            // what said so: parks 5.6/frame, timeouts 5.6/frame, wakes 0.
+            {
+                static FenceWaitStats lastRw;
+                const FenceWaitStats rw = FenceWait_Stats();
+                const double inv = frames ? 1.0 / double(frames) : 0.0;
+                fprintf(stderr,
+                        "[vkprof]   fence wait (part 107): body calls %.1f/frame | "
+                        "ready at entry %.1f | spin-resolved %.1f | parks %.1f (woken %.1f, "
+                        "timeouts %.1f, MISSED %.1f, eagain %.1f) | contended %.1f passthrough %.1f | "
+                        "executor stores seen while parked %.1f, wakes %.1f/frame%s\n",
+                        double(rw.bodyCalls - lastRw.bodyCalls) * inv,
+                        double(rw.readyAtEntry - lastRw.readyAtEntry) * inv,
+                        double(rw.spinResolved - lastRw.spinResolved) * inv,
+                        double(rw.parks - lastRw.parks) * inv,
+                        double(rw.parkWoken - lastRw.parkWoken) * inv,
+                        double(rw.parkTimeouts - lastRw.parkTimeouts) * inv,
+                        double(rw.parkMissed - lastRw.parkMissed) * inv,
+                        double(rw.parkEagain - lastRw.parkEagain) * inv,
+                        double(rw.contended - lastRw.contended) * inv,
+                        double(rw.passthrough - lastRw.passthrough) * inv,
+                        double(rw.storeChecks - lastRw.storeChecks) * inv,
+                        double(rw.wakeCalls - lastRw.wakeCalls) * inv,
+                        FenceWait_Enabled() ? "" : "  [CW_FENCE_PARK=0: spinning]");
+                lastRw = rw;
+            }
 
             // ...and the one thing `outside` has never been able to say: how much of it
             // is the pump WORKING and how much is the pump NOT RUNNING AT ALL.
@@ -24843,6 +25736,23 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
                         (unsigned long long)(R->persistCursor >> 20),
                         (unsigned long long)(R->persist.size >> 20),
                         (unsigned long long)p.flushes);
+                if (R->persistDev.buffer)
+                {
+                    fprintf(stderr,
+                            "[vkprof] store mirror: %.2f MB/frame copied host->VRAM in "
+                            "%.1f copies/frame; hits bound the MIRROR %.1f%% of the time "
+                            "(%llu dev, %llu host) this window\n",
+                            frames ? double(R->mirrorBytes) / double(frames) / 1048576.0 : 0.0,
+                            frames ? double(R->mirrorCopies) / double(frames) : 0.0,
+                            (R->mirrorHitsDev + R->mirrorHitsHost)
+                                ? 100.0 * double(R->mirrorHitsDev) /
+                                      double(R->mirrorHitsDev + R->mirrorHitsHost)
+                                : 0.0,
+                            (unsigned long long)R->mirrorHitsDev,
+                            (unsigned long long)R->mirrorHitsHost);
+                    R->mirrorCopies = R->mirrorBytes = 0;
+                    R->mirrorHitsDev = R->mirrorHitsHost = 0;
+                }
                 R->persistStats = Renderer::PersistStats{};
             }
             if (g_streamCensus)
@@ -25153,6 +26063,10 @@ void ApplyPendingRenderScale()
                         "%ux%u); snapshots and the cube map rebuild lazily over the "
                         "next frames\n",
                 nw, nh, RSX(R->targetWidth), RS(R->edramHeight));
+        // A windowed window follows the applied resolution (part 108). Handed to the
+        // window thread, which owns every SDL call; it declines (and says so) when the
+        // window is fullscreen, maximised or pinned by a measurement variable.
+        Host_WindowFollowInternalRes(nw, nh);
     }
 }
 
@@ -25225,9 +26139,24 @@ void VkRenderer_RequestSwapchainRebuild()
     g_swapRebuildRequest.store(true, std::memory_order_release);
 }
 
+// The factor the GAME's roaming camera must be widened by, in tan space, so that its
+// own 16:9 culling frustum covers the rendered view: k in wide mode (the horizontal
+// grows by k), 1/k in narrow mode (the vertical grows by 1/k; part 108), 1 at 16:9.
+// The EDRAM sample count THIS run is using (1, 2 or 4), for the panel's "applies at
+// next launch" star: the setting can differ from it until a relaunch. 0 before the
+// renderer exists.
+int VkRenderer_MsaaSamples()
+{
+    return R ? int(R->msaaSamples) : 0;
+}
+
 float VkRenderer_WideFovFactor()
 {
-    return WideMode() ? WideFovFactor() : 1.0f;
+    if (WideMode())
+        return WideFovFactor();
+    if (NarrowMode())
+        return 1.0f / WideFovFactor();
+    return 1.0f;
 }
 
 void VkRenderer_SavePipelineCache()
@@ -25315,7 +26244,8 @@ void VkRenderer_DumpStats()
             {
                 const uint64_t named = g_texDecAllocNs + g_texDecBaseNs + g_texDecMipNs +
                                        g_texDecMipChkNs + g_texDecScanNs +
-                                       g_texDecGuardNs + g_texDecImageNs;
+                                       g_texDecGuardNs + g_texDecImageNs +
+                                       g_texDecGoldenNs;
                 const double tot = double(g_texDecodeNs);
                 auto pc = [&](uint64_t v) { return 100.0 * double(v) / tot; };
                 fprintf(stderr,
@@ -25323,7 +26253,7 @@ void VkRenderer_DumpStats()
                         "base-untile %.1f (%.1f%%)  mip-untile %.1f (%.1f%%)  "
                         "mip-guards %.1f (%.1f%%)  content-scan %.1f (%.1f%%)  "
                         "src-hash %.1f (%.1f%%)  vkCreateImage %.1f (%.1f%%)  "
-                        "RESIDUAL %.1f (%.1f%%)\n",
+                        "golden %.1f (%.1f%%)  RESIDUAL %.1f (%.1f%%)\n",
                         double(g_texDecAllocNs) / 1e6, pc(g_texDecAllocNs),
                         double(g_texDecBaseNs) / 1e6, pc(g_texDecBaseNs),
                         double(g_texDecMipNs) / 1e6, pc(g_texDecMipNs),
@@ -25331,6 +26261,7 @@ void VkRenderer_DumpStats()
                         double(g_texDecScanNs) / 1e6, pc(g_texDecScanNs),
                         double(g_texDecGuardNs) / 1e6, pc(g_texDecGuardNs),
                         double(g_texDecImageNs) / 1e6, pc(g_texDecImageNs),
+                        double(g_texDecGoldenNs) / 1e6, pc(g_texDecGoldenNs),
                         double(g_texDecodeNs - std::min(named, g_texDecodeNs)) / 1e6,
                         pc(g_texDecodeNs - std::min(named, g_texDecodeNs)));
                 fprintf(stderr,
@@ -25510,6 +26441,53 @@ void VkRenderer_DumpStats()
                     double(g_gpN[c]) / f,
                     g_gpN[c] ? double(g_gpNs[c]) / double(g_gpN[c]) : 0.0);
         }
+        // THE INVOCATION CENSUS (CW_VK_GPU_STATS). Per pass class: primitives in, vertex
+        // invocations, fragment invocations — and fragment invocations per INTERNAL
+        // PIXEL, which is the overdraw factor and the first number a GPU budget needs.
+        {
+            bool any = false;
+            for (int c = 0; c < kGpClasses; ++c)
+                any = any || g_stN[c];
+            if (any)
+            {
+                // The VISIBLE internal resolution, not the EDRAM stand-in (which carries the
+                // 1024-row guest surface below the 720 the title presents from): overdraw
+                // is "how many times the screen was shaded", and the screen is 1920x1080.
+                const double px = double(g_internalW.load()) * double(g_internalH.load());
+                uint64_t tot[kStCounters] = {};
+                fprintf(stderr,
+                        "[vk]   INVOCATION CENSUS (CW_VK_GPU_STATS) — per frame, over %llu "
+                        "frames; overdraw = FS invocations / %ux%u internal pixels "
+                        "(overflow %llu, bad reads %llu)\n",
+                        (unsigned long long)g_gpFrames, g_internalW.load(),
+                        g_internalH.load(),
+                        (unsigned long long)g_stOverflow, (unsigned long long)g_stBadRead);
+                for (int c = 0; c < kGpClasses; ++c)
+                {
+                    if (!g_stN[c])
+                        continue;
+                    for (uint32_t k = 0; k < kStCounters; ++k)
+                        tot[k] += g_stSum[c][k];
+                    fprintf(stderr,
+                            "[vk]     %-20s %7.2f passes  IA prims %9.0f  VS inv %10.0f  "
+                            "clip prims %9.0f  FS inv %11.0f  = %.2f x pixels  "
+                            "(%.1f VS inv/prim)\n",
+                            kGpNames[c], double(g_stN[c]) / f, double(g_stSum[c][1]) / f,
+                            double(g_stSum[c][2]) / f, double(g_stSum[c][4]) / f,
+                            double(g_stSum[c][5]) / f, double(g_stSum[c][5]) / f / px,
+                            g_stSum[c][1] ? double(g_stSum[c][2]) / double(g_stSum[c][1])
+                                          : 0.0);
+                }
+                fprintf(stderr,
+                        "[vk]     %-20s          IA prims %9.0f  VS inv %10.0f  "
+                        "clip prims %9.0f  FS inv %11.0f  = %.2f x pixels\n",
+                        "ALL PASSES", double(tot[1]) / f, double(tot[2]) / f,
+                        double(tot[4]) / f, double(tot[5]) / f, double(tot[5]) / f / px);
+                for (uint32_t k = 0; k < kStCounters; ++k)
+                    fprintf(stderr, "[vk]       %-18s %14.0f /frame\n", kStNames[k],
+                            double(tot[k]) / f);
+            }
+        }
         fprintf(stderr,
                 "[vk]     resolve copies moved %.2f Mpixel/frame (%.1f full %ux%u "
                 "screens' worth)\n",
@@ -25538,7 +26516,7 @@ void VkRenderer_DumpStats()
         // overhead on a 96x45 bloom target. Truncated at 16 rows per class with the tail
         // SUMMED rather than dropped, because a silently truncated census reads as a
         // complete one (gotcha 3).
-        for (int c = kGpPassEmpty; c <= kGpPassBig; ++c)
+        for (int c = kGpPassEmpty; c <= kGpPassShadow; ++c)
         {
             if (g_gpExtents[c].empty())
                 continue;
@@ -25979,6 +26957,19 @@ void VkRenderer_DumpStats()
                     (unsigned long long)std::get<1>(byDead[i]),
                     double(std::get<0>(byDead[i])) / 1e9, std::get<3>(byDead[i]));
     }
+    if (R->persistDev.buffer)
+        fprintf(stderr,
+                "[vk]   store mirror: %.2f MB/frame copied host->VRAM in %.1f copies/frame "
+                "over the run; persist hits bound the MIRROR %.1f%% of the time (%llu dev, "
+                "%llu host)\n",
+                R->frame ? double(R->mirrorBytes) / double(R->frame) / 1048576.0 : 0.0,
+                R->frame ? double(R->mirrorCopies) / double(R->frame) : 0.0,
+                (R->mirrorHitsDev + R->mirrorHitsHost)
+                    ? 100.0 * double(R->mirrorHitsDev) /
+                          double(R->mirrorHitsDev + R->mirrorHitsHost)
+                    : 0.0,
+                (unsigned long long)R->mirrorHitsDev,
+                (unsigned long long)R->mirrorHitsHost);
     fprintf(stderr, "[vk]   pipelines=%zu shaders=%zu textures=%zu arenaHighWater=%llu KB\n",
             R->pipelines.size(), R->shadersMap.size(), TexSize(),
             (unsigned long long)(R->arenaHighWater >> 10));
@@ -26515,3 +27506,147 @@ void VkRenderer_DumpStats()
     }
 }
 
+
+// ===================================================================================
+// `cw_runtime --diag` — the Vulkan half (part 105, docs/steam-deck-plan.md §3 item 1)
+// ===================================================================================
+// Everything bring-up would decide, printed for a device that is never created: every
+// physical device the loader sees with its driver's own name and version, the one the
+// renderer would pick, the requirements table verdict on it, the EDRAM depth format,
+// the MSAA sample counts and the device-local memory. One line per fact so a player
+// can paste the block into an issue. Returns false when the loader has no device or
+// the pick fails the table — the exit code a script can read.
+bool VkRenderer_Diag()
+{
+    const char* T = "[diag] vulkan:";
+    uint32_t loaderVer = VK_API_VERSION_1_0;
+    if (vkEnumerateInstanceVersion)
+        vkEnumerateInstanceVersion(&loaderVer);
+    fprintf(stderr, "%s loader instance version %u.%u.%u\n", T, VK_VERSION_MAJOR(loaderVer),
+            VK_VERSION_MINOR(loaderVer), VK_VERSION_PATCH(loaderVer));
+
+    VkApplicationInfo app{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
+    app.pApplicationName = "cw_runtime --diag";
+    app.apiVersion = VK_API_VERSION_1_3;
+    VkInstanceCreateInfo ici{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+    ici.pApplicationInfo = &app;
+    VkInstance inst = VK_NULL_HANDLE;
+    const VkResult ir = vkCreateInstance(&ici, nullptr, &inst);
+    if (ir != VK_SUCCESS)
+    {
+        fprintf(stderr, "%s vkCreateInstance FAILED: VkResult %d — no Vulkan loader/ICD "
+                        "usable from this process (is a Vulkan driver installed?)\n",
+                T, int(ir));
+        return false;
+    }
+    uint32_t count = 0;
+    vkEnumeratePhysicalDevices(inst, &count, nullptr);
+    std::vector<VkPhysicalDevice> devices(count);
+    vkEnumeratePhysicalDevices(inst, &count, devices.data());
+    fprintf(stderr, "%s %u physical device%s\n", T, count, count == 1 ? "" : "s");
+    if (devices.empty())
+    {
+        vkDestroyInstance(inst, nullptr);
+        return false;
+    }
+    // The same pick as CreateDevice: the first discrete GPU, else the first device.
+    VkPhysicalDevice pick = devices[0];
+    for (VkPhysicalDevice d : devices)
+    {
+        VkPhysicalDeviceProperties p{};
+        vkGetPhysicalDeviceProperties(d, &p);
+        if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+        {
+            pick = d;
+            break;
+        }
+    }
+    bool ok = true;
+    for (uint32_t i = 0; i < count; i++)
+    {
+        DeviceCaps c;
+        QueryDeviceCaps(devices[i], c);
+        fprintf(stderr, "%s   [%u] %s (%s) Vulkan %u.%u.%u vendor %#06x device %#06x%s\n", T,
+                i, c.props.deviceName, DeviceTypeName(c.props.deviceType),
+                VK_VERSION_MAJOR(c.props.apiVersion), VK_VERSION_MINOR(c.props.apiVersion),
+                VK_VERSION_PATCH(c.props.apiVersion), c.props.vendorID, c.props.deviceID,
+                devices[i] == pick ? "  <- the renderer would use this one" : "");
+        std::string tag = std::string(T) + "      ";
+        PrintDriverLine(c, tag.c_str());
+        if (devices[i] != pick)
+            continue;
+
+        if (c.props.apiVersion < VK_API_VERSION_1_3)
+        {
+            fprintf(stderr, "%s   VERDICT: CANNOT run the renderer — Vulkan 1.3 is required "
+                            "and this device reports %u.%u\n", T,
+                    VK_VERSION_MAJOR(c.props.apiVersion), VK_VERSION_MINOR(c.props.apiVersion));
+            ok = false;
+        }
+        VkPhysicalDeviceVulkan12Features r12{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES
+        };
+        VkPhysicalDeviceVulkan13Features r13{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES
+        };
+        VkPhysicalDeviceFeatures2 rf2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+        std::vector<const char*> missing;
+        fprintf(stderr, "%s   features the renderer asks for:\n", T);
+        EvaluateRequirements(c, rf2, r12, r13, missing, T, /*listAll=*/true);
+        if (missing.empty())
+            fprintf(stderr, "%s   every REQUIRED feature is present\n", T);
+        else
+        {
+            fprintf(stderr, "%s   VERDICT: CANNOT run the renderer — missing REQUIRED:", T);
+            for (const char* m : missing)
+                fprintf(stderr, " %s", m);
+            fprintf(stderr, "\n");
+            ok = false;
+        }
+        fprintf(stderr, "%s   VK_KHR_swapchain: %s (needed to present into a window)\n", T,
+                c.HasExt(VK_KHR_SWAPCHAIN_EXTENSION_NAME) ? "present" : "ABSENT");
+        fprintf(stderr, "%s   ray query (parked feature): %s\n", T,
+                (c.HasExt("VK_KHR_acceleration_structure") && c.HasExt("VK_KHR_ray_query")
+                 && c.HasExt("VK_KHR_deferred_host_operations"))
+                    ? "supported" : "unsupported (fine; RT is parked)");
+
+        bool d24 = false;
+        const VkFormat depth = PickEdramDepthFormat(devices[i], &d24);
+        fprintf(stderr, "%s   D24_UNORM_S8_UINT sampleable: %s -> EDRAM depth format %s%s\n", T,
+                d24 ? "yes" : "no",
+                depth == VK_FORMAT_D24_UNORM_S8_UINT ? "D24_UNORM_S8_UINT"
+                                                     : "D32_SFLOAT_S8_UINT",
+                EnvOn("CW_VK_DEPTH_FLOAT") ? " (CW_VK_DEPTH_FLOAT)" : "");
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(devices[i], VK_FORMAT_D32_SFLOAT_S8_UINT, &fp);
+        if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT))
+            fprintf(stderr, "%s   D32_SFLOAT_S8_UINT is not a depth attachment here — a "
+                            "device with neither depth format cannot run the renderer\n", T);
+        const VkSampleCountFlags sup = c.props.limits.framebufferColorSampleCounts
+                                       & c.props.limits.framebufferDepthSampleCounts;
+        fprintf(stderr, "%s   framebuffer sample counts: colour %#x depth %#x -> the 2x MSAA "
+                        "default %s\n", T,
+                unsigned(c.props.limits.framebufferColorSampleCounts),
+                unsigned(c.props.limits.framebufferDepthSampleCounts),
+                (sup & 2) ? "is available" : (sup & 4) ? "is unavailable; 4x would be used"
+                                                        : "is unavailable; single-sample");
+        VkPhysicalDeviceMemoryProperties mp{};
+        vkGetPhysicalDeviceMemoryProperties(devices[i], &mp);
+        uint64_t local = 0;
+        for (uint32_t h = 0; h < mp.memoryHeapCount; h++)
+            if (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                local += mp.memoryHeaps[h].size;
+        fprintf(stderr, "%s   device-local memory: %llu MB in %u heap%s; max 2D image %u; "
+                        "sampled images per stage %u\n", T,
+                (unsigned long long)(local >> 20), mp.memoryHeapCount,
+                mp.memoryHeapCount == 1 ? "" : "s", c.props.limits.maxImageDimension2D,
+                c.props.limits.maxPerStageDescriptorSampledImages);
+        fprintf(stderr, "%s   timestamps: period %.3f ns%s\n", T,
+                double(c.props.limits.timestampPeriod),
+                c.props.limits.timestampPeriod > 0 ? "" : " (GPU frame time unavailable)");
+    }
+    fprintf(stderr, "%s VERDICT: the renderer %s on this machine's pick\n", T,
+            ok ? "CAN run" : "CANNOT run");
+    vkDestroyInstance(inst, nullptr);
+    return ok;
+}

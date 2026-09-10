@@ -13,9 +13,12 @@
 # libc is deliberate for the opposite reason: glibc is not relocatable, and a bundled
 # copy loaded against the host's ld.so is the packaging defect that produces
 # `symbol lookup error` on someone else's distribution. Which means the artifact
-# inherits the BUILD MACHINE's glibc floor, and that is a real limitation rather than
-# something this script solves — see the note it prints at the end. The proper answers
-# are an old build base or an AppImage runtime, and both are E.2 work.
+# inherits the glibc floor of the machine that LINKED it — so the release is linked on
+# an old base (tools/release_build_oldbase.sh, Ubuntu 22.04 = glibc 2.35, part 104) and
+# this script runs INSIDE that container, because the ldd it bundles from must resolve
+# libstdc++ to the old base's copy and not this machine's. The floor is computed and
+# printed at the end, per file, and a floor equal to the running machine's glibc is
+# called out as "not built on the old base".
 #
 # The RPATH does the finding, not a launcher script: runtime/CMakeLists.txt links the
 # release binary with $ORIGIN/lib, so the bundle is what loads even when the player runs
@@ -31,6 +34,10 @@ BUILD=${1:-$ROOT/runtime/build-release}
 OUT=${2:-$ROOT/dist}
 NAME=CaseWestRecomp
 STAGE=$OUT/$NAME
+# Where the ffmpeg source and the SDL2 prefix are: the host scripts' defaults, or wherever
+# tools/release_build_oldbase.sh put them for a container build (it exports both).
+FFWORK=${CW_FFMPEG_WORK:-/var/tmp/cw-ffmpeg-build}
+SDL2PFX=${CW_SDL2_PREFIX:-$ROOT/thirdparty/sdl2}
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -160,6 +167,25 @@ print(f"    prewarm.keys                    {n} keys")
 PY
 cp "$ROOT/tools/release/prewarm.keys" "$STAGE/"
 
+# THE VERTEX-SHADER RECIPES (part 102): per runtime vertex shader, which disc template
+# and which dwords the title's own bind patches — 102 recipes, ~10 KB — so the first-run
+# pass can translate the vertex half BEFORE the first frame and the seed above builds
+# every pipeline at boot on session one. Regenerate with tools/vs_recipes.py whenever
+# the seed is redone; header-checked here like the seed (magic ZCVR, v1).
+[ -f "$ROOT/tools/release/vs_recipes.bin" ] || fail "no tools/release/vs_recipes.bin"
+python3 - "$ROOT/tools/release/vs_recipes.bin" <<'PY' || fail "vs_recipes.bin failed its header check"
+import struct, sys
+d = open(sys.argv[1], 'rb').read()
+m, v, n = struct.unpack_from('<III', d, 0)
+assert m == 0x5256435A and v == 1 and n > 0, (hex(m), v, n)
+off = 12
+for i in range(n):
+    th, rh, dw, pc = struct.unpack_from('<QQII', d, off); off += 24 + pc * 8
+assert off == len(d), (off, len(d))
+print(f"    vs_recipes.bin                  {n} recipes")
+PY
+cp "$ROOT/tools/release/vs_recipes.bin" "$STAGE/"
+
 # THE KEY-CAP CHIPS (release-github §0): the 26 keyboard prompt icons as finished
 # DXT5 texel blobs — OUR art, no Capcom byte — which the first-run overlay
 # generator (host/overlay_gen.cpp) composes into the player's own fecmn.tex. All
@@ -213,12 +239,12 @@ echo "==> generating THIRD_PARTY.md"
     echo 'They are DYNAMICALLY linked and shipped as separate files in `lib/`, so they'
     echo 'can be replaced with your own build.'
     echo
-    if [ -f /var/tmp/cw-ffmpeg-build/ffmpeg-8.1.2.tar.xz ]; then
+    if [ -f "$FFWORK/ffmpeg-8.1.2.tar.xz" ]; then
         echo 'Corresponding source:'
         echo
         echo '```'
         echo 'https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz'
-        sha256sum /var/tmp/cw-ffmpeg-build/ffmpeg-8.1.2.tar.xz | awk '{print "sha256 " $1}'
+        sha256sum "$FFWORK/ffmpeg-8.1.2.tar.xz" | awk '{print "sha256 " $1}'
         echo '```'
         echo
     fi
@@ -229,17 +255,21 @@ echo "==> generating THIRD_PARTY.md"
     echo '```'
 } > "$STAGE/THIRD_PARTY.md"
 
-if [ -f /var/tmp/cw-ffmpeg-build/ffmpeg-8.1.2/COPYING.LGPLv2.1 ]; then
-    cp /var/tmp/cw-ffmpeg-build/ffmpeg-8.1.2/COPYING.LGPLv2.1 "$STAGE/lib/LICENSE.ffmpeg"
+if [ -f "$FFWORK/ffmpeg-8.1.2/COPYING.LGPLv2.1" ]; then
+    cp "$FFWORK/ffmpeg-8.1.2/COPYING.LGPLv2.1" "$STAGE/lib/LICENSE.ffmpeg"
 fi
-if [ -f "$ROOT/thirdparty/sdl2/share/licenses/SDL2/LICENSE.txt" ]; then
-    cp "$ROOT/thirdparty/sdl2/share/licenses/SDL2/LICENSE.txt" "$STAGE/lib/LICENSE.SDL2"
+if [ -f "$SDL2PFX/share/licenses/SDL2/LICENSE.txt" ]; then
+    cp "$SDL2PFX/share/licenses/SDL2/LICENSE.txt" "$STAGE/lib/LICENSE.SDL2"
 fi
 
 echo "==> archive"
 mkdir -p "$OUT"
 TAR=$OUT/$NAME-linux-x86_64.tar.zst
 rm -f "$TAR"
+# Part 105: the runtime writes cw_runtime.log (and --diag writes cw_diag.txt) beside its
+# data root, which for the stage IS the stage — so a gate that ran the staged exe leaves
+# a log in it, and a re-package after a gate would ship someone's log. Never archive one.
+rm -f "$STAGE"/cw_runtime.log "$STAGE"/cw_runtime.log.1 "$STAGE"/cw_diag.txt "$STAGE"/cw_diag.txt.1
 tar --zstd -cf "$TAR" -C "$OUT" "$NAME"
 sha256sum "$TAR" > "$TAR.sha256"
 
@@ -254,16 +284,40 @@ if [ -n "$KEEP" ]; then
     echo "    play-copy assets restored into the stage (the archive carries the clean skeleton)"
 fi
 
+# THE GLIBC FLOOR, COMPUTED AND PRINTED (release-plan E.2, part 104). Until part 104 this
+# script printed "this artifact inherits the build machine's glibc" as a known limitation.
+# Now the floor is READ off the artifact: the highest GLIBC_x.y version any bundled ELF
+# imports — the executable AND every .so in lib/, because a bundled library with a higher
+# floor than the executable fails just as surely, one dlopen later (libdxcompiler.so is
+# the one that sets it: GLIBC_2.34, from a prebuilt this repo does not compile). It is
+# printed per file so a regression names its file, and compared with the build machine's
+# own glibc: equal means the build was NOT made on the old base and the floor is this
+# machine's, which is the state tools/release_build_oldbase.sh exists to prevent.
+echo
+echo "==> glibc floor of the artifact (the OLDEST distribution it starts on)"
+floor=""
+for f in "$STAGE/cw_runtime" "$STAGE"/lib/*.so*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    v=$(objdump -T "$f" 2>/dev/null | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -t. -k1,1n -k2,2n -u | tail -1)
+    printf '    %-30s %s\n' "$(basename "$f")" "${v:-(no versioned glibc imports)}"
+    [ -n "$v" ] && floor=$(printf '%s\n%s\n' "$floor" "$v" | grep . | sort -t_ -k2,2V | tail -1)
+done
+# sed, not head: `head -1` closes the pipe after one line, ldd takes SIGPIPE, and under
+# `set -o pipefail` that made this assignment exit the script SILENTLY, right here.
+here=$(ldd --version 2>/dev/null | sed -n '1{s/.* //;p}')
+echo "    FLOOR: ${floor#GLIBC_}   (this machine: $here${CW_OLDBASE_INSIDE:+, the old-base container})"
+if [ -n "${CW_OLDBASE_INSIDE:-}" ]; then
+    : # inside the container the floor EQUALS this machine's by construction; no alarm
+elif [ "${floor#GLIBC_}" = "$here" ]; then
+    cat <<MSG
+    !! the floor EQUALS the build machine's glibc: this was not built on the old base.
+       tools/release_build_oldbase.sh is the release path (release-plan E.2); a bundle
+       built here refuses to start on anything older than this machine.
+MSG
+fi
 cat <<MSG
 
-==> KNOWN LIMITATION, stated rather than discovered by a player
-    This artifact inherits the glibc floor of the machine it was built on
-    ($(ldd --version | head -1)).
-    It will refuse to start on any distribution older than that, with a
-    "GLIBC_x.yz not found" message. Fixing it properly means building on an old
-    base image or shipping an AppImage runtime, and that is release-plan E.2 work
-    that has not been done.
-
-==> NEXT: prove the bundle is what loads (A.4's gate)
+==> NEXT: prove the bundle is what loads (A.4's gate), in a container OLDER than the floor
     tools/release_gate_clean_container.sh $STAGE
+    tools/release_package_appimage.sh        # then the AppImage, from this stage
 MSG

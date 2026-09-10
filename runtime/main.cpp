@@ -1,4 +1,4 @@
-// Host runtime for the Dead Rising 2: Case Zero XenonRecomp port.
+// Host runtime for the Dead Rising 2: Case West XenonRecomp port.
 //
 // Phase 1 boot sequence (docs/runtime-plan.md, docs/phase1-notes.md):
 //   reserve guest memory + register the 57,822 recompiled functions (Memory::Init)
@@ -30,6 +30,13 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#include <windows.h>
+#elif !defined(__APPLE__)
+#include <gnu/libc-version.h>
+#include <sys/utsname.h>
+#endif
+
 #include <image.h> // XenonUtils: Image::ParseImage (devkit-key + LZX; see gotchas 15/16)
 
 #include "cpu/thread_budget.h"
@@ -43,6 +50,7 @@
 #include "gpu/vk_renderer.h"
 #include "host/first_run.h"
 #include "host/host_paths.h"
+#include "host/log_file.h"
 #include "host/overlay_gen.h"
 #include "host/stfs_extract.h"
 #include "host/settings.h"
@@ -162,6 +170,108 @@ int RunSmoke()
     return 0;
 }
 
+// `--diag`: the machine, one line per fact. The Vulkan and SDL halves live with the
+// code whose decisions they report (VkRenderer_Diag, Host_DiagVideo); this prints the
+// OS, the C library, the CPU and thread budget, the paths and what the first-run
+// check would say, the session variables that decide a video driver, and the
+// settings a player may have carried over from another machine.
+bool RunDiag()
+{
+    const char* T = "[diag]";
+    fprintf(stderr, "%s cw_runtime --diag (built %s %s, %s)\n", T, __DATE__, __TIME__,
+#if defined(__clang__)
+            "clang " __clang_version__
+#elif defined(_MSC_VER)
+            "msvc"
+#else
+            "gcc " __VERSION__
+#endif
+    );
+#if defined(_WIN32)
+    {
+        // RtlGetVersion tells the truth where GetVersionEx lies past Windows 8, and
+        // wine_get_version in ntdll is the one export that names a Proton/Wine run —
+        // the Steam Deck's Windows-build case, where "Windows 10" would be a fiction.
+        typedef LONG(WINAPI * RtlGetVersionFn)(PRTL_OSVERSIONINFOW);
+        typedef const char*(CDECL * WineVersionFn)(void);
+        RTL_OSVERSIONINFOW vi{};
+        vi.dwOSVersionInfoSize = sizeof vi;
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        auto rtl = nt ? (RtlGetVersionFn)GetProcAddress(nt, "RtlGetVersion") : nullptr;
+        if (rtl)
+            rtl(&vi);
+        auto wine = nt ? (WineVersionFn)GetProcAddress(nt, "wine_get_version") : nullptr;
+        fprintf(stderr, "%s os: Windows %lu.%lu build %lu%s%s\n", T, vi.dwMajorVersion,
+                vi.dwMinorVersion, vi.dwBuildNumber, wine ? " under Wine " : "",
+                wine ? wine() : "");
+        if (const char* p = getenv("STEAM_COMPAT_TOOL_PATHS"))
+            fprintf(stderr, "%s proton: STEAM_COMPAT_TOOL_PATHS=%s\n", T, p);
+    }
+#elif defined(__APPLE__)
+    fprintf(stderr, "%s os: macOS\n", T);
+#else
+    {
+        struct utsname u{};
+        uname(&u);
+        fprintf(stderr, "%s os: %s %s %s; glibc %s\n", T, u.sysname, u.release, u.machine,
+                gnu_get_libc_version());
+        std::ifstream osr("/etc/os-release");
+        std::string line;
+        while (osr && std::getline(osr, line))
+            if (line.rfind("PRETTY_NAME=", 0) == 0 || line.rfind("VERSION_ID=", 0) == 0)
+                fprintf(stderr, "%s os-release: %s\n", T, line.c_str());
+    }
+#endif
+    // The variables that decide a video driver and name a Deck. Printed whether set
+    // or not, so an absent one is a fact and not a line nobody thought to print.
+    for (const char* v : { "SteamDeck", "SteamOS", "GAMESCOPE_WAYLAND_DISPLAY",
+                           "XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP", "XDG_SESSION_TYPE",
+                           "WAYLAND_DISPLAY", "DISPLAY", "SDL_VIDEODRIVER", "APPIMAGE",
+                           "STEAM_COMPAT_DATA_PATH", "CW_ROOT", "CW_VKDRAW", "CW_LAUNCHER" })
+    {
+        const char* val = getenv(v);
+        fprintf(stderr, "%s env: %s=%s\n", T, v, val ? val : "(unset)");
+    }
+    ThreadBudget_Report();
+    HostPaths::Report();
+    fprintf(stderr, "%s saved games: %s\n", T, HostPaths::SavedGames().string().c_str());
+    {
+        const std::string xex = HostPaths::GameXex().string();
+        const FirstRun::Status st = FirstRun::Check(xex);
+        const char* what = st == FirstRun::Status::Ready         ? "ready (package unpacked, "
+                                                                   "shader cache present)"
+                           : st == FirstRun::Status::NoPackage   ? "NO PACKAGE in assets/package"
+                           : st == FirstRun::Status::NoGame      ? "package present, not yet "
+                                                                   "unpacked (first run will)"
+                                                                 : "game present, no shader "
+                                                                   "cache (first run builds it)";
+        fprintf(stderr, "%s first-run state: %s\n", T, what);
+        std::error_code ec;
+        size_t spv = 0;
+        for (const auto& e : std::filesystem::directory_iterator(HostPaths::ShaderCache(), ec))
+            if (e.path().extension() == ".spv")
+                spv++;
+        fprintf(stderr, "%s shader cache: %zu .spv modules at %s\n", T, spv,
+                HostPaths::ShaderCache().string().c_str());
+    }
+    {
+        // The settings file may have come from another machine (a copied save folder):
+        // a persisted 2560x1440 on a 1280x800 Deck is exactly the H6 case.
+        ContentSetRootFromGameDir(HostPaths::Game().string());
+        const std::string sp = (ContentSettingsDir() / "cw_settings.txt").string();
+        Settings_Load(sp);
+        uint32_t w = 0, h = 0;
+        Settings_InternalRes(w, h);
+        fprintf(stderr, "%s settings (%s): display mode %d, internal res %ux%u, vsync %s, "
+                        "fps cap %d\n", T, sp.c_str(), int(Settings_DisplayMode()), w, h,
+                Settings_VSync() ? "on" : "off", Settings_FpsCap());
+    }
+    Host_DiagVideo();
+    const bool ok = VkRenderer_Diag();
+    fprintf(stderr, "%s done — paste everything above into the issue\n", T);
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -172,7 +282,7 @@ int main(int argc, char** argv)
     // Release D.2: the in-process cache builder. This is the same translation D.4's
     // first-sight path uses at [imload] time, run over a directory of microcode dumps —
     // and it is the standing gate for the two deliberate duplicates in
-    // gpu/shader_translator.cpp: run it over ~/DR2CZ-troubleshooting/ucode-dumps and
+    // gpu/shader_translator.cpp: run it over ~/DR2CW-troubleshooting/ucode-dumps and
     // diff against assets/shader_spv; every byte must match.
     if (argc > 1 && strcmp(argv[1], "--translate-shaders") == 0)
     {
@@ -195,7 +305,9 @@ int main(int argc, char** argv)
                            "deadrisingepilogue-ps.big";
         const std::filesystem::path out =
             argc > 3 ? std::filesystem::path(argv[3]) : HostPaths::ShaderCache();
-        return ShaderPrebuild::BuildFromDisc(bank, out);
+        return ShaderPrebuild::BuildFromDisc(bank, out, {},
+                                             bank.parent_path() / "deadrisingepilogue-vs.big",
+                                             HostPaths::VsRecipes());
     }
 
     // Release §2.3 step 2: the extract by hand — what the first-run hook below runs
@@ -234,6 +346,24 @@ int main(int argc, char** argv)
         }
         return 0;
     }
+
+    // THE DIAGNOSTIC MODE (part 105, docs/steam-deck-plan.md §3 item 1): print every
+    // fact a bug report needs and exit. Written for a player pasting into an issue —
+    // one line per fact — and it goes through the same log tee as a game run, into
+    // cw_diag.txt beside the data root, so a Steam Deck in Game Mode (no console) still
+    // leaves a file. Exit code: 0 when the renderer can run on this machine's pick.
+    if (argc > 1 && strcmp(argv[1], "--diag") == 0)
+    {
+        LogFile::Begin(HostPaths::Root(), "cw_diag.txt");
+        const bool ok = RunDiag();
+        LogFile::End();
+        return ok ? 0 : 1;
+    }
+
+    // THE LOG FILE (part 105), from before the first path line: cw_runtime.log beside
+    // the data root — the bundle directory, or beside the .AppImage — rotated once.
+    // A player who double-clicked has no console; this is what they attach instead.
+    LogFile::Begin(HostPaths::Root(), "cw_runtime.log");
 
     // Where everything is, decided once and printed once. It used to be
     // "../../assets/game/default.xex" — CWD-relative, which is why every recipe in
@@ -349,7 +479,8 @@ int main(int argc, char** argv)
         // over; if the pass cannot run (game not unpacked, bank unreadable) it falls
         // through and the gate names what is actually missing. The marker files keep
         // this away from developer caches built from dumps (shader_prebuild.h).
-        if (renderer && ShaderPrebuild::WantedAtBoot(HostPaths::ShaderCache()))
+        if (renderer && ShaderPrebuild::WantedAtBoot(HostPaths::ShaderCache(),
+                                                     HostPaths::VsRecipes()))
         {
             const std::filesystem::path bank = HostPaths::Game() / "data" / "shaders" /
                                               "deadrisingepilogue-ps.big";
@@ -364,7 +495,8 @@ int main(int argc, char** argv)
                         snprintf(l, sizeof l, "PREPARING SHADERS - %u OF %zu",
                                  done, total);
                         Host_ProgressUpdate(l, total ? float(done) / float(total) : 1.f);
-                    });
+                    },
+                    bank.parent_path() / "deadrisingepilogue-vs.big", HostPaths::VsRecipes());
             }
         }
         // Release §0: the KB/M prompt overlay, generated on the player's machine
@@ -417,6 +549,7 @@ int main(int argc, char** argv)
             ::FeProbe_Report();
             ::VkRenderer_SavePipelineCache();
             fflush(nullptr);
+            LogFile::Flush(2000);
             std::_Exit(128 + s);
         });
 
@@ -622,5 +755,6 @@ int main(int argc, char** argv)
         Host_WindowRun();
     }
     guest.join();
+    LogFile::End();
     return 0;
 }

@@ -53,6 +53,10 @@ bool Host_WindowInit();
 // drawing, and MUST be called from the same thread as Begin — the SDL rule the
 // whole window module is built around.
 bool Host_ProgressBegin(const char* title);
+// `cw_runtime --diag` (part 105): SDL's version, its video drivers, the one that takes
+// on this session and every display's desktop mode. Inits and quits the video
+// subsystem itself; never opens a window.
+void Host_DiagVideo();
 void Host_ProgressUpdate(const char* line, float fraction);
 void Host_ProgressEnd();
 
@@ -178,6 +182,33 @@ bool Host_ConsumeDebugMenuPressed();
 void Host_RequestDebugJump();
 void Host_RequestDebugEnter();
 void Host_RequestDebugMenu();
+
+// THE WINDOW FOLLOWS THE INTERNAL RESOLUTION (part 108, operator instruction: "when we
+// are in windowed mode when changing resolution it also resize the window"). The
+// renderer calls this from its live-apply seam, on the pump thread, once the new
+// internal resolution is in effect; the window thread consumes it at its next loop
+// turn and resizes a WINDOWED window to WxH (clamped, aspect kept, to the display's
+// usable bounds, then re-centred). Borderless/fullscreen windows are sized by the
+// display and ignore it; CW_WINDOW_SIZE / CW_WINDOW_MAXIMIZED pin the window for a
+// measurement and win over it. Outside the CW_HAVE_SDL split for the same reason as the
+// Request* functions above: the caller has no window to ask.
+void Host_WindowFollowInternalRes(uint32_t w, uint32_t h);
+
+// CONTROLLER VIBRATION (part 108, from the first public player reports: "no
+// vibration"). The kernel's XamInputSetState hands the title's two motor speeds here,
+// XInput's units (0..65535; left = the low-frequency motor, right = the high-frequency
+// one), from whatever guest thread ran the title's rumble path. The window thread
+// consumes the newest pair at its next loop turn and drives the SDL controller's
+// motors; XInput has no duration, so a held non-zero pair is re-issued every 250 ms
+// with a 700 ms duration, which is what keeps a long effect alive across the gap
+// between two title updates without a burst of device writes. Only pad 0 has a
+// physical controller behind it. `CW_NO_RUMBLE=1` is the off switch (the runtime as
+// it was before this part), `CW_RUMBLE_TRACE=1` prints every pair and the driver's
+// answer, and `CW_RUMBLE_TEST=1` pulses the motors once at window creation
+// regardless of the guest — the positive control that separates "this pad cannot
+// rumble under SDL" from "the title never asked". Outside the CW_HAVE_SDL split for
+// the same reason as the Request* functions above.
+void Host_PadRumble(uint32_t userIndex, uint16_t leftMotor, uint16_t rightMotor);
 
 // F9 — dump every resolve snapshot of the NEXT frame, on demand, into
 // `CW_VK_SNAP_DUMP`'s directory. The renderer consumes the edge at present time.
