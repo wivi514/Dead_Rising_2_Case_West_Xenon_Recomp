@@ -170,6 +170,21 @@ minute of play:
   (`tools/release_build_oldbase.sh` — `podman tag cz-oldbase:jammy
   cw-oldbase:jammy` first), then v1.0.1 (`docs/release-notes-v1.0.1.md`).
 
+## 3c. TWO THINGS THE IMPORT LEFT OPEN (both in `imported-fixes.md` §8's tail)
+
+1. **`config/cw_soak_route.seq` IS STALE — the crowd route no longer reaches the
+   crowd.** Three runs peak at ~900 draws against a 4,500 gate, and the PRE-IMPORT
+   binary run the same night fails identically at 902, so this predates the import.
+   Every crowd measurement on this box is blocked until the route is re-recorded,
+   which needs one operator play-through (`tools/cw_route_record.sh`). The mirror's
+   crowd benefit is currently the sibling's number, not ours.
+2. **An intermittent hang on the EXIT path, seen once, unattributed.** A run printed
+   its exit counters then sat until killed; every thread was queued behind one blocked
+   `write()` to fd 2, which part 11 turned into the log tee's pipe. Both tee copies of
+   that run are byte-identical and complete, which argues the reader was not behind.
+   Not reproduced in three later runs. **Settle it before v1.0.1 ships** — a hang on
+   exit is player-visible. One-variable test: the same route under `CW_NO_LOG_FILE=1`.
+
 ## 3b. THE NEXT ARTIFACT BUILD IS NOW A FULL ROUND, NOT A REPACKAGE
 
 The §1a recipe (rebuild both, re-gate, refresh hashes) still holds, with two
