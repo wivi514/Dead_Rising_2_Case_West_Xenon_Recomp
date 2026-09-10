@@ -716,3 +716,75 @@ counts quoted in the table above come from the unvalidated boots, which do dump.
   `make_icon.py` drew "CZ". All fixed by a grep for `cz\b|CZ_|prologue|DR2CZ` over the
   merged tree BEFORE the first build (gotcha 325's rule, applied at merge time).
 * `main.cpp`'s first line still said "Case Zero" from the original transplant. Fixed.
+
+### The performance audit the operator asked for (2026-09-09)
+
+*"You got all the performance improvement like mirror for crowd?"* — so every
+performance-bearing commit in the range was checked individually against this tree by a
+distinctive marker rather than assumed from the merge. **15 of 15 present:**
+
+| item | marker checked | present |
+|---|---|---|
+| stream-store device-local mirror (`544ccf2`) | `NO_STORE_MIRROR`, `vkCmdCopyBuffer` at the frame top, `TRANSFER_SRC` on the persist usage | yes |
+| `CW_VK_TRI1` / `CW_VK_VRAM_STORE` arms (`e4a59e8`) | both env names | yes |
+| `CW_VK_GPU_STATS` / `NULL_PS` / `SCISSOR_1PX` (`ff286b9`) | all three env names | yes |
+| the pass-extent census fix, blind since part 8 | reads `scissor.extent`, NOT `R->bound.scissor` | yes |
+| fence wait parked (`c324bfa`) | `CW_FENCE_PARK` in `fence_wait.cpp` | yes |
+| glyph scan finder + aligned pass (`bbba9f6`, `f08cdf3`) | `CW_KBM_SCAN_LEGACY`, `ScanAligned64` | yes |
+| three workers at four cores (`4d9cfc6`) | `floor 3@4c` | yes |
+| warm workers BELOW_NORMAL (`ab80b87`) | `ThreadBudget_SetLowPriority` | yes |
+| async boot pre-warm (`fcfd4ef`) | `CW_VK_SYNC_PREWARM` | yes |
+| first-run vertex pass (`370d02c`) | `CW_NO_VS_RECIPES` | yes |
+| MSAA as a setting (`1467d7b`) | `Settings_Msaa` | yes |
+| the clang-15 structured-binding fix (`c7ee332`) | `snapBinding` — the old-base build needs it | yes |
+
+**The first version of that audit printed MISSING on all fifteen.** The checker was
+broken, not the tree — a shell function whose test could never be true. Gotcha 25 at
+small scale, caught only because a row it printed MISSING had been read as present ten
+minutes earlier. A detector's own output is a claim about the detector first.
+
+The only performance work NOT taken is the golden texture store's (`200f5b9`, `1501bb0`,
+`ff48698`, `5871178`): a store this port never had, so its background writer, its pack
+file and its cache-dir fix have nothing here to improve.
+
+### The crowd A/B could NOT be run, and the reason is not the import
+
+The mirror is ON and BINDING — `persist hits bound the MIRROR 100.0% of the time
+(5,774,480 dev, 0 host)` — but **no frame-time number is claimed here**, because the
+replay route no longer reaches the crowd:
+
+| arm | peak windowed draws med | gate (needs >= 4500) |
+|---|---|---|
+| new binary, attempt 1 | 930 | REJECTED |
+| new binary, attempt 2 | 900 | REJECTED |
+| **PRE-IMPORT binary (`build-release`, 2026-09-06), run tonight** | **902** | **REJECTED** |
+
+The control is the old binary run NOW (gotchas 50/51/86), and it fails identically. So
+`config/cw_soak_route.seq` is STALE — the recorded press sequence desynchronises in the
+frontend and the run never leaves the menus — and it was stale before this import. The
+memory note [[debug-jump-recipe]] warns about exactly this class: recorded timings move
+under the runtime and a retyped press sequence stops landing.
+
+**What that costs**: the mirror's crowd benefit is taken on the sibling's measurement
+(8.84 -> 4.00 ms GPU at 1080p there), not on ours. Re-recording the route needs the
+operator to play it once; until then there is no admissible crowd A/B on this box.
+
+### OPEN — an intermittent hang on the EXIT path, seen once, NOT attributed
+
+The first route run did not die at its `timeout`: it printed its exit counter dump and
+then sat for 18 minutes until killed. A backtrace of the live process showed the jam:
+
+* one thread inside `write()` from stdio, holding stderr's FILE lock;
+* another blocked on that same lock inside `fprintf` (the graphics interrupt pump);
+* the guest's own threads blocked behind them.
+
+So everything was queued behind one blocked write to descriptor 2 — which part 11 turned
+into a PIPE feeding the new log tee. What argues against the tee being at fault: the
+tee's two copies of that run (the console redirect and `cw_runtime.log`) are
+**byte-identical and the same length**, so the reader was not behind when it stopped.
+
+**Not reproduced since** — the next three runs, including the pre-import control, all
+exited normally. Recorded rather than diagnosed because one occurrence is one sample.
+**The cheap next test is a one-variable arm**: run the route with `CW_NO_LOG_FILE=1`
+until it either hangs (the tee is innocent) or a hundred runs pass (it is not). A hang
+on exit would be player-visible, so this must be settled before v1.0.1 ships.
