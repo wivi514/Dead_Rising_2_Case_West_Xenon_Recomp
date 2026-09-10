@@ -68,6 +68,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Sibling XenonRecomp checkout: supplies simde (which ppc_context.h includes) and,
 # from phase 1, the XEX loader in XenonUtils.
 set(XENON_ROOT "$ENV{HOME}/GithubRepo/XenonRecomp" CACHE PATH "XenonRecomp source root")
+# Sibling XenonLive checkout: libxlive, which owns the account, the durable
+# achievement record and the server sync. Same convention as XENON_ROOT — a
+# checkout beside this one, statically linked, no shared runtime library.
+set(XLIVE_ROOT "$ENV{HOME}/GithubRepo/XenonLive" CACHE PATH "XenonLive source root")
 # CW_PPC_DIR overrides where the generated code comes from — CI points it at a
 # STUB tree from tools/gen_stub_ppc.py, because no runner may hold the game
 # (release-plan E.1). Unset, the sibling ppc/ is used as always.
@@ -300,6 +304,7 @@ add_executable(cw_runtime
     audio/audio_out.cpp              # phase A/V; stubs itself out without CW_HAVE_SDL
     kernel/content.cpp
     kernel/xex_imports.cpp
+    kernel/xlive_glue.cpp            # XenonLive: the account and achievements
     gpu/vd.cpp
     gpu/pm4.cpp
     # gpu/parallel_record.cpp — part 7's per-range secondaries + deferred replay, PARKED
@@ -381,6 +386,20 @@ else()
 endif()
 # dlopen for the DXC library (a no-op string on Windows, where LoadLibrary is used).
 target_link_libraries(cw_runtime PRIVATE ${CMAKE_DL_LIBS})
+
+# libxlive. REQUIRED at configure time for the same reason SDL2, Vulkan and
+# ffmpeg are: kernel/xlive_glue.cpp is unconditionally in the build, so a
+# missing checkout should be a build message naming what to clone, not a wall
+# of undefined symbols. It is inert at RUNTIME without an account, and
+# CW_NO_XLIVE=1 turns it off entirely.
+if(NOT EXISTS "${XLIVE_ROOT}/client/CMakeLists.txt")
+    message(FATAL_ERROR
+        "No XenonLive checkout at ${XLIVE_ROOT}.\n"
+        "  git clone <XenonLive> ${XLIVE_ROOT}\n"
+        "or point XLIVE_ROOT somewhere else.")
+endif()
+add_subdirectory("${XLIVE_ROOT}/client" "${CMAKE_CURRENT_BINARY_DIR}/xlive")
+target_link_libraries(cw_runtime PRIVATE xlive::client)
 
 if(CW_WINDOW)
     target_compile_definitions(cw_runtime PRIVATE CW_HAVE_SDL=1)
