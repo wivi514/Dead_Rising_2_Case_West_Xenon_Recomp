@@ -3,13 +3,13 @@
 **This is the text to paste into the GitHub Release body** (everything below the
 `---`) once the Windows leg exists. The v1.0.0 artifacts stay exactly as tested.
 
-**Built 2026-09-10 at source `7d5f42e`, on the OLD BASE** (Ubuntu 22.04 in a podman
+**Built 2026-09-10 at source `a950870`, on the OLD BASE** (Ubuntu 22.04 in a podman
 container, clang 15, with SDL2 and the LGPL ffmpeg compiled inside it):
 
 | artifact | bytes | sha256 |
 |---|---|---|
-| `CaseWestRecomp-linux-x86_64.tar.zst` | 28,353,124 | `20a7bb03624e8e1e94de3989a598c55c2edba73876edee50a538ba3d2e1ff7db` |
-| `CaseWestRecomp-linux-x86_64.AppImage` | 27,343,352 | `b97555e9bbfb83dd78fade8dbedd4982ce6ca99587b58ca0922367096b90dfb6` |
+| `CaseWestRecomp-linux-x86_64.tar.zst` | 28,349,411 | `f04c6829a5fb4269db1f45b1017ac58047753643ca217e3446d44ad66fa73f86` |
+| `CaseWestRecomp-linux-x86_64.AppImage` | 27,340,760 | `1d2b8495cbfe150798fff4efb661332f3187e77e6b885d6a1c2deeb69fd0f7ca` |
 | `CaseWestRecomp-windows-x86_64.zip` | — | **NOT REBUILT — czwin owes it** |
 
 **Gates run on both Linux artifacts:**
@@ -61,6 +61,9 @@ shader cache are reused.
 - **Keyboard: Q acts as the Y button everywhere the game reads it**, and the grapple
   QTE's face buttons follow the on-screen key art (Space / E / left-click / Q) instead
   of the DR2 PC WASD mapping the prompt never showed.
+- **Prompts read correctly on a controller.** The on-screen wording now follows the
+  device the same way the button art already did — being grabbed by a zombie while
+  playing on a pad no longer tells you to MASH, which is the keyboard instruction.
 - **Mouse wheel: one notch, one item.** Every notch counts now.
 - **MSAA is a setting** — off / 2x / 4x in the launcher and in Help & Options → Visuals
   (applies at the next launch). Turning it off is the lever for lower-end GPUs.
@@ -133,7 +136,7 @@ XenosRecomp.
 ### Checksums (SHA-256)
 
 ```
-20a7bb03624e8e1e94de3989a598c55c2edba73876edee50a538ba3d2e1ff7db  CaseWestRecomp-linux-x86_64.tar.zst
-b97555e9bbfb83dd78fade8dbedd4982ce6ca99587b58ca0922367096b90dfb6  CaseWestRecomp-linux-x86_64.AppImage
+f04c6829a5fb4269db1f45b1017ac58047753643ca217e3446d44ad66fa73f86  CaseWestRecomp-linux-x86_64.tar.zst
+1d2b8495cbfe150798fff4efb661332f3187e77e6b885d6a1c2deeb69fd0f7ca  CaseWestRecomp-linux-x86_64.AppImage
 (windows zip pending its rebuild on czwin)
 ```
