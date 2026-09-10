@@ -170,6 +170,22 @@ minute of play:
   (`tools/release_build_oldbase.sh` — `podman tag cz-oldbase:jammy
   cw-oldbase:jammy` first), then v1.0.1 (`docs/release-notes-v1.0.1.md`).
 
+## 3e. THE LINUX v1.0.1 ARTIFACTS ARE BUILT AND GATED (2026-09-10, `imported-fixes.md` §10)
+
+`dist/CaseWestRecomp-linux-x86_64.{tar.zst,AppImage}` at source `7d5f42e`, built on the
+old base. **glibc floor 2.35, down from 2.43** — which is what made v1.0.0 unable to
+start on SteamOS. Gated: PASSED at the floor for both, REFUSED below it with the
+documented `GLIBC_2.35 not found`. Hashes are in `docs/release-notes-v1.0.1.md`.
+
+**What v1.0.1 still needs**: the Windows zip rebuilt on czwin (nothing here can build
+it; `fence_wait.cpp` and `log_file.cpp` have Windows halves never yet compiled for this
+port) and the operator's play sitting. Then attach three files and publish.
+
+The Steam Deck audit is §10: all seven of the sibling's deliverables accounted for, the
+player guide at `docs/steam-deck-testing.md`, and 1280x800 accepted exactly at the
+resolution rule's 16:10 floor. **No Deck has run this** — the rows are causes removed,
+not successes observed.
+
 ## 3d. THE LAUNCHER ROUND (imported-fixes §9, commit `28189b5`)
 
 The sibling's `8b67e6a`/`e3981ad` — the pad drives the launcher, and the ladder carries
