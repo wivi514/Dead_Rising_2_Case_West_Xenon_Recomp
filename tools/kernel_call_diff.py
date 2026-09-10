@@ -296,7 +296,15 @@ def derive_mask(logdir: Path) -> int:
 
 def read_lines(path: Path):
     # Xenia logs carry occasional non-UTF-8 bytes from guest strings.
-    with path.open("r", encoding="utf-8", errors="replace") as f:
+    #
+    # AND THEY ARE OFTEN STORED GZIPPED — this repo's own captures are, at
+    # 54 MB compressed. Reading one with plain open() matches nothing, and
+    # "nothing" is not an error here: the comparison then runs against an empty
+    # Xenia side and reports every one of our calls as a divergence, which reads
+    # like a catastrophic regression and is in fact a decompression that never
+    # happened. derive_mask() below has always handled .gz; this did not.
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", encoding="utf-8", errors="replace") as f:
         yield from f
 
 
