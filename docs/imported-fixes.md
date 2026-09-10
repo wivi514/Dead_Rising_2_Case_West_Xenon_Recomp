@@ -622,3 +622,81 @@ Gotcha 325's class: grep transplanted code for the sibling's string literals.
   build alongside the 688-key pre-warm seed. Neither is in the staged artifacts.
 * `42f99bc` (skip-intro-logos) remains deferred — different mechanism (a data
   patch on `intro.txt`), needs its own recon here.
+
+## §8 — Case Zero parts 102-109: the post-release fix round (2026-09-09, part 11)
+
+| | |
+|---|---|
+| **Imported** | 2026-09-09 (part 11), the commits listed at the end of this section |
+| **Source** | Case Zero `95611b9..28de2f8` — 83 commits, their parts 102-109, everything behind their v1.0.2 and the three player-report fixes after it. Runtime delta ~6,000 lines over 56 files |
+| **Why now** | Operator: *"Did a lot of fix on Case Zero implement them here."* |
+| **Method** | The part-8 three-way merge again: base = CZ@`95611b9` renamed (`CZ_`→`CW_`, `cz_`→`cw_`, `cz-recomp`→`cw-recomp`, the display strings), theirs = CZ@HEAD same treatment, ours = the working tree. `git merge-file` per changed file: **~30 conflicts in ~6,000 lines**, every one at a seam this port keeps deliberately (the RT stubs, the absent golden texture store, the absent skip-intro-logos and shadow-distance features, our own address blocks, our own save-diagnostic fix). Per-title addresses RE-DERIVED here by byte-shape search before any hook was wired |
+| **Re-measured here?** | Engagement of every default and every control arm, one headless boot each; the vertex-recipe pass gated by byte identity against the runtime-dumped cache; validation clean at 16:9 and 16:10. **Behaviour owed to the operator** for the input fixes (a pad and a mouse cannot be synthesised headlessly) |
+
+### What came across, and what proved it here
+
+| fix / feature | source | state on this image | gate run here |
+|---|---|---|---|
+| **Controller vibration** (XamInputSetState → the window thread → `SDL_GameControllerRumble`; change at once, held level refreshed every 250 ms) | `d6a967c` | **Present, identical stub**: our `XamInputSetState_x` logged the motor words and discarded them | Boot with a pad attached: `[host] rumble: change -> SDL_GameControllerRumble(0, 0) = 0 (has-rumble: yes)`. `CW_NO_RUMBLE=1` prints its OFF line. **Felt behaviour owed to the operator** |
+| **The rumble tick at 30 Hz of real time** (effect durations are counts of 30-fps frames; at 110 fps every hit was 27 ms) | `e8cad35` | **Present — and the four functions RE-DERIVED here**: the tick `sub_828003D8` (theirs `sub_82805A58`), SetMotor `sub_82801130`, Send `sub_82801160`, StopAll `sub_82801210`, each found ONCE by its instruction bytes and read instruction for instruction; effect table `0x82AF0880`; the pad vtable has one extra slot here (SetMotor vt+0x58, Send vt+0x5C). Chain above the tick: `sub_828008C8 ← sub_82491868 ← sub_824A46A8` | `[rumble] the title's rumble tick (sub_828003D8) runs at 30 Hz of real time`; `CW_RUMBLE_TICK_HZ=0` prints the per-frame control line. `CW_RUMBLE_TRACE=1` is the bounded probe (their 248 GB lesson kept) |
+| **Samplers honour the fetch constants' clamp modes** (address modes were REPEAT since their part 41 — a screen-space blur read the far edge; their "light's glow on the opposite side" report) | `3f557d4` | **Present, shared decode** (`SamplerIndexForFetch` keyed on filter/aniso only) — Case Zero's characteristic "experiment deferred on purpose", inherited whole | First boot: 7 distinct samplers, **four of them clamp/clamp** (`#2 #4 #5 #6`), three wrap/wrap — so the title DOES ask for clamping here and was not getting it. `CW_VK_NO_FETCH_CLAMP=1` prints `forced wrap`. Validation: no new VUID |
+| **Scene-transform classifier admits the door-transition camera** (unit-row tolerance 0.004 → 0.01; their 21:9 door stretch) | `63913ab` | **Present, shared code** (`SceneXformForm`). The 1.0024 view-row norm is a Case Zero measurement of the same engine's door camera; not re-measured here (no headless door), taken with its arm | `CW_VK_XFORM_STRICT=1` restores 0.004. The F9 census gains `xf= bEff= n0= n1= n3=` per draw and `[fov-composite]` change lines under `CW_VK_FOV_CENSUS` |
+| **MSAA as a SETTING** (`msaa=0|2|4` in `cw_settings.txt`, default 2; a row in the panel — starred until relaunch — and in the launcher; `CW_VK_MSAA` still wins) | `1467d7b` | **Ported by hand into `pc_options_cw.cpp`** (our panel file; theirs is `pc_options.cpp`): row 4, panel now **8 rows**, `%8` cycling; launcher row from the merge | `[vk] msaa in cw_settings.txt — EDRAM is MULTISAMPLED at 2x ... [the 2x default]`; with `CW_VK_MSAA=1` the env wins and says so |
+| **16:10 resolutions — NARROW MODE** (world vert-plus inside a widened frustum, UI letterboxed at full width, clip planes mirrored; aspect floor 16:9 → 16:10; launcher ladder + 1280x800/1920x1200/2560x1600) | `a084700` | **Renderer + settings halves present.** The GAME-SIDE half (`camera_fov.cpp`, the roaming camera widened by 1/k for culling) is **absent here as it is for 21:9** — backlog item 1, recipe transfers, addresses do not. So 16:10 here has the same culling caveat 21:9 already has | Boot at `CW_VK_RES=1920x1200` with validation: see the gate table below |
+| **A windowed window follows the internal resolution** | `c0ff3d1` | Present (merge) | Not exercised headlessly beyond the boot; the log's window line |
+| **Mouse-wheel notch: the release is carried to the tick after its press** (press+release in one level-sampled tick was no press — "two notches per item") | `390f09d` | **Present, shared feed code** | build; `CW_KBM_NO_TAP_SPLIT=1` control. **Owed to the operator** |
+| **Minigame face buttons follow the button art** (MINIGAME_Y on Q, A on SPACE, B on E) | `b92880d` | **Present**: `kbm_default_map.h` is the shared DR2-PC keymap; the chips draw the same caps here | build; **owed to the operator** (the grapple QTE) |
+| **Q drives the controller's BUTTON_4 source on key edges** (their "tell the survivor to wait here": a padmap record already full of two sources is unreachable from a key line) | `28de2f8` | **Mechanism present** (`LookupName(..."BUTTON_4")`, resolved at run time on our token table). Case West has no survivors to send anywhere, but every padmap line reading Y now works from Q | `[kbm] Q drives the controller's BUTTON_4 source (edges only): token N`; `CW_KBM_NO_KEY_BUTTONS=1` control |
+| **The KB/M glyph scan was the busiest thread in the process** (150 s of memchr+memcmp on a core beside the pump in every run since their part 92 — ours since part 8): 64-aligned multi-probe pass, rarest-byte memchr finder, physical arena first, worker at low priority | `bbba9f6` `f08cdf3` | **Present, identical scan.** Every crowd number this port has quoted since part 8 was taken with that sweep running (their gotcha 535 applies here verbatim). The string-bank half of their change (`ScanForStrBank`) does NOT exist here — our struggle-prompt fix went through the string-bank overlay, not a live memory swap — so that function was dropped at the merge | `[kbm] device-follow scan: aligned pass located 26 of 26 glyphs (29 copies) in 63.4 ms` / `END, 0.063 s`. `CW_KBM_SCAN_LEGACY=1` is the old sweep |
+| **The Draw Thread's FENCE wait parks on a futex** instead of spinning (their part 107 item 2; woken from the executor's store site) | `c324bfa` | **Present — both functions RE-DERIVED here**: the loop `sub_825B5FB8` (theirs `sub_82845160`) and the body `sub_825B7668` (`sub_8283C6C8`), each found ONCE by byte shape; every device-struct offset (0x2A90/0x2A9C/0x2ABD/0x2A88/0x2B00/0x3460) and the 0x1388 hang check identical; nested helper `sub_825B6DC0` | `[fencewait] the Draw Thread's fence wait PARKS ...`; `CW_FENCE_PARK=0` restores the spin. Engagement counters (parks/woken/missed) per `[fps]` window — see the gate table |
+| **Four-core machines get THREE workers** (floor 3@4c+; their operator's instruction for the Ryzen 3 3100 class — the same operator) | `4d9cfc6` | Present (merge; our §6 floor comment updated in place) | `[threads] ... floor 3@4c+` in every thread report |
+| **Async boot pre-warm on 1..4 workers, BELOW_NORMAL priority for the spare tier**; the thread report names every pool (pipeline / translate / audio / xma) | `fcfd4ef` `ab80b87` | Present. Worth more here: our seed is 688 keys | `pipeline pre-warm: 696 of 696 queued to the background worker (async boot warm)`; `pipeline 4 outside the budget (... BELOW_NORMAL priority for the speculative warm ...)`. `CW_VK_SYNC_PREWARM=1` / `CW_NO_LOW_PRIORITY=1` controls |
+| **Vertex-shader RECIPES + the first-run VERTEX pass** (102/104 runtime VS are a disc template + 2-32 patched dwords there; the pass reproduces them at first run so the seed can build every pipeline before the first frame — their session-one pop-in) | `0cd57ff` `370d02c` `c43fdc2` | **Re-derived on THIS title's data**: `tools/vs_recipes.py` over our `deadrisingepilogue-vs.big` (145 templates) and our 109 dumped runtime VS → **107 recipes, 2-31 dwords each, the same two engine-synthesised shaders without a template** (`vs_539ea9e0…`, `vs_a4ae7c2b…`), **0 orphans** in our 688-key seed (74 distinct VS, 74 producible). `tools/release/vs_recipes.bin` is ours, 11,276 bytes | **Byte-identity gate**: `--build-shader-cache` into a scratch dir → `107 runtime vertex shaders reproduced, 0 refused`, and all **107 `.spv` byte-identical** to the cache translated from the runtime dumps (389/389 pixel shaders present in both also identical). `CW_NO_VS_RECIPES=1` is the pixel-only control |
+| **The log file** (`cw_runtime.log` beside the data root, a descriptor-level stderr tee drained on every exit path incl. the crash reporter; text mode on Windows) and **`cw_runtime --diag`** | `5b56039` `31e035c` `88fca99` | Present (new `host/log_file.{h,cpp}`; the packaging scripts strip the logs from the stage) | `--diag` exit 0, 69 lines: glibc 2.43, Wayland, both displays, the RTX 3070 with the required-feature table, D24S8 sampleable, 2x MSAA; `cw_diag.txt` written. Every boot: `[log] writing a copy of this output to .../cw_runtime.log`. `CW_NO_LOG_FILE=1` control. Both files gitignored |
+| **Prefer SDL's Wayland driver** when the session offers one (their Wayland+NVIDIA XWayland path presented at exactly 1 fps) | `79ef1b7` | Present | `[diag] sdl: video-driver hint: wayland,x11 / video driver that took: wayland`; `[host] window ... on SDL video driver 'wayland'` |
+| **Window title = the game's name + fps; the window wears the title's own dashboard tile** (`X_IMAGEID_GAME.PNG`, decoded by a new self-contained PNG reader; never shipped) | `482b47f` | Present (new `host/png_icon.{h,cpp}`); the file exists in our unpacked package too | `[icon] window icon: .../X_IMAGEID_GAME.PNG (64x64)`; on Wayland SDL2 takes no icon and the log says so |
+| **The cross-frame stream store gets a DEVICE-LOCAL MIRROR** (their part 106: the crowd's device frame at 1080p was ~4.5 ms of vertex/index fetch over PCIe; 8.84 → 4.0 ms there) | `544ccf2` | Present, ON by default | `stream store MIRROR: 1024 MB of the 1024 MB store twinned in video memory`; exit: `persist hits bound the MIRROR 100.0% of the time (5,774,480 dev, 0 host)`. `CW_VK_NO_STORE_MIRROR=1` control. **No frame-time claim here** — not measured on this box this part |
+| **GPU-decomposition instruments** (`CW_VK_GPU_STATS`, `CW_VK_NULL_PS`, `CW_VK_SCISSOR_1PX`, `CW_VK_TRI1`, `CW_VK_VRAM_STORE`) **and the pass-extent census fix** (blind since their part 89 under parallel record — ours too, since part 8) | `ff286b9` `e4a59e8` | Present (`gpu/null_ps_spv.h`, `tools/null_ps.hlsl`, `tools/gen_null_ps_shader.sh`, `tools/gpu_split_window.py`) | build; not exercised |
+| **Audio packets carry a timestamp** (no more `Could not update timestamps` 30x/s); the audio threads named `cw-xma-decode` / `cw-audio-pump` | `c21f6e6` | Present (the thread names were a sibling literal in the merge — `cz-` — fixed by hand) | 0 `Could not update timestamps` lines in the boot log |
+| **AppImage data root** (`$APPIMAGE` beside the file, guarded by the exe being inside `$APPDIR`), the **old-base Linux build** (Ubuntu 22.04 / glibc 2.35 in a podman container, SDL2 + LGPL ffmpeg with nasm built inside), **`release_package_appimage.sh`**, the icon | `7d1f279` `f610d6c` `c7ee332` | Scripts present and renamed; `tools/release/icon/cw_runtime.png` drawn by `make_icon.py` with the letters CW (our art, no Capcom byte). The `cz-oldbase:jammy` image already on this box is byte-identical in Containerfile after the rename; `podman tag` reuses it | **The old-base build itself is NOT run in this part** — it is the next artifact build's first step (`docs/release-notes-v1.0.1.md`) |
+| **Issue templates** (bug report, Steam Deck) | `9e60979` | Present, renamed | — |
+| **`--diag`'s depth-format decision without side effects** (`PickEdramDepthFormat`) | `5b56039` | Present — the §6 AMD row's logic, factored | `--diag` names the format it would pick |
+
+### Measured differences from the sibling, recorded so nobody assumes
+
+* **Every guest address differs and every one was re-derived**, none by arithmetic: the
+  sibling's instruction sequences were searched for as bytes in `default_image.bin`
+  (each found exactly once), then disassembled and compared line by line. The rumble
+  pad's vtable has one more slot here than there. `tools/guest_callers.py` gave the call
+  chains. The provenance is in each file's header.
+* **107 vertex recipes here against their 102** — this title has 145 disc templates to
+  their 142 and 109 runtime vertex shaders to their 104; the two template-less
+  engine-synthesised shaders are the SAME two hashes on both titles.
+* **Seven distinct samplers at the title screen, four clamping** — the clamp census
+  is this image's own, and it is the evidence that the sampler change is not inert here.
+
+### Not imported from this range, and why
+
+* **The golden texture store's part-102/104 work** (background writer, `golden.pack`,
+  XDG dir) — refinements of a store this port never took (§6: a Case Zero location and a
+  Case Zero asset hash). Every hunk touching it was resolved to OURS and the leaked
+  references removed; the decode-split profiler keeps a zeroed `golden` column so the
+  next merge stays three-way.
+* **`camera_fov.cpp`'s 16:10 line** — the file does not exist here (backlog item 1).
+* **The RT blobs** (`rt_factor_spv.h`, `rt_shadow_spv.h`) — the stubs stay stubs.
+* **Skip-intro-logos** (`boot_skip.cpp`, the settings key, the launcher row) — still
+  deferred (§6); every merge hunk carrying it was dropped.
+* **`tools/czamd/*.ps1`** — their czamd campaign scripts with `C:\Users\lisab\cz` paths.
+* **Their `prewarm.keys`** — ours is the 688-key harvest from this title.
+* **Their part 102-108 docs** (`part102-no-popin-plan.md`, `perf-plan-part106/107.md`,
+  `picture-plan-part109.md`, `steam-deck-plan.md`, gotchas 514-542) — referenced, not
+  copied; `docs/gotchas.md` here continues at 326.
+
+### Found beside it
+
+* The merge introduced **three sibling string literals** that the rename sed could not
+  see — `deadrisingprologue-vs.big` (twice in `main.cpp`, once in `shader_prebuild.h`),
+  the `cz-xma-decode`/`cz-audio-pump` thread names, `/var/tmp/cz-ffmpeg-build` — and
+  `make_icon.py` drew "CZ". All fixed by a grep for `cz\b|CZ_|prologue|DR2CZ` over the
+  merged tree BEFORE the first build (gotcha 325's rule, applied at merge time).
+* `main.cpp`'s first line still said "Case Zero" from the original transplant. Fixed.

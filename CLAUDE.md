@@ -55,8 +55,31 @@ is committed for the next artifact build.
 **Post-tag, unreleased (2026-09-09, part 11):** the launcher gained a **SUBTITLES**
 row (Case Zero's part-99 language selection, mapping re-measured here —
 `docs/imported-fixes.md` §7, `CW_LANGUAGE=N` the dev arm) and its header no
-longer says CASE ZERO. Both wait for the next artifact build; the operator's
-per-language eye pass is owed.
+longer says CASE ZERO. Operator-confirmed in fr/ko/ja.
+
+**Then, the same day, CASE ZERO'S PARTS 102-109 WERE IMPORTED WHOLESALE**
+(`docs/imported-fixes.md` §8 — the operator's "did a lot of fix on Case Zero,
+implement them here"): a three-way merge of 83 commits / ~6,000 runtime lines
+with ~30 conflicts, all at seams this port keeps on purpose. What is new and
+DEFAULT: **controller vibration** with the title's rumble tick at 30 Hz of real
+time (`CW_NO_RUMBLE=1`, `CW_RUMBLE_TICK_HZ=0`), **samplers honouring the fetch
+constants' clamp modes** (four of the title screen's seven samplers clamp —
+`CW_VK_NO_FETCH_CLAMP=1`), the door-camera classifier tolerance
+(`CW_VK_XFORM_STRICT=1`), **MSAA as a setting** (launcher + an 8th panel row),
+**16:10 narrow mode** (same game-side-culling caveat as 21:9), the wheel-notch
+and minigame-button KB/M fixes, Q as the pad's Y, the **glyph scan cut from
+~150 s of a core to 63 ms** (`CW_KBM_SCAN_LEGACY=1`), the **fence wait parked
+on a futex** (`CW_FENCE_PARK=0`), three workers on four cores, the **async
+low-priority boot pre-warm**, **vertex-shader recipes at first run** (107 here,
+byte-identical gate), the **device-local stream-store mirror**
+(`CW_VK_NO_STORE_MIRROR=1`), the audio timestamp, **`cw_runtime.log` +
+`cw_runtime --diag`**, Wayland-first, the window icon/title, and the old-base /
+AppImage release scripts. **Every guest address was re-derived here by
+byte-shape search** (`fence_wait.cpp`, `rumble_guest.cpp` headers). NOT taken:
+the golden texture store, camera_fov, skip-intro-logos, RT blobs. Owed: the
+operator's play sitting on the input fixes, the czwin compile, the old-base
+Linux build, then the v1.0.1 artifacts (`docs/release-notes-v1.0.1.md` is the
+draft).
 
 ## Status: PART 10 BUILT AND GATED THE RELEASE (2026-09-05)
 

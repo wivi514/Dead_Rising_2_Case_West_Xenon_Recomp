@@ -155,6 +155,30 @@ minute of play:
   player-visible in v1.0.0. Fixed.
 * Both ride the NEXT artifact build with the 688-key seed; the staged v1.0.0
   stays exactly as tested.
+* **Case Zero parts 102-109 imported** (`docs/imported-fixes.md` §8, same day):
+  vibration + the 30 Hz rumble tick, sampler clamp modes, the door-camera
+  tolerance, MSAA as a setting, 16:10, the wheel/minigame/Q KB/M fixes, the
+  glyph-scan and fence-park CPU fixes, 3 workers @ 4 cores, the async
+  low-priority pre-warm, vertex-shader recipes (107, byte-identical),
+  the stream-store VRAM mirror, the audio timestamp, the log file + `--diag`,
+  Wayland-first, the window icon/title, old-base + AppImage scripts. Every guest
+  address re-derived here. Gates: engagement of every default and control arm,
+  the recipe byte-identity gate, validation at 16:9 and 16:10.
+  **OWED**: the operator's sitting (vibration felt; MSAA row; a 16:10 mode;
+  Q on a Y prompt; wheel notches; the grapple QTE), the czwin compile (Windows
+  halves of `fence_wait.cpp`/`log_file.cpp`), the old-base build
+  (`tools/release_build_oldbase.sh` — `podman tag cz-oldbase:jammy
+  cw-oldbase:jammy` first), then v1.0.1 (`docs/release-notes-v1.0.1.md`).
+
+## 3b. THE NEXT ARTIFACT BUILD IS NOW A FULL ROUND, NOT A REPACKAGE
+
+The §1a recipe (rebuild both, re-gate, refresh hashes) still holds, with two
+additions from §8: the Linux leg is built INSIDE the old-base container
+(`tools/release_build_oldbase.sh`, which also packages; then
+`tools/release_package_appimage.sh` for the AppImage), and the Windows leg
+must compile `cpu/fence_wait.cpp` (WaitOnAddress, the `synchronization` lib is
+on the link line) and `host/log_file.cpp` (text-mode log) — both compiled on
+czwin for the sibling, neither yet here.
 
 ## 4. THE BACKLOG OTHERWISE (carried from part 9, unchanged)
 

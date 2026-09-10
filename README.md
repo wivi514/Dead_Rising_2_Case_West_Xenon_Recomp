@@ -66,7 +66,9 @@ game folder at any time without losing progress.
   via a `kbmap.txt` file next to the executable.
 - **Any controller SDL recognizes** (Xbox layout) works, and the prompts switch
   between keyboard and controller art automatically depending on which one you
-  touched last.
+  touched last. **Controller vibration** reaches the pad, at the lengths the
+  console gave each effect whatever your frame rate (`CW_NO_RUMBLE=1` turns it
+  off).
 
 ## Features
 
@@ -77,11 +79,13 @@ game folder at any time without losing progress.
   available as a setting, along with higher caps.
 - **A graphics menu inside the game's own options** (Help & Options → Visuals):
   resolution — which **applies live, without a restart** — display mode, vsync,
-  shadow quality, frame cap, field of view and mouse sensitivity.
+  shadow quality, MSAA (off / 2x / 4x, next launch), frame cap, field of view
+  and mouse sensitivity. The launcher carries the same rows.
 - **Ultrawide support** — the resolution row lists your monitor's own modes, so
   a 21:9 display can pick e.g. 3440×1440 and the game renders true widescreen.
-  **Tip:** raise Field of View in the options when playing ultrawide; the stock
-  FOV was chosen for 16:9.
+  **16:10 displays** (1280×800, 1920×1200, 2560×1600) render the world taller
+  with the interface letterboxed at full width. **Tip:** raise Field of View in
+  the options when playing ultrawide; the stock FOV was chosen for 16:9.
 - **MSAA 2x anti-aliasing** by default, a settings launcher, and a pipeline
   pre-warm plus background pipeline building, so even a first session plays
   smoothly instead of hitching the first time it sees something new.
@@ -92,6 +96,10 @@ game folder at any time without losing progress.
   the console's hardware loop behaviour.
 - **Built for long sessions**: texture memory recycles over a full playthrough
   — no whitening or slow degradation on marathon runs.
+- **A log file and a diagnostic mode** for bug reports: every run writes
+  `cw_runtime.log` beside the game folder's `assets/` (the previous run is kept
+  as `cw_runtime.log.1`), and `cw_runtime --diag` prints one line per fact
+  about your OS, GPU, driver and display path, and writes it to `cw_diag.txt`.
 - Bink video plays through the game's own decoder; the port supplies file I/O
   and nothing else.
 - Under the hood: **58,345 PowerPC functions** statically recompiled to native
@@ -110,9 +118,10 @@ game folder at any time without losing progress.
 
 - The occasional spot may shade slightly differently than original hardware;
   everything is being tracked and refined.
-- **Linux glibc floor**: distributions older than the build base (glibc 2.43)
-  refuse to start with a `GLIBC_x.yz not found` message. An AppImage-style
-  build is planned.
+- **Linux glibc floor**: the v1.0.0 build was linked on Fedora 44 and refuses
+  to start on distributions older than glibc 2.43 (`GLIBC_x.yz not found`).
+  The next build is made on an Ubuntu 22.04 base (glibc 2.35) and also ships
+  as an AppImage — the build machinery is in the tree (`tools/release_build_oldbase.sh`).
 - **No macOS build yet** — nothing blocks it in principle; it awaits test
   hardware.
 - **No co-op** — Case West's second player is online-only on the 360 (see the
