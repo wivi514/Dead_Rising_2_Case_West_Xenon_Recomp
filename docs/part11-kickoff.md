@@ -170,6 +170,33 @@ minute of play:
   (`tools/release_build_oldbase.sh` — `podman tag cz-oldbase:jammy
   cw-oldbase:jammy` first), then v1.0.1 (`docs/release-notes-v1.0.1.md`).
 
+## 3h. v1.0.1 IS BUILT, STAGED AND OPERATOR-TESTED ON BOTH VENDORS (2026-09-10)
+
+All three artifacts at source `b01d404`, staged at `~/Release/Case West/1.0.1/` with
+`SHA256SUMS` and the paste-ready notes. Windows built on czwin at the same commit and
+deployed to **czamd** (RX 6600) over the existing install, game data preserved.
+
+**Operator verdicts**: the ultrawide culling fix, *"Seems to be working perfectly"* on
+their 3440x1440; the Windows build on AMD, *"it works good on amd too"*.
+
+### OPEN — the AMD black square, and it is now a TWO-TITLE defect
+
+The operator's report from czamd: **a black square in the MIDDLE of the screen, appearing
+during LOADING SCREENS and CUTSCENES** — *"the same as case zero"*.
+
+That is worth more than it looks. The sibling has chased this as their item 0af on the
+same GPU, and their finding is that it **clears on alt-tab / Win+PrintScreen**, which
+points at the PRESENT path rather than the rendered image. Two DIFFERENT TITLES showing
+it on the same hardware makes it shared-code, not content — and note it is NOT Bink:
+cutscenes here are Bink, but Case Zero ships no Bink at all and shows the same square.
+
+**Operator's decision, 2026-09-10: NOT fixing it for v1.0.1** — it ships as a known
+issue with the alt-tab workaround, worded like the sibling's. The bisection order when
+it is picked up is theirs and is already ordered: `CW_VK_NO_SWAPCHAIN=1` first (the
+pre-part-54 readback present path), then the present mode (`CW_VK_SWAPCHAIN_FIFO=1`).
+`cw_play_v101` is a scheduled task on czamd that launches the build interactively, so
+an arm is one bat edit away.
+
 ## 3g. THE ULTRAWIDE CULLING FIX IS IN AND OPERATOR-VERIFIED (`imported-fixes.md` §12)
 
 `5467a3e` — the game-side fov substitution, Case Zero's mechanism with all three

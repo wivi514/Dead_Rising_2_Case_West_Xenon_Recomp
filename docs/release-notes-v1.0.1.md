@@ -130,6 +130,15 @@ shader cache are reused.
 
 ### Known issues (minor)
 
+- **On some AMD GPUs** (we see it on our own RX 6600 test machine; NVIDIA is
+  unaffected): a **black square can appear in the middle of the screen** during loading
+  screens and cutscenes. **If you hit it, alt-tab out and back, or press
+  Win+PrintScreen** — either one clears it. It does not affect gameplay or progress.
+  The sibling port shows exactly the same thing on the same hardware, which points at
+  the code the two share rather than at anything in this game; it is being
+  investigated. Also on AMD, one launch after a GPU driver update may sit on a black
+  screen for a minute or two while the driver recompiles its pipeline cache — it is not
+  hung, and later launches are fast.
 - The occasional spot may shade slightly differently than the console.
 - **No macOS build yet** — awaits test hardware, nothing structural.
 - **No co-op** — Case West's second player is online-only on the 360.
