@@ -610,10 +610,11 @@ Gotcha 325's class: grep transplanted code for the sibling's string literals.
 
 ### Still owed
 
-* **The eye pass** — one launcher pick per language to the title screen and one
-  subtitled cinematic (the New Game intro is Bink with subtitles). ja/ko glyph
-  completeness is *likely* (`arialko.bcf` / `arialutf.bcf` ship in
-  `data/system/{480,720}/`) but unproven here as it was unproven there.
+* ~~**The eye pass**~~ — **OPERATOR-CONFIRMED 2026-09-09 ("Yeah it works")**: a
+  launcher session picked FRANCAIS, the run opened `str_fr.bcs` and nothing else,
+  the setting persisted as `language=4`, zero faults in the log. Not yet looked at:
+  ja/ko glyph completeness (*likely* — `arialko.bcf` / `arialutf.bcf` ship in
+  `data/system/{480,720}/` — but still unproven, as it was in the sibling).
 * **Unreleased**: this lands AFTER the v1.0.0 tag. It ships with the next artifact
   build alongside the 688-key pre-warm seed. Neither is in the staged artifacts.
 * `42f99bc` (skip-intro-logos) remains deferred — different mechanism (a data

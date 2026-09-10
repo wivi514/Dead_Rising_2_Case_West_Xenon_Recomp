@@ -149,8 +149,8 @@ minute of play:
   this image (1=en 2=ja 4=fr 5=es 6=it 7=ko; 3 and 8 fall back to en). New
   `language=` key in `cw_settings.txt`; `CW_LANGUAGE=N` is the dev arm. Gates run:
   one bank per boot, persisted path, loud clamp, A1 kernel-order diff identical to
-  the English control. **Owed: the operator's eye pass** (each language to the
-  title, one subtitled cinematic; ja/ko glyphs unproven).
+  the English control. **Operator-confirmed in a launcher session (French, 2026-09-09)**; ja/ko glyphs
+  still unlooked-at.
 * **Launcher header said CASE ZERO** (`644c9b7`) — a sibling string literal,
   player-visible in v1.0.0. Fixed.
 * Both ride the NEXT artifact build with the 688-key seed; the staged v1.0.0
