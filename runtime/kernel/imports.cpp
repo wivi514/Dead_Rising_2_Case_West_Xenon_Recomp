@@ -4879,7 +4879,19 @@ static uint32_t XamInputSetState_x(uint32_t userIndex, uint32_t unk,
     if (vibration)
     {
         const uint16_t l = vibration->leftMotor.get(), r = vibration->rightMotor.get();
-        KLOG("XamInputSetState(user=%u, motors %u/%u)\n", userIndex, l, r);
+        // The title calls this EVERY controller tick with the same pair almost every
+        // time, so an unconditional line here is a log of nothing at a few hundred a
+        // second — 3,393 of a 9,601-line boot log HERE, measured, and since part 11
+        // gave the runtime a log FILE it is also a write to the player's disk on the
+        // frame path. The witness is CW_RUMBLE_TRACE, and it names CHANGES only;
+        // host/window.cpp prints the SDL outcome of each change under the same arm.
+        // (Imported from Case Zero 3bbf3e9, which measured 65,034 of 131,516 lines.)
+        static const bool trace = getenv("CW_RUMBLE_TRACE") != nullptr;
+        static uint64_t last[kLocalPadCount] = {};   // 0 = never seen; bit 32 marks a value
+        const uint64_t pair = (1ull << 32) | (uint64_t(l) << 16) | r;
+        if (trace && last[userIndex] != pair)
+            KLOG("XamInputSetState(user=%u, motors %u/%u)\n", userIndex, l, r);
+        last[userIndex] = pair;
         Host_PadRumble(userIndex, l, r);
     }
     return 0;
