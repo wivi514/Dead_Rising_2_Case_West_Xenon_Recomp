@@ -3,13 +3,13 @@
 **This is the text to paste into the GitHub Release body** (everything below the
 `---`) once the Windows leg exists. The v1.0.0 artifacts stay exactly as tested.
 
-**Built 2026-09-10 at source `a950870`, on the OLD BASE** (Ubuntu 22.04 in a podman
+**Built 2026-09-10 at source `be203d5`, on the OLD BASE** (Ubuntu 22.04 in a podman
 container, clang 15, with SDL2 and the LGPL ffmpeg compiled inside it):
 
 | artifact | bytes | sha256 |
 |---|---|---|
-| `CaseWestRecomp-linux-x86_64.tar.zst` | 28,357,797 | `f04c6829a5fb4269db1f45b1017ac58047753643ca217e3446d44ad66fa73f86` |
-| `CaseWestRecomp-linux-x86_64.AppImage` | 27,347,448 | `1d2b8495cbfe150798fff4efb661332f3187e77e6b885d6a1c2deeb69fd0f7ca` |
+| `CaseWestRecomp-linux-x86_64.tar.zst` | 28,359,146 | `6acf7ec4fb3e7a75cff78274a218072ffbaab6abdb38957ad2c5bb6e72830aac` |
+| `CaseWestRecomp-linux-x86_64.AppImage` | 27,355,640 | `478905c77f2b8e4e50fffbb7a943108134c89f89a3edd53c03f8c49d4ae3b016` |
 | `CaseWestRecomp-windows-x86_64.zip` | — | **NOT REBUILT — czwin owes it** |
 
 **Gates run on both Linux artifacts:**
@@ -32,9 +32,6 @@ What the next build carries beyond v1.0.0, in the order it landed:
 * the launcher SUBTITLES row and the CASE ZERO header fix (part 11, §7);
 * everything in §8 — the fix round below;
 * the launcher round in §9 — the pad, the 21:9 rungs, and the clipped footer.
-
-**Note**: the artifacts named above predate the ultrawide culling fix and the 898-key
-seed; they need one more rebuild before publishing.
 
 **Owed before this ships**: the operator's play sitting (vibration, the MSAA row, a
 16:10 mode if a display offers one, keyboard Q on a Y prompt, the mouse wheel), and the
@@ -144,7 +141,7 @@ XenosRecomp.
 ### Checksums (SHA-256)
 
 ```
-f04c6829a5fb4269db1f45b1017ac58047753643ca217e3446d44ad66fa73f86  CaseWestRecomp-linux-x86_64.tar.zst
-1d2b8495cbfe150798fff4efb661332f3187e77e6b885d6a1c2deeb69fd0f7ca  CaseWestRecomp-linux-x86_64.AppImage
+6acf7ec4fb3e7a75cff78274a218072ffbaab6abdb38957ad2c5bb6e72830aac  CaseWestRecomp-linux-x86_64.tar.zst
+478905c77f2b8e4e50fffbb7a943108134c89f89a3edd53c03f8c49d4ae3b016  CaseWestRecomp-linux-x86_64.AppImage
 (windows zip pending its rebuild on czwin)
 ```
