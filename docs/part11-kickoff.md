@@ -170,6 +170,19 @@ minute of play:
   (`tools/release_build_oldbase.sh` — `podman tag cz-oldbase:jammy
   cw-oldbase:jammy` first), then v1.0.1 (`docs/release-notes-v1.0.1.md`).
 
+## 3d. THE LAUNCHER ROUND (imported-fixes §9, commit `28189b5`)
+
+The sibling's `8b67e6a`/`e3981ad` — the pad drives the launcher, and the ladder carries
+the 21:9 rungs (the operator's own display is 3440x1440). Found beside them and fixed:
+OUR launcher window was still 720x420 from when it had seven rows, so with nine the
+drop-hint footer drew at y=416 and was clipped. Gate: `CW_LAUNCHER_PAD_TEST`, which
+synthesises real SDL pad events so a box with no controller can still test it.
+**It rewrites `cw_settings.txt` — back it up and restore byte-identical.**
+
+Also read out of their docs, not their code: their RX 6600 sitting confirms §8's stream
+mirror, glyph scan and fence park ON AMD, and their black square now points at the
+PRESENT path (it clears on alt-tab), with a bisection order this port should reuse.
+
 ## 3c. TWO THINGS THE IMPORT LEFT OPEN (both in `imported-fixes.md` §8's tail)
 
 1. **`config/cw_soak_route.seq` IS STALE — the crowd route no longer reaches the
