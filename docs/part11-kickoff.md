@@ -170,9 +170,22 @@ minute of play:
   (`tools/release_build_oldbase.sh` — `podman tag cz-oldbase:jammy
   cw-oldbase:jammy` first), then v1.0.1 (`docs/release-notes-v1.0.1.md`).
 
+## 3f. THE PRE-RELEASE AUDIT IS DONE (`imported-fixes.md` §11)
+
+Four checks — every file, every arm, every range boundary, then the gap they exposed.
+**One live defect found and fixed**: the prompt WORDING did not follow the device, so on
+a controller the struggle prompt said MASH (`db1bab5`). It sat in a numbering gap between
+two import ranges. **Backlog item 4 is CLOSED, not deferred**: the sibling's
+shadow-distance work landed and does not work, by their own header.
+
+Still absent ON PURPOSE, both needing per-title RE rather than an import: skip-intro-logos
+and `camera_fov.cpp`. The second has a player-visible consequence worth knowing — at 21:9
+and 16:10 the world is DRAWN wide but still CULLED at 16:9, so the flanks can pop. v1.0.0
+does this too.
+
 ## 3e. THE LINUX v1.0.1 ARTIFACTS ARE BUILT AND GATED (2026-09-10, `imported-fixes.md` §10)
 
-`dist/CaseWestRecomp-linux-x86_64.{tar.zst,AppImage}` at source `7d5f42e`, built on the
+`dist/CaseWestRecomp-linux-x86_64.{tar.zst,AppImage}` at source `a950870`, built on the
 old base. **glibc floor 2.35, down from 2.43** — which is what made v1.0.0 unable to
 start on SteamOS. Gated: PASSED at the floor for both, REFUSED below it with the
 documented `GLIBC_2.35 not found`. Hashes are in `docs/release-notes-v1.0.1.md`.
