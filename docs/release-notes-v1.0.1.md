@@ -8,8 +8,8 @@ container, clang 15, with SDL2 and the LGPL ffmpeg compiled inside it):
 
 | artifact | bytes | sha256 |
 |---|---|---|
-| `CaseWestRecomp-linux-x86_64.tar.zst` | 28,349,411 | `f04c6829a5fb4269db1f45b1017ac58047753643ca217e3446d44ad66fa73f86` |
-| `CaseWestRecomp-linux-x86_64.AppImage` | 27,340,760 | `1d2b8495cbfe150798fff4efb661332f3187e77e6b885d6a1c2deeb69fd0f7ca` |
+| `CaseWestRecomp-linux-x86_64.tar.zst` | 28,357,797 | `f04c6829a5fb4269db1f45b1017ac58047753643ca217e3446d44ad66fa73f86` |
+| `CaseWestRecomp-linux-x86_64.AppImage` | 27,347,448 | `1d2b8495cbfe150798fff4efb661332f3187e77e6b885d6a1c2deeb69fd0f7ca` |
 | `CaseWestRecomp-windows-x86_64.zip` | — | **NOT REBUILT — czwin owes it** |
 
 **Gates run on both Linux artifacts:**
