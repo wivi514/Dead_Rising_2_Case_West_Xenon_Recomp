@@ -1,9 +1,31 @@
-# Release notes — v1.0.1 (DRAFT — no artifact built yet)
+# Release notes — v1.0.1 (DRAFT — the two LINUX artifacts are BUILT and GATED; Windows is owed)
 
 **This is the text to paste into the GitHub Release body** (everything below the
-`---`) once the artifacts exist. Nothing here is built: the source is at the head of
-`master` after part 11's import of Case Zero's parts 102-109
-(`docs/imported-fixes.md` §8), and the v1.0.0 artifacts stay exactly as tested.
+`---`) once the Windows leg exists. The v1.0.0 artifacts stay exactly as tested.
+
+**Built 2026-09-10 at source `7d5f42e`, on the OLD BASE** (Ubuntu 22.04 in a podman
+container, clang 15, with SDL2 and the LGPL ffmpeg compiled inside it):
+
+| artifact | bytes | sha256 |
+|---|---|---|
+| `CaseWestRecomp-linux-x86_64.tar.zst` | 28,353,124 | `20a7bb03624e8e1e94de3989a598c55c2edba73876edee50a538ba3d2e1ff7db` |
+| `CaseWestRecomp-linux-x86_64.AppImage` | 27,343,352 | `b97555e9bbfb83dd78fade8dbedd4982ce6ca99587b58ca0922367096b90dfb6` |
+| `CaseWestRecomp-windows-x86_64.zip` | — | **NOT REBUILT — czwin owes it** |
+
+**Gates run on both Linux artifacts:**
+* **glibc floor 2.35**, computed per file from the artifact itself. The binding library
+  is `libavutil` (2.35); everything else needs only 2.34.
+* **Clean-container gate AT THE FLOOR** (`ubuntu:22.04`), both artifacts: **GATE PASSED**,
+  including the whole first-run flow — the real package extracted, **1,429 shaders
+  translated with 0 failures** (1,322 pixel + 107 from the new vertex recipes), overlay
+  generation byte-identical to the Python reference, a boot that read 261 `.big` archives
+  from the extracted tree, and the honest refusal from a container with no game.
+* **BELOW the floor** (`rockylinux:9-minimal`, glibc 2.34): refuses exactly as documented
+  — `GLIBC_2.35 not found (required by libavutil.so.60)`. A demonstration of the floor,
+  not a passing gate.
+* The AppImage additionally self-checks: `--appimage-extract-and-run` smoke (no FUSE),
+  the data root resolving BESIDE the image with `assets/package/` seeded, and the FUSE
+  mount path a double-click takes.
 
 What the next build carries beyond v1.0.0, in the order it landed:
 * the 688-key pre-warm seed (part 10's harvest, committed and waiting);
@@ -12,10 +34,9 @@ What the next build carries beyond v1.0.0, in the order it landed:
 * the launcher round in §9 — the pad, the 21:9 rungs, and the clipped footer.
 
 **Owed before this ships**: the operator's play sitting (vibration, the MSAA row, a
-16:10 mode if a display offers one, keyboard Q on a Y prompt, the mouse wheel), the
+16:10 mode if a display offers one, keyboard Q on a Y prompt, the mouse wheel), and the
 Windows leg on czwin (`fence_wait.cpp` and `log_file.cpp` have Windows halves that
-compiled there for the sibling but not yet here), the old-base Linux build + AppImage
-(`tools/release_build_oldbase.sh`), fresh hashes.
+compiled there for the sibling but not yet here). The Linux half is done.
 
 ---
 
@@ -112,5 +133,7 @@ XenosRecomp.
 ### Checksums (SHA-256)
 
 ```
-(to be filled by the build)
+20a7bb03624e8e1e94de3989a598c55c2edba73876edee50a538ba3d2e1ff7db  CaseWestRecomp-linux-x86_64.tar.zst
+b97555e9bbfb83dd78fade8dbedd4982ce6ca99587b58ca0922367096b90dfb6  CaseWestRecomp-linux-x86_64.AppImage
+(windows zip pending its rebuild on czwin)
 ```
