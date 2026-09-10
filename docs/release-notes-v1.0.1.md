@@ -33,6 +33,9 @@ What the next build carries beyond v1.0.0, in the order it landed:
 * everything in §8 — the fix round below;
 * the launcher round in §9 — the pad, the 21:9 rungs, and the clipped footer.
 
+**Note**: the artifacts named above predate the ultrawide culling fix and the 898-key
+seed; they need one more rebuild before publishing.
+
 **Owed before this ships**: the operator's play sitting (vibration, the MSAA row, a
 16:10 mode if a display offers one, keyboard Q on a Y prompt, the mouse wheel), and the
 Windows leg on czwin (`fence_wait.cpp` and `log_file.cpp` have Windows halves that
@@ -70,6 +73,11 @@ shader cache are reused.
 - **16:10 resolutions** (1280×800, 1920×1200, 2560×1600): the world renders taller
   with the interface letterboxed at full width, and a windowed window follows the
   internal resolution you pick.
+- **Ultrawide stops popping at the edges.** On a 21:9 or 16:10 display the game now
+  CULLS to the width it renders, where before it still decided what to draw using the
+  16:9 view — so scenery at the far left and right no longer appears and disappears as
+  you turn. The Field of View slider moves the game's own camera the same way, rather
+  than only the projection.
 - **No first-session pop-in from vertex shaders**: the first run now prepares the
   vertex shaders too (107 recipes over the disc's templates), so the shipped pipeline
   pre-warm can build every pipeline before the first frame, and that warm now runs in

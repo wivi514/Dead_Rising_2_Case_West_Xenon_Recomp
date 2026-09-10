@@ -82,10 +82,12 @@ game folder at any time without losing progress.
   shadow quality, MSAA (off / 2x / 4x, next launch), frame cap, field of view
   and mouse sensitivity. The launcher carries the same rows.
 - **Ultrawide support** — the resolution row lists your monitor's own modes, so
-  a 21:9 display can pick e.g. 3440×1440 and the game renders true widescreen.
-  **16:10 displays** (1280×800, 1920×1200, 2560×1600) render the world taller
-  with the interface letterboxed at full width. **Tip:** raise Field of View in
-  the options when playing ultrawide; the stock FOV was chosen for 16:9.
+  a 21:9 display can pick e.g. 3440×1440 and the game renders true widescreen,
+  and **culls to that width too**, so scenery at the far edges does not pop in
+  and out as you turn. **16:10 displays** (1280×800, 1920×1200, 2560×1600)
+  render the world taller with the interface letterboxed at full width.
+  **Tip:** raise Field of View in the options when playing ultrawide; the stock
+  FOV was chosen for 16:9.
 - **MSAA 2x anti-aliasing** by default, a settings launcher, and a pipeline
   pre-warm plus background pipeline building, so even a first session plays
   smoothly instead of hitching the first time it sees something new.
