@@ -1,7 +1,8 @@
-# Release notes — v1.0.1 (DRAFT — the two LINUX artifacts are BUILT and GATED; Windows is owed)
+# Release notes — v1.0.1 (ALL THREE ARTIFACTS BUILT AND GATED)
 
 **This is the text to paste into the GitHub Release body** (everything below the
-`---`) once the Windows leg exists. The v1.0.0 artifacts stay exactly as tested.
+`---`). The v1.0.0 artifacts stay exactly as tested. All three v1.0.1 artifacts are
+staged for upload at `~/Release/Case West/1.0.1/` with a `SHA256SUMS` beside them.
 
 **Built 2026-09-10 at source `be203d5`, on the OLD BASE** (Ubuntu 22.04 in a podman
 container, clang 15, with SDL2 and the LGPL ffmpeg compiled inside it):
@@ -10,7 +11,7 @@ container, clang 15, with SDL2 and the LGPL ffmpeg compiled inside it):
 |---|---|---|
 | `CaseWestRecomp-linux-x86_64.tar.zst` | 28,359,146 | `6acf7ec4fb3e7a75cff78274a218072ffbaab6abdb38957ad2c5bb6e72830aac` |
 | `CaseWestRecomp-linux-x86_64.AppImage` | 27,355,640 | `478905c77f2b8e4e50fffbb7a943108134c89f89a3edd53c03f8c49d4ae3b016` |
-| `CaseWestRecomp-windows-x86_64.zip` | — | **NOT REBUILT — czwin owes it** |
+| `CaseWestRecomp-windows-x86_64.zip` | 22,212,742 | `973b136939d114d362e33ef0c320c8bbdcd494aad1357b3cf0ba25ada77d5bba` |
 
 **Gates run on both Linux artifacts:**
 * **glibc floor 2.35**, computed per file from the artifact itself. The binding library
@@ -33,10 +34,15 @@ What the next build carries beyond v1.0.0, in the order it landed:
 * everything in §8 — the fix round below;
 * the launcher round in §9 — the pad, the 21:9 rungs, and the clipped footer.
 
+**The Windows leg is built** (czwin, at the same source commit): the files whose Windows
+halves had never been compiled for this port — `fence_wait.cpp` (WaitOnAddress),
+`log_file.cpp` (text-mode log), `png_icon.cpp`, `rumble_guest.cpp`, `camera_fov.cpp` —
+all compiled, with ONE warning and no errors, and the staged exe passed `--smoke`.
+
 **Owed before this ships**: the operator's play sitting (vibration, the MSAA row, a
 16:10 mode if a display offers one, keyboard Q on a Y prompt, the mouse wheel), and the
-Windows leg on czwin (`fence_wait.cpp` and `log_file.cpp` have Windows halves that
-compiled there for the sibling but not yet here). The Linux half is done.
+one check no script here can make — running the staged Windows exe on a machine with no
+dev tree.
 
 ---
 
@@ -143,5 +149,5 @@ XenosRecomp.
 ```
 6acf7ec4fb3e7a75cff78274a218072ffbaab6abdb38957ad2c5bb6e72830aac  CaseWestRecomp-linux-x86_64.tar.zst
 478905c77f2b8e4e50fffbb7a943108134c89f89a3edd53c03f8c49d4ae3b016  CaseWestRecomp-linux-x86_64.AppImage
-(windows zip pending its rebuild on czwin)
+973b136939d114d362e33ef0c320c8bbdcd494aad1357b3cf0ba25ada77d5bba  CaseWestRecomp-windows-x86_64.zip
 ```
