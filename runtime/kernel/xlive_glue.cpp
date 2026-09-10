@@ -8,6 +8,7 @@
 #include <xlive/client.h>
 
 #include "klog.h"
+#include "xlive_session.h"
 
 namespace
 {
@@ -139,6 +140,13 @@ void CwXlive_Start(uint32_t titleId)
         PublishGamertag(identity.gamertag);
 
     KLOG("[xlive] %s\n", xlive::Client::Instance().status().c_str());
+
+    // Co-op, if it was asked for. It is a separate switch from this one
+    // because identity and achievements are finished work and the session
+    // surface is not: a player who wants their gamertag back should not have
+    // to opt into unexercised matchmaking to get it.
+    XliveSession_Start();
+    XliveSession_SelfTest();
 }
 
 bool CwXlive_SignedIn()
@@ -209,6 +217,10 @@ void CwXlive_Shutdown(int timeoutMs)
 {
     if (!g_started)
         return;
+    // The session thread first: it writes into guest memory and completes
+    // overlappeds, and it must not still be doing that while the rest of the
+    // process is being torn down.
+    XliveSession_Shutdown();
     const size_t pending = xlive::Client::Instance().pending_writes();
     if (pending != 0)
     {

@@ -79,6 +79,7 @@
 #include "memory.h"
 #include "xex_imports.h"
 #include "xlive_glue.h"  // XenonLive: the account, and where achievements go
+#include "xlive_session.h"  // the XGI session surface (co-op), off by default
 
 // ---------------------------------------------------------------------------
 // Stub helpers
@@ -5168,8 +5169,19 @@ static std::map<uint64_t, uint32_t> g_userContexts;
 // perform, so failing it is the honest answer rather than a gap. A1 only ever
 // sends 000B0006 during boot.
 static uint32_t DispatchAppMessage(uint32_t app, uint32_t message, void* buffer,
-                                   uint32_t bufferLength)
+                                   uint32_t bufferLength, uint32_t overlappedVa = 0)
 {
+    // The session surface, when co-op is on. It takes the overlapped because
+    // every one of its messages is answered by a server and none of them may
+    // block a guest thread; see kernel/xlive_session.h. With co-op off this
+    // never claims a message and everything below is exactly as it was.
+    if (app == kAppXgi)
+    {
+        uint32_t sessionResult = 0;
+        if (XliveSession_Dispatch(message, buffer, bufferLength, overlappedVa, &sessionResult))
+            return sessionResult;
+    }
+
     if (app == kAppXgi && message == 0x000B0006)
     {
         if (!buffer || bufferLength < sizeof(GuestXgiUserContext))
@@ -5178,6 +5190,9 @@ static uint32_t DispatchAppMessage(uint32_t app, uint32_t message, void* buffer,
         const uint32_t user = msg->userIndex.get();
         const uint32_t id = msg->contextId.get();
         g_userContexts[(uint64_t(user) << 32) | id] = msg->contextValue.get();
+        // And to the session layer, which advertises them when a lobby is
+        // created — the create message does not carry them.
+        XliveSession_SetContext(id, msg->contextValue.get());
         KLOG("XGI user %u context %04X = %u\n", user, id, msg->contextValue.get());
         return 0;
     }
@@ -5388,9 +5403,18 @@ static uint32_t DispatchAppMessage(uint32_t app, uint32_t message, void* buffer,
 static uint32_t XMsgStartIORequest_x(uint32_t app, uint32_t message, uint32_t overlapped,
                                      void* buffer, uint32_t bufferLength)
 {
-    const uint32_t result = DispatchAppMessage(app, message, buffer, bufferLength);
+    const uint32_t result = DispatchAppMessage(app, message, buffer, bufferLength, overlapped);
     if (!overlapped)
         return result;
+    // A session message that was accepted completes ITSELF, later, from
+    // xlive_session's thread — the overlapped is already marked pending and
+    // completing it here would tell the title the answer had arrived when the
+    // request has not even left the machine.
+    if (XliveSession_Enabled() && app == kAppXgi && result == 0 &&
+        reinterpret_cast<GuestOverlapped*>(g_memory.Translate(overlapped))->result.get() == 997)
+    {
+        return 0;
+    }
     CompleteOverlapped(reinterpret_cast<GuestOverlapped*>(g_memory.Translate(overlapped)),
                        result, bufferLength);
     return 0;

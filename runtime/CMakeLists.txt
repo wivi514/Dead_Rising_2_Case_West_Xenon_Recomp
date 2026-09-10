@@ -305,6 +305,7 @@ add_executable(cw_runtime
     kernel/content.cpp
     kernel/xex_imports.cpp
     kernel/xlive_glue.cpp            # XenonLive: the account and achievements
+    kernel/xlive_session.cpp         # the XGI session surface; off unless CW_XLIVE_COOP=1
     gpu/vd.cpp
     gpu/pm4.cpp
     # gpu/parallel_record.cpp — part 7's per-range secondaries + deferred replay, PARKED
