@@ -844,3 +844,63 @@ image, and their "old driver" theory is refuted by their own log (26.8.1, Vulkan
 This port shares that present path. If an AMD player reports it here, the bisection is
 theirs and is already ordered: `CW_VK_NO_SWAPCHAIN=1` first, then the present mode — do
 not start from the renderer.
+
+## §10 — the Steam Deck audit, and the glibc floor actually lowered (2026-09-10)
+
+The operator asked whether the sibling's Steam Deck work was done here, naming the glibc
+floor. Their plan is `docs/steam-deck-plan.md` §3, seven deliverables. Audited item by
+item against this tree:
+
+| their §3 deliverable | here |
+|---|---|
+| 1. a log file on every platform, plus `--diag` | **in** (§8) — `cw_runtime.log`, `cw_diag.txt`, gated |
+| 2. the Wine / lavapipe probes | their investigation, not code; nothing to import |
+| 3. REQUIRED features as a checked list, named in the log and `--diag` | **in** (§8) |
+| 4. gamescope-awareness for the video-driver hint | **in** (§8) — under gamescope the Wayland hint is NOT set and the log says why |
+| 5. the operator's RADV live-USB test | an operator action, not code |
+| 6. a Deck test request written for a player | **in** — `.github/ISSUE_TEMPLATE/steam-deck-report.md` (§8) and now `docs/steam-deck-testing.md` |
+| 7. a Deck row in the README's requirements and known issues | **in**, 2026-09-10 |
+
+Plus the two things that make a Deck able to run this at all, both already in from §8:
+**the glibc floor work** (`tools/release_build_oldbase.sh`, the AppImage script, the
+`$APPIMAGE` data root, the clang-15 fix) and **16:10 narrow mode** — the Deck's panel is
+**1280x800**, which this port's own resolution rule accepts exactly at its floor
+(`w*10 >= h*16` is 12,800 >= 12,800) and which the launcher ladder lists.
+
+### The floor was CODE-complete and ARTIFACT-incomplete, which is not the same thing
+
+Everything above was in the tree after §8, and a player would still have met **glibc
+2.43**, because no artifact had ever been built on the old base. That gap is the whole
+of what "did you do the glibc thing" was really asking, and it is now closed:
+
+| | before | after |
+|---|---|---|
+| Linux glibc floor | 2.43 (this machine's) | **2.35** (`libavutil` binds it; everything else 2.34) |
+| AppImage | none | `CaseWestRecomp-linux-x86_64.AppImage`, 27,343,352 B |
+| ffmpeg x86 assembly | **absent** (no nasm on the dev box) | **present** (the container has nasm) |
+
+Built at source `7d5f42e` by `tools/release_build_oldbase.sh`, which compiles SDL2, the
+LGPL ffmpeg and XenonRecomp's static libs inside the container and packages there too —
+packaging inside matters, because an `ldd` on the host resolves the bundle's libraries to
+Fedora's and would ship this machine's floor straight back. The container image is the
+sibling's (`Containerfile` byte-identical after the rename), so `podman tag
+cz-oldbase:jammy cw-oldbase:jammy` saved a 1 GB rebuild.
+
+**Gates, and the third is what makes the first two mean anything:**
+
+| gate | verdict |
+|---|---|
+| clean container AT THE FLOOR (`ubuntu:22.04`), tarball | **GATE PASSED** — full first-run flow, **1,429 shaders, 0 failures**, overlay byte-identical to the Python reference, 261 `.big` archives read, honest refusal with no game |
+| clean container AT THE FLOOR, AppImage | **GATE PASSED** |
+| clean container BELOW THE FLOOR (`rockylinux:9-minimal`, glibc 2.34) | **REFUSED**, exactly as documented: `GLIBC_2.35 not found (required by libavutil.so.60)` |
+
+A gate that only ever passes has not been shown capable of failing (gotcha 30); the Rocky
+9 run is that demonstration and is deliberately NOT counted as a pass.
+
+The AppImage also self-checks three paths of its own: `--appimage-extract-and-run` with no
+FUSE, the data root resolving BESIDE the image with `assets/package/` seeded, and the FUSE
+mount a double-click takes.
+
+**Still owed for v1.0.1**: the Windows leg on czwin (nothing here can build it), and the
+operator's play sitting. Neither is a Deck item. **And no Deck has run this** — every row
+above is a cause removed, not a success observed.
