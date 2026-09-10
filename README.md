@@ -27,6 +27,9 @@ project is not affiliated with, or endorsed by, Capcom or Microsoft.
    [Releases](../../releases) page:
    - Windows: `CaseWestRecomp-windows-x86_64.zip`
    - Linux: `CaseWestRecomp-linux-x86_64.tar.zst`
+   - Linux, single file: `CaseWestRecomp-linux-x86_64.AppImage` (same build;
+     `chmod +x` it and run it. The tarball is the better choice on a Steam Deck —
+     see `docs/steam-deck-testing.md` for why)
 2. **Unpack it anywhere** (Windows: right-click → Extract All; Linux:
    `tar --zstd -xf CaseWestRecomp-linux-x86_64.tar.zst`).
 3. **Add your copy of the game.** You need the XBLA package file your Xbox 360
@@ -115,8 +118,9 @@ game folder at any time without losing progress.
 
 - A GPU and driver with **Vulkan 1.3** support (tested on NVIDIA and AMD).
 - **Windows**: Windows 10 or later, x86-64.
-- **Linux**: x86-64 with glibc **2.43 or newer** for the v1.0.0 download (see known
-  issues); the next build lowers this to **2.35** and adds an AppImage.
+- **Linux**: x86-64 with glibc **2.35 or newer** (v1.0.1 and later — Ubuntu 22.04,
+  Debian 12, Fedora 36 and anything newer). **The v1.0.0 download needs 2.43** and
+  will not start on older distributions; take v1.0.1 or later instead.
 - **~3 GB free disk space** after first-run unpacking.
 - **Your own copy of the game** (see above).
 
@@ -124,20 +128,29 @@ game folder at any time without losing progress.
 
 - The occasional spot may shade slightly differently than original hardware;
   everything is being tracked and refined.
-- **Linux glibc floor**: the v1.0.0 build was linked on Fedora 44 and refuses
-  to start on distributions older than glibc 2.43 (`GLIBC_x.yz not found`).
-  The next build is made on an Ubuntu 22.04 base (glibc 2.35) and also ships
-  as an AppImage — the build machinery is in the tree (`tools/release_build_oldbase.sh`).
-- **Steam Deck**: never run there by anyone on this project. v1.0.0's Linux build
-  **cannot start on SteamOS** — it needs glibc 2.43 and SteamOS is older. The next
-  release removes that cause (built on Ubuntu 22.04, so glibc 2.35) and lets the pad
-  drive the launcher, which Game Mode needs. Everything else about the Deck is
-  unknown, not known-good. `docs/steam-deck-testing.md` says exactly what to try and
-  what to send back; a report from a Deck owner is genuinely useful.
+- **On some AMD GPUs** (seen on our own RX 6600 test machine; NVIDIA is unaffected):
+  a **black square can appear in the middle of the screen** during loading screens and
+  cutscenes. **Alt-tab out and back, or press Win+PrintScreen** — either clears it. It
+  does not affect gameplay or progress. The sibling port shows the same thing on the
+  same hardware, which points at the code the two share rather than at this game; it is
+  being investigated.
+- **Steam Deck**: never run there by anyone on this project. v1.0.0 provably could not
+  start on SteamOS (it needed glibc 2.43); **v1.0.1 removes that cause** and lets the
+  pad drive the launcher, which Game Mode needs. Everything else about the Deck is
+  **unknown, not known-good**. `docs/steam-deck-testing.md` says exactly what to try
+  and what to send back; a report from a Deck owner is genuinely useful.
 - **No macOS build yet** — nothing blocks it in principle; it awaits test
   hardware.
 - **No co-op** — Case West's second player is online-only on the 360 (see the
   status note above).
+
+## The sibling port
+
+The prologue, **Dead Rising 2: Case Zero**, is ported the same way and shares almost
+all of this runtime:
+[Dead_Rising_2_Case_Zero_Xenon_Recomp](https://github.com/wivi514/Dead_Rising_2_Case_Zero_Xenon_Recomp).
+Fixes flow both ways between the two, which is why a defect seen on both — like the
+AMD black square above — is worth more than one seen on either alone.
 
 ## Building from source
 
