@@ -113,7 +113,8 @@ game folder at any time without losing progress.
 
 - A GPU and driver with **Vulkan 1.3** support (tested on NVIDIA and AMD).
 - **Windows**: Windows 10 or later, x86-64.
-- **Linux**: x86-64 with glibc **2.43 or newer** (see known issues).
+- **Linux**: x86-64 with glibc **2.43 or newer** for the v1.0.0 download (see known
+  issues); the next build lowers this to **2.35** and adds an AppImage.
 - **~3 GB free disk space** after first-run unpacking.
 - **Your own copy of the game** (see above).
 
@@ -125,6 +126,12 @@ game folder at any time without losing progress.
   to start on distributions older than glibc 2.43 (`GLIBC_x.yz not found`).
   The next build is made on an Ubuntu 22.04 base (glibc 2.35) and also ships
   as an AppImage — the build machinery is in the tree (`tools/release_build_oldbase.sh`).
+- **Steam Deck**: never run there by anyone on this project. v1.0.0's Linux build
+  **cannot start on SteamOS** — it needs glibc 2.43 and SteamOS is older. The next
+  release removes that cause (built on Ubuntu 22.04, so glibc 2.35) and lets the pad
+  drive the launcher, which Game Mode needs. Everything else about the Deck is
+  unknown, not known-good. `docs/steam-deck-testing.md` says exactly what to try and
+  what to send back; a report from a Deck owner is genuinely useful.
 - **No macOS build yet** — nothing blocks it in principle; it awaits test
   hardware.
 - **No co-op** — Case West's second player is online-only on the 360 (see the

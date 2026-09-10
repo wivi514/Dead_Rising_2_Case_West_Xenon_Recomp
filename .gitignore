@@ -50,3 +50,11 @@ build-relid/
 /cw_runtime.log.1
 /cw_diag.txt
 /cw_diag.txt.1
+
+# The old-base (Ubuntu 22.04 / glibc 2.35) release build, built inside a podman
+# container by tools/release_build_oldbase.sh: its build trees and the SDL2/ffmpeg/
+# XenonUtils it compiles there are all regeneratable from source.
+/runtime/build-release-oldbase/
+/runtime/build-relmatch-oldbase/
+/runtime/*.configure.log
+/thirdparty/oldbase/
