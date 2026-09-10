@@ -285,6 +285,7 @@ add_executable(cw_runtime
     # in BOTH images and would have linked silently to an unrelated function.
     cpu/debug_tunables_cw.cpp
     cpu/native_kbm.cpp               # part 92 (Case Zero): native KB/M via the title's own input layer
+    cpu/camera_fov.cpp               # Case Zero parts 62/108 (imported part 11): the game-side fov substitution — the ultrawide/16:10 CULLING fix; addresses re-derived here
     cpu/fence_wait.cpp               # Case Zero part 107 (imported part 11): the Draw Thread fence wait parked on a futex — addresses re-derived here
     cpu/rumble_guest.cpp             # Case Zero part 108 (imported part 11): the rumble tick at 30 Hz (CW_RUMBLE_TICK_HZ) + the probe (CW_RUMBLE_TRACE) — addresses re-derived here
     kernel/klog.cpp
