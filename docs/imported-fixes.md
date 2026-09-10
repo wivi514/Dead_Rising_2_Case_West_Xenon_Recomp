@@ -788,3 +788,59 @@ exited normally. Recorded rather than diagnosed because one occurrence is one sa
 **The cheap next test is a one-variable arm**: run the route with `CW_NO_LOG_FILE=1`
 until it either hangs (the tee is innocent) or a hundred runs pass (it is not). A hang
 on exit would be player-visible, so this must be settled before v1.0.1 ships.
+
+## §9 — the launcher round, and what the sibling's AMD sittings say about §8 (2026-09-09, part 11)
+
+| | |
+|---|---|
+| **Imported** | 2026-09-09, commit `28189b5` |
+| **Source** | Case Zero `8b67e6a` (21:9 launcher rungs) and `e3981ad` (the pad drives the launcher), both landed after §8's snapshot |
+| **Method** | Three-way merge again, base = CZ@`a9e7d95`. ONE conflict: the launcher window's height, because their launcher has ten rows and ours has nine |
+
+* **The pad drives the launcher** — D-pad and left stick move, A selects, START plays
+  from any row, B quits, each press becoming the key it stands for so the row behaviour
+  is one implementation. Written for a handheld in game mode, where a keyboard-only
+  modal window reads as "the game doesn't start".
+* **21:9 rungs in the ladder** (2560x1080, 3440x1440, 3840x1600), ordered by height then
+  width. **This one matters more here than there**: the operator's own main display is a
+  3440x1440 ultrawide, and before this the only way to reach it from the launcher was to
+  have the desktop already at that size.
+* **AND A DEFECT OF OURS THE SAME FILE REVEALED**: the launcher window has been 720x420
+  since it had seven rows. MSAA (§8) and SUBTITLES (§7) made it nine without growing it,
+  so the drop-hint footer was drawn at y=416 in a 420-tall window — the line telling a
+  new player where to put their game file, clipped. Now sized from the layout's own
+  arithmetic (458 for nine rows) with the formula in the comment.
+
+**Gate**: `CW_LAUNCHER_PAD_TEST` — the sibling's own idea, and the reason a machine with
+no pad can still gate this. It pushes real SDL controller events through the same cases a
+physical pad delivers. Run here: two DOWNs reach RESOLUTION; seven RIGHTs walk
+`2560x1440 -> 3440x1440 -> 2560x1600 -> 3840x1600 -> 3840x2160 -> 1280x720 -> 1280x800 ->
+1600x900`; `LSDOWN`/`LSUP` move the selection (the stick's edge-trigger); `B` quits, exit 0.
+
+**A hazard, recorded so the next session does not learn it the hard way**: the launcher's
+setters persist IMMEDIATELY, so a pad test rewrites the operator's `cw_settings.txt` (this
+one walked their resolution to 1600x900). Back it up first and restore it byte-identical
+after, sha256 checked — the discipline §7's language experiment used.
+
+### What the sibling's AMD sittings say about §8's performance items
+
+Their `8abdcda` is the closest thing this port has to third-party evidence for the work
+§8 imported, and it is worth reading precisely rather than as reassurance. On an **RX
+6600 at 1080p with MSAA 2x**, from a cold shader cache, their operator measured a crowd
+of 7,861 draws at **70 fps median, p99 19-21 ms, 0.1% of frames above twice the median**,
+and confirmed the three part-106/107 items ON AMD: the **stream store in VRAM**, the
+**glyph scan at 0.128 s**, and the **fence park with MISSED 0.0** — the same three
+engagement facts §8 gates here on NVIDIA, now seen on the other vendor.
+
+**What it is NOT**: a number for this title. It is the sibling's game, their route, their
+machine. It raises confidence that the imported code behaves on AMD; it does not stand in
+for the crowd A/B this port still cannot run (§8's stale-route note).
+
+### A live AMD lead worth knowing before a player reports it here
+
+Their item 0af (`2b34148`): the **black square on AMD survives v1.0.2 and CLEARS ON
+ALT-TAB / Win+PrintScreen**, which points at the **present path** rather than the rendered
+image, and their "old driver" theory is refuted by their own log (26.8.1, Vulkan 1.4.315).
+This port shares that present path. If an AMD player reports it here, the bisection is
+theirs and is already ordered: `CW_VK_NO_SWAPCHAIN=1` first, then the present mode — do
+not start from the renderer.
