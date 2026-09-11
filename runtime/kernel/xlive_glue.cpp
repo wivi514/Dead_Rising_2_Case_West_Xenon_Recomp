@@ -122,10 +122,19 @@ void OnEvent(const xlive::Event& event)
         break;
 
     case xlive::EventKind::InviteReceived:
+        // Delivered only when no launcher is connected to ask the player.
         KLOG("[xlive] invite from %s to session %016llX\n", event.gamertag.c_str(),
              (unsigned long long)event.session_id);
         XliveSocial_OnInviteReceived(event.invite_id, event.xuid, event.title_id,
-                                     event.session_id);
+                                     event.session_id, /*accept=*/true);
+        break;
+
+    case xlive::EventKind::InviteAccepted:
+        // The player said yes in the launcher; this is the title's cue.
+        KLOG("[xlive] invite from %s to session %016llX accepted in the launcher\n",
+             event.gamertag.c_str(), (unsigned long long)event.session_id);
+        XliveSocial_OnInviteReceived(event.invite_id, event.xuid, event.title_id,
+                                     event.session_id, /*accept=*/false);
         break;
 
     case xlive::EventKind::InviteAnswered:

@@ -154,6 +154,8 @@ struct PendingInvite
     uint64_t fromXuid = 0;
     uint32_t titleId = 0;
     uint64_t sessionId = 0;
+    // Whether the server still has to be told it was taken.
+    bool accept = false;
     bool valid() const { return sessionId != 0; }
 };
 PendingInvite g_pendingInvite;   // waiting for the session details
@@ -586,13 +588,13 @@ void XliveSocial_OnFriendsChanged()
 }
 
 void XliveSocial_OnInviteReceived(uint64_t inviteId, uint64_t fromXuid, uint32_t titleId,
-                                  uint64_t sessionId)
+                                  uint64_t sessionId, bool accept)
 {
     if (sessionId == 0)
         return;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        g_pendingInvite = PendingInvite{inviteId, fromXuid, titleId, sessionId};
+        g_pendingInvite = PendingInvite{inviteId, fromXuid, titleId, sessionId, accept};
     }
     if (!XliveSession_PrefetchInviteSession(sessionId))
     {
@@ -623,15 +625,19 @@ void XliveSocial_OnInviteSessionReady(uint64_t sessionId, bool ok)
              (unsigned long long)sessionId);
         return;
     }
-    // Tell the sender it was taken. There is no guide UI in this runtime to
-    // ask the player, and an invitation can only come from someone they have
-    // accepted as a friend; the title's own state machine still decides what
-    // to do with it. The ticket is not polled: a game does not need to know
-    // whether the server recorded the answer.
-    if (invite.inviteId)
+    // Tell the sender it was taken — when nobody else has. The server only
+    // delivers a raw invitation to a game when no launcher is connected to
+    // ask the player, and there is no guide UI in this runtime; an
+    // invitation can only come from someone they have accepted as a friend,
+    // and the title's own state machine still decides what to do with it.
+    // When the player answered in the launcher, the server already knows.
+    // The ticket is not polled: a game does not need to know whether the
+    // server recorded the answer.
+    if (invite.accept && invite.inviteId)
         XliveSession_DrainSocialTicket(Live().AcceptInvite(invite.inviteId));
-    KLOG("[xlive] invite from %016llX to session %016llX: XN_LIVE_INVITE_ACCEPTED\n",
-         (unsigned long long)invite.fromXuid, (unsigned long long)sessionId);
+    KLOG("[xlive] invite from %016llX to session %016llX%s: XN_LIVE_INVITE_ACCEPTED\n",
+         (unsigned long long)invite.fromXuid, (unsigned long long)sessionId,
+         invite.accept ? " (taken here: no launcher)" : " (accepted in the launcher)");
     PostGuestNotification(XN_LIVE_INVITE_ACCEPTED, 0);
 }
 

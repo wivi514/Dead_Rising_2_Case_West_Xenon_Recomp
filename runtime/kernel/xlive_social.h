@@ -60,8 +60,15 @@ void XliveSocial_OnFriendsChanged();
 // not carry. So this asks the session layer for the details first and posts
 // the notification only once they are in memory, because the handler is not
 // allowed to wait for them.
+//
+// Two events arrive here, and which one says who answered the invitation:
+//   InviteReceived — no launcher was connected, so nobody could ask the
+//                    player; the invitation is taken on their behalf and the
+//                    server is told (`accept` = true).
+//   InviteAccepted — the player already said yes, in the launcher; the server
+//                    knows, and this is only the title's cue (`accept` = false).
 void XliveSocial_OnInviteReceived(uint64_t inviteId, uint64_t fromXuid, uint32_t titleId,
-                                  uint64_t sessionId);
+                                  uint64_t sessionId, bool accept);
 
 // The session layer's answer to the request above.
 void XliveSocial_OnInviteSessionReady(uint64_t sessionId, bool ok);
