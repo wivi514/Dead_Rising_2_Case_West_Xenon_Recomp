@@ -184,6 +184,21 @@ uint32_t Fail(uint32_t error)
     return kSocketError;
 }
 
+// Per-packet trace, off unless CW_NET_LOG=1. What the first two-machine
+// session needed to see: which guest port a datagram left from, which it was
+// addressed to, the peer, and every datagram dropped because no socket owned
+// its destination port.
+bool NetLogOn()
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char* env = std::getenv("CW_NET_LOG");
+        on = (env && *env && *env != '0') ? 1 : 0;
+    }
+    return on == 1;
+}
+
 template <typename T>
 T* GuestPtr(uint32_t va)
 {
@@ -342,6 +357,9 @@ uint32_t SendToAddress(const GuestSocket& sock, uint32_t addr, uint16_t port, co
         std::memcpy(&framed[kPortHeader], data, length);
 
     const int n = Live().SendTo(xuid, framed.data(), framed.size());
+    if (NetLogOn())
+        KLOG("[net] send %u->%u peer %016llX %uB -> %d\n", sock.boundPort, port,
+             (unsigned long long)xuid, length, n);
     if (n >= 0)
     {
         *sent = length;
@@ -423,6 +441,9 @@ bool PullOne(uint32_t handle, const GuestSocket& sock, GuestDatagram& out)
     datagram.payload.assign(raw + kPortHeader, size_t(n) - kPortHeader);
     if (toPort == sock.boundPort)
     {
+        if (NetLogOn())
+            KLOG("[net] recv %u<-%u peer %016llX %zuB -> sock %08X (mine)\n", toPort, fromPort,
+                 (unsigned long long)xuid, datagram.payload.size(), handle);
         out = std::move(datagram);
         return true;
     }
@@ -435,9 +456,16 @@ bool PullOne(uint32_t handle, const GuestSocket& sock, GuestDatagram& out)
             if (target.inbox.size() >= 256)
                 target.inbox.pop_front();
             target.inbox.push_back(std::move(datagram));
+            if (NetLogOn())
+                KLOG("[net] recv %u<-%u peer %016llX %zuB -> sock %08X inbox (%zu)\n", toPort,
+                     fromPort, (unsigned long long)xuid, datagram.payload.size(), other,
+                     target.inbox.size());
             return false;
         }
     }
+    if (NetLogOn())
+        KLOG("[net] DROP recv to port %u<-%u peer %016llX %zuB: no socket bound to %u\n", toPort,
+             fromPort, (unsigned long long)xuid, datagram.payload.size(), toPort);
     return false; // a port nobody is bound to
 }
 
