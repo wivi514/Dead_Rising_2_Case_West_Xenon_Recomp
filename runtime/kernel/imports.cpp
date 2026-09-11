@@ -3180,12 +3180,38 @@ GUEST_FUNCTION_STUB(__imp__XexUnloadImage)
 //
 // If a later phase implements a real XAM export table, raising this is the right
 // move — but it must be raised WITH those exports, never before them.
-static uint32_t XamGetSystemVersion_x()
-{
-    return 0;
-}
+//
+// TWO OF THE SEVEN ARE THE OTHER WAY ROUND. sub_82606770 (XSessionGetDetails)
+// and sub_82606D30 (XSessionMigrateHost) do not resolve anything dynamically
+// above 0x200CE900: below it they REFUSE, with ERROR_FUNCTION_FAILED, before
+// sending their message — those two XGI messages arrived with a dashboard
+// update and the wrapper will not send them to a kernel it believes is too
+// old. This runtime handles both (kernel/xlive_session.cpp), and the first
+// two-machine co-op session found what the refusal costs: the title's
+// lobby state machine asks for the session's details right after creating
+// it, takes the 1627 as a failure, and deletes the session it just made —
+// on both machines, forever, so nothing was ever joinable.
+//
+// So the answer depends on who is asking, which the link register says: the
+// two wrappers that ask "may I send this message" hear a version that lets
+// them, everything that asks "may I resolve a newer entry point" hears the 0
+// that keeps it on the static path. That is the truthful statement of what
+// this runtime has: those two messages, and no export table.
+constexpr uint32_t kSessionDetailsWrapperBegin = 0x82606770; // sub_82606770
+constexpr uint32_t kSessionDetailsWrapperEnd   = 0x826068A0;
+constexpr uint32_t kSessionMigrateWrapperBegin = 0x82606D30; // sub_82606D30
+constexpr uint32_t kSessionMigrateWrapperEnd   = 0x82606E28;
+constexpr uint32_t kSessionMessagesVersion     = 0x200CE900; // the wrappers' own threshold
 
-GUEST_FUNCTION_HOOK(__imp__XamGetSystemVersion, XamGetSystemVersion_x)
+PPC_FUNC(__imp__XamGetSystemVersion)
+{
+    KCALL("XamGetSystemVersion");
+    const uint32_t caller = uint32_t(ctx.lr);
+    const bool sessionWrapper =
+        (caller >= kSessionDetailsWrapperBegin && caller < kSessionDetailsWrapperEnd) ||
+        (caller >= kSessionMigrateWrapperBegin && caller < kSessionMigrateWrapperEnd);
+    ctx.r3.u64 = (sessionWrapper && XliveSession_Enabled()) ? kSessionMessagesVersion : 0u;
+}
 
 // RtlCompareStringN(s1, len1, s2, len2, caseInsensitive) — memcmp semantics over the
 // shorter length, then by length; 0 means equal.
