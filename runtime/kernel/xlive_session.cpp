@@ -333,6 +333,10 @@ struct Pending
     uint32_t detailsPtr = 0;
     uint32_t detailsSize = 0;
     uint64_t sessionId = 0;
+    // XSessionCreate without XSESSION_CREATE_HOST: the title is registering
+    // a session it FOUND — the XSESSION_INFO it passed in names it — and
+    // nothing is created anywhere. Answered with the session's details.
+    bool joiner = false;
 };
 std::vector<Pending> g_pending;
 
@@ -673,8 +677,13 @@ void SettleWith(const Pending& pending, const xlive::Client::SessionResult& resu
                 FillSessionInfo(info, result.session);
             if (auto* nonce = GuestPtr<be<uint64_t>>(pending.noncePtr))
                 *nonce = result.session.nonce;
-            KLOG("[xlive] hosting session %016llX (%d public slot(s))\n",
-                 (unsigned long long)result.session.session_id, result.session.public_slots);
+            if (pending.joiner)
+                KLOG("[xlive] registered session %016llX to join (host %s, %d open slot(s))\n",
+                     (unsigned long long)result.session.session_id,
+                     result.session.host_gamertag.c_str(), result.session.open_public_slots);
+            else
+                KLOG("[xlive] hosting session %016llX (%d public slot(s))\n",
+                     (unsigned long long)result.session.session_id, result.session.public_slots);
             break;
 
         case 0x000B0012: // XSessionJoinLocal
@@ -732,6 +741,12 @@ void SettleWith(const Pending& pending, const xlive::Client::SessionResult& resu
     switch (pending.message)
     {
     case 0x000B0010:
+        // A joiner's create only registered the session; it is not a member
+        // until its JoinLocal, and the server hands addresses to members
+        // only. Peering starts there.
+        if (pending.joiner)
+            break;
+        [[fallthrough]];
     case 0x000B0012:
         // Start opening paths as soon as we are in a session. Punching takes
         // seconds; starting it when the title first sends a packet would put
@@ -1050,6 +1065,37 @@ bool XliveSession_Dispatch(uint32_t message, void* buffer, uint32_t bufferLength
             return true;
         }
         const auto* msg = static_cast<const GuestSessionCreate*>(buffer);
+
+        // XSESSION_CREATE_HOST clear: the title is not making a session, it
+        // is registering one it found — the joiner's XSessionCreate, with the
+        // host's XSESSION_INFO (from a search, an invitation or a friend's
+        // presence) in the buffer it would otherwise be asking us to fill.
+        // The first two-machine session found this: the joiner's create
+        // opened a second, empty lobby on the server and its packets went to
+        // a session the host was never in.
+        constexpr uint32_t kSessionCreateHost = 0x00000001;
+        if ((msg->flags.get() & kSessionCreateHost) == 0)
+        {
+            const auto* info = GuestPtr<const GuestSessionInfo>(msg->sessionInfoPtr.get());
+            const uint64_t sessionId = info ? ReadXnkid(&info->sessionId) : 0;
+            if (sessionId == 0)
+            {
+                KLOG("XSessionCreate: not the host, and no session named to join\n");
+                *result = kErrorInvalidParameter;
+                return true;
+            }
+            Pending pending;
+            pending.message = message;
+            pending.overlappedVa = overlappedVa;
+            pending.objectPtr = msg->objectPtr.get();
+            pending.sessionInfoPtr = msg->sessionInfoPtr.get();
+            pending.noncePtr = msg->noncePtr.get();
+            pending.sessionId = sessionId;
+            pending.joiner = true;
+            pending.ticket = Live().GetSessionDetails(sessionId);
+            *result = Begin(std::move(pending));
+            return true;
+        }
 
         xlive::Client::SessionCreateRequest request;
         request.flags = msg->flags.get();
