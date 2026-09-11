@@ -161,6 +161,14 @@ struct PendingInvite
 PendingInvite g_pendingInvite;   // waiting for the session details
 PendingInvite g_announcedInvite; // XN_LIVE_INVITE_ACCEPTED has been posted for it
 
+// XN_LIVE_INVITE_ACCEPTED that found no listener. A title launched INTO an
+// invitation learns of it from libxlive's first sync, which happens while the
+// boot logos are still up and before the title has created the listener that
+// wants area 1 — PostGuestNotification would have dropped it. It is held here
+// and posted on the title's next Live call (XliveSocial_Dispatch), which is
+// the title's own proof that its Live layer, listeners included, is up.
+bool g_heldInviteNotification = false;
+
 // What the friends list looked like the last time the title was told, so the
 // next change can be named rather than just announced.
 std::set<uint64_t> g_lastFriendSet;
@@ -496,9 +504,12 @@ uint32_t InviteGetAcceptedInfo(uint32_t argumentsVa)
 // The public surface
 // ---------------------------------------------------------------------------
 
+static void PostHeldInviteNotification();
+
 bool XliveSocial_Dispatch(uint32_t message, void* buffer, uint32_t argumentsVa,
                           uint32_t* result)
 {
+    PostHeldInviteNotification();
     switch (message)
     {
     case 0x00058004: *result = GetLogonId(buffer); return true;
@@ -638,7 +649,29 @@ void XliveSocial_OnInviteSessionReady(uint64_t sessionId, bool ok)
     KLOG("[xlive] invite from %016llX to session %016llX%s: XN_LIVE_INVITE_ACCEPTED\n",
          (unsigned long long)invite.fromXuid, (unsigned long long)sessionId,
          invite.accept ? " (taken here: no launcher)" : " (accepted in the launcher)");
-    PostGuestNotification(XN_LIVE_INVITE_ACCEPTED, 0);
+    if (!PostGuestNotification(XN_LIVE_INVITE_ACCEPTED, 0))
+    {
+        KLOG("[xlive] XN_LIVE_INVITE_ACCEPTED: no listener yet; held for the title's "
+             "first Live call\n");
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_heldInviteNotification = true;
+    }
+}
+
+// Posts a held XN_LIVE_INVITE_ACCEPTED once a listener exists. Called from
+// XliveSocial_Dispatch: cheap when nothing is held, which is always but once.
+static void PostHeldInviteNotification()
+{
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!g_heldInviteNotification)
+            return;
+    }
+    if (!PostGuestNotification(XN_LIVE_INVITE_ACCEPTED, 0))
+        return;
+    KLOG("[xlive] XN_LIVE_INVITE_ACCEPTED: posted the held notification\n");
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_heldInviteNotification = false;
 }
 
 void XliveSocial_OnConnectionChanged(bool online)

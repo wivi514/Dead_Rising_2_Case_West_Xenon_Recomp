@@ -101,5 +101,6 @@ constexpr uint32_t XN_FRIENDS_PRESENCE_CHANGED = 0x04000001;
 constexpr uint32_t XN_FRIENDS_FRIEND_ADDED     = 0x04000002; // sub_825F8EB8 tests it
 constexpr uint32_t XN_FRIENDS_FRIEND_REMOVED   = 0x04000003; // and this
 
-// Defined in imports.cpp: the seam into the title's notification queues.
-void PostGuestNotification(uint32_t id, uint32_t param);
+// Defined in imports.cpp: the seam into the title's notification queues. False
+// when no listener for the id's area exists yet, in which case nothing heard it.
+bool PostGuestNotification(uint32_t id, uint32_t param);

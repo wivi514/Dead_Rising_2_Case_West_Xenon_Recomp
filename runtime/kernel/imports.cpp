@@ -3843,19 +3843,25 @@ static bool ListenerWants(const NotifyListener* l, uint32_t id)
 
 static std::vector<NotifyListener*> g_notifyListeners;
 
-// The seam for a future input/storage/UI layer: post an event to every listener
-// subscribed to its area. Unused today, and deliberately kept rather than deferred —
-// the queue is only testable if something can fill it.
-void PostGuestNotification(uint32_t id, uint32_t param)
+// The seam the Live layer posts through (kernel/xlive_glue.cpp, xlive_social.cpp):
+// an event to every listener subscribed to its area. Returns whether ANY listener
+// took it, because a notification posted before the title has created a listener
+// for that area is simply gone — and at boot, libxlive connects and learns of an
+// invitation the process was launched into well before the title's listeners
+// exist. A caller that must not lose one holds it and posts again later.
+bool PostGuestNotification(uint32_t id, uint32_t param)
 {
     std::lock_guard guard(g_kernelLock);
+    bool delivered = false;
     for (NotifyListener* l : g_notifyListeners)
     {
         if (!ListenerWants(l, id))
             continue;
         std::lock_guard q(l->m);
         l->queue.emplace_back(id, param);
+        delivered = true;
     }
+    return delivered;
 }
 
 // A1: XamNotifyCreateListener(0000000000000001, 00000005) and four more with masks
