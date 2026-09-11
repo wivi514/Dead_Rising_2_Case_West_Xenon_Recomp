@@ -79,6 +79,7 @@
 #include "memory.h"
 #include "xex_imports.h"
 #include "xlive_glue.h"  // XenonLive: the account, and where achievements go
+#include "xlive_social.h" // XenonLive: the XLiveBase messages (friends, invites)
 #include "xlive_session.h"  // the XGI session surface (co-op), off by default
 
 // ---------------------------------------------------------------------------
@@ -3388,9 +3389,17 @@ constexpr const char* kLocalUserName = "Player";
 
 // XamUserGetSigninState returns the state itself, not a status: 0 = not signed in,
 // 1 = signed in locally, 2 = signed in to Live.
+//
+// THE 2 IS BEHIND CW_XLIVE_ONLINE=1, and it is the riskiest line in the XenonLive
+// integration: it is what sends the title down XOnlineStartup, the friends list
+// and the invite state machine — every path kernel/xlive_social.cpp exists for
+// and nothing before it had exercised. Without the flag this is the 1 it has
+// always been, and the A1/A5 call sequence is untouched.
 static uint32_t XamUserGetSigninState_x(uint32_t userIndex)
 {
-    return userIndex == kLocalUserIndex ? 1u : 0u;
+    if (userIndex != kLocalUserIndex)
+        return 0;
+    return CwXlive_SignedInToLive() ? 2u : 1u;
 }
 
 // XamUserGetName(userIndex, buffer, bufferLen) -> 0 on success. A1 always asks for
@@ -3436,7 +3445,13 @@ static uint32_t XamUserGetSigninInfo_x(uint32_t userIndex, uint32_t flags, be<ui
         *out = 0;
         return ERROR_NO_SUCH_USER;
     }
-    *out = (flags & 1) ? 0ull : kLocalOfflineXuid;
+    // flags=1 asks for the ONLINE xuid. There is one exactly when the title
+    // is being told it is signed in to Live (see XamUserGetSigninState); the
+    // rest of the time the answer stays the zero A1's call sequence depends on.
+    if (flags & 1)
+        *out = CwXlive_SignedInToLive() ? CwXlive_Xuid(0) : 0ull;
+    else
+        *out = CwXlive_Xuid(kLocalOfflineXuid);
     return 0;
 }
 
@@ -3466,6 +3481,11 @@ static uint32_t XamUserGetXUID_x(uint32_t userIndex, uint32_t type, be<uint64_t>
 // A1 asks for privilege 0x000000FC = XPRIVILEGE_COMMUNICATIONS. With no Live identity
 // (see the XUID above) the truthful answer is "not granted", and saying otherwise
 // would invite the title into an online path this runtime cannot follow.
+//
+// Signed in to Live (CW_XLIVE_ONLINE=1 and a gateway up), every privilege is
+// granted: the account is an adult one with nothing to restrict, and the title
+// asks about communications and multiplayer sessions before it will show a
+// co-op lobby or a friends list.
 static uint32_t XamUserCheckPrivilege_x(uint32_t userIndex, uint32_t privilege,
                                         be<uint32_t>* result)
 {
@@ -3473,7 +3493,10 @@ static uint32_t XamUserCheckPrivilege_x(uint32_t userIndex, uint32_t privilege,
     if (!result)
         return ERROR_NO_SUCH_USER;
     *result = 0;
-    return userIndex == kLocalUserIndex ? 0u : ERROR_NO_SUCH_USER;
+    if (userIndex != kLocalUserIndex)
+        return ERROR_NO_SUCH_USER;
+    *result = CwXlive_SignedInToLive() ? 1u : 0u;
+    return 0;
 }
 
 GUEST_FUNCTION_HOOK(__imp__XamUserGetSigninState, XamUserGetSigninState_x)
@@ -3804,15 +3827,18 @@ struct NotifyListener final : KernelObject
     explicit NotifyListener(uint64_t areaMask) : mask(areaMask) {}
 };
 
-// The notification area is the id's high halfword; the listener mask has one bit per
-// area. Every id this title tests for is in area 0 (the system area), so in practice
-// this only ever asks "did you subscribe to bit 0" — but the shift is written out
-// because a listener created with mask 0x20 (A1 shows one) is subscribing to
-// something else entirely, and silently delivering system events to it would be
-// wrong in a way nothing would report.
+// The notification area is bits 25..30 of the id; the listener mask has one bit per
+// area. Read off the title now that it tests ids outside area 0: sub_8259DC38 polls
+// the listener created with mask 3 and handles 0x02000001 and 0x02000002
+// (XN_LIVE_CONNECTIONCHANGED, XN_LIVE_INVITE_ACCEPTED — area 1, mask bit 1) beside
+// 10 and 14; sub_825F8EB8 polls a mask-5 listener for 0x04000002/3 (the friends
+// area, 2); and the mask-0x20 listener A1 shows is area 5, the media player, which
+// sub_827F6D98 polls for 0x0A000001. Xenia agrees (kXNotificationAreaMask =
+// 0x7E000000). The earlier `id >> 16` was only ever exercised on area-0 ids, where
+// both encodings give bit 0.
 static bool ListenerWants(const NotifyListener* l, uint32_t id)
 {
-    return (l->mask & (1ull << (id >> 16))) != 0;
+    return (l->mask & (1ull << ((id >> 25) & 0x3F))) != 0;
 }
 
 static std::vector<NotifyListener*> g_notifyListeners;
@@ -5193,6 +5219,11 @@ static uint32_t DispatchAppMessage(uint32_t app, uint32_t message, void* buffer,
         // And to the session layer, which advertises them when a lobby is
         // created — the create message does not carry them.
         XliveSession_SetContext(id, msg->contextValue.get());
+        // X_CONTEXT_PRESENCE is the one context that is FOR other people: on
+        // the console it was the line under the gamertag in a friend's list.
+        // libxlive publishes it to accepted friends and never blocks here.
+        if (id == 0x8001)
+            CwXlive_SetPresence(msg->contextValue.get());
         KLOG("XGI user %u context %04X = %u\n", user, id, msg->contextValue.get());
         return 0;
     }
@@ -5421,10 +5452,22 @@ static uint32_t XMsgStartIORequest_x(uint32_t app, uint32_t message, uint32_t ov
 }
 
 // The synchronous form: no overlapped, the status is the return value.
+//
+// THE FOURTH PARAMETER IS NOT A LENGTH. For XLiveBase it is a pointer — to the
+// marshalled argument list for XFriendsCreateEnumerator and
+// XInviteGetAcceptedInfo, to the caller's BOOL for XUserMuteListQuery — and
+// the recovery tool was right to refuse to fold it to a constant. It is passed
+// through raw and each message interprets it (kernel/xlive_social.cpp); the
+// XGI and content messages that come this way still see a length of 0.
 static uint32_t XMsgInProcessCall_x(uint32_t app, uint32_t message, void* buffer,
-                                    uint32_t unused)
+                                    uint32_t argumentsVa)
 {
-    (void)unused;
+    if (app == kAppXLiveBase)
+    {
+        uint32_t result = 0;
+        if (XliveSocial_Dispatch(message, buffer, argumentsVa, &result))
+            return result;
+    }
     return DispatchAppMessage(app, message, buffer, 0);
 }
 

@@ -52,6 +52,29 @@ void XliveSession_SetContext(uint32_t contextId, uint32_t value);
 bool XliveSession_Dispatch(uint32_t message, void* buffer, uint32_t bufferLength,
                            uint32_t overlappedVa, uint32_t* result);
 
+// -- invitations -------------------------------------------------------------
+//
+// An invitation names a session by XNKID, but the X_INVITE_INFO the title asks
+// for carries the whole XSESSION_INFO — key and host address included — and
+// XInviteGetAcceptedInfo arrives with no overlapped, so the details have to be
+// in memory before the title is told there is an invitation at all.
+
+// Asks the server for the session behind an invitation, on the completion
+// thread. Answers through XliveSocial_OnInviteSessionReady. Returns false when
+// co-op is off, because then there is nothing to fetch it on and nothing to
+// join with.
+bool XliveSession_PrefetchInviteSession(uint64_t sessionId);
+
+// Fills 0x3C bytes of guest memory with the XSESSION_INFO of a session the
+// prefetch above brought in. False when it never arrived.
+bool XliveSession_InviteSessionInfo(uint64_t sessionId, void* sessionInfoOut);
+
+// Collects a social ticket nobody else will: the answer is logged and dropped.
+// For the calls a game makes without needing the result — accepting an
+// invitation on the player's behalf — where Forget() would cancel a request
+// that has not left the queue yet.
+void XliveSession_DrainSocialTicket(uint64_t ticket);
+
 // -- the virtual XNet ------------------------------------------------------
 //
 // The title translates an XNADDR to an IN_ADDR and then uses ordinary sockets.

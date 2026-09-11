@@ -33,6 +33,7 @@
 #include "klog.h"
 #include "memory.h"
 #include "xlive_glue.h"
+#include "xlive_social.h"
 
 #include <xlive/client.h>
 
@@ -313,6 +314,15 @@ struct Pending
 };
 std::vector<Pending> g_pending;
 
+// A private message number for the invite prefetch, which is a request of
+// ours rather than the guest's: no overlapped, and its answer goes to
+// xlive_social.cpp instead of into guest memory.
+constexpr uint32_t kInviteDetails = 0xFFFF0001;
+std::map<uint64_t, xlive::Client::SessionInfo> g_inviteSessions;
+
+// Social tickets handed over to be collected and dropped.
+std::vector<xlive::Client::Ticket> g_socialTickets;
+
 xlive::Client& Live() { return xlive::Client::Instance(); }
 
 // ---------------------------------------------------------------------------
@@ -553,6 +563,23 @@ uint32_t StatusFor(const std::string& error)
 // takes the ticket's answer, rather than two that race to take it.
 void SettleWith(const Pending& pending, const xlive::Client::SessionResult& result)
 {
+    if (pending.message == kInviteDetails)
+    {
+        if (result.ok && result.session.valid())
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_inviteSessions[pending.sessionId] = result.session;
+        }
+        else
+        {
+            KLOG("[xlive] invite session %016llX: %s\n",
+                 (unsigned long long)pending.sessionId,
+                 result.ok ? "no such session" : result.error.c_str());
+        }
+        XliveSocial_OnInviteSessionReady(pending.sessionId, result.ok && result.session.valid());
+        return;
+    }
+
     if (!result.ok)
     {
         KLOG("[xlive] message %08X failed: %s\n", pending.message, result.error.c_str());
@@ -635,10 +662,23 @@ void SettleWith(const Pending& pending, const xlive::Client::SessionResult& resu
         // seconds; starting it when the title first sends a packet would put
         // those seconds in front of the player.
         Live().StartPeering(result.session.session_id, kVirtualPort);
+        [[fallthrough]];
+    case 0x000B0014:
+    case 0x000B0015:
+    case 0x000B001E:
+        // And tell the friends list, so an invite can name this session.
+        // "Joinable" is a seat being open in a lobby, which is the only state
+        // in which the title's own join path would let anyone in.
+        if (result.session.valid())
+            CwXlive_SetPresenceSession(result.session.session_id,
+                                       result.session.open_public_slots > 0 &&
+                                       result.session.state ==
+                                           xlive::Client::SessionState::Lobby);
         break;
     case 0x000B0011:
     case 0x000B0013:
         Live().StopPeering();
+        CwXlive_SetPresenceSession(0, false);
         break;
     default:
         break;
@@ -674,10 +714,37 @@ void CompletionThread()
                 // does next, forever, with no error to find.
                 KLOG("[xlive] session ticket %llu vanished; failing the request\n",
                      (unsigned long long)pending.ticket);
-                Complete(pending, kErrorFunctionFailed, 0);
+                if (pending.message == kInviteDetails)
+                    XliveSocial_OnInviteSessionReady(pending.sessionId, false);
+                else
+                    Complete(pending, kErrorFunctionFailed, 0);
                 continue;
             }
             SettleWith(pending, result);
+        }
+
+        // The fire-and-forget social calls. Collected so the library's result
+        // table does not grow, and logged so a refusal is not silent.
+        std::vector<xlive::Client::Ticket> social;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            social = g_socialTickets;
+        }
+        for (auto ticket : social)
+        {
+            xlive::Client::SocialResult result;
+            const auto status = Live().Poll(ticket, result);
+            if (status == xlive::Client::OpStatus::Pending)
+                continue;
+            if (status == xlive::Client::OpStatus::Failed)
+                KLOG("[xlive] social request refused: %s\n", result.error.c_str());
+            std::lock_guard<std::mutex> lock(g_mutex);
+            for (auto it = g_socialTickets.begin(); it != g_socialTickets.end(); ++it)
+                if (*it == ticket)
+                {
+                    g_socialTickets.erase(it);
+                    break;
+                }
         }
 
         if (!settled.empty())
@@ -763,6 +830,51 @@ void XliveSession_SetContext(uint32_t contextId, uint32_t value)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_contexts[contextId] = value;
+}
+
+bool XliveSession_PrefetchInviteSession(uint64_t sessionId)
+{
+    if (!g_enabled || sessionId == 0)
+        return false;
+    Pending pending;
+    pending.message = kInviteDetails;
+    pending.sessionId = sessionId;
+    pending.ticket = Live().GetSessionDetails(sessionId);
+    if (pending.ticket == 0)
+        return false;
+    // Not through Begin(): that refuses a request with no overlapped, and
+    // rightly, because a guest request with no overlapped has nowhere to put
+    // its answer. This one has: the map above.
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_pending.push_back(std::move(pending));
+    return true;
+}
+
+bool XliveSession_InviteSessionInfo(uint64_t sessionId, void* sessionInfoOut)
+{
+    if (!sessionInfoOut)
+        return false;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_inviteSessions.find(sessionId);
+    if (it == g_inviteSessions.end())
+        return false;
+    FillSessionInfo(static_cast<GuestSessionInfo*>(sessionInfoOut), it->second);
+    return true;
+}
+
+void XliveSession_DrainSocialTicket(uint64_t ticket)
+{
+    if (ticket == 0)
+        return;
+    if (!g_enabled)
+    {
+        // No thread to collect it on. The request still goes out; only its
+        // result is left in the library's table, which is bounded by how many
+        // invitations a player can accept in one run.
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_socialTickets.push_back(ticket);
 }
 
 bool XliveSession_Dispatch(uint32_t message, void* buffer, uint32_t bufferLength,
