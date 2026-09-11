@@ -271,8 +271,19 @@ constexpr uint32_t kErrorInvalidParameter = 87;
 // 198.18.0.0/15, the IANA benchmarking block. It is never routed, which is
 // exactly what a stand-in address has to be: if a bug ever sends real traffic
 // to one of these, it goes nowhere instead of somewhere.
+//
+// A player's address is 198.18.0.0 | the low 16 bits of their XUID, and that
+// arithmetic is the whole point: EVERY machine computes the same address for
+// a given player, this machine included. The title stamps each network event
+// with the sender's own address (from XNetGetTitleXnAddr) and the receiver's
+// link manager matches that stamp against the address it recorded for the
+// link when it accepted it (from XNetXnAddrToInAddr of the peer's XNADDR).
+// The first two-machine session handed out addresses in order of first
+// sight instead — 198.18.0.1, .2, ... — so the guest's own address on the
+// guest was not the guest's address on the host, and reported itself as
+// 0.0.0.0 anyway because the import was not wired; the host dropped every
+// handshake without a word and the guest hung on "attempting to join".
 constexpr uint32_t kFakeNetBase = 0xC6120000u;  // 198.18.0.0
-constexpr uint32_t kFakeNetLocal = 0xC612FFFEu; // 198.18.255.254 — this machine
 
 constexpr uint16_t kVirtualPort = 3074;  // what the console used for title traffic
 
@@ -327,12 +338,12 @@ std::map<uint64_t, uint32_t> g_objectForSession;    // session id -> guest objec
 std::map<uint32_t, uint32_t> g_contexts;
 std::map<uint32_t, xlive::Client::StatProperty> g_properties;
 
-// The peer address table. Index 1 is 198.18.0.1, and so on. Never reused
-// within a run: an address the title cached must not start meaning a different
-// player.
+// The peer address table: every player this run has computed an address for,
+// so an address can be turned back into its XUID (recvfrom's source, the
+// session's member list). The address itself is a pure function of the XUID —
+// see kFakeNetBase.
 std::map<uint64_t, uint32_t> g_addressForXuid;
 std::map<uint32_t, uint64_t> g_xuidForAddress;
-uint32_t g_nextAddress = 1;
 
 // One in-flight guest request.
 struct Pending
@@ -381,11 +392,10 @@ uint32_t AddressForXuid(uint64_t xuid)
     auto it = g_addressForXuid.find(xuid);
     if (it != g_addressForXuid.end())
         return it->second;
-    // 65534 peers is far past anything these titles do, and stopping is better
-    // than wrapping onto an address that already means someone else.
-    if (g_nextAddress >= 0xFFFE)
-        return 0;
-    const uint32_t address = kFakeNetBase | g_nextAddress++;
+    // Deterministic across machines (see kFakeNetBase). Two accounts 65536
+    // apart would share an address; a server has to be large before that is
+    // reachable, and even then only two such players in one session collide.
+    const uint32_t address = kFakeNetBase | uint32_t(xuid & 0xFFFFu);
     g_addressForXuid[xuid] = address;
     g_xuidForAddress[address] = xuid;
     return address;
@@ -1517,21 +1527,10 @@ bool XliveSession_LocalXnAddr(void* xnaddrOut)
     if (!Live().online() || xuid == xlive::kOfflineXuid)
         return false;
 
-    auto* out = static_cast<GuestXnAddr*>(xnaddrOut);
-    std::memset(out, 0, sizeof(*out));
-    out->ina = kFakeNetLocal;
-    out->inaOnline = kFakeNetLocal;
-    out->portOnline = kVirtualPort;
-    out->enet[0] = 0x02;
-    out->enet[1] = 0x58;
-    out->enet[2] = uint8_t(xuid >> 24);
-    out->enet[3] = uint8_t(xuid >> 16);
-    out->enet[4] = uint8_t(xuid >> 8);
-    out->enet[5] = uint8_t(xuid);
-    out->online.ina = kFakeNetLocal;
-    out->online.securityParameterIndex = uint32_t(xuid >> 32);
-    out->online.xboxId = xuid;
-    out->online.platformType = 4;
+    // This machine's XNADDR is the one every peer computes for our XUID —
+    // the same FillXnAddr the session's member list is built with.
+    std::lock_guard<std::mutex> lock(g_mutex);
+    FillXnAddr(static_cast<GuestXnAddr*>(xnaddrOut), xuid);
     return true;
 }
 
@@ -1992,7 +1991,6 @@ void XliveSession_SelfTest()
         g_properties.clear();
         g_addressForXuid.clear();
         g_xuidForAddress.clear();
-        g_nextAddress = 1;
     }
     g_enabled = wasEnabled;
 

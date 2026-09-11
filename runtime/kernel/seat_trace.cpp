@@ -20,6 +20,11 @@
 //   sub_8254A7C0  cLocalServer::Accept(this, conn, req)  ("Accept Step 1")
 //   sub_82558650  cTopologyManager's link-accepted registration: the peer's
 //                 address/port/xuid as the host recorded them
+//   sub_8253E8E0  cTopologyManager::HandleMessage(this, msg): a Handshake
+//                 (0x14 == 3, 0x10 == 0x88) is routed to the topology whose
+//                 id (+0x48) equals the request's target id — bits 1..7 of
+//                 the decoded word — and DROPPED without a word otherwise
+//   sub_8252CEC0  the decoder that produces that word
 //
 // Every function here is a recompiled weak symbol; the override calls the
 // original through __imp__ and only prints around it, so with the switch off
@@ -38,6 +43,9 @@ extern "C" PPC_FUNC(__imp__sub_8254B2D8);
 extern "C" PPC_FUNC(__imp__sub_8254B098);
 extern "C" PPC_FUNC(__imp__sub_8254A7C0);
 extern "C" PPC_FUNC(__imp__sub_82558650);
+extern "C" PPC_FUNC(__imp__sub_8253E8E0);
+extern "C" PPC_FUNC(__imp__sub_8252CEC0);
+extern "C" PPC_FUNC(__imp__sub_82517D68);
 
 namespace
 {
@@ -175,4 +183,51 @@ PPC_FUNC(sub_82558650)
     __imp__sub_82558650(ctx, base);
     if (SeatLog())
         fprintf(stderr, "[seat]   -> %u\n", ctx.r3.u32);
+}
+
+PPC_FUNC(sub_8253E8E0)
+{
+    const uint32_t self = ctx.r3.u32, msg = ctx.r4.u32;
+    if (SeatLog())
+    {
+        fprintf(stderr, "[seat] TopoMan::HandleMessage this=%08X msg=%08X msg+10=%02X msg+14=%02X\n",
+                self, msg, L8(base, msg + 0x10), L8(base, msg + 0x14));
+        for (uint32_t i = 0; i < 4; i++)
+        {
+            const uint32_t t = L32(base, self + 0x94 + i * 4);
+            if (t)
+                fprintf(stderr, "[seat]   topology %u: %08X id(+48)=%d vtable=%08X\n", i, t,
+                        int(L32(base, t + 0x48)), L32(base, t));
+        }
+    }
+    __imp__sub_8253E8E0(ctx, base);
+    if (SeatLog())
+        fprintf(stderr, "[seat]   -> %u\n", ctx.r3.u32);
+}
+
+PPC_FUNC(sub_8252CEC0)
+{
+    const uint32_t out = ctx.r3.u32;
+    __imp__sub_8252CEC0(ctx, base);
+    if (SeatLog())
+    {
+        const uint32_t w = L32(base, out + 0x24);
+        fprintf(stderr,
+                "[seat] handshake decoded: word(+24)=%08X target id=%d (bits 1..7) +28=%02X +2c=%08X\n",
+                w, int(int32_t(w << 1) >> 25), L8(base, out + 0x28), L32(base, out + 0x2c));
+    }
+}
+
+// The event sink's sequenced path decodes the event header with this and
+// then looks for a peer slot whose address (+0x18) equals the decoded +0x20;
+// no slot, no delivery, no message.
+PPC_FUNC(sub_82517D68)
+{
+    const uint32_t out = ctx.r3.u32;
+    __imp__sub_82517D68(ctx, base);
+    if (SeatLog())
+        fprintf(stderr,
+                "[seat] event header decoded: +10=%02X id(+14)=%u seq(+15)=%u +18=%016llX from(+20)=%08X\n",
+                L8(base, out + 0x10), L8(base, out + 0x14), L8(base, out + 0x15),
+                (unsigned long long)L64(base, out + 0x18), L32(base, out + 0x20));
 }
