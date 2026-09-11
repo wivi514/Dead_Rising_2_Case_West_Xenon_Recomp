@@ -105,6 +105,7 @@
 #include "vfs.h"
 #include "xex_imports.h" // XexTitleId — the enumeration is filtered on it
 #include "xlive_social.h" // the friends enumerator shares XamEnumerate
+#include "xlive_stats.h"  // and so does the stats enumerator
 
 namespace {
 
@@ -674,6 +675,11 @@ static uint32_t XamEnumerate_x(uint32_t handle, uint32_t flags, uint32_t buffer,
         uint32_t result = 0;
         if (XliveSocial_Enumerate(handle, buffer, bufferLength, itemsReturned, overlapped,
                                   &result))
+            return result;
+        // The stats enumerator too — its page comes from a server, so this
+        // one is the door where the overlapped stays pending (kernel/xlive_stats.h).
+        if (XliveStats_Enumerate(handle, buffer, bufferLength, itemsReturned, overlapped,
+                                 &result))
             return result;
     }
     (void)overlapped;

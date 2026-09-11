@@ -81,6 +81,7 @@
 #include "xlive_glue.h"  // XenonLive: the account, and where achievements go
 #include "xlive_social.h" // XenonLive: the XLiveBase messages (friends, invites)
 #include "xlive_session.h"  // the XGI session surface (co-op), off by default
+#include "xlive_stats.h"    // the leaderboard read path, on with CW_XLIVE_ONLINE
 
 // ---------------------------------------------------------------------------
 // Stub helpers
@@ -3500,6 +3501,26 @@ static uint32_t XamUserCheckPrivilege_x(uint32_t userIndex, uint32_t privilege,
 }
 
 GUEST_FUNCTION_HOOK(__imp__XamUserGetSigninState, XamUserGetSigninState_x)
+
+// XamUserCreateStatsEnumerator(titleId, kind, pivot, rows, specCount, specs,
+// &size, &handle) — the import behind XUserCreateStatsEnumeratorByRank
+// (sub_825AA998: `li r4,1` and the rank zero-extended into r5, which is a
+// 64-bit argument and arrives as one). See kernel/xlive_stats.h.
+static uint32_t XamUserCreateStatsEnumerator_x(uint32_t titleId, uint32_t kind, uint64_t pivot,
+                                               uint32_t rows, uint32_t specCount,
+                                               const void* specs, be<uint32_t>* sizeOut,
+                                               be<uint32_t>* handleOut)
+{
+    if (!XliveStats_Enabled())
+    {
+        // Exactly the generated stub's answer, so a boot without
+        // CW_XLIVE_ONLINE stays byte-for-byte what it was.
+        return 0xC0000002u;
+    }
+    return XliveStats_CreateEnumerator(titleId, kind, pivot, rows, specCount, specs, sizeOut,
+                                       handleOut);
+}
+GUEST_FUNCTION_HOOK(__imp__XamUserCreateStatsEnumerator, XamUserCreateStatsEnumerator_x)
 GUEST_FUNCTION_HOOK(__imp__XamUserGetName, XamUserGetName_x)
 GUEST_FUNCTION_HOOK(__imp__XamUserGetSigninInfo, XamUserGetSigninInfo_x)
 GUEST_FUNCTION_HOOK(__imp__XamUserGetXUID, XamUserGetXUID_x)
@@ -5212,6 +5233,10 @@ static uint32_t DispatchAppMessage(uint32_t app, uint32_t message, void* buffer,
         uint32_t sessionResult = 0;
         if (XliveSession_Dispatch(message, buffer, bufferLength, overlappedVa, &sessionResult))
             return sessionResult;
+        // And the leaderboard read, which is answered the same way: by a
+        // server, through the overlapped, from a thread of its own.
+        if (XliveStats_Dispatch(message, buffer, bufferLength, overlappedVa, &sessionResult))
+            return sessionResult;
     }
 
     if (app == kAppXgi && message == 0x000B0006)
@@ -5443,11 +5468,12 @@ static uint32_t XMsgStartIORequest_x(uint32_t app, uint32_t message, uint32_t ov
     const uint32_t result = DispatchAppMessage(app, message, buffer, bufferLength, overlapped);
     if (!overlapped)
         return result;
-    // A session message that was accepted completes ITSELF, later, from
-    // xlive_session's thread — the overlapped is already marked pending and
-    // completing it here would tell the title the answer had arrived when the
-    // request has not even left the machine.
-    if (XliveSession_Enabled() && app == kAppXgi && result == 0 &&
+    // A session or leaderboard message that was accepted completes ITSELF,
+    // later, from its own thread — the handler marked the overlapped pending
+    // (the only thing in this runtime that writes 997 there), and completing
+    // it here would tell the title the answer had arrived when the request
+    // has not even left the machine.
+    if (app == kAppXgi && result == 0 &&
         reinterpret_cast<GuestOverlapped*>(g_memory.Translate(overlapped))->result.get() == 997)
     {
         return 0;

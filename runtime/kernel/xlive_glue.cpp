@@ -11,6 +11,7 @@
 #include "klog.h"
 #include "xlive_session.h"
 #include "xlive_social.h"
+#include "xlive_stats.h"
 
 namespace
 {
@@ -197,6 +198,11 @@ void CwXlive_Start(uint32_t titleId)
     XliveSession_Start();
     XliveSession_SelfTest();
     XliveSocial_SelfTest();
+    // Leaderboard reads ride the online switch: a title only asks for a board
+    // once it believes it is signed in to Live, and CW_XLIVE_ONLINE is what
+    // lets it believe that.
+    XliveStats_Start();
+    XliveStats_SelfTest();
 }
 
 bool CwXlive_SignedIn()
@@ -327,6 +333,7 @@ void CwXlive_Shutdown(int timeoutMs)
     // overlappeds, and it must not still be doing that while the rest of the
     // process is being torn down.
     XliveSession_Shutdown();
+    XliveStats_Shutdown();
     const size_t pending = xlive::Client::Instance().pending_writes();
     if (pending != 0)
     {
