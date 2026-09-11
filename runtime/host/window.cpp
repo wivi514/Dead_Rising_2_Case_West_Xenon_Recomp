@@ -189,6 +189,7 @@ int Host_DisplayModeList(uint32_t*, int) { return 0; }
 #include "host_paths.h"
 #include "log_file.h"
 #include "../kernel/xlive_glue.h"
+#include "../kernel/xlive_overlay_glue.h"
 #include "png_icon.h"
 #include "settings.h"
 #include "../cpu/native_kbm.h"
@@ -254,6 +255,13 @@ void PublishDrawableSize()
     if (w <= 0 || h <= 0)
         return;
     const uint32_t nw = uint32_t(w), nh = uint32_t(h);
+    {
+        // The overlay maps mouse positions (window points) onto the swapchain
+        // (drawable pixels), so it needs the other size too.
+        int pw = 0, ph = 0;
+        SDL_GetWindowSize(g_window, &pw, &ph);
+        CwOverlay_SetWindowSize(pw, ph);
+    }
     // BOTH exchanges must run UNCONDITIONALLY. The first version had them inside one
     // `||`, and `||` short-circuits: on the very first publish the width exchange
     // returned "changed", so the HEIGHT EXCHANGE ON THE RIGHT NEVER EXECUTED — height
@@ -1176,7 +1184,7 @@ void NativeKbmKeyEvent(const SDL_KeyboardEvent& e, bool down)
     NativeKbm_PanelKeyLevel(vk, down);
     if (!g_keyboardFocus ||
         g_debugOverlayVisible.load(std::memory_order_acquire) ||
-        Settings_OverlayVisible())
+        Settings_OverlayVisible() || CwOverlay_Open())
         return;
     if (down)
         NativeKbm_NoteDeviceInput(false);
@@ -1227,8 +1235,9 @@ HostPadState ReadKeyboard()
         f4WasDown = f4Down;
 
         // While the host overlay owns the keyboard, do not also hand its navigation
-        // presses to the game as controller-2 input.
-        if (g_debugOverlayVisible.load(std::memory_order_acquire))
+        // presses to the game as controller-2 input. The XenonLive overlay owns
+        // it the same way while it is open.
+        if (g_debugOverlayVisible.load(std::memory_order_acquire) || CwOverlay_Open())
             return s;
 
         // Part 92: with the NATIVE keyboard live — key bindings spliced into
@@ -1415,7 +1424,9 @@ HostPadState ReadKeyboard()
 HostPadState ReadController()
 {
     HostPadState s{};
-    if (g_controller)
+    // The XenonLive overlay owns the pad while it is open: the game sees a
+    // pad at rest, not the presses that navigate the friends list.
+    if (g_controller && !CwOverlay_Open())
     {
         for (const auto& p : kPadMap)
             if (SDL_GameControllerGetButton(g_controller, p.sdl))
@@ -2895,6 +2906,11 @@ void Host_WindowRun()
         SDL_Event e;
         while (SDL_PollEvent(&e))
         {
+            // The XenonLive overlay sees every event: its own toggle (Shift+Tab,
+            // Back+Start) is consumed here, and while it is open it takes the
+            // keyboard, mouse and pad below, the way the F4 panel does.
+            if (CwOverlay_QueueSdlEvent(e))
+                continue;
             switch (e.type)
             {
                 case SDL_QUIT:
@@ -2923,6 +2939,8 @@ void Host_WindowRun()
                         PublishDrawableSize();
                     break;
                 case SDL_MOUSEMOTION:
+                    if (CwOverlay_Open())
+                        break;
                     // Relative deltas only — absolute positions mean nothing to a
                     // stick. Accumulated here, consumed (and zeroed) by the pad
                     // assembly below in this same loop iteration. The native path
@@ -2935,6 +2953,8 @@ void Host_WindowRun()
                 case SDL_MOUSEBUTTONDOWN:
                 case SDL_MOUSEBUTTONUP:
                 {
+                    if (CwOverlay_Open())
+                        break;
                     // Level state for the native path's BUTTON_1/2/3 sources.
                     const uint32_t mb = SDL_GetMouseState(nullptr, nullptr);
                     uint32_t mask = 0;
@@ -2947,7 +2967,7 @@ void Host_WindowRun()
                     break;
                 }
                 case SDL_MOUSEWHEEL:
-                    if (e.wheel.y != 0)
+                    if (e.wheel.y != 0 && !CwOverlay_Open())
                         NativeKbm_MouseWheel(e.wheel.y);
                     break;
                 case SDL_KEYUP:
@@ -3058,7 +3078,7 @@ void Host_WindowRun()
             const bool wantRel =
                 g_keyboardFocus &&
                 !g_debugOverlayVisible.load(std::memory_order_acquire) &&
-                !Settings_OverlayVisible();
+                !Settings_OverlayVisible() && !CwOverlay_Open();
             if (wantRel != g_relativeMouse)
             {
                 SDL_SetRelativeMouseMode(wantRel ? SDL_TRUE : SDL_FALSE);

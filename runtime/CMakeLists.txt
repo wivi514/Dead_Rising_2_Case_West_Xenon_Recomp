@@ -309,6 +309,7 @@ add_executable(cw_runtime
     kernel/xlive_social.cpp          # the XLiveBase surface: friends, invites, mutes
     kernel/xlive_stats.cpp           # the leaderboard read path
     kernel/xlive_net.cpp             # the socket family over the punched path, and QoS
+    kernel/xlive_overlay_glue.cpp    # the in-game overlay's seam; no-ops without CW_XLIVE_OVERLAY
     kernel/guest_log.cpp             # the title's own log, printed with CW_GUEST_LOG=1
     kernel/seat_trace.cpp            # the co-op seating trace, CW_SEAT_LOG=1 (temporary)
     gpu/vd.cpp
@@ -406,6 +407,30 @@ if(NOT EXISTS "${XLIVE_ROOT}/client/CMakeLists.txt")
 endif()
 add_subdirectory("${XLIVE_ROOT}/client" "${CMAKE_CURRENT_BINARY_DIR}/xlive")
 target_link_libraries(cw_runtime PRIVATE xlive::client)
+
+# The XenonLive in-game overlay (kernel/xlive_overlay_glue.cpp), from the
+# launcher checkout beside this one. OPTIONAL, unlike libxlive: it is a window
+# over the game, not a part of it, and a build without it is the same game
+# minus Shift+Tab. Default on when the checkout is there.
+set(XLIVE_LAUNCHER_ROOT "$ENV{HOME}/GithubRepo/XenonLive_Launcher" CACHE PATH
+    "XenonLive_Launcher source root (supplies the in-game overlay)")
+if(EXISTS "${XLIVE_LAUNCHER_ROOT}/overlay/CMakeLists.txt")
+    set(CW_XLIVE_OVERLAY_DEFAULT ON)
+else()
+    set(CW_XLIVE_OVERLAY_DEFAULT OFF)
+endif()
+option(CW_XLIVE_OVERLAY "Build the XenonLive in-game overlay (Shift+Tab)" ${CW_XLIVE_OVERLAY_DEFAULT})
+if(CW_XLIVE_OVERLAY)
+    if(NOT EXISTS "${XLIVE_LAUNCHER_ROOT}/overlay/CMakeLists.txt")
+        message(FATAL_ERROR "CW_XLIVE_OVERLAY is on but ${XLIVE_LAUNCHER_ROOT}/overlay is missing")
+    endif()
+    add_subdirectory("${XLIVE_LAUNCHER_ROOT}/overlay" "${CMAKE_CURRENT_BINARY_DIR}/xlive_overlay")
+    target_link_libraries(cw_runtime PRIVATE xlive::overlay)
+    target_compile_definitions(cw_runtime PRIVATE CW_HAVE_XLIVE_OVERLAY=1)
+    message(STATUS "XenonLive overlay: on (${XLIVE_LAUNCHER_ROOT}/overlay)")
+else()
+    message(STATUS "XenonLive overlay: off")
+endif()
 
 if(CW_WINDOW)
     target_compile_definitions(cw_runtime PRIVATE CW_HAVE_SDL=1)
