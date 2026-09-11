@@ -51,6 +51,28 @@ bool IsXContentMagic(const std::string& m)
     return m == "LIVE" || m == "CON " || m == "PIRS";
 }
 
+// The title id in an XContent header: the execution-info block at 0x354, title
+// id at +12 — 0x360, the offset stfs_extract.cpp prints from. 0 when unreadable.
+uint32_t PackageTitleId(const fs::path& p)
+{
+    FILE* f = std::fopen(p.string().c_str(), "rb");
+    if (!f)
+        return 0;
+    uint8_t b[4] = {};
+    uint32_t id = 0;
+    if (std::fseek(f, 0x354 + 12, SEEK_SET) == 0 && std::fread(b, 1, 4, f) == 4)
+        id = (uint32_t(b[0]) << 24) | (uint32_t(b[1]) << 16) | (uint32_t(b[2]) << 8) | b[3];
+    std::fclose(f);
+    return id;
+}
+
+// This title's. A player who keeps both Dead Rising 2 XBLA titles has two
+// packages, and the first-run flow once extracted Case Zero's into this
+// port's game directory because the finder took the first XContent file it
+// met — and then failed, several minutes later, on a missing shader bank
+// named for the other game. The wrong package is skipped by its title id.
+constexpr uint32_t kThisTitleId = 0x58410B00;
+
 // The package lives at assets/package/<titleid>/<contenttype>/<hash>, so this walks
 // rather than globs one level.
 //
@@ -75,6 +97,16 @@ bool FindPackage(fs::path* out, std::string* magicOut, bool requireMagic)
             continue;
         if (requireMagic && !IsXContentMagic(magic))
             continue;
+        if (requireMagic && IsXContentMagic(magic))
+        {
+            const uint32_t id = PackageTitleId(it->path());
+            if (id != 0 && id != kThisTitleId)
+            {
+                fprintf(stderr, "[first-run] skipping %s: title %08X is not this game\n",
+                        it->path().string().c_str(), id);
+                continue;
+            }
+        }
         if (out)
             *out = it->path();
         if (magicOut)
