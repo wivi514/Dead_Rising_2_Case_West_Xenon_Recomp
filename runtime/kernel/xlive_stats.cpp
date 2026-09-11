@@ -977,9 +977,13 @@ void TestReadStatsOffline()
 // on the other end. It runs on a thread of its own because the gateway is
 // not up yet when CwXlive_Start returns, and it waits for it.
 //
-// It reads Case West's own board (view 1) by rank and by name, with the
-// account's own XUID — a read that must always answer, with a rank-0 row for
-// an account that has never posted a score.
+// It reads this title's own board by rank and by name, with the account's
+// own XUID — a read that must always answer, with a rank-0 row for an account
+// that has never posted a score. Title id 0 in the message means the title
+// the library was started for, so this file is the same in both ports; the
+// view is the one each title's players see (docs/leaderboards.md).
+constexpr uint32_t kBoardView = 1; // Case West: STATS_VIEW_LEADERBOARD_PRESTIGE_POINTS
+
 void OnlineReadTest()
 {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
@@ -1008,12 +1012,12 @@ void OnlineReadTest()
         return status->get();
     };
 
-    const uint32_t titleId = 0x58410B00;
+    const uint32_t titleId = 0;
     GuestScratch spec(sizeof(GuestStatsSpec));
     if (!spec.va)
         return;
     auto* guestSpec = GuestPtr<GuestStatsSpec>(spec.va);
-    guestSpec->viewId = 1;
+    guestSpec->viewId = kBoardView;
     guestSpec->columnCount = 0;
 
     // --- by rank, the way sub_82598DB0 + sub_82594930 do it ---------------
@@ -1036,11 +1040,11 @@ void OnlineReadTest()
             const auto* header = GuestPtr<GuestReadResults>(page.va);
             const auto* views = GuestPtr<GuestStatsView>(header->viewsPtr.get());
             XLIVE_EXPECT_ONLINE(header->viewCount.get() == 1);
-            XLIVE_EXPECT_ONLINE(views && views[0].viewId.get() == 1);
+            XLIVE_EXPECT_ONLINE(views && views[0].viewId.get() == kBoardView);
             if (views)
             {
-                fprintf(stderr, "[xlive] stats self-test (online): view 1 by rank: %u of %u row(s)\n",
-                        views[0].rowCount.get(), views[0].totalRows.get());
+                fprintf(stderr, "[xlive] stats self-test (online): view %u by rank: %u of %u row(s)\n",
+                        kBoardView, views[0].rowCount.get(), views[0].totalRows.get());
                 const auto* rows = GuestPtr<GuestStatsRow>(views[0].rowsPtr.get());
                 for (uint32_t i = 0; rows && i < views[0].rowCount.get(); i++)
                 {
