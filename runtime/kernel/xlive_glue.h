@@ -24,10 +24,17 @@
 //     which is why the state moves only behind its own flag.
 //
 // Three switches, then, each for a different kind of change: CW_NO_XLIVE=1
-// (who the player is), CW_XLIVE_COOP=1 (what a session message answers),
-// CW_XLIVE_ONLINE=1 (what the title believes is available). Presence — what
-// the title says it is doing, published to accepted friends — has no switch
-// of its own beyond the first: it is on whenever an account is signed in.
+// (who the player is), CW_XLIVE_COOP=1 (what a session message answers, and
+// with it the socket family and QoS — kernel/xlive_net.cpp — since sockets
+// carry a session's traffic), CW_XLIVE_ONLINE=1 (what the title believes is
+// available, and with it the leaderboard reads — kernel/xlive_stats.cpp —
+// since a title only asks for a board once it believes it is online).
+// Presence — what the title says it is doing, published to accepted friends
+// — has no switch of its own beyond the first: it is on whenever an account
+// is signed in.
+//
+// The self-tests, one per file, each behind its own CW_XLIVE_*_TEST=1:
+// SESSION, SOCIAL, STATS, NET.
 //
 // EVERYTHING HERE IS OPTIONAL AT RUNTIME. CW_NO_XLIVE=1 turns it off, and with
 // it off every function below behaves as if no account exists, which is

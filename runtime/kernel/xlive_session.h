@@ -93,6 +93,11 @@ bool XliveSession_InAddrToXnAddr(uint32_t inAddr, void* xnaddrOut);
 // a send to the punched path.
 uint64_t XliveSession_PeerForInAddr(uint32_t inAddr);
 
+// The reverse, allocating: the private address that stands for a peer, minted
+// on first sight. The socket layer uses this to name the sender of a packet
+// that arrived before the title ever saw that peer's XNADDR.
+uint32_t XliveSession_InAddrForPeer(uint64_t xuid);
+
 // Fills the local machine's XNADDR — what NetDll_XNetGetTitleXnAddr answers
 // with once there is an account. Returns false when there is no identity yet,
 // and the caller must then keep reporting XNET_GET_XNADDR_NONE rather than

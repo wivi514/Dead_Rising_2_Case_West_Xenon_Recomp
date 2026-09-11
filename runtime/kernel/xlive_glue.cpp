@@ -11,6 +11,7 @@
 #include "klog.h"
 #include "xlive_session.h"
 #include "xlive_social.h"
+#include "xlive_net.h"
 #include "xlive_stats.h"
 
 namespace
@@ -203,6 +204,7 @@ void CwXlive_Start(uint32_t titleId)
     // lets it believe that.
     XliveStats_Start();
     XliveStats_SelfTest();
+    XliveNet_SelfTest();
 }
 
 bool CwXlive_SignedIn()

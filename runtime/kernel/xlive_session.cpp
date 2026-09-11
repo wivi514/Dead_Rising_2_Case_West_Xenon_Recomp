@@ -1344,6 +1344,12 @@ bool XliveSession_InAddrToXnAddr(uint32_t inAddr, void* xnaddrOut)
     return true;
 }
 
+uint32_t XliveSession_InAddrForPeer(uint64_t xuid)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return AddressForXuid(xuid);
+}
+
 uint64_t XliveSession_PeerForInAddr(uint32_t inAddr)
 {
     std::lock_guard<std::mutex> lock(g_mutex);

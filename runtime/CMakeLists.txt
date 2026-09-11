@@ -308,6 +308,7 @@ add_executable(cw_runtime
     kernel/xlive_session.cpp         # the XGI session surface; off unless CW_XLIVE_COOP=1
     kernel/xlive_social.cpp          # the XLiveBase surface: friends, invites, mutes
     kernel/xlive_stats.cpp           # the leaderboard read path
+    kernel/xlive_net.cpp             # the socket family over the punched path, and QoS
     gpu/vd.cpp
     gpu/pm4.cpp
     # gpu/parallel_record.cpp — part 7's per-range secondaries + deferred replay, PARKED
