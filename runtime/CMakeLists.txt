@@ -310,6 +310,7 @@ add_executable(cw_runtime
     kernel/xlive_stats.cpp           # the leaderboard read path
     kernel/xlive_net.cpp             # the socket family over the punched path, and QoS
     kernel/guest_log.cpp             # the title's own log, printed with CW_GUEST_LOG=1
+    kernel/seat_trace.cpp            # the co-op seating trace, CW_SEAT_LOG=1 (temporary)
     gpu/vd.cpp
     gpu/pm4.cpp
     # gpu/parallel_record.cpp — part 7's per-range secondaries + deferred replay, PARKED

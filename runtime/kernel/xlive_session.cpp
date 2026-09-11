@@ -19,6 +19,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -274,6 +275,21 @@ constexpr uint32_t kFakeNetBase = 0xC6120000u;  // 198.18.0.0
 constexpr uint32_t kFakeNetLocal = 0xC612FFFEu; // 198.18.255.254 — this machine
 
 constexpr uint16_t kVirtualPort = 3074;  // what the console used for title traffic
+
+// The UDP port the punched path actually binds. The console's 3074 by
+// default; CW_XLIVE_PEER_PORT=N moves it so two copies of the game can run
+// on ONE machine (host and guest of the same session, for co-op work without
+// a second box). Only the socket moves — the XNADDR the title sees keeps
+// portOnline 3074, since the title compares that against its own constant.
+uint16_t PeerPort()
+{
+    static const uint16_t port = [] {
+        const char* e = std::getenv("CW_XLIVE_PEER_PORT");
+        const long n = e ? std::strtol(e, nullptr, 10) : 0;
+        return (n > 0 && n < 65536) ? uint16_t(n) : kVirtualPort;
+    }();
+    return port;
+}
 
 // ---------------------------------------------------------------------------
 // State
@@ -748,7 +764,7 @@ void SettleWith(const Pending& pending, const xlive::Client::SessionResult& resu
         // Start opening paths as soon as we are in a session. Punching takes
         // seconds; starting it when the title first sends a packet would put
         // those seconds in front of the player.
-        Live().StartPeering(result.session.session_id, kVirtualPort);
+        Live().StartPeering(result.session.session_id, PeerPort());
         [[fallthrough]];
     case 0x000B0014:
     case 0x000B0015:
