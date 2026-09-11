@@ -451,15 +451,22 @@ bool PullOne(uint32_t handle, const GuestSocket& sock, GuestDatagram& out)
     {
         if (other != handle && target.boundPort == toPort)
         {
-            // Bounded, like the path's own inbox: a socket nobody reads must
-            // not grow without limit.
-            if (target.inbox.size() >= 256)
-                target.inbox.pop_front();
-            target.inbox.push_back(std::move(datagram));
             if (NetLogOn())
                 KLOG("[net] recv %u<-%u peer %016llX %zuB -> sock %08X inbox (%zu)\n", toPort,
                      fromPort, (unsigned long long)xuid, datagram.payload.size(), other,
-                     target.inbox.size());
+                     target.inbox.size() + 1);
+            // A reliable game stream must not be silently thinned by our own
+            // buffering: one guest socket (the host's listener) drains the
+            // shared path far more often than the other (the connection), so
+            // it files the connection's packets here and the cap has to be
+            // deep enough that the connection reads them before it fills. The
+            // first two-machine session overflowed a 256 cap and the reliable
+            // layer retransmit-stormed to death. The drop is a last resort
+            // against a peer nobody reads at all, not backpressure on a live
+            // connection.
+            if (target.inbox.size() >= 8192)
+                target.inbox.pop_front();
+            target.inbox.push_back(std::move(datagram));
             return false;
         }
     }
