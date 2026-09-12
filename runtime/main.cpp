@@ -32,6 +32,11 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#pragma comment(lib, "winmm.lib")
+// timeBeginPeriod's own header (mmsystem.h/timeapi.h) does not survive this tree's
+// WIN32_LEAN_AND_MEAN + the SDL/renderer macro set under clang-cl; the one prototype is
+// declared here instead (MMRESULT is UINT).
+extern "C" unsigned int __stdcall timeBeginPeriod(unsigned int uPeriod);
 #elif !defined(__APPLE__)
 #include <gnu/libc-version.h>
 #include <sys/utsname.h>
@@ -589,6 +594,25 @@ int main(int argc, char** argv)
     // CW_GUEST_PIN (part 118): from the process's main thread, before anything spawns,
     // because affinity is inherited — see thread_budget.cpp.
     ThreadBudget_PinProcessAway();
+#if defined(_WIN32)
+    // THE WINDOWS TIMER RESOLUTION (part 118, czamd). Every 1 ms sleep in the frame
+    // path — the pump's nap, the vblank tick, the fence park's bounded wait — is a
+    // Sleep/WaitForSingleObject whose granularity is the system timer's, 15.6 ms unless
+    // some process has asked for 1 ms. czamd, with nobody else running, read a FLAT
+    // 46.8 ms a frame at 150 draws and at 8,000 (3 x 15.625 ms) where part 106 had read
+    // 9.9 ms on the same box the day a browser held the timer at 1 ms for it. On
+    // Windows 11 the resolution is per process unless the window is in the foreground,
+    // so a game that does not ask for it is at the mercy of whatever else is open.
+    // CW_NO_TIMER_PERIOD=1 is the control.
+    if (!getenv("CW_NO_TIMER_PERIOD"))
+    {
+        const unsigned tr = timeBeginPeriod(1);   // 0 = TIMERR_NOERROR
+        fprintf(stderr, "[host] timeBeginPeriod(1) -> %s (CW_NO_TIMER_PERIOD=1 is the control)\n",
+                tr == 0 ? "ok" : "REFUSED");
+    }
+    else
+        fprintf(stderr, "[host] timer resolution left at the system default (CW_NO_TIMER_PERIOD)\n");
+#endif
 
     // Before any guest code: the title reads the XMA context-array base out of the
     // decoder's register aperture exactly once (sub_8285EDF8) and caches it, so a
