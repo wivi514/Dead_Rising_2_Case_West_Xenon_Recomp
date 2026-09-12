@@ -5,16 +5,26 @@
 #include <bit>
 #include <chrono>
 #include <cstring>
+#include <ctime>
 #include <map>
 #include <mutex>
+#include <string>
+#include <algorithm>
+#include <cstdlib>
+#include <vector>
 
 #if !defined(_WIN32)
+#include <pthread.h>
 #include <unistd.h>
+#else
+#include <windows.h>
 #endif
 
 #include "../kernel/guestcall.h"
+#include "../kernel/kobject.h"
 #include "../kernel/heap.h"
 #include "../kernel/memory.h"
+#include "thread_budget.h"
 
 constexpr size_t kPcrSize = 0xAB0;
 constexpr size_t kTlsSize = 0x100; // 64 slots x 4 bytes — matches the XEX header
@@ -81,6 +91,213 @@ uint32_t GuestThread::ThreadIdForPcr(uint32_t pcr)
     return it != g_pcrToThreadId.end() ? it->second : 0;
 }
 
+// Guest thread id -> the host thread, for BindHostName. Filled at spawn (the
+// std::thread's native handle exists before the new thread has run a single
+// instruction) and by Run() for threads we did not spawn (the main guest thread).
+static std::mutex g_hostThreadMutex;
+static std::map<uint32_t, std::thread::native_handle_type> g_hostThreadFor;
+
+static void RegisterHostThread(uint32_t threadId, std::thread::native_handle_type h)
+{
+    std::lock_guard lk(g_hostThreadMutex);
+    g_hostThreadFor[threadId] = h;
+}
+
+// The named guest threads' host handles, for CpuSecondsOf. Keyed by the title's own
+// name; a name reused for two threads (HavokWorkerThread) keeps the first.
+static std::map<std::string, std::thread::native_handle_type> g_hostThreadByName;
+static std::map<std::string, uint32_t> g_tidByName;                   // under g_hostThreadMutex
+
+bool GuestThread::BindHostName(uint32_t threadId, const char* name)
+{
+    // The registry is kept on every platform (part 118: the Windows pin needs the
+    // handle); only the OS-visible naming is platform-specific.
+    std::thread::native_handle_type h;
+    {
+        std::lock_guard lk(g_hostThreadMutex);
+        auto it = g_hostThreadFor.find(threadId);
+        if (it == g_hostThreadFor.end())
+            return false;
+        h = it->second;
+        g_hostThreadByName.emplace(name, h);
+        g_tidByName.emplace(name, threadId);
+    }
+#if !defined(_WIN32) && !defined(__APPLE__)
+    char shortName[16]; // the kernel keeps 15 characters
+    snprintf(shortName, sizeof shortName, "%s", name);
+    return pthread_setname_np(h, shortName) == 0;
+#else
+    return true;
+#endif
+}
+
+// Per-thread wait accumulators, registered under the guest tid at Run() (the thread
+// itself, so no wait can precede the registration) and looked up by the title's name
+// for the [fps] line. Never erased: a thread that ended keeps a stale-but-valid entry
+// (the thread_local's storage outlives nothing here — the map holds a copy pointer to
+// a thread_local, so ended threads are dropped by the same path that drops the PCR).
+static thread_local GuestThread::WaitStats t_waitStats;
+static std::map<uint32_t, GuestThread::WaitStats*> g_waitStatsByTid;   // under g_hostThreadMutex
+
+GuestThread::WaitStats& GuestThread::MyWaitStats() { return t_waitStats; }
+
+const GuestThread::WaitStats* GuestThread::WaitStatsOf(const char* name)
+{
+    std::lock_guard lk(g_hostThreadMutex);
+    auto it = g_tidByName.find(name);
+    if (it == g_tidByName.end())
+        return nullptr;
+    auto jt = g_waitStatsByTid.find(it->second);
+    return jt == g_waitStatsByTid.end() ? nullptr : jt->second;
+}
+
+static inline uint64_t MonoNs()
+{
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count());
+}
+
+// CW_WAIT_CALLERS=1 (part 118): the same census keyed by the GUEST CALLER — the lr of
+// the import call — per thread and kind, printed every 10 s from whichever wait ends
+// the window. The [guestwait] line says the Main Thread spends 0.5 ms a frame in 5.7
+// single-object waits; only the caller says which of the title's subsystems it is
+// waiting FOR (a Havok step, a job, the Draw Thread), and that decides which lever
+// moves it. Diagnostic arm only: a mutex on every wait exit.
+static bool WaitCallersOn()
+{
+    static const bool on = getenv("CW_WAIT_CALLERS") != nullptr;
+    return on;
+}
+struct WaitCallerRow { uint64_t ns = 0, calls = 0; };
+static std::mutex g_waitCallerMutex;
+static std::map<std::string, WaitCallerRow> g_waitCallers;   // "name kind lr" -> row
+static uint64_t g_waitCallerLastPrint = 0;
+// The calling thread's comm (the title's name, bound by BindHostName), read once per
+// thread; it is 15 characters at most and "?" where the platform cannot say.
+static const char* CurrentThreadComm()
+{
+    static thread_local char comm[20] = {0};
+    if (!comm[0])
+    {
+#if !defined(_WIN32) && !defined(__APPLE__)
+        if (pthread_getname_np(pthread_self(), comm, sizeof comm) != 0 || !comm[0])
+#endif
+            snprintf(comm, sizeof comm, "?");
+    }
+    return comm;
+}
+static void WaitCallerRecord(GuestThread::WaitKind kind, uint64_t ns)
+{
+    static const char* const kindName[] = {"single", "multi", "sleep", "fence"};
+    const uint32_t lr = g_ppcContext ? uint32_t(g_ppcContext->lr) : 0;
+    // Two more frames up the guest's back chain (*(r1) = the caller's r1, its lr at
+    // -8 from there), because the title's waits go through a WaitForMultipleObjects
+    // wrapper (sub_828402A8 here — the sibling's sub_82822548, re-derived by shape: 43
+    // instructions, 1.000, unique, 0 immediate diffs) and the lr at the import names
+    // only the wrapper.
+    uint32_t lr2 = 0, lr3 = 0;
+    if (g_ppcContext)
+    {
+        uint8_t* base = g_memory.base;
+        uint32_t sp = g_ppcContext->r1.u32;
+        for (int i = 0; i < 2 && sp >= 0x10000 && sp < PPC_MEMORY_SIZE - 8; ++i)
+        {
+            const uint32_t prev = PPC_LOAD_U32(sp);
+            if (prev <= sp || prev - sp > 0x100000 || prev >= PPC_MEMORY_SIZE - 8)
+                break;
+            (i == 0 ? lr2 : lr3) = PPC_LOAD_U32(prev - 8);
+            sp = prev;
+        }
+    }
+    char key[128];
+    // The comm alone aggregates: a thread inherits its creator's name until the title
+    // names it, so four host threads read "Main Thread". The guest tid separates them.
+    snprintf(key, sizeof(key), "%-12s %08X %-6s %08X<%08X<%08X", CurrentThreadComm(),
+             GuestThread::GetCurrentThreadId(), kindName[kind], lr, lr2, lr3);
+    std::lock_guard lk(g_waitCallerMutex);
+    auto& r = g_waitCallers[key];
+    r.ns += ns;
+    r.calls += 1;
+    const uint64_t now = MonoNs();
+    if (g_waitCallerLastPrint == 0)
+        g_waitCallerLastPrint = now;
+    if (now - g_waitCallerLastPrint >= 10'000'000'000ull)
+    {
+        const double secs = double(now - g_waitCallerLastPrint) * 1e-9;
+        fprintf(stderr, "[waitcallers] %.1f s window — thread kind caller: ms/s calls/s\n", secs);
+        std::vector<std::pair<std::string, WaitCallerRow>> rows(g_waitCallers.begin(), g_waitCallers.end());
+        std::sort(rows.begin(), rows.end(), [](auto& a, auto& b) { return a.second.ns > b.second.ns; });
+        int n = 0;
+        for (auto& [k, v] : rows)
+        {
+            if (v.ns * 1e-6 / secs < 0.5 || n++ >= 24)
+                break;
+            fprintf(stderr, "[waitcallers]   %s  %8.2f  %8.1f\n", k.c_str(), v.ns * 1e-6 / secs, v.calls / secs);
+        }
+        g_waitCallers.clear();
+        g_waitCallerLastPrint = now;
+    }
+}
+
+GuestThread::WaitScope::WaitScope(WaitKind k) : kind(k), t0(MonoNs()) {}
+GuestThread::WaitScope::~WaitScope()
+{
+    const uint64_t ns = MonoNs() - t0;
+    t_waitStats.ns[kind].fetch_add(ns, std::memory_order_relaxed);
+    t_waitStats.calls[kind].fetch_add(1, std::memory_order_relaxed);
+    if (WaitCallersOn())
+        WaitCallerRecord(kind, ns);
+}
+
+void GuestThread::PinHostByName(const char* name)
+{
+    std::thread::native_handle_type h;
+    {
+        std::lock_guard lk(g_hostThreadMutex);
+        auto it = g_hostThreadByName.find(name);
+        if (it == g_hostThreadByName.end())
+            return;
+        h = it->second;
+    }
+    ThreadBudget_PinNamedThread(name, h);
+}
+
+double GuestThread::CpuSecondsOf(const char* name)
+{
+#if defined(__linux__) || defined(_WIN32)
+    std::thread::native_handle_type h;
+    {
+        std::lock_guard lk(g_hostThreadMutex);
+        auto it = g_hostThreadByName.find(name);
+        if (it == g_hostThreadByName.end())
+            return -1.0;
+        h = it->second;
+    }
+#endif
+#if defined(_WIN32)
+    // The Windows spelling of the thread clock (owed since part 116): kernel + user
+    // time in 100 ns units.
+    FILETIME c, e, k, u;
+    if (!GetThreadTimes(HANDLE(h), &c, &e, &k, &u))
+        return -1.0;
+    const uint64_t kt = (uint64_t(k.dwHighDateTime) << 32) | k.dwLowDateTime;
+    const uint64_t ut = (uint64_t(u.dwHighDateTime) << 32) | u.dwLowDateTime;
+    return double(kt + ut) * 1e-7;
+#elif defined(__linux__)
+    clockid_t cid;
+    if (pthread_getcpuclockid(h, &cid) != 0)
+        return -1.0;
+    timespec ts{};
+    if (clock_gettime(cid, &ts) != 0)
+        return -1.0;
+    return double(ts.tv_sec) + 1e-9 * double(ts.tv_nsec);
+#else
+    (void)name;
+    return -1.0;
+#endif
+}
+
 uint32_t GuestThread::Run(const GuestThreadParams& params)
 {
     // Top set bit of the processor mask picks the CPU number (matches
@@ -92,6 +309,24 @@ uint32_t GuestThread::Run(const GuestThreadParams& params)
     const uint32_t cpuNumber = procMask == 0 ? 0 : 7 - std::countl_zero(procMask);
 
     GuestThreadContext ctx(cpuNumber, params.stackSize);
+#if !defined(_WIN32)
+    RegisterHostThread(GuestThread::GetCurrentThreadId(), pthread_self());
+#else
+    // GetCurrentThread() is a pseudo-handle valid only on this thread; the registry is
+    // read from others (the pin, the thread clock), so a real one is duplicated. Without
+    // this the title's own naming of its Main Thread — which runs on main.cpp's raw
+    // std::thread, not a GuestThreadHandle — found nothing to bind (part 118, czwin).
+    {
+        HANDLE real = nullptr;
+        if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &real, 0,
+                            FALSE, DUPLICATE_SAME_ACCESS))
+            RegisterHostThread(GuestThread::GetCurrentThreadId(), real);
+    }
+#endif
+    {
+        std::lock_guard lk(g_hostThreadMutex);
+        g_waitStatsByTid[GuestThread::GetCurrentThreadId()] = &t_waitStats;
+    }
     ctx.ppcContext.r3.u64 = params.arg0;
     ctx.ppcContext.r4.u64 = params.arg1;
 
@@ -147,6 +382,11 @@ uint32_t GuestThread::Run(const GuestThreadParams& params)
     fprintf(stderr, "[kernel] guest thread tid=%08X entry=%08X ENDED (%s, r3=%08X)\n",
             GuestThread::GetCurrentThreadId(), params.function,
             terminated ? "ExTerminateThread" : "returned", ctx.ppcContext.r3.u32);
+    {
+        // The thread_local dies with this thread; drop the pointer before it does.
+        std::lock_guard lk(g_hostThreadMutex);
+        g_waitStatsByTid.erase(GuestThread::GetCurrentThreadId());
+    }
 
     return ctx.ppcContext.r3.u32;
 }
@@ -173,6 +413,13 @@ GuestThreadHandle::GuestThreadHandle(const GuestThreadParams& params)
       suspended((params.flags & 0x1) != 0), // CREATE_SUSPENDED
       thread(GuestThreadFunc, this)
 {
+    RegisterHostThread(threadId, thread.native_handle());
+    // CW_GUEST_PIN: a thread spawned by a PINNED thread inherits its one-CPU mask (Linux;
+    // on Windows the process's), and the Main Thread spawns everything (the Havok
+    // workers, the job pool, audio) after it is named — the first build of the arm ran
+    // all of them on the Main Thread's core and the frame went to 25 fps. Every spawn
+    // gets the "rest" mask.
+    ThreadBudget_PinRest(thread.native_handle());
 }
 
 GuestThreadHandle::~GuestThreadHandle()

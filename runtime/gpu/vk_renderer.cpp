@@ -2,6 +2,7 @@
 #include "../cpu/fence_wait.h"
 
 #include "pm4.h"
+#include "pump_split.h"   // part 117: the draw context under the two-core pump
 #include "pump_stats.h"
 #include "shader_translator.h"
 #include "drawid_ps_spv.h"
@@ -11,6 +12,7 @@
 #include "../host/host_paths.h"
 #include "../host/settings.h"
 #include "../host/window.h"
+#include "../cpu/guest_thread.h"
 #include "../cpu/thread_budget.h"
 
 #include <vulkan/vulkan.h>
@@ -121,6 +123,11 @@ constexpr uint32_t kSharedClipPlanes = 544 + 96 * 16;                 // 2080
 // real but wrong texture. Change both or neither.
 constexpr uint32_t kSharedRtShadow = kSharedClipPlanes + 6 * 16;      // 2176
 constexpr uint32_t kSharedSize = kSharedRtShadow + 16;                // 2192
+// The stride of one shared block in the part-111 pre-zeroed sub-arena. 256 because that
+// is `ArenaAlloc`'s default alignment and the address goes into a push constant the
+// shaders reach with `vk::RawBufferLoad`; keeping the alignment identical to the old
+// allocation means the arm and its control hand the shader the same shape of address.
+constexpr uint32_t kSharedStride = (kSharedSize + 255u) & ~255u;      // 2304
 
 // BOTH stages get 256 float4 registers, and the pixel shader's 256 is load-bearing.
 //
@@ -524,7 +531,14 @@ struct ProfScope
         sink = nullptr;
         ++g_prof.scopes;   // one add against this scope's two clock reads; see above
     }
-    ~ProfScope() { Close(); }
+    // The check inlined, the body not: with the profiler OFF — every shipped run — the
+    // destructor was still a call per scope, ~10 scopes a draw, 0.5% of the pump
+    // (part 117's profile). Now it is one hot-bool test.
+    ~ProfScope()
+    {
+        if (__builtin_expect(g_profileOn, 0))
+            Close();
+    }
 };
 thread_local ProfScope* ProfScope::current = nullptr;
 
@@ -553,6 +567,94 @@ void CalibrateProfNow()
             "cost lands in the residual of the scope AROUND them (see g_profNowNs10)\n",
             double(g_profNowNs10) / 10.0);
 }
+
+#if CW_WHOLEFUNC
+// --- WHOLE-FUNCTION SAMPLED TIMERS (part 110, item A.2) ------------------------------
+//
+// THE DEFECT THEY ANSWER. A `ProfScope` measures a REGION OF CODE, and this renderer's
+// regions do not cover the functions they are named after. `streams` reads 0.3% of the
+// frame while the SYMBOL `UploadStream` is 9.4% of the pump thread and 13.1% with
+// `PersistFind` — a factor of thirty, and it has now misled three separate parts about
+// the same function (22 closed the stream cache on it, 55 re-opened it from a `perf`
+// symbol profile, 109 read it and wrote "almost certainly dead on price" four hours
+// before its own symbol profile said otherwise). Gotcha 343 was written about exactly
+// this and the table went on saying it.
+//
+// WHY NOT JUST SCOPE THE WHOLE FUNCTION. `UploadStream` runs ~46,000 times a crowd frame
+// and a `ProfScope` is two clock reads at ~21 ns, so a per-call scope is ~2 ms a frame —
+// larger than several of the phases it would be separating. An instrument that big does
+// not measure the function, it replaces it (gotchas 7, 223). So: time one call in
+// `kWfPeriod` and scale.
+//
+// THE PERIOD IS 17 AND THAT IS DELIBERATE. Part 89's resolve-split census samples every
+// 16th DRAW, which is fine for a per-draw mean but is a power of two sitting on top of a
+// renderer whose work batches in powers of two — a sampler aligned with the thing it
+// samples measures a phase of it rather than a mean of it. A prime period cannot align
+// with any power-of-two batching, and it is sampled on a per-CALL counter rather than a
+// per-draw one, because one draw's streams are not interchangeable with another's.
+//
+// THEY ARE INCLUSIVE OF CALLEES, unlike every `ProfScope` here, and that is the point:
+// the question is what a SUBSYSTEM costs, so `UploadStream`'s number includes
+// `PersistFind` and the guard, and `DoDraw`'s includes all of it. **That means they must
+// be compared with a `perf` symbol GROUP and never with one symbol's self time** —
+// `tools/phase_vs_perf.py` computes exactly those groups.
+//
+// **IT IS NOT FREE WHEN OFF, AND THAT IS A MEASUREMENT, NOT A CONCESSION.** This was
+// written expecting one predictable branch on an already-hot global — tested before the
+// counter is even incremented — and its own pre-registered identity gate refuted that:
+// three runs an arm, both binaries alternated in one session, matched draw bands,
+// **+0.65 / +0.67 / +0.43 / +0.29 / +0.42 ms of pump CPU** in every band with real
+// sample counts, against a bar of +-0.10 (part 110 §6.8). Roughly 6 ns per call across
+// ~78,000 calls a frame, which is twenty times what a predicted branch costs.
+//
+// The mechanism is the RAII object, not the branch: a non-trivial destructor on
+// `UploadTexture` — a wrapper whose body is a tail call — forces a real call and a stack
+// frame, and on `DoDraw` it puts one on every early return. **A probe changes codegen
+// even when its body never runs**, so "free when off" has to be MEASURED and cannot be
+// argued from the source.
+//
+// So the three call sites are behind `-DCW_WHOLEFUNC=1` and a default build carries no
+// code at all. `CW_VK_NO_WHOLEFUNC=1` is the runtime control INSIDE such a build; it
+// cannot refund the 0.5 ms, which is why the build announces itself and says to read its
+// shares rather than its milliseconds.
+//
+// SINGLE-THREADED BY CONSTRUCTION: all three functions run on the pump thread only (the
+// parallel-record workers replay captured commands and call none of them), so these are
+// plain adds and not atomics. If any of them is ever moved to a worker, this comment is
+// the thing that has to change first.
+struct WholeFunc
+{
+    uint64_t ns = 0;        // summed over the SAMPLED calls only
+    uint64_t sampled = 0;   // how many calls were timed
+    uint64_t calls = 0;     // how many calls happened while armed
+};
+WholeFunc g_wfStream, g_wfTexture, g_wfDraw;
+bool g_wholeFunc = false;
+constexpr uint64_t kWfPeriod = 17;
+
+struct WfScope
+{
+    WholeFunc* w = nullptr;
+    uint64_t t0 = 0;
+    explicit WfScope(WholeFunc* wf)
+    {
+        if (!g_wholeFunc)
+            return;
+        if (++wf->calls % kWfPeriod)
+            return;
+        w = wf;
+        t0 = NowNs();
+    }
+    ~WfScope()
+    {
+        if (!w)
+            return;
+        w->ns += NowNs() - t0;
+        ++w->sampled;
+    }
+};
+
+#endif // CW_WHOLEFUNC
 
 // CW_VK_TEX_CENSUS=1 — per texture ADDRESS, where its pixels came from.
 //
@@ -950,6 +1052,21 @@ inline bool GuardFoldSerial()
 // The tail is folded serially into lane 0 so a buffer under 32 bytes still mixes every
 // byte, and the lanes are combined with distinct rotations so that two lanes swapping
 // contents cannot cancel.
+// CW_VK_GUARD_NTA=1 (part 118): non-temporal PREFETCH ahead of the fold, so the ~37 MB
+// a frame the guard streams through does not displace the GUEST's working set from the
+// shared L3. The guard reads every vertex stream once a frame, sequentially, and never
+// again until the next frame — the textbook non-temporal access — and part 118's PMU
+// pair on the Main Thread says our renderer's presence turns ~3,700 of its L3 hits a
+// frame into DRAM fills (31.1k vs 27.4k), on a thread whose cost is serialised misses.
+// x86 has no non-temporal LOAD for write-back memory; PREFETCHNTA is the nearest thing
+// (AMD: fills L1 only, not written back into L2/L3 on eviction). An arm because the
+// benefit lands on ANOTHER thread and only a frame-time A/B can price it.
+inline bool GuardFoldNta()
+{
+    static const bool nta = getenv("CW_VK_GUARD_NTA") != nullptr;
+    return nta;
+}
+
 inline uint64_t GuardFold(uint64_t h, const uint8_t* p, size_t n)
 {
     constexpr uint64_t P = 1099511628211ull;
@@ -958,8 +1075,14 @@ inline uint64_t GuardFold(uint64_t h, const uint8_t* p, size_t n)
     {
         uint64_t h0 = h, h1 = h ^ 0x9E3779B97F4A7C15ull, h2 = h ^ 0xC2B2AE3D27D4EB4Full,
                  h3 = h ^ 0x165667B19E3779F9ull;
+        const bool nta = GuardFoldNta();
+        if (nta)   // the first lines, which the loop's own prefetch would arrive too late for
+            for (size_t k = 0; k < 512 && k < n; k += 64)
+                __builtin_prefetch(p + k, 0, 0);
         for (; i + 32 <= n; i += 32)
         {
+            if (nta && (i & 63) == 0)
+                __builtin_prefetch(p + i + 512, 0, 0);   // locality 0 = prefetchnta
             uint64_t v0, v1, v2, v3;
             memcpy(&v0, p + i, 8);        // unaligned-safe; each compiles to one load
             memcpy(&v1, p + i + 8, 8);
@@ -1167,6 +1290,24 @@ bool g_d3dMode = false;
 
 const char* Env(const char* n) { return getenv(n); }
 bool EnvOn(const char* n) { return getenv(n) != nullptr; }
+
+// Take one from a "print only the first N of these" countdown, STOPPING at zero.
+//
+// The obvious spelling -- decrementing inside the comparison -- is a bug, and it shipped
+// in v1.0.2 on the hottest path in the project (pm4.cpp's [pm4draw] trace): it decrements
+// on EVERY call whether it prints or not, so the counter runs past zero and, at 2^31, wraps
+// to INT_MAX — at which point a trace NOBODY ARMED turns itself on and never stops. On a
+// per-draw path that took about 80 minutes of play: the frame rate roughly halved and
+// cw_runtime.log reached 98 GB. Every countdown in this file had the same shape; none of
+// the others could reach 2^31 because they only tick on rare or defect paths, which is
+// luck rather than design. This makes the safe form the easy one to write.
+bool TakeOne(int& left)
+{
+    if (left <= 0)
+        return false;
+    --left;
+    return true;
+}
 
 // ===================================================================================
 // PART 81 §1.1: THE DEVICE COMMAND TABLE — one indirection off every vkCmd* call
@@ -1984,23 +2125,33 @@ void GuardRunJob(const GuardJob& j, GuardOut& o)
 // after the Renderer (they record Vulkan commands); the pool only needs these two.
 bool ParRec_PendingChunks();
 void ParRec_WorkerDrain(uint32_t workerIdx);
+// ...and the same two hooks for the part-111 shared-block pre-zero (item B1).
+bool Prezero_Pending();
+void Prezero_WorkerDrain();
 
 void GuardWorker(unsigned workerIdx)
 {
+    { char n[16]; snprintf(n, sizeof n, "cw-guard%u", workerIdx); ThreadBudget_NameSelf(n); }
     GuardPool& gp = *g_gp;
     uint64_t seen = 0;
     for (;;)
     {
         {
             std::unique_lock<std::mutex> lk(gp.mx);
-            gp.wake.wait(lk,
-                         [&] { return gp.generation != seen || ParRec_PendingChunks(); });
+            gp.wake.wait(lk, [&] {
+                return gp.generation != seen || ParRec_PendingChunks() ||
+                       Prezero_Pending();
+            });
             seen = gp.generation;
         }
         const uint64_t busy0 = NowNs();
         // Record chunks FIRST: a chunk blocks THIS frame's submit where a guard job
         // is a prediction for the next frame — the priorities are not symmetric.
         ParRec_WorkerDrain(workerIdx);
+        // ...then the pre-zero, which is for THIS frame and which the pump will start
+        // asking for at its first draw. A guard job is a prediction for the NEXT frame,
+        // so it is the lowest priority of the three.
+        Prezero_WorkerDrain();
         for (;;)
         {
             const size_t i = gp.next.fetch_add(1, std::memory_order_relaxed);
@@ -2018,6 +2169,8 @@ void GuardWorker(unsigned workerIdx)
             // dispatch of hashes.
             if (ParRec_PendingChunks())
                 ParRec_WorkerDrain(workerIdx);
+            if (Prezero_Pending())
+                Prezero_WorkerDrain();
         }
         // A worker that woke to an already-drained list adds its ~0, which is correct:
         // that IS its busy time for the dispatch.
@@ -2396,6 +2549,28 @@ struct ShaderMeta
     VkShaderModule moduleRt = VK_NULL_HANDLE;
     bool isVertex = false;
     std::vector<VertexAttribute> attributes; // vertex shaders only
+    // HOW MUCH OF THE VFETCH TABLE THIS SHADER CAN READ (part 109). Derived from
+    // `attributes` when the sidecar is parsed, never at draw time.
+    //
+    // The shared constant block is zeroed on EVERY draw — 2,192 bytes into
+    // write-combined arena memory, ~20 MB a frame at the operator's crowd, and `perf`
+    // puts `__memset_avx2` at 4.2% of the pump thread = 0.44 ms of a 10.8 ms frame.
+    // 1,536 of those 2,192 bytes are the dependent-vertex-fetch table (96 slots x 16),
+    // and **only a slot this shader actually declares can ever be read**: XenosRecomp's
+    // `XeVfetchDep` addresses the table by the slot baked into the shader, so a slot no
+    // attribute names is dead memory. 45 of this title's 67 vertex shaders declare NO
+    // dependent fetch at all and read none of it.
+    //
+    // Zeroing is still load-bearing for the slots that ARE declared: the publish loop
+    // `continue`s on a bad range or a failed upload, and the shader's own bounds check
+    // then sees size 0 and returns float4(0,0,0,0) — the mesh collapses to the origin
+    // rather than reading a stale address. So this is the highest declared slot plus
+    // one, not the count of declared slots, and a shader with none gets zero.
+    // The declared slots themselves, sorted and deduped — not just the highest one. A
+    // PREFIX up to the highest slot saved 940 of 2,192 bytes a draw (42.9%); the shaders
+    // that do use dependent fetches declare a handful of slots scattered up to ~37, so
+    // zeroing the entries rather than the span is most of the rest.
+    std::vector<uint16_t> vfetchSlots;
     std::vector<uint32_t> interpolators;
     std::vector<uint32_t> tfetchConsts;
     // PARALLEL to tfetchConsts: 0 = 1D, 1 = 2D, 2 = 3D, 3 = cube, and it decides which
@@ -2770,6 +2945,10 @@ bool LoadShaderMeta(const std::filesystem::path& path, ShaderMeta& meta)
             a.strideDwords = uint32_t(JsonIntField(obj, "strideDwords", 0));
             a.offsetDwords = uint32_t(JsonIntField(obj, "offsetDwords", 0));
             a.indirect = uint32_t(JsonIntField(obj, "indirect", 0));
+            if (a.indirect && a.fetchSlot < 96 &&
+                std::find(meta.vfetchSlots.begin(), meta.vfetchSlots.end(),
+                          uint16_t(a.fetchSlot)) == meta.vfetchSlots.end())
+                meta.vfetchSlots.push_back(uint16_t(a.fetchSlot));
             meta.attributes.push_back(a);
             cursor = objClose + 1;
             const size_t nextBrace = text.find('{', cursor);
@@ -3000,6 +3179,10 @@ uint64_t g_flatCacheLookups = 0;
 // better" is a judgement, and this is the number that says the code ran at all — on the
 // title backdrop it should read ~80 a frame and `CW_VK_NO_POLY_OFFSET=1` must take it to 0.
 uint64_t g_polyOffsetDraws = 0;
+// THE SCOPED SHARED-BLOCK ZERO (part 109), counted so the arm proves it engaged. Bytes
+// NOT written rather than a boolean: "the fast path is on" and "the fast path is reached"
+// are different claims, and this title's shader mix decides the second (gotcha 408).
+uint64_t g_sharedZeroDraws = 0, g_sharedZeroSaved = 0;
 // Draws that enabled the STENCIL TEST. ~18% of a gameplay frame on the operator's own
 // captures, and this renderer honoured none of them until part 56.
 uint64_t g_stencilDraws = 0;
@@ -3578,6 +3761,215 @@ inline uint64_t CycNow()
     return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now().time_since_epoch())
                         .count());
+}
+
+// ---- CW_VK_PARDRAW_CENSUS=1 — part 111 §3: THE ASK-FIRST STEP FOR ITEM B ------------
+//
+// Item B moves per-draw renderer work off the pump onto the idle cores. Before any
+// threading code is written, two questions have to be answered PER SUBSYSTEM, and part
+// 110 §1 is the reason there are two rather than one:
+//
+//   1. WHAT MUTATES SHARED STATE — the part that must serialise or shard, and whose cost
+//      `S` sits on the pump forever however good the sharding is; and
+//   2. WHAT READS STATE THE PUMP WILL OVERWRITE before a deferred job could run — the
+//      part that cannot be deferred at all. That is what killed the constants stage
+//      before it was designed: `CopyConstWindow`'s source is `g_regs`, which the pump's
+//      own walk rewrites, and the VS window changes on 98.3% of draws.
+//
+// The encouraging prior this is testing: 47,000 stream lookups a frame against ~2,000
+// frame-first touches, i.e. 96% of that traffic is READS. If that holds, B2's shared
+// tables can be read-mostly with a small serial insert queue and the sharding question
+// never becomes the hard one.
+//
+// THE HIGH-FREQUENCY OPERATIONS ARE COUNTED AND THE LOW-FREQUENCY ONES ARE TIMED, on
+// purpose. A `steady_clock` read is ~25 ns, and the arena bump runs ~3 times a draw
+// (~28,000 times a crowd frame) — timing that would add 1.4 ms to the frame and measure
+// the instrument. The mutations that matter for `S` run ~2,000 times a frame, where two
+// clock reads cost ~0.1 ms and the reading survives. A DIAGNOSTIC ARM either way: never
+// quote a frame time from a run carrying it.
+bool g_pardrawCensus = false;
+struct ParDrawCensus
+{
+    // --- the per-frame arena (a bump pointer, ours, serial by construction) ---
+    uint64_t arenaAllocs = 0;      // ArenaAlloc calls
+    uint64_t arenaBytes = 0;
+    uint64_t persistAllocs = 0;    // PersistAlloc calls (the cross-frame store's bump)
+    uint64_t persistAllocBytes = 0;
+    // --- the frame stream cache (FlatCache<StreamLoc>, reset every swap) ---
+    uint64_t streamFinds = 0;      // lookups — the READ traffic
+    uint64_t streamInserts = 0;    // ...and the mutations
+    uint64_t streamInsertNs = 0;
+    // --- the cross-frame persist store (FlatCache<PersistEntry>, survives the swap) ---
+    uint64_t persistFinds = 0;
+    uint64_t persistInserts = 0;
+    uint64_t persistUpdates = 0;   // in-place edits of a found entry (guard/frame stamps)
+    uint64_t mirrorPushes = 0;     // MirrorMark's vector append — a second shared mutable
+    uint64_t persistMutNs = 0;     // inserts + mirror pushes
+    // --- the texture table ---
+    uint64_t texFinds = 0;         // ...every one of which WRITES `lastUsedFrame`, so a
+                                   // "read" here is a read-modify-write and the sharding
+                                   // question is different from the stream cache's
+    uint64_t texInserts = 0;
+    uint64_t texInsertNs = 0;
+    // --- Vulkan calls that cannot leave the pump without external synchronisation ---
+    uint64_t descWrites = 0;       // vkUpdateDescriptorSets on the per-draw path
+    uint64_t descWriteNs = 0;
+    // --- the pipeline cache ---
+    uint64_t pipeFinds = 0;
+    uint64_t pipeInserts = 0;
+    // --- question 2: what reads `g_regs` on the per-draw path ---
+    uint64_t constWindowCopies = 0;  // CopyConstWindow calls — reads g_regs, cannot defer
+    uint64_t fetchWalks = 0;         // fetch-constant walks — also reads g_regs
+};
+ParDrawCensus g_pdc;
+// One scope for the timed sites, so a site is two tokens and cannot forget its close.
+struct PdcScope
+{
+    uint64_t* sink;
+    uint64_t t0;
+    explicit PdcScope(uint64_t* s) : sink(s), t0(s ? CycNow() : 0) {}
+    ~PdcScope() { if (sink) *sink += CycNow() - t0; }
+};
+#define PDC_SCOPE(field) PdcScope _pdcScope(g_pardrawCensus ? &g_pdc.field : nullptr)
+
+// ===================================================================================
+// B1 — THE SHARED-BLOCK PRE-ZERO, ON THE GUARD POOL'S WORKERS (part 111 §4)
+// ===================================================================================
+//
+// WHY THIS IS THE FIRST STAGE OF ITEM B EVEN THOUGH IT IS THE SMALLEST. Part 110
+// measured the pump's serial floor at 2.49 ms against a 10.93 ms pump, so ~8.4 ms of
+// per-draw work is movable in principle and item B is worth ~2.3 ms in practice (the
+// wall has a second floor at 8.8 ms — the title's own recompiled code — so the useful
+// headroom is ~2.1 ms, not 5.6). Every remaining stage of item B has a hazard to argue
+// about: the constants read `g_regs`, which the pump rewrites between draws, and the
+// streams and textures mutate caches the pump also reads. THIS ONE HAS NEITHER. The
+// per-draw `memset(shared, 0, 2192)` has no source at all; it writes a constant into
+// memory only this draw owns.
+//
+// So it is the job to build the machinery on: a work queue the pump posts to, workers
+// taking from the existing budget, a drain point, an engagement counter, and a control
+// arm. If the dispatch overhead cannot pay for a job THIS clean, it cannot pay for the
+// harder stages either, and the whole design is refuted for one day's work. That is the
+// pre-registered kill in §4.3 and it is the outcome worth paying for.
+//
+// WHERE THE THREADS COME FROM: the guard pool, unchanged, per §7. It runs at ~34% busy
+// per worker and its work is front-loaded (dispatched at the swap, done early in the
+// frame), so an idle guard worker picking up zero chunks costs the thread budget
+// nothing. The hook is the same one `ParRec` already uses — `Prezero_Pending()` in the
+// worker's wait predicate and `Prezero_WorkerDrain()` between guard jobs.
+//
+// CORRECTNESS NEVER DEPENDS ON THE PREDICTION, exactly as the parallel guard's does
+// not: a slot whose chunk is not finished falls back to an inline `memset`, counted. A
+// fallback rate above a few percent means the workers are not keeping up and the item
+// is HALF-ENGAGED — which would otherwise read as a weak win rather than as a broken
+// arm (gotcha 151).
+//
+// THE HAZARD THAT IS REAL, AND HOW IT IS CLOSED. A worker must never zero memory that
+// the GPU is still reading or that this frame has already filled. Two things make that
+// true by construction rather than by argument:
+//   * the dispatch happens in `DoSwapImpl` AFTER `R->frameSlot` advances — i.e. after
+//     `RetireOldestFrame` has observed the new slot's fence, which is the same moment
+//     that already makes reusing that slot's command buffer and arena region legal; and
+//   * a new dispatch DRAINS the previous one first, with the pump helping (it claims
+//     and zeroes whatever is unclaimed rather than blocking on it), so a straggler from
+//     the previous frame can never be writing into the region the new frame is handing
+//     out. With `framesInFlight=1` those two regions are the SAME memory, which is
+//     exactly the case a generation counter alone would not have covered.
+constexpr uint32_t kPzSlotsPerChunk = 128;    // 128 * 2,304 = 294,912 B a chunk
+constexpr uint32_t kPzMaxChunks = 512;        // 65,536 slots = draws per frame region
+
+// The queue. `g_pzQueued` is posted by the pump under the drain above, so it only ever
+// grows while no worker is claiming; `g_pzClaim` is the workers' shared cursor and
+// `g_pzDone` is what the drain waits on.
+std::atomic<uint32_t> g_pzQueued{ 0 }, g_pzClaim{ 0 }, g_pzDone{ 0 };
+
+// PER-CHUNK OWNERSHIP, AND IT IS NOT A READINESS FLAG. The first version of this was one
+// `ready` byte per chunk, and it had a real defect: a chunk the pump reached BEFORE a
+// worker got to it took the inline path, filled its constants — and then the worker
+// claimed that same chunk and zeroed the constants underneath it. The symptom would have
+// been intermittent wrong descriptor indices and cleared clip planes, i.e. a picture bug
+// that appears only when the workers fall behind, which is exactly the load where nobody
+// is looking at correctness.
+//
+// So the chunk is OWNED, by a compare-exchange, and only the owner writes it:
+//   FREE  -> the first of the two to claim it wins
+//   BUSY  -> a worker is inside the memset. The pump must WAIT here; it cannot go inline,
+//            because the worker's zeros would land after the pump's constants. Bounded by
+//            one chunk's memset (~295 KB, tens of microseconds) and counted.
+//   READY -> zeroed; the pump takes the fast path
+//   PUMP  -> the pump got there first and owns it for the rest of the frame; every slot
+//            in it takes the inline memset and no worker will touch it
+constexpr uint8_t kPzFree = 0, kPzBusy = 1, kPzReady = 2, kPzPump = 3;
+std::atomic<uint8_t> g_pzChunkState[kPzMaxChunks];
+uint8_t* g_pzBase = nullptr;                  // the region's mapped address, stamped at
+                                              // dispatch so a worker never reads `R`
+
+bool g_prezeroOff = false;      // CW_VK_NO_PREZERO=1 — the same-binary control arm
+bool g_prezeroPoison = false;   // CW_VK_PREZERO_POISON=1 — the positive control
+// The bill, both sides of it (gotcha 344: part 53 moved 13.1 points off the pump and
+// 33.2 points appeared on the workers; a measurement that reports one side is not one).
+uint64_t g_pzBytesPre = 0;      // bytes a worker zeroed
+uint64_t g_pzBytesInline = 0;   // ...and bytes the pump had to zero itself
+uint64_t g_pzHits = 0, g_pzMisses = 0, g_pzOverflow = 0;
+std::atomic<uint64_t> g_pzWorkerNsA{ 0 };
+uint64_t g_pzDrainNs = 0, g_pzDrainHelped = 0, g_pzDrainWaits = 0;
+uint64_t g_pzDispatches = 0, g_pzChunksPosted = 0;
+uint64_t g_pzPumpClaims = 0;      // chunks the pump got to first
+// ...and the workers therefore skipped. ATOMIC, and it is the only counter here that has
+// to be: `Prezero_RunChunk` runs on a worker AND on the pump (which helps its own drain),
+// so several threads can reach this increment at once. Every other counter in this block
+// is touched by the pump alone. A plain `uint64_t` here would be a real data race — small
+// in consequence, but a race argument that says "these two threads never overlap" has to
+// actually be true for every counter it covers.
+std::atomic<uint64_t> g_pzWorkerSkips{ 0 };
+uint64_t g_pzWaits = 0, g_pzWaitNs = 0;   // the pump waiting on a BUSY chunk
+uint64_t g_pzBeyondWatermark = 0;         // slots past what this frame's dispatch posted
+
+bool Prezero_Pending()
+{
+    return g_pzClaim.load(std::memory_order_relaxed) <
+           g_pzQueued.load(std::memory_order_acquire);
+}
+
+// Zero (or poison) one chunk. Called on a worker, and on the PUMP when it is helping a
+// drain — which is why it takes no worker index and touches no per-worker state.
+void Prezero_RunChunk(uint32_t c)
+{
+    uint8_t expect = kPzFree;
+    if (!g_pzChunkState[c].compare_exchange_strong(expect, kPzBusy,
+                                                   std::memory_order_acq_rel))
+    {
+        // The pump reached this chunk first and owns it. Leaving it alone is the whole
+        // point of the handshake; zeroing it here would wipe constants already written.
+        g_pzWorkerSkips.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const uint64_t t0 = CycNow();
+    uint8_t* p = g_pzBase + uint64_t(c) * kPzSlotsPerChunk * kSharedStride;
+    const size_t n = size_t(kPzSlotsPerChunk) * kSharedStride;
+    // The POISON arm writes 0xAA where the zero would go. It is the gotcha-30 test for
+    // this whole item: the claim is "the block a draw reads is the one a worker
+    // prepared", and "the picture looks the same" cannot tell that apart from "the fast
+    // path never engaged and the inline memset did the work". Under poison the picture
+    // MUST break; if it does not, the arm is inert and the measurement is meaningless.
+    std::memset(p, g_prezeroPoison ? 0xAA : 0x00, n);
+    g_pzChunkState[c].store(kPzReady, std::memory_order_release);
+    g_pzWorkerNsA.fetch_add(CycNow() - t0, std::memory_order_relaxed);
+}
+
+void Prezero_WorkerDrain()
+{
+    for (;;)
+    {
+        uint32_t c = g_pzClaim.load(std::memory_order_relaxed);
+        const uint32_t q = g_pzQueued.load(std::memory_order_acquire);
+        if (c >= q)
+            return;
+        if (!g_pzClaim.compare_exchange_weak(c, c + 1, std::memory_order_acq_rel))
+            continue;
+        Prezero_RunChunk(c);
+        g_pzDone.fetch_add(1, std::memory_order_release);
+    }
 }
 
 // `g_texFetchResolves` counts CALLS to UploadTexture — one per texture fetch per draw,
@@ -4486,6 +4878,46 @@ struct Renderer
     // Set by ArenaAlloc when it has to refuse a draw; acted on at the next frame
     // boundary, which is the only place the old buffer is provably not in use.
     VkDeviceSize arenaWant = 0;
+
+    // --- THE SHARED-BLOCK SUB-ARENA (part 111, item B1) -------------------------------
+    //
+    // Every draw needs 2,192 zeroed bytes for its shared-constant block, and until part
+    // 111 every draw got them by bumping the arena above and calling `memset` on the
+    // pump — `__memset_avx2`, 0.44 ms/frame and the 6th-largest symbol on the pump
+    // thread at the operator's crowd. That memset has NO SOURCE: it writes a constant
+    // into memory only this draw owns, so it is the one piece of per-draw work that can
+    // be moved to another core with no race to argue about, which is why item B builds
+    // its dispatch machinery on it first.
+    //
+    // A SEPARATE BUFFER, and for the same reason the cross-frame store below is one: the
+    // arena's exhaustion path is load-bearing (§6ap), and a worker zeroing ahead of a
+    // cursor inside it would have to reason about where the general bump has reached.
+    // Here the worker's write region is a different VkBuffer entirely, so "the worker
+    // never touches memory the pump is writing" is true by construction rather than by
+    // an argument about two cursors in one address range.
+    //
+    // A FIXED-STRIDE SLOT ARRAY, not a bump allocator. `kSharedStride` is `kSharedSize`
+    // rounded to 256, so slot i lives at `sharedBase + i * kSharedStride` and a block
+    // NEVER SPANS A PRE-ZERO CHUNK. That is what lets "is this block already zeroed?" be
+    // one array read instead of a range test, and it is what makes the watermark
+    // bookkeeping incapable of reporting a half-zeroed block as ready.
+    Buffer sharedArena;
+    VkDeviceSize sharedBase = 0;      // this slot's region start, in bytes
+    uint32_t sharedSlotsCapacity = 0; // what the region can hold at all
+    uint32_t sharedSlotsPosted = 0;   // ...and how many of them a worker was asked to
+                                      // clear this frame. THE TWO ARE DIFFERENT and the
+                                      // difference is the item's whole efficiency: the
+                                      // first version posted the WHOLE region every
+                                      // frame — 56.6 MB of write-combined stores for the
+                                      // 19.6 MB a crowd frame actually uses, and the
+                                      // workers' side of the bill read 4.49 ms against
+                                      // the 0.44 the pump was paying. The posted count is
+                                      // now last frame's usage plus a margin, which is
+                                      // what "a worker zeroes AHEAD OF the bump pointer"
+                                      // means (§4.1) rather than "a worker zeroes
+                                      // everything".
+    uint32_t sharedNext = 0;          // next slot index within the region
+    VkDeviceSize sharedWant = 0;      // set on exhaustion, acted on at the frame boundary
 
     // --- the CROSS-FRAME stream store -------------------------------------------------
     //
@@ -5556,6 +5988,8 @@ float FovHalfRadThisFrame()
 // insert into the same container, which is exactly the guarantee the old iterator gave.
 Renderer::PersistEntry* PersistFind(uint64_t key)
 {
+    if (g_pardrawCensus)
+        ++g_pdc.persistFinds;
     if (!g_flatCacheOff)
         return R->persistCache.Find(key);
     auto it = R->persistCacheMap.find(key);
@@ -5563,6 +5997,9 @@ Renderer::PersistEntry* PersistFind(uint64_t key)
 }
 Renderer::PersistEntry* PersistInsert(uint64_t key, const Renderer::PersistEntry& e)
 {
+    PDC_SCOPE(persistMutNs);
+    if (g_pardrawCensus)
+        ++g_pdc.persistInserts;
     if (!g_flatCacheOff)
         return R->persistCache.Insert(key, e);
     return &R->persistCacheMap.emplace(key, e).first->second;
@@ -5592,9 +6029,14 @@ inline void MirrorMark(Renderer::PersistEntry& e, VkDeviceSize at, VkDeviceSize 
 {
     if (!R->persistDev.buffer)
         return;
+    PDC_SCOPE(persistMutNs);
     e.mirrorSeq = R->mirrorGen;
     if (at + bytes <= R->persistDev.size)
+    {
+        if (g_pardrawCensus)
+            ++g_pdc.mirrorPushes;
         R->mirrorPending.push_back(VkBufferCopy{ at, at, bytes });
+    }
 }
 
 // Which buffer a persist HIT binds: the mirror when its copy of this slot is already in
@@ -5696,8 +6138,29 @@ size_t PersistSize()
 }
 
 // The texture cache, through the same seam and for the same reason.
+// THE TEXTURE-RESOLUTION GENERATION (part 109 item 1). `UploadTexture` is called once per
+// texture fetch per draw — ~13,900 times a frame at the crowd — and 0.0014% of those calls
+// do any work: the rest hash six fetch-constant dwords, decode them, and look the result
+// up. The fetch constants for a slot almost never change between draws, so the answer is
+// memoisable per fetch-constant index — but ONLY against everything else the answer
+// depends on, which is why this counter exists rather than a bare cache.
+//
+// It is bumped by every mutation of the two things a resolved slot depends on:
+//   * the resolve-snapshot set (emplace, erase, and the whole-set clear) — a snapshot
+//     appearing mid-frame changes a fetch's answer from "the cached upload" to "the
+//     snapshot", which is the ordering the big comment in UploadTexture exists to protect;
+//   * the texture table (TexInsert, and BOTH arms of ReclaimTextureSlot's eviction) — a
+//     recycled bindless slot would otherwise be handed out from a stale memo.
+// Miss anything that changes an answer and the symptom is a frozen or wrong texture, so
+// the memo ships with CW_VK_TEXMEMO_VERIFY=1, which computes both answers and counts
+// disagreements.
+uint64_t g_texGen = 1;
+inline void TexGenBump() { ++g_texGen; }
+
 TextureEntry* TexFind(uint64_t key)
 {
+    if (g_pardrawCensus)
+        ++g_pdc.texFinds;
     TextureEntry* e = nullptr;
     if (!g_flatCacheOff)
         e = R->textures.Find(key);
@@ -5714,6 +6177,10 @@ TextureEntry* TexFind(uint64_t key)
 }
 void TexInsert(uint64_t key, TextureEntry&& e)
 {
+    PDC_SCOPE(texInsertNs);
+    if (g_pardrawCensus)
+        ++g_pdc.texInserts;
+    TexGenBump();
     if (!g_flatCacheOff)
         R->textures.Insert(key, e);
     else
@@ -6494,11 +6961,106 @@ VkDeviceSize ArenaAlloc(VkDeviceSize bytes, VkDeviceSize align = 256)
         return VkDeviceSize(-1);
     }
     R->arenaCursor = at + bytes;
+    if (g_pardrawCensus)
+    {
+        ++g_pdc.arenaAllocs;
+        g_pdc.arenaBytes += bytes;
+    }
     // The high water is what ONE FRAME used, so it is measured from this slot's base and
     // stays comparable across the arms. Reading it against the whole buffer would make
     // the second frame in flight look like a doubling of the title's demand.
     R->arenaHighWater = std::max(R->arenaHighWater, R->arenaCursor - R->arenaBase);
     return at;
+}
+
+// Hand out one shared block from the part-111 sub-arena. Returns the byte offset into
+// `R->sharedArena` and sets `preZeroed` when a worker has already cleared it. On
+// exhaustion it returns -1 and the caller falls back to the general arena plus an inline
+// `memset` — i.e. to exactly the pre-part-111 code path, which is what keeps this item
+// incapable of losing a draw.
+VkDeviceSize ArenaAllocShared(bool& preZeroed)
+{
+    preZeroed = false;
+    if (g_prezeroOff || !R->sharedArena.buffer)
+        return VkDeviceSize(-1);
+    if (R->sharedNext >= R->sharedSlotsCapacity)
+    {
+        // A REAL overflow: the buffer itself is full. Ask for twice the region at the
+        // next frame boundary, the same way the arena does, and take the general-arena
+        // path for this draw. Counted, because a sub-arena that silently ran out every
+        // frame would present as "the item is worth nothing" rather than as "it never
+        // ran". `sharedSlotsCapacity == 0` is the pre-first-swap state and is NOT an
+        // overflow — counting it as one would ask for a doubling on every boot.
+        if (R->sharedSlotsCapacity)
+        {
+            ++g_pzOverflow;
+            R->sharedWant = std::max(R->sharedWant, R->sharedArena.size * 2);
+        }
+        return VkDeviceSize(-1);
+    }
+    const uint32_t idx = R->sharedNext++;
+    if (idx >= R->sharedSlotsPosted)
+    {
+        // PAST THE WATERMARK: the region has room but no worker was asked to clear this
+        // far, because last frame did not come this far. The slot is still handed out —
+        // it just gets the inline memset, and the next dispatch posts further. This is
+        // the ordinary way a frame that grows its draw count pays for the growth.
+        ++g_pzMisses;
+        ++g_pzBeyondWatermark;
+        g_pzBytesInline += kSharedSize;
+        return R->sharedBase + VkDeviceSize(idx) * kSharedStride;
+    }
+    const uint32_t chunk = idx / kPzSlotsPerChunk;
+    // A block NEVER SPANS A CHUNK (kSharedStride divides the chunk exactly, by
+    // construction of kPzSlotsPerChunk), so one chunk's state is the whole question and
+    // this test cannot report a half-zeroed block as ready.
+    //
+    // The common case is one acquire byte load that reads READY. Everything below it is
+    // the handshake described at `g_pzChunkState`, and after the first draw of a chunk it
+    // is not re-run: the state is READY or PUMP and stays that way for the frame.
+    for (;;)
+    {
+        const uint8_t st = g_pzChunkState[chunk].load(std::memory_order_acquire);
+        if (st == kPzReady)
+        {
+            preZeroed = true;
+            break;
+        }
+        if (st == kPzPump)
+            break;                       // ours already; inline, like every slot in it
+        if (st == kPzFree)
+        {
+            uint8_t expect = kPzFree;
+            if (g_pzChunkState[chunk].compare_exchange_strong(expect, kPzPump,
+                                                              std::memory_order_acq_rel))
+            {
+                ++g_pzPumpClaims;
+                break;                   // we own it now; a worker will skip it
+            }
+            continue;                    // a worker took it under us — re-read
+        }
+        // BUSY: a worker is inside this chunk's memset and the pump CANNOT go inline,
+        // because the worker's zeros would land on top of the constants. Waiting is the
+        // only correct move; it is bounded by one 295 KB memset and it is counted, so a
+        // run where this is not rare says the dispatch is arriving too late rather than
+        // reading as a mysteriously slow frame.
+        ++g_pzWaits;
+        const uint64_t w0 = CycNow();
+        while (g_pzChunkState[chunk].load(std::memory_order_acquire) == kPzBusy)
+            std::this_thread::yield();
+        g_pzWaitNs += CycNow() - w0;
+    }
+    if (preZeroed)
+    {
+        ++g_pzHits;
+        g_pzBytesPre += kSharedSize;
+    }
+    else
+    {
+        ++g_pzMisses;
+        g_pzBytesInline += kSharedSize;
+    }
+    return R->sharedBase + VkDeviceSize(idx) * kSharedStride;
 }
 
 // --- the cross-frame stream store ------------------------------------------------------
@@ -6519,6 +7081,11 @@ VkDeviceSize PersistAlloc(VkDeviceSize bytes, VkDeviceSize align = 16)
         return VkDeviceSize(-1);
     }
     R->persistCursor = at + bytes;
+    if (g_pardrawCensus)
+    {
+        ++g_pdc.persistAllocs;
+        g_pdc.persistAllocBytes += bytes;
+    }
     return at;
 }
 
@@ -7873,6 +8440,7 @@ bool tablesReady = false;
 
 void Worker()
 {
+    ThreadBudget_NameSelf("cw-shaderjit");
     for (;;)
     {
         Job job;
@@ -8942,6 +9510,7 @@ uint32_t ReclaimTextureSlot(bool isCube)
             return UINT32_MAX;
         RetireImage(t.vals[bestIdx].image);
         t.Erase(bestKey);
+        TexGenBump();   // a recycled slot must not be served from the memo
     }
     else
     {
@@ -8964,6 +9533,7 @@ uint32_t ReclaimTextureSlot(bool isCube)
             return UINT32_MAX;
         RetireImage(best->second.image);
         R->texturesMap.erase(best);
+        TexGenBump();   // a recycled slot must not be served from the memo
     }
     return bestSlot;
 }
@@ -9283,8 +9853,99 @@ static bool PackedLevelOffset(uint32_t width, uint32_t height, uint32_t blockDim
 // cannot be conflated: set 0 holds `Texture2D` views and set 2 holds `TextureCube` ones,
 // so a 2D slot number published into the cube array indexes a descriptor that was never
 // written.
+// THE PER-SLOT MEMO (part 109 item 1). 32 fetch-constant groups, so the table is 32
+// entries and the index is the slot itself — no hashing to find the memo.
+//
+// A hit must still STAMP RECENCY. `TexFind` writes `lastUsedFrame` on every lookup and the
+// LRU reclaimer evicts by it, so a memo that skipped the lookup would silently stop
+// marking a texture as used and the reclaimer would evict textures that are in use every
+// frame. That is the whole hazard class of a fast path that bypasses a check nobody
+// remembered was there, so the memo stores the ENTRY POINTER and stamps it itself; the
+// generation covers the pointer's validity as well as the answer's.
+// The texture cache's key, factored out so the memo and `UploadTextureUncached` cannot
+// drift: two copies of a hash is two things to keep in step, and a silent divergence here
+// would hand back another texture's slot.
+inline uint64_t TexMemoKey(const uint32_t* regs, uint32_t constIdx, uint32_t shaderDim)
+{
+    uint64_t key = 1469598103934665603ull;
+    for (uint32_t i = 0; i < 6; i++)
+    {
+        key ^= regs[xenos::kFetchConstantBase + constIdx * 6 + i];
+        key *= 1099511628211ull;
+    }
+    key ^= shaderDim;
+    key *= 1099511628211ull;
+    return key;
+}
+
+struct TexSlotMemo
+{
+    uint32_t regs[6] = {};
+    uint32_t dim = 0xFFFFFFFFu;
+    uint64_t gen = 0;              // 0 = empty; never matches g_texGen, which starts at 1
+    uint32_t slot = 0;
+    TextureEntry* entry = nullptr; // non-null only when the answer came from the table
+};
+TexSlotMemo g_texMemo[32];
+uint64_t g_texMemoHits = 0, g_texMemoMiss = 0, g_texMemoDisagree = 0;
+
+uint32_t UploadTextureUncached(uint8_t* base, const uint32_t* regs, uint32_t constIdx,
+                               uint32_t shaderDim);
+
 uint32_t UploadTexture(uint8_t* base, const uint32_t* regs, uint32_t constIdx,
                        uint32_t shaderDim)
+{
+#if CW_WHOLEFUNC
+    WfScope _wf(&g_wfTexture);   // part 110 A.2 — see CW_WHOLEFUNC
+#endif
+    // OPT-IN UNTIL IT IS VERIFIED AND MEASURED. The memo is built and its verifier arm
+    // works, but no run has yet read 0 disagreements and no A/B has priced it, so HEAD
+    // must behave exactly like the released v1.0.2 build. `CW_VK_TEXMEMO=1` engages it;
+    // flip this to on-by-default (and rename the arm to CW_VK_NO_TEXMEMO) only after a
+    // crowd run reads 0 disagreements AND three runs an arm clear the 0.4 ms kill rule.
+    static const bool memoOn = EnvOn("CW_VK_TEXMEMO");
+    static const bool verify = EnvOn("CW_VK_TEXMEMO_VERIFY");
+    if (memoOn && constIdx < 32)
+    {
+        TexSlotMemo& m = g_texMemo[constIdx];
+        const uint32_t* r = &regs[xenos::kFetchConstantBase + constIdx * 6];
+        if (m.gen == g_texGen && m.dim == shaderDim &&
+            std::memcmp(m.regs, r, sizeof(m.regs)) == 0)
+        {
+            ++g_texMemoHits;
+            if (m.entry)
+                m.entry->lastUsedFrame = R->frame;   // the stamp TexFind would have made
+            if (!verify)
+                return m.slot;
+            const uint32_t real = UploadTextureUncached(base, regs, constIdx, shaderDim);
+            if (real != m.slot)
+            {
+                if (g_texMemoDisagree++ < 8)
+                    fprintf(stderr, "[texmemo] DISAGREEMENT slot %u dim %u: memo %u real "
+                                    "%u (gen %llu)\n", constIdx, shaderDim, m.slot, real,
+                            (unsigned long long)g_texGen);
+                return real;
+            }
+            return m.slot;
+        }
+        ++g_texMemoMiss;
+        const uint32_t slot = UploadTextureUncached(base, regs, constIdx, shaderDim);
+        std::memcpy(m.regs, r, sizeof(m.regs));
+        m.dim = shaderDim;
+        m.gen = g_texGen;
+        m.slot = slot;
+        // Only a table answer carries a stampable entry. Snapshot and dummy answers do
+        // not live in R->textures, and the generation already invalidates them.
+        m.entry = TexFind(TexMemoKey(regs, constIdx, shaderDim));
+        if (m.entry && m.entry->slot != slot)
+            m.entry = nullptr;      // the answer did not come from the table
+        return slot;
+    }
+    return UploadTextureUncached(base, regs, constIdx, shaderDim);
+}
+
+uint32_t UploadTextureUncached(uint8_t* base, const uint32_t* regs, uint32_t constIdx,
+                               uint32_t shaderDim)
 {
     ProfScope _p(&g_prof.textures);
     // One increment, unconditionally. The PROFILER's `textures` phase already times this
@@ -9315,19 +9976,13 @@ uint32_t UploadTexture(uint8_t* base, const uint32_t* regs, uint32_t constIdx,
     // which is also the correctness check.
     if (shaderDim == 3)
         COUNT("texture: CUBE fetch");
-    uint64_t key = 1469598103934665603ull;
-    for (uint32_t i = 0; i < 6; i++)
-    {
-        key ^= regs[xenos::kFetchConstantBase + constIdx * 6 + i];
-        key *= 1099511628211ull;
-    }
     // THE DIMENSION IS PART OF THE KEY, because the cached value is a slot number and a
     // slot number only means something against one heap. Two shaders could in principle
     // sample the same fetch constant as a 2D texture and as a cube; without this the
     // second one would be served the first one's slot, indexing the wrong descriptor
     // array. It costs one multiply and removes a whole class of impossible-to-read bug.
-    key ^= shaderDim;
-    key *= 1099511628211ull;
+    // (The hash itself is `TexMemoKey`, shared with the per-slot memo above.)
+    const uint64_t key = TexMemoKey(regs, constIdx, shaderDim);
     const xenos::TextureFetch t = xenos::DecodeTextureFetch(regs, constIdx);
     if (t.type != 2)
     {
@@ -10016,7 +10671,7 @@ uint32_t UploadTexture(uint8_t* base, const uint32_t* regs, uint32_t constIdx,
         {
             Count("texture: units left BLACK — tiled offset outside the footprint");
             static int left = 20;
-            if (left-- > 0)
+            if (TakeOne(left))
                 fprintf(stderr,
                         "[vk] untile %08X %ux%u fmt=%u bpu=%u pitchUnits=%u "
                         "srcRows=%u srcBytes=%llu: %llu of %llu units (%.1f%%) fell "
@@ -10352,7 +11007,7 @@ uint32_t UploadTexture(uint8_t* base, const uint32_t* regs, uint32_t constIdx,
                     // below are declined like any other packed tail.
                     Count("mip: level REJECTED — diverges from the level above");
                     static int left = 8;
-                    if (left-- > 0)
+                    if (TakeOne(left))
                         fprintf(stderr,
                                 "[vk] mip %08X %ux%u fmt=%u level %u: endpoint luma "
                                 "%.1f vs %.1f one level up — this level is probably not "
@@ -10764,7 +11419,7 @@ uint32_t UploadTexture(uint8_t* base, const uint32_t* regs, uint32_t constIdx,
         {
             Count("texture: uploaded a SINGLE REPEATED BLOCK — one flat colour");
             static int left = 12;
-            if (left-- > 0)
+            if (TakeOne(left))
                 fprintf(stderr,
                         "[vk] texture %08X %ux%u fmt=%u uploaded UNIFORM: every block is "
                         "%02X%02X%02X%02X%02X%02X%02X%02X — this surface can only render "
@@ -10882,7 +11537,12 @@ uint32_t UploadTexture(uint8_t* base, const uint32_t* regs, uint32_t constIdx,
     w.descriptorCount = 1;
     w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     w.pImageInfo = &ii;
-    vkUpdateDescriptorSets(R->device, 1, &w, 0, nullptr);
+    {
+        PDC_SCOPE(descWriteNs);
+        if (g_pardrawCensus)
+            ++g_pdc.descWrites;
+        vkUpdateDescriptorSets(R->device, 1, &w, 0, nullptr);
+    }
 
     const uint32_t slot = entry.slot;
     TexInsert(key, std::move(entry));
@@ -10890,7 +11550,7 @@ uint32_t UploadTexture(uint8_t* base, const uint32_t* regs, uint32_t constIdx,
     {
         Count("texture: CUBE MAP uploaded (six faces)");
         static int left = 8;
-        if (left-- > 0)
+        if (TakeOne(left))
             fprintf(stderr,
                     "[vk] cube %08X %ux%u fmt=%u tiled=%u pitchBlk=%u faceBytes=%llu "
                     "-> set 2 slot %u\n",
@@ -11492,6 +12152,8 @@ static VkPipeline RegisterBuiltPipeline(const PipelineKey& key, const PipelineBu
             COUNT("pipeline: two-sided stencil built with FRONT=CCW "
                   "(CW_VK_STENCIL_CCW_FRONT control arm)");
     }
+    if (g_pardrawCensus)
+        ++g_pdc.pipeInserts;
     R->pipelines.emplace(key, b.pipeline);
     // Persist the growing key set as we go, so a kill or a crash cannot throw away the
     // warm-up. See SavePipelineKeysIfDue.
@@ -11586,6 +12248,7 @@ bool ChainOn()
 
 void Worker()
 {
+    ThreadBudget_NameSelf("cw-pipeline");
     // PRIORITY FOLLOWS THE TIER (part 103 item 4a). A SPARE job is the speculative
     // warm — nobody is waiting for it, and on a cold driver cache it is 155 ms of pure
     // compiler time per key on czamd, 1,339 keys, four of these threads: for the first
@@ -11791,6 +12454,8 @@ VkPipeline GetPipeline(const PipelineKey& key, const ShaderMeta& vs, const Shade
         }
         ++g_pipeCache1Misses;
     }
+    if (g_pardrawCensus)
+        ++g_pdc.pipeFinds;
     auto it = R->pipelines.find(key);
     if (it != R->pipelines.end())
     {
@@ -11963,6 +12628,155 @@ void GrowArenaIfNeeded()
             R->arenaWant = 0;
         }
     }
+}
+
+// --- B1's frame-boundary half (part 111 §4) -------------------------------------------
+//
+// DRAIN FIRST, AND THE PUMP HELPS RATHER THAN BLOCKS. A straggler from the previous
+// dispatch must not still be writing when the new frame starts handing out slots, and
+// with `framesInFlight=1` the previous region and the new one are the SAME memory — so a
+// generation counter on the readiness flags would not have been enough. The pump claims
+// whatever is unclaimed and zeroes it itself (that is work it wanted done anyway), then
+// waits only for the chunks a worker is actually inside, which is at most one chunk per
+// worker: ~295 KB of `memset` each.
+void Prezero_Drain()
+{
+    if (g_pzQueued.load(std::memory_order_relaxed) == 0)
+        return;
+    const uint64_t t0 = CycNow();
+    if (Prezero_Pending())
+    {
+        ++g_pzDrainHelped;
+        Prezero_WorkerDrain();
+    }
+    while (g_pzDone.load(std::memory_order_acquire) <
+           g_pzQueued.load(std::memory_order_acquire))
+    {
+        ++g_pzDrainWaits;
+        std::this_thread::yield();
+    }
+    g_pzDrainNs += CycNow() - t0;
+}
+
+// Called from `DoSwapImpl` AFTER `R->frameSlot` advances — i.e. after `RetireOldestFrame`
+// has observed the new slot's fence, which is the same moment that already makes reusing
+// that slot's command buffer and arena region legal. Posting earlier would hand a worker
+// memory the GPU may still be reading.
+void Prezero_Dispatch()
+{
+    if (g_prezeroOff || !R->sharedArena.buffer)
+        return;
+    Prezero_Drain();
+    // NO WORKERS, NO ITEM. `CW_VK_NO_PARALLEL_GUARD=1` grants none, and the pool does not
+    // spawn its threads until the first frame files a guard job — so there is a window at
+    // boot with none either. Posting chunks into that would leave them for the PUMP to
+    // clear at the next drain, i.e. the pump would memset the whole posted region instead
+    // of 2,192 bytes a draw: a REGRESSION, and in exactly the arm that is the first
+    // picture bisection this project reaches for. Setting the capacity to zero sends
+    // every draw down the general-arena path, which is byte-for-byte the pre-part-111 one.
+    if (!GuardPoolWorkers() || !g_gp || !g_gp->started)
+    {
+        R->sharedSlotsCapacity = 0;
+        R->sharedSlotsPosted = 0;
+        R->sharedNext = 0;
+        g_pzQueued.store(0, std::memory_order_relaxed);
+        g_pzClaim.store(0, std::memory_order_relaxed);
+        g_pzDone.store(0, std::memory_order_relaxed);
+        return;
+    }
+    // WHAT TO POST, and this is the whole efficiency of the item. `R->sharedNext` still
+    // holds the slot count of the frame that just ended, so it is the predictor: post
+    // that plus a quarter plus one chunk of slack. A frame that grows faster than the
+    // margin runs past the watermark and pays the inline memset for the excess — counted
+    // as `beyond watermark`, distinct from a chunk the workers simply had not finished —
+    // and the NEXT dispatch posts further. A frame that shrinks stops paying for bytes
+    // nobody reads, which the first version of this did to the tune of 56.6 MB/frame.
+    const uint32_t used = R->sharedNext;
+    const VkDeviceSize region = R->sharedArena.size / R->framesInFlight;
+    R->sharedBase = VkDeviceSize(R->frameSlot) * region;
+    R->sharedSlotsCapacity = uint32_t(region / kSharedStride);
+    R->sharedNext = 0;
+    g_pzBase = R->sharedArena.mapped + R->sharedBase;
+    const uint64_t wantSlots = uint64_t(used) + used / 4 + kPzSlotsPerChunk;
+    uint32_t chunks =
+        uint32_t((wantSlots + kPzSlotsPerChunk - 1) / kPzSlotsPerChunk);
+    const uint32_t capChunks = R->sharedSlotsCapacity / kPzSlotsPerChunk;
+    if (chunks > capChunks)
+        chunks = capChunks;
+    if (chunks > kPzMaxChunks)
+        chunks = kPzMaxChunks;
+    // Slots past the last whole POSTED chunk take the inline path. Deliberate: a partial
+    // chunk is a special case in the ownership test, and that test is the one piece of
+    // this whose mistake produces garbage constants rather than a slow frame.
+    R->sharedSlotsPosted = chunks * kPzSlotsPerChunk;
+    for (uint32_t i = 0; i < chunks; ++i)
+        g_pzChunkState[i].store(kPzFree, std::memory_order_relaxed);
+    g_pzClaim.store(0, std::memory_order_relaxed);
+    g_pzDone.store(0, std::memory_order_relaxed);
+    g_pzQueued.store(chunks, std::memory_order_release);
+    ++g_pzDispatches;
+    g_pzChunksPosted += chunks;
+    // Wake the pool. The workers are the guard pool's, so this is its condition variable;
+    // a worker already awake on a guard dispatch will pick the chunks up at its next
+    // between-jobs check without any notify at all.
+    if (g_gp)
+    {
+        std::lock_guard<std::mutex> lk(g_gp->mx);
+        g_gp->wake.notify_all();
+    }
+}
+
+// Grow the shared sub-arena, at the same frame boundary and under the same rule as
+// `GrowArenaIfNeeded`: every frame in flight is idle here, so destroying the old buffer
+// cannot pull memory out from under a recorded draw. The drain is what makes it safe
+// against our OWN workers, which no fence covers.
+void GrowSharedArenaIfNeeded()
+{
+    if (g_prezeroOff || R->sharedWant <= R->sharedArena.size)
+        return;
+    constexpr VkDeviceSize kSharedCeiling = 512ull << 20;
+    const VkDeviceSize want = std::min(R->sharedWant, kSharedCeiling);
+    if (want <= R->sharedArena.size)
+    {
+        fprintf(stderr, "[vk] shared sub-arena is at its %llu MB ceiling; the overflow "
+                        "draws keep taking the inline memset path\n",
+                (unsigned long long)(kSharedCeiling >> 20));
+        R->sharedWant = 0;
+        return;
+    }
+    Prezero_Drain();
+    WaitAllFramesIdle();
+    vkDeviceWaitIdle(R->device);
+    const Buffer old = R->sharedArena;
+    Buffer grown{};
+    if (CreateBuffer(grown, want, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     /*deviceAddress=*/true, "shared sub-arena (regrown)"))
+    {
+        R->sharedArena = grown;
+        vkDestroyBuffer(R->device, old.buffer, nullptr);
+        vkFreeMemory(R->device, old.memory, nullptr);
+        fprintf(stderr, "[vk] shared sub-arena grown to %llu MB\n",
+                (unsigned long long)(want >> 20));
+    }
+    else
+    {
+        // Keep the old one. Overflowing draws take the inline memset, which is exactly
+        // the pre-part-111 behaviour, so the failure costs performance and not a picture.
+        fprintf(stderr, "[vk] shared sub-arena could NOT be grown to %llu MB — the "
+                        "overflow draws keep taking the inline memset path\n",
+                (unsigned long long)(want >> 20));
+        R->sharedWant = 0;
+    }
+    g_pzQueued.store(0, std::memory_order_relaxed);
+    g_pzClaim.store(0, std::memory_order_relaxed);
+    g_pzDone.store(0, std::memory_order_relaxed);
+    // Defensive: the dispatch immediately below this call recomputes both, but a future
+    // caller that grows without dispatching would otherwise hand out "posted" slots in a
+    // region nobody has cleared.
+    R->sharedSlotsPosted = 0;
+    R->sharedSlotsCapacity = 0;
 }
 
 // The cross-frame store's frame-boundary maintenance: grow it, or drop it, or neither.
@@ -14156,6 +14970,9 @@ void WaitAllFramesIdle()
 StreamLoc UploadStream(uint8_t* base, uint32_t va, uint64_t bytes, uint32_t endian,
                        int kind)
 {
+#if CW_WHOLEFUNC
+    WfScope _wf(&g_wfStream);   // part 110 A.2 — see CW_WHOLEFUNC
+#endif
     // The key must be an IDENTITY, not a hash. The first version was
     // `(uint64_t(va) << 24) ^ (bytes << 2) ^ endian`, and those fields OVERLAP: a
     // 32-bit address shifted 24 occupies bits 24..55 and a byte count shifted 2
@@ -14210,6 +15027,8 @@ StreamLoc UploadStream(uint8_t* base, uint32_t va, uint64_t bytes, uint32_t endi
             ++g_dedupOverflow;
     }
     const StreamLoc* hit = nullptr;
+    if (g_pardrawCensus)
+        ++g_pdc.streamFinds;
     if (!g_flatCacheOff)
         hit = R->streamCache.Find(key);
     if (g_flatCacheOff || g_flatCacheVerify)
@@ -14562,10 +15381,15 @@ StreamLoc UploadStream(uint8_t* base, uint32_t va, uint64_t bytes, uint32_t endi
         g_reuseCopiedKeys.insert(key);
         g_reuseDrawDirty = true;
     }
-    if (!g_flatCacheOff)
-        R->streamCache.Insert(key, loc);
-    if (g_flatCacheOff || g_flatCacheVerify)
-        R->streamCacheMap.emplace(key, loc);
+    {
+        PDC_SCOPE(streamInsertNs);
+        if (g_pardrawCensus)
+            ++g_pdc.streamInserts;
+        if (!g_flatCacheOff)
+            R->streamCache.Insert(key, loc);
+        if (g_flatCacheOff || g_flatCacheVerify)
+            R->streamCacheMap.emplace(key, loc);
+    }
 
     // The census, entirely on the first-touch path — which already costs a guard and
     // usually a copy, so the instrument is small against what it is measuring, and the
@@ -15252,7 +16076,12 @@ static uint32_t SamplerIndexForFetch(const uint32_t* regs, uint32_t constIdx)
     w.descriptorCount = 1;
     w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
     w.pImageInfo = &ii;
-    vkUpdateDescriptorSets(R->device, 1, &w, 0, nullptr);
+    {
+        PDC_SCOPE(descWriteNs);
+        if (g_pardrawCensus)
+            ++g_pdc.descWrites;
+        vkUpdateDescriptorSets(R->device, 1, &w, 0, nullptr);
+    }
     R->samplerBySpec[key] = int32_t(idx);
     // One line per DISTINCT spec for the process — a handful, and each is the
     // engagement evidence the census can be checked against.
@@ -16095,6 +16924,31 @@ bool g_paletteCensus = false;
 //   reuse       — no palette-region write since the last dynamic copy: the file
 //                 content is unchanged and the previous bound still describes it
 //                 (0.0% at the crowd, consistent with §6ef's ~98% constant churn).
+// PART 117: the draw's view of pm4's globals. On the one-thread pump these are the
+// command processor's own counters, read at the draw; under CW_PUMP_SPLIT=1 the draw
+// executes on `cw-draw` after the walk has moved on, so they are the values the walk
+// captured AT THE PACKET (split::DrawCtx). Same numbers, same instant in the stream.
+inline uint64_t DrawAluConstVersion(uint32_t half)
+{
+    if (const split::DrawCtx* c = split::CurrentDraw())
+        return c->aluVersion[half & 1];
+    return Pm4_AluConstVersion(half);
+}
+inline uint64_t DrawFetchConstVersion()
+{
+    if (const split::DrawCtx* c = split::CurrentDraw())
+        return c->fetchVersion;
+    return Pm4_FetchConstVersion();
+}
+inline Pm4VsPaletteWrites DrawTakeVsPaletteWrites()
+{
+    return split::g_on ? split::TakePalette() : Pm4_TakeVsPaletteWrites();
+}
+inline uint32_t DrawVsPaletteHighWater()
+{
+    return split::g_on ? split::PaletteHighWater() : Pm4_VsPaletteHighWater();
+}
+
 uint32_t g_vsPalSticky = 0;
 struct VsPalTake
 {
@@ -16106,7 +16960,7 @@ struct VsPalTake
 inline VsPalTake TakeVsPaletteBound()
 {
     VsPalTake r;
-    r.w = Pm4_TakeVsPaletteWrites();
+    r.w = DrawTakeVsPaletteWrites();
     if (r.w.coverBursts && r.w.partialExtent <= r.w.coverExtent)
     {
         g_vsPalSticky = r.w.coverExtent;
@@ -16114,7 +16968,7 @@ inline VsPalTake TakeVsPaletteBound()
     }
     else if (r.w.coverBursts || r.w.partialBursts)
     {
-        g_vsPalSticky = Pm4_VsPaletteHighWater();
+        g_vsPalSticky = DrawVsPaletteHighWater();
         r.kind = 1;
     }
     else
@@ -16240,7 +17094,7 @@ inline void Record(const VsPalTake& pt, size_t listN, uint32_t memoVsBase)
             std::min<uint64_t>(256, 4 + listN + (pt.bound >= 8 ? pt.bound - 7 : 0));
     t.bytesFull += 256 * 16;
     t.bytesBounded += boundedRegs * 16;
-    const uint32_t hw = Pm4_VsPaletteHighWater();
+    const uint32_t hw = DrawVsPaletteHighWater();
     t.bytesHighWater +=
         16 * std::min<uint64_t>(256, 4 + listN + (hw >= 8 ? hw - 7 : 0));
     t.extentSum += pt.bound;
@@ -16391,6 +17245,12 @@ bool GatherFillOn()
 void CopyConstWindow(uint32_t* dst, const uint32_t* src, const ShaderMeta& meta, bool isVs,
                      uint32_t dynBound = 0)
 {
+    // CENSUS QUESTION 2 (part 111 §3): this reads `src`, which is `g_regs` — the live
+    // register file the pump's own walk rewrites between draws. Every call counted here
+    // is a draw whose constants CANNOT be deferred to a worker without snapshotting the
+    // window first, and snapshotting the window IS the copy.
+    if (g_pardrawCensus)
+        ++g_pdc.constWindowCopies;
     (void)isVs;
     // NOTE the absence of `aluConsts.empty()` here: an empty list from a sidecar that has
     // the key is "this shader reads nothing", and the gather loop below then copies
@@ -17159,9 +18019,71 @@ uint64_t g_noLight = 0, g_noScene = 0, g_noTlas = 0, g_singular = 0;
 // The register file and shader bindings are PARAMETERS, not globals: the PM4 feed
 // passes pm4.cpp's, the D3D feed (phase C) passes the private file its walker built
 // from the title's own flush output. Everything below is feed-agnostic.
+// ---- CW_VK_NO_DODRAW=1 — THE SERIAL-FLOOR CEILING PROBE (part 110 §3.1) ------------
+//
+// THE QUESTION IT EXISTS TO ANSWER, and it is a decision point rather than an item.
+// Part 109 measured the pump thread at 97.7% of a core and 25% of all the CPU this
+// process uses while the machine ran 3.91 of 8 physical cores. Its decomposition says
+// ~2.3 ms of the pump is the PM4 walk — a register state machine, inherently serial,
+// because draw ORDER is semantic — and the remaining ~8 ms is per-draw work that could
+// in principle move to the four idle cores. **That is a thesis, not a measurement**, and
+// designing a threading scheme on top of it before testing it is exactly what part 79
+// was charged for (gotcha 470: sizing a fix from arithmetic nobody did).
+//
+// So: run the walk with the per-draw work removed and read what is left. `F` is the
+// SERIAL FLOOR — everything the pump must do whatever else moves — and `M = 10.5 - F` is
+// the movable half. The best three budgeted workers could ever do is `F + M/3`, before
+// dispatch, snapshot, merge or contention costs, all of which are additive and none of
+// which is zero. If that number is above ~8.0 ms the item cannot reach 120 fps even
+// implemented perfectly, and the honest move is to say so and not write threading code.
+//
+// WHAT IT SKIPS AND WHAT IT KEEPS. Every packet still executes, every register write
+// still lands, every state change still happens, the resolve path still runs (so frames
+// still present and the route still reaches the crowd), and the draw COUNT is still
+// incremented — without which `[fps] draws med` reads 0 and the crowd band this is
+// supposed to be measured in cannot be identified at all. What is skipped is DoDraw's
+// body: the decode, the constants, the streams, the textures and the recording.
+//
+// IT IS DESTRUCTIVE, LIKE `CW_VK_NO_DRIVER_RECORD` ABOVE, AND IN ONE EXTRA WAY.
+// Nothing is drawn, so no picture claim can come from it — and, unlike that arm, the
+// GPU has no work at all, so the WALL time is meaningless twice over: the frame is not
+// waiting on anything and the present has nothing in it. **The only admissible reading
+// is the PUMP THREAD's own CPU per presented frame**, from `tools/part109_probe.sh`'s
+// `perf` capture or the profiler's `pump thread:` line. An arm that renders less is
+// inadmissible for wall by this project's own A/B rule; this one is admissible for the
+// pump's CPU and for nothing else.
+bool NoDoDraw()
+{
+    static const bool off = [] {
+        const bool v = EnvOn("CW_VK_NO_DODRAW");
+        if (v)
+            fprintf(stderr,
+                    "[vk] CW_VK_NO_DODRAW=1 — DESTRUCTIVE CEILING PROBE (part 110 "
+                    "§3.1). The PM4 walk runs in full; DoDraw's body does not. NOTHING "
+                    "WILL BE DRAWN. Read the PUMP THREAD's CPU per frame and nothing "
+                    "else — wall time here is meaningless because the GPU is empty.\n");
+        return v;
+    }();
+    return off;
+}
+uint64_t g_noDoDrawSkipped = 0;
+
 void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
             const Pm4ShaderBinding& vsBind, const Pm4ShaderBinding& psBind)
 {
+    // THE CEILING PROBE'S CUT (part 110 §3.1), first thing and above every scope: a
+    // `ProfScope` opened here would charge the arm's own clock reads to `other` and make
+    // the serial floor read high (see ProfScope's residual note). The draw count is
+    // still incremented because the crowd band is identified by it.
+    if (NoDoDraw())
+    {
+        ++R->drawsThisFrame;
+        ++g_noDoDrawSkipped;
+        return;
+    }
+#if CW_WHOLEFUNC
+    WfScope _wf(&g_wfDraw);   // part 110 A.2 — see CW_WHOLEFUNC
+#endif
     // DoDraw's OWN work, exclusive of the named phases nested inside it. Without a
     // scope here the profile's unaccounted column would mix this function's untimed
     // work (register decode, the pipeline-key build and lookup, the fetch-constant
@@ -17689,8 +18611,8 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     VkDeviceSize vsConstAt, psConstAt;
     const uint32_t memoVsBase = regs[0x2307] & 0x1FF;
     const uint32_t memoPsBase = regs[0x2308] & 0x1FF;
-    const uint64_t vsVersion = Pm4_AluConstVersion(0);
-    const uint64_t psVersion = Pm4_AluConstVersion(1);
+    const uint64_t vsVersion = DrawAluConstVersion(0);
+    const uint64_t psVersion = DrawAluConstVersion(1);
     const bool memoOn = !g_constMemoOff && !g_psConstScaleActive &&
                         R->constMemoFrame == R->frame;
     // **THE SHADER IS PART OF THE KEY WHEN THE GATHER IS ON (part 74).** A gathered slot
@@ -17803,12 +18725,21 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     g_constMemoRunPsHits += uint32_t(psHit);
     vsConstAt = vsHit ? R->constMemoVsAt : ArenaAlloc(kVsConstBytes);
     psConstAt = psHit ? R->constMemoPsAt : ArenaAlloc(kPsConstBytes);
-    const VkDeviceSize sharedAt = ArenaAlloc(kSharedSize);
+    // B1 (part 111 §4): the shared block comes from the PRE-ZEROED sub-arena when a
+    // worker has already cleared its chunk, and from the general arena otherwise. The
+    // fallback is the whole of the pre-part-111 path — same allocation, same inline
+    // memset — so a worker that cannot keep up costs milliseconds and never a draw.
+    bool sharedPreZeroed = false;
+    VkDeviceSize sharedAt = ArenaAllocShared(sharedPreZeroed);
+    const bool sharedInSubArena = sharedAt != VkDeviceSize(-1);
+    if (!sharedInSubArena)
+        sharedAt = ArenaAlloc(kSharedSize);
     if (vsConstAt == VkDeviceSize(-1) || psConstAt == VkDeviceSize(-1) ||
         sharedAt == VkDeviceSize(-1))
         return;
 
-    uint8_t* shared = R->arena.mapped + sharedAt;
+    const Buffer& sharedBuf = sharedInSubArena ? R->sharedArena : R->arena;
+    uint8_t* shared = sharedBuf.mapped + sharedAt;
     _pBegin.Close();
     {
         ProfScope _p(&g_prof.constants);
@@ -18273,7 +19204,76 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
         }
         {
             ProfScope _pcs(&g_prof.constShared);
-            memset(shared, 0, kSharedSize);
+            // SCOPED (part 109). The block is one contiguous allocation and the shader
+            // reads it as one, but the middle 1,536 bytes are the vfetch table and only
+            // the slots this vertex shader declares can be read out of it — so zero the
+            // head, the declared prefix of the table, and the tail, and leave the rest
+            // of the table as whatever the arena held. `CW_VK_FULL_SHARED_ZERO=1` is the
+            // same-binary control arm: it restores the unconditional 2,192-byte zero, so
+            // any picture defect this could possibly cause has a one-variable bisection.
+            //
+            // The tail is NOT optional and is the part that would be silently wrong if
+            // dropped: the user clip planes live at 2,080 and a zero plane dots to
+            // distance 0, which Vulkan KEEPS, so a draw with no planes enabled clips
+            // nothing BY CONSTRUCTION — garbage there would clip the world away. The RT
+            // shadow words at 2,176 are read as a descriptor index, and a nonzero one is
+            // a valid index into a real heap: it would sample some other texture rather
+            // than fail.
+            // AND `CW_VK_SHARED_ZERO_POISON=1` IS WHAT MAKES THE CLAIM TESTABLE RATHER
+            // THAN ARGUED. The whole optimisation rests on one proposition — no shader
+            // reads a vfetch slot its sidecar does not declare — and "the picture looks
+            // the same" cannot distinguish that from "the arena happened to hold zeros".
+            // The poison arm writes 0xFF over exactly the bytes the fast path skips, so
+            // a shader that reads one gets a colossal stream address and a size of
+            // 0xFFFFFFFF instead of a quiet zero. If the picture is unchanged UNDER
+            // POISON, nothing reads those bytes and the skip is safe; if it breaks, the
+            // premise is false and the item dies with a reproduction attached. A test
+            // that cannot fail proves nothing by passing (gotcha 30).
+            // OPT-IN, BECAUSE IT MISSED ITS OWN KILL RULE. It is correct (its poison
+            // arm is inside the picture null) and it is worth -0.21 ms, and part 109
+            // pre-registered 0.4 ms as the bar. HEAD therefore behaves exactly like the
+            // released v1.0.2 and `CW_VK_SCOPED_SHARED_ZERO=1` engages it; the operator
+            // decides whether a bundle of sub-threshold items is worth taking, because
+            // the decomposition says there is no single large item left and a 2.5 ms gap
+            // closed by sub-threshold items is the only shape still available. Flipping
+            // this to on-by-default is one line and its gates are already run.
+            static const bool fullZero = !EnvOn("CW_VK_SCOPED_SHARED_ZERO");
+            static const bool poison = EnvOn("CW_VK_SHARED_ZERO_POISON");
+            // B1: already zero, on another core, before this draw asked. Note that this
+            // makes the scoped item above REDUNDANT rather than additive — the two are
+            // alternatives, which is why §4.1 requires a three-configuration A/B
+            // (stock / scoped / pre-zeroed) and not a pair.
+            if (sharedPreZeroed)
+            {
+                // Nothing to write: a worker already cleared these bytes. `g_sharedZeroDraws`
+                // below is NOT bumped on this path — it is the SCOPED item's denominator,
+                // and counting a draw that did no zeroing at all as one that zeroed the
+                // whole block made the `[sharedzero]` line read "0.0% saved" in the
+                // pre-zero arm, which is a true statement about the wrong population.
+            }
+            else if (fullZero)
+            {
+                memset(shared, 0, kSharedSize);
+            }
+            else
+            {
+                // The head (descriptor indices, bools, the loop and bool files) and the
+                // tail (clip planes, RT shadow) are always zeroed; the vfetch table in
+                // between is zeroed ONE DECLARED ENTRY AT A TIME. Each is 16 bytes — a
+                // single vector store — and a shader declares a handful, so this writes
+                // tens of bytes where the block wrote 1,536.
+                memset(shared, 0, kSharedVfetchTable);
+                if (poison)
+                    memset(shared + kSharedVfetchTable, 0xFF,
+                           kSharedClipPlanes - kSharedVfetchTable);
+                for (uint16_t slot : vs.vfetchSlots)
+                    memset(shared + kSharedVfetchTable + uint32_t(slot) * 16, 0, 16);
+                memset(shared + kSharedClipPlanes, 0, kSharedSize - kSharedClipPlanes);
+                g_sharedZeroSaved += kSharedClipPlanes - kSharedVfetchTable -
+                                     uint32_t(vs.vfetchSlots.size()) * 16;
+            }
+            if (!sharedPreZeroed)
+                g_sharedZeroDraws++;
         }
     }
     // ROUTE (B): where the factor image is and how to address it. Returns false — and
@@ -18287,6 +19287,12 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     // what this measures is the WALK — the decode, the dimension lookup, the sampler
     // lookup and the descriptor writes — and not the untile and upload it drives.
     ProfScope _pFetch(&g_prof.otherFetch);
+    // CENSUS QUESTION 2 again: the texture and sampler walk reads `regs` directly, so
+    // the DECISIONS it makes must stay on the pump. What a worker could take is only
+    // what the walk hands it (an address, an extent, a format) — which is exactly B2's
+    // "the pump keeps the decisions, the workers do the bytes".
+    if (g_pardrawCensus)
+        ++g_pdc.fetchWalks;
 
     // Texture and sampler descriptor indices, one per sampler slot the pixel shader
     // declared. A slot the shader does not use is left at 0, which is the dummy — a
@@ -19883,7 +20889,7 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     struct { uint64_t vs, ps, shared; uint32_t drawIndex, pad; } pushConstants = {
         uint64_t(R->arena.address + vsConstAt),
         uint64_t(R->arena.address + psConstAt),
-        uint64_t(R->arena.address + sharedAt),
+        uint64_t(sharedBuf.address + sharedAt),
         uint32_t(R->drawsThisFrame), 0 };
     if (capturing)
         memcpy(&cap.push, &pushConstants, sizeof cap.push);
@@ -19970,7 +20976,7 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     if (fetchProbe && !vs.attributes.empty())
     {
         static int left = 4;
-        if (left-- > 0)
+        if (TakeOne(left))
         {
             fprintf(stderr, "[vkfetch] draw vs=%016llx populated vertex fetch slots:\n",
                     (unsigned long long)vsBind.hash);
@@ -20069,7 +21075,7 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     // pairs that match, because that is what a memo actually experiences.
     if (g_fetchMemoCensus)
     {
-        const uint64_t v = Pm4_FetchConstVersion();
+        const uint64_t v = DrawFetchConstVersion();
         if (R->fetchMemoFor == &vs && R->fetchMemoVersion == v)
             ++g_fetchMemoHits;
         else
@@ -20516,7 +21522,7 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
                               ? atoi(Env("CW_VK_DRAW_PROBE_COUNT"))
                               : 3;
         if (vsBind.hash == strtoull(probe, nullptr, 16) && draw.indexCount >= minVerts &&
-            R->frame >= minFrame && left-- > 0)
+            R->frame >= minFrame && TakeOne(left))
         {
             const uint32_t* c = regs + xenos::kAluConstantBase;
             // The bound texture belongs on the header line. Two draws through one shader
@@ -21557,6 +22563,7 @@ void DoResolve(uint8_t* base, const uint32_t* regs)
                 RetireImage(v);
             }
             R->snapshots.erase(it);
+            TexGenBump();
             it = R->snapshots.end();
             Count("resolve: snapshot resized");
         }
@@ -21640,6 +22647,7 @@ void DoResolve(uint8_t* base, const uint32_t* regs)
                             baseKey, RZx(w), RZ(h), w, h, passW, passH, InternalW(),
                             InternalH());
                 it = R->snapshots.emplace(key, std::move(s)).first;
+                TexGenBump();
                 Count("resolve: snapshot created");
             }
             else
@@ -22489,6 +23497,32 @@ bool InitCommon()
     fprintf(stderr, "[vk] frames in flight: %u%s\n", R->framesInFlight,
             R->framesInFlight == 1 ? " (submit and wait; the pre-part-23 renderer)" : "");
 
+    // B1's arms, read BEFORE the buffers exist because the control arm must not allocate
+    // the sub-arena at all — an arm that still pays for its subject's memory is not a
+    // control for its memory.
+    // OFF BY DEFAULT, BECAUSE IT WAS MEASURED AND IT IS A NULL. B1 does exactly what it
+    // was built to do — 100% of draws served pre-zeroed, zero fallbacks, zero drain, and
+    // `perf` says 0.43 ms of `__memset_avx2` left the pump — and the pump's CPU per frame
+    // did not move by a hundredth of a millisecond (three runs an arm, six matched draw
+    // bands, §10.2). The cost is store BANDWIDTH, which is machine-wide, so issuing the
+    // same stores from another core buys nothing.
+    //
+    // KEPT RATHER THAN DELETED, and for a reason with a date on it: this box is an 8-core
+    // 4654 MHz desktop whose memory pipe is the bound. A machine with a slower core
+    // relative to its memory — the Ryzen 3 stand-in of part 107, or a Steam Deck — may
+    // put the same 0.43 ms back on the CPU side of the ledger, where relocating it would
+    // pay. `CW_VK_PREZERO=1` is how that gets asked, and it costs one run.
+    g_prezeroOff = !EnvOn("CW_VK_PREZERO");
+    g_prezeroPoison = EnvOn("CW_VK_PREZERO_POISON");
+    if (!g_prezeroOff)
+        fprintf(stderr,
+                "[vk] CW_VK_PREZERO=1 — the shared-block pre-zero is ON (part 111 B1). "
+                "MEASURED A NULL on this box: the memset leaves the pump and the frame "
+                "does not move. An arm, not a default.\n");
+    if (g_prezeroPoison)
+        fprintf(stderr, "[vk] CW_VK_PREZERO_POISON=1 — the pre-zero writes 0xAA instead "
+                        "of 0. THE PICTURE MUST BREAK; if it does not, the fast path "
+                        "never engaged and every number from it is meaningless\n");
     if (!CreateBuffer(R->arena, (arenaMb << 20) * R->framesInFlight,
                       VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
@@ -22496,6 +23530,19 @@ bool InitCommon()
                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                       /*deviceAddress=*/true, "per-frame arena") ||
         (g_texNoBatch = EnvOn("CW_VK_NO_TEX_BATCH"), false) ||
+        // B1's shared sub-arena (part 111 §4). Sized in SLOTS, not megabytes: the number
+        // that matters is draws per frame, and 24,576 slots a region is well past the
+        // ~9,700 the operator's crowd reaches, so the overflow path is a safety net
+        // rather than a thing the measurement runs through. 56.6 MB total at 2 frames in
+        // flight, against an arena that is already hundreds.
+        (g_prezeroOff ? false
+                      : !CreateBuffer(R->sharedArena,
+                                      VkDeviceSize(kSharedStride) * 24576 *
+                                          R->framesInFlight,
+                                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                      /*deviceAddress=*/true, "shared sub-arena")) ||
         // THE STAGING ARENA IS `kTexUploadSlots` SEGMENTS AS OF PART 79, and it grew from
         // a flat 64 MB to 3 x 32 MB so that partitioning it did not narrow the per-upload
         // ceiling below anything real. The measured largest single upload on the
@@ -22902,6 +23949,13 @@ bool InitCommon()
     if (g_verifyBindPoison)
         g_verifyBindBatch = true;
     g_streamDedupCensus = EnvOn("CW_VK_STREAM_DEDUP_CENSUS");
+    g_pardrawCensus = EnvOn("CW_VK_PARDRAW_CENSUS");
+    if (g_pardrawCensus)
+        fprintf(stderr,
+                "[vk] CW_VK_PARDRAW_CENSUS=1 — the per-draw MUTATION census is ON (part "
+                "111 §3, item B's ask-first step). It counts the shared-state reads and "
+                "writes on the per-draw path and TIMES the low-frequency mutations. A "
+                "DIAGNOSTIC ARM: never quote a frame time from this run.\n");
     g_reuseCensus = EnvOn("CW_VK_REUSE_CENSUS");
     if (g_reuseCensus)
     {
@@ -23010,6 +24064,16 @@ bool InitCommon()
                 double(RSX(R->targetWidth)) * RS(R->targetHeight) * 4.0 / 1048576.0);
     if (g_profileOn)
         fprintf(stderr, "[vkprof] frame CPU profile ON\n");
+        // A.2's sampled whole-function timers ride with the profiler; the control arm
+        // turns them off inside a profiled run so their own bill can be measured.
+#if CW_WHOLEFUNC
+        g_wholeFunc = !EnvOn("CW_VK_NO_WHOLEFUNC");
+        fprintf(stderr,
+                "[vkprof] WHOLE-FUNCTION timers COMPILED IN (-DCW_WHOLEFUNC=1). THIS "
+                "BUILD IS ~0.5 ms/frame SLOWER THAN A DEFAULT ONE AT THE CROWD, "
+                "measured (part 110 §6.8) — read its SHARES, never its milliseconds, "
+                "and never quote a frame time from it.\n");
+#endif
     return true;
 }
 
@@ -23095,6 +24159,22 @@ void VkRenderer_Draw(uint8_t* base, const Pm4Draw& draw)
                     draw.indexCount, draw.indexed ? 1u : 0u);
     }
     DoDraw(base, draw, regs, Pm4_BoundShader(0), Pm4_BoundShader(1));
+}
+
+// Part 117: the same draw, from `cw-draw`, with the register file D replayed and the
+// bindings the walk captured at the packet (gpu/pump_split.h).
+void VkRenderer_DrawQueued(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
+                           const Pm4ShaderBinding& vs, const Pm4ShaderBinding& ps)
+{
+    if (!g_active || g_d3dMode)
+        return;
+    COUNT("draw: handed to the renderer");
+    if ((regs[0x2208] & 7) == 6)
+    {
+        DoResolve(base, regs);
+        return;
+    }
+    DoDraw(base, draw, regs, vs, ps);
 }
 
 namespace {
@@ -23389,15 +24469,228 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
                     dMed = d[d.size() / 2];
                     dMax = d.back();
                 }
+                // THE PUMP'S OWN CPU PER FRAME, on the [fps] line and therefore
+                // available in an UNPROFILED run (part 110 §3.1).
+                //
+                // It exists because the quantity part 110 has to measure — the pump's
+                // CPU milliseconds per presented frame — was only ever obtainable by
+                // crossing two instruments taken over DIFFERENT windows: `perf`'s or
+                // `part50_thread_cpu.py`'s "% of one core" over its own 15 s sample,
+                // divided into a frame rate from somewhere else. This project has a
+                // name for that arithmetic and it invented 59 MB/frame that never
+                // existed (`two-counters-are-not-a-pair`). One `clock_gettime` per FPS
+                // WINDOW — not per frame — makes it one measurement over one window,
+                // banded by the same draw count as everything else on this line.
+                //
+                // Free: the [fps] window is seconds long, so this is one vDSO read per
+                // several hundred frames, against the profiler's thousands per frame.
+                // It is printed unconditionally under CW_FPS_LOG because a number that
+                // needs its own env var is a number nobody has when they need it.
+                double pumpCpuMs = 0.0, pumpDuty = 0.0;
+                {
+                    static uint64_t lastPumpCpuNs = 0;
+                    static bool havePumpCpu = false;
+                    timespec pts{};
+                    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &pts);
+                    const uint64_t nowNs =
+                        uint64_t(pts.tv_sec) * 1000000000ull + uint64_t(pts.tv_nsec);
+                    if (havePumpCpu && frames)
+                    {
+                        const double dNs = double(nowNs - lastPumpCpuNs);
+                        pumpCpuMs = dNs * 1e-6 / double(frames);
+                        pumpDuty = elapsed > 0.0 ? 100.0 * dNs * 1e-9 / elapsed : 0.0;
+                    }
+                    lastPumpCpuNs = nowNs;
+                    havePumpCpu = true;
+                }
+                // THE GUEST'S OWN CPU PER FRAME, same window, same line (part 116). The
+                // title's Main Thread and Draw Thread are the 8.8 ms floor part 110
+                // found under `wall ~ max(pump, guest, GPU)`; a guest-side change (a
+                // native CRT hook, PGO on the recompiled TUs) moves THESE columns and,
+                // while the pump is the longer term, nothing else. Read through the
+                // named thread's CPU clock; -1 until the title has named its threads.
+                // Part 117: under CW_PUMP_SPLIT=1 `pump cpu` above is THIS thread — the
+                // one calling DoDraw, i.e. cw-draw — and the walk's own core is this
+                // column. -1 on the one-thread pump.
+                double walkCpuMs = -1.0;
+                {
+                    static double lastWalk = -1.0;
+                    const double nowWalk = split::WalkCpuSeconds();
+                    if (frames && lastWalk >= 0.0 && nowWalk >= 0.0)
+                        walkCpuMs = (nowWalk - lastWalk) * 1e3 / double(frames);
+                    lastWalk = nowWalk;
+                }
+                double guestMainMs = -1.0, guestDrawMs = -1.0;
+                {
+                    static double lastMain = -1.0, lastDraw = -1.0;
+                    const double nowMain = GuestThread::CpuSecondsOf("Main Thread");
+                    const double nowDraw = GuestThread::CpuSecondsOf("Draw Thread");
+                    if (frames && lastMain >= 0.0 && nowMain >= 0.0)
+                        guestMainMs = (nowMain - lastMain) * 1e3 / double(frames);
+                    if (frames && lastDraw >= 0.0 && nowDraw >= 0.0)
+                        guestDrawMs = (nowDraw - lastDraw) * 1e3 / double(frames);
+                    lastMain = nowMain;
+                    lastDraw = nowDraw;
+                }
+                // ...and where each thread's NON-CPU time went: ms/frame and calls/frame
+                // in our kernel's waits, by kind — single-object, wait-any/all, sleep,
+                // fence park (part 116 item 4). Same window, same denominator.
+                char waitLine[256] = "";
+                {
+                    static uint64_t lastNs[2][GuestThread::kWaitKinds] = {};
+                    static uint64_t lastCalls[2][GuestThread::kWaitKinds] = {};
+                    static bool haveWait = false;
+                    const char* names[2] = { "Main Thread", "Draw Thread" };
+                    const char* kinds[GuestThread::kWaitKinds] = { "single", "multi", "sleep", "fence" };
+                    size_t off = 0;
+                    bool any = false;
+                    for (int t = 0; t < 2; t++)
+                    {
+                        const GuestThread::WaitStats* w = GuestThread::WaitStatsOf(names[t]);
+                        if (!w)
+                            continue;
+                        any = true;
+                        off += snprintf(waitLine + off, sizeof waitLine - off, "%s%s:",
+                                        t ? " | " : "", t ? "draw" : "main");
+                        for (int k = 0; k < GuestThread::kWaitKinds; k++)
+                        {
+                            const uint64_t ns = w->ns[k].load(std::memory_order_relaxed);
+                            const uint64_t calls = w->calls[k].load(std::memory_order_relaxed);
+                            if (haveWait && frames && off < sizeof waitLine)
+                                off += snprintf(waitLine + off, sizeof waitLine - off,
+                                                " %s %.2f/%.1f", kinds[k],
+                                                double(ns - lastNs[t][k]) * 1e-6 / double(frames),
+                                                double(calls - lastCalls[t][k]) / double(frames));
+                            lastNs[t][k] = ns;
+                            lastCalls[t][k] = calls;
+                        }
+                    }
+                    haveWait = any;
+                }
                 fprintf(stderr,
                         "[fps] %.1f fps mean (%.2f ms) | %.1f fps median (%.2f ms) | "
                         "p99 %.2f ms | worst %.2f ms | >2x med %.1f%% | "
-                        "%llu frames in %.1f s | draws med %u (%u..%u)\n",
+                        "%llu frames in %.1f s | draws med %u (%u..%u) | "
+                        "pump cpu %.2f ms/frame (%.0f%% of a core) | walk cpu %.2f | "
+                        "guest main %.2f draw %.2f ms/frame\n",
                         double(frames) / elapsed, 1000.0 * elapsed / double(frames),
                         1e6 / double(medUs), double(medUs) / 1000.0,
                         double(p99Us) / 1000.0, double(worstUs) / 1000.0,
                         n > 1 ? 100.0 * double(overTwice) / double(n - 1) : 0.0,
-                        (unsigned long long)frames, elapsed, dMed, dMin, dMax);
+                        (unsigned long long)frames, elapsed, dMed, dMin, dMax,
+                        pumpCpuMs, pumpDuty, walkCpuMs, guestMainMs, guestDrawMs);
+                if (waitLine[0])
+                    fprintf(stderr, "[guestwait] ms/frame / calls/frame: %s\n", waitLine);
+                ThreadBudget_PinSweep();   // CW_GUEST_PIN (part 118): a no-op unless set
+                // ...and the register-run census beside it when armed, PER WINDOW rather
+                // than only at exit. The exit path is the right home for a summary
+                // (gotcha 543) but it is not a reliable one: two runs tonight ended
+                // without the SIGTERM handler printing anything at all, and a census that
+                // only speaks on the way out is a census that some runs simply do not
+                // have. A windowed print costs ten lines every FPS window on a
+                // diagnostic-only arm and cannot be lost.
+                // The scoped shared-block zero's own proof, per window rather than at
+                // exit. Bytes NOT written, and the share of the 2,192 a draw used to
+                // cost unconditionally — an arm that says "on" without saying "reached"
+                // is how a null gets quoted as a saving.
+                // THE CEILING PROBE'S ENGAGEMENT (part 110 §3.1), per window and
+                // not only at exit (gotcha 543: two of part 109's runs ended without
+                // the SIGTERM handler printing anything at all). Its control arm —
+                // every other run — prints nothing, because the counter never moves.
+                if (g_noDoDrawSkipped)
+                    fprintf(stderr,
+                            "[nododraw] DESTRUCTIVE: %llu draws skipped in total, "
+                            "%u this frame — the walk ran, the draws did not. Read the "
+                            "pump thread's CPU, never this run's wall time.\n",
+                            (unsigned long long)g_noDoDrawSkipped,
+                            unsigned(R->lastFrameDraws));
+                // B1's ENGAGEMENT (part 111 §4.3), per window, and BOTH SIDES OF THE
+                // BILL. A hit rate says the fast path ran; the worker milliseconds say
+                // where the work it removed from the pump actually landed. Part 53 moved
+                // 13.1 points off the pump and 33.2 appeared on the workers, so a line
+                // that reports only the pump's half is not a measurement (gotcha 344).
+                // The CONTROL ARM (`CW_VK_NO_PREZERO=1`) prints the opposite: hits 0,
+                // every draw inline.
+                if (g_pzHits || g_pzMisses)
+                {
+                    static uint64_t lh = 0, lm = 0, lwns = 0, ldns = 0, lpre = 0, lin = 0;
+                    const uint64_t h = g_pzHits, m = g_pzMisses;
+                    const uint64_t wns = g_pzWorkerNsA.load(std::memory_order_relaxed);
+                    const uint64_t dns = g_pzDrainNs;
+                    const double inv = 1.0 / double(frames);
+                    fprintf(stderr,
+                            "[prezero] %.1f%% of draws served pre-zeroed (%llu hits, "
+                            "%llu inline fallbacks this window) | %.2f MB/frame moved off "
+                            "the pump, %.2f MB/frame still inline | worker %.3f ms/frame, "
+                            "pump drain %.3f ms/frame | past watermark %llu | overflow "
+                            "%llu\n",
+                            (h + m > lh + lm)
+                                ? 100.0 * double(h - lh) / double((h - lh) + (m - lm))
+                                : 0.0,
+                            (unsigned long long)(h - lh), (unsigned long long)(m - lm),
+                            double(g_pzBytesPre - lpre) * inv / 1048576.0,
+                            double(g_pzBytesInline - lin) * inv / 1048576.0,
+                            double(wns - lwns) * inv * 1e-6,
+                            double(dns - ldns) * inv * 1e-6,
+                            (unsigned long long)g_pzBeyondWatermark,
+                            (unsigned long long)g_pzOverflow);
+                    lh = h; lm = m; lwns = wns; ldns = dns;
+                    lpre = g_pzBytesPre; lin = g_pzBytesInline;
+                }
+                if (g_sharedZeroDraws)
+                    fprintf(stderr,
+                            "[sharedzero] %llu draws, %.0f bytes/draw not written "
+                            "(%.1f%% of the %u-byte block)\n",
+                            (unsigned long long)g_sharedZeroDraws,
+                            double(g_sharedZeroSaved) / double(g_sharedZeroDraws),
+                            100.0 * double(g_sharedZeroSaved) /
+                                (double(g_sharedZeroDraws) * double(kSharedSize)),
+                            kSharedSize);
+                Pm4_RegRunCensusReport();
+                if (split::g_on)
+                {
+                    // Part 117: the queue's health per window. `wspace` must stay 0 (W
+                    // never blocked for room); `irqwait` is D's stall at INTERRUPT ops.
+                    static split::Stats last{};
+                    const split::Stats st = split::GetStats();
+                    fprintf(stderr,
+                            "[split] per frame: ops %.0f draws %.0f stores %.0f irq %.1f "
+                            "logdw %.0f (%.0f runs + %.0f merged) | wspace %llu dempty %llu irqwait %.2f ms/frame "
+                            "(%.0f us each) | didle %.2f ms/frame | waits unmet %.1f/frame "
+                            "of which on OUR store %.1f, run-ahead %.1f\n",
+                            double(st.ops - last.ops) / double(frames),
+                            double(st.draws - last.draws) / double(frames),
+                            double(st.stores - last.stores) / double(frames),
+                            double(st.interrupts - last.interrupts) / double(frames),
+                            double(st.logDwords - last.logDwords) / double(frames),
+                            double(st.runs - last.runs) / double(frames),
+                            double(st.runsMerged - last.runsMerged) / double(frames),
+                            (unsigned long long)(st.wSpaceWaits - last.wSpaceWaits),
+                            (unsigned long long)(st.dEmptyWaits - last.dEmptyWaits),
+                            double(st.dIrqWaitNs - last.dIrqWaitNs) * 1e-6 / double(frames),
+                            st.interrupts > last.interrupts
+                                ? double(st.dIrqWaitNs - last.dIrqWaitNs) * 1e-3 /
+                                      double(st.interrupts - last.interrupts)
+                                : 0.0,
+                            double(st.dIdleNs - last.dIdleNs) * 1e-6 / double(frames),
+                            double(st.waitsUnmet - last.waitsUnmet) / double(frames),
+                            double(st.waitsOnOurStore - last.waitsOnOurStore) / double(frames),
+                            double(st.waitsByPending - last.waitsByPending) / double(frames));
+                    fprintf(stderr,
+                            "[split]   D idle after: draw %.2f store %.2f irq %.2f swap %.2f "
+                            "other %.2f ms/frame | unmet by word: %08X %.1f  %08X %.1f  "
+                            "%08X %.1f  %08X %.1f /frame\n",
+                            double(st.dIdleByKindNs[1] - last.dIdleByKindNs[1]) * 1e-6 / double(frames),
+                            double(st.dIdleByKindNs[2] - last.dIdleByKindNs[2]) * 1e-6 / double(frames),
+                            double(st.dIdleByKindNs[3] - last.dIdleByKindNs[3]) * 1e-6 / double(frames),
+                            double(st.dIdleByKindNs[4] - last.dIdleByKindNs[4]) * 1e-6 / double(frames),
+                            double(st.dIdleByKindNs[0] - last.dIdleByKindNs[0]) * 1e-6 / double(frames),
+                            st.waitVa[0], double(st.waitVaCount[0] - last.waitVaCount[0]) / double(frames),
+                            st.waitVa[1], double(st.waitVaCount[1] - last.waitVaCount[1]) / double(frames),
+                            st.waitVa[2], double(st.waitVaCount[2] - last.waitVaCount[2]) / double(frames),
+                            st.waitVa[3], double(st.waitVaCount[3] - last.waitVaCount[3]) / double(frames));
+                    last = st;
+                }
                 // Part 107 item 2: the Draw Thread's fence wait, per window, beside
                 // the frame rate it is meant to move — so a plain crowd run (no phase
                 // profiler) still says whether the park ENGAGED and how each episode
@@ -23676,6 +24969,12 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
     // GrowArenaIfNeeded for why the old placement was a measurement defect: it charged a
     // device-wait and an allocation to `other`.
     GrowArenaIfNeeded();
+    // B1 (part 111): the shared sub-arena grows under the same rule, and then this
+    // frame's pre-zero is posted. The ORDER is load-bearing — growth destroys the buffer
+    // the workers write into, so it drains first and the dispatch that follows is against
+    // the new one.
+    GrowSharedArenaIfNeeded();
+    Prezero_Dispatch();
     // Same site, and for the store the reason is stronger: its offsets are recorded into
     // command buffers, so reusing its memory before the GPU is done hands an in-flight
     // draw somebody else's vertices.
@@ -23757,7 +25056,7 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
         {
             Count("PRESENT PIXELS ARE FROM A DIFFERENT FRAME — a stale readback slot");
             static int left = 8;
-            if (left-- > 0)
+            if (TakeOne(left))
                 fprintf(stderr,
                         "[vk] !! present slot describes frame %llu but holds frame %llu's "
                         "pixels — every picture instrument reading this frame is looking "
@@ -24924,6 +26223,53 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
                     pct(submitTotal), pct(g_prof.submitCall), pct(g_prof.fenceWait),
                     pct(g_prof.readback), pct(g_prof.rt), 100.0 - pct(known));
 
+#if CW_WHOLEFUNC
+            // A.2 — WHAT THOSE PHASES DO NOT SAY, printed immediately under the table
+            // so the gap is visible in the log rather than only in a `perf` capture
+            // somebody has to think to take. INCLUSIVE of callees and scaled by the
+            // sampling period; the estimator is (timed ns) x (calls / sampled), which is
+            // the period exactly when the call count is a multiple of it and within one
+            // call of it otherwise.
+            if (g_wholeFunc)
+            {
+                static WholeFunc lw[3];
+                WholeFunc* cur[3] = { &g_wfStream, &g_wfTexture, &g_wfDraw };
+                const char* nm[3] = { "UploadStream", "UploadTexture", "DoDraw" };
+                double est[3] = {}, calls[3] = {};
+                uint64_t sampled = 0;
+                for (int i = 0; i < 3; ++i)
+                {
+                    const uint64_t dn = cur[i]->ns - lw[i].ns;
+                    const uint64_t ds = cur[i]->sampled - lw[i].sampled;
+                    const uint64_t dc = cur[i]->calls - lw[i].calls;
+                    lw[i] = *cur[i];
+                    sampled += ds;
+                    est[i] = ds ? double(dn) * (double(dc) / double(ds)) : 0.0;
+                    calls[i] = frames ? double(dc) / double(frames) : 0.0;
+                }
+                // The bill, next to the numbers rather than in a footnote: two clock
+                // reads per sampled call, at the same calibrated cost the scopes pay.
+                const double billMs =
+                    double(sampled) * 2.0 * (double(g_profNowNs10) / 10.0) * 1e-6;
+                fprintf(stderr,
+                        "[vkprof] WHOLE-FUNCTION (1 call in %llu, INCLUSIVE of callees "
+                        "— compare with a `perf` symbol GROUP, never one symbol's self "
+                        "time): %s %.2f ms/frame (%.1f%%, %.0f calls/frame) | %s %.2f "
+                        "(%.1f%%, %.0f) | %s %.2f (%.1f%%, %.0f) — the table above says "
+                        "streams %.1f%% textures %.1f%% draw %.1f%%; this instrument's "
+                        "own bill %.2f ms over the window\n",
+                        (unsigned long long)kWfPeriod,
+                        nm[0], frames ? est[0] * 1e-6 / double(frames) : 0.0,
+                        pct(uint64_t(est[0])), calls[0],
+                        nm[1], frames ? est[1] * 1e-6 / double(frames) : 0.0,
+                        pct(uint64_t(est[1])), calls[1],
+                        nm[2], frames ? est[2] * 1e-6 / double(frames) : 0.0,
+                        pct(uint64_t(est[2])), calls[2],
+                        pct(g_prof.streams), pct(g_prof.textures), pct(drawTotal),
+                        billMs);
+            }
+
+#endif // CW_WHOLEFUNC
             // THE INSTRUMENT'S OWN BILL, on its own line so it can never be read as
             // part of the game's frame. It is charged to the run that asked for it and
             // to nothing else, and it is ZERO in a run without CW_VK_FRAME_STATS — but
@@ -25303,6 +26649,50 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
                             frames ? offNs * 1e-6 / double(frames) : 0.0,
                             frames ? double(dSleep) * 1e-6 / double(frames) : 0.0,
                             frames ? blockedNs * 1e-6 / double(frames) : 0.0);
+
+                    // --- A.1: THE TABLE'S OWN COVERAGE, AND WHAT COVERAGE DOES NOT
+                    // MEAN (part 110) ------------------------------------------------
+                    //
+                    // Every column above is a percentage of WALL. Nothing above says
+                    // what fraction of the PUMP'S CPU the named phases account for, or
+                    // names the part that is inside no scope at all — and `outside`
+                    // reads like a category ("the walk, the guest") when it is a
+                    // residual. So state it: phases, the walk (which is not a
+                    // ProfScope and is only ever obtained by subtraction), and the
+                    // genuinely UNSCOPED remainder, as shares of this thread's CPU.
+                    //
+                    // AND THE WARNING IS THE POINT, because part 110 measured the
+                    // coverage before writing this and it is HIGH — ~73% phases, ~28%
+                    // walk, ~0% unscoped — on the same build whose `streams` column
+                    // under-reports its own subsystem by a factor of thirty. **A phase
+                    // table can account for 100% of a thread and still be wrong about
+                    // every row**, because the defect is misattribution, not omission:
+                    // `UploadStream`'s cost is charged to `record`, which is a real
+                    // scope that really did contain it. Coverage is necessary and it is
+                    // nowhere near sufficient, and a line that printed only the number
+                    // would be the next thing to mislead somebody. The check that CAN
+                    // catch it compares each phase with the SYMBOLS implementing the
+                    // subsystem it is named after — `tools/phase_vs_perf.py`.
+                    const double cpuMs = double(dCpu) * 1e-6;
+                    const double phaseMs = double(known) * 1e-6;
+                    const double walkOnlyMs = double(pm4Ns) * 1e-6;
+                    const double unscopedMs =
+                        cpuMs > phaseMs + walkOnlyMs ? cpuMs - phaseMs - walkOnlyMs : 0.0;
+                    const auto cpct = [&](double m) {
+                        return cpuMs > 0.0 ? 100.0 * m / cpuMs : 0.0;
+                    };
+                    fprintf(stderr,
+                            "[vkprof]   COVERAGE: phases %.1f%% of the pump's CPU "
+                            "(%.2f of %.2f ms/frame) + PM4 walk %.1f%% (not a phase: "
+                            "`walk` minus the phases) + UNSCOPED %.1f%% — unscoped is "
+                            "NOT a category, it is code this table does not measure. "
+                            "AND HIGH COVERAGE IS NOT AGREEMENT: a phase names a SCOPE, "
+                            "not a subsystem (gotcha 343). Run tools/phase_vs_perf.py "
+                            "against a `perf` capture of this run before pricing "
+                            "anything off a column above.\n",
+                            cpct(phaseMs), frames ? phaseMs / double(frames) : 0.0,
+                            frames ? cpuMs / double(frames) : 0.0, cpct(walkOnlyMs),
+                            cpct(unscopedMs));
                 }
             }
 
@@ -26042,6 +27432,7 @@ void ApplyPendingRenderScale()
         ++flushed;
     }
     R->snapshots.clear();
+    TexGenBump();
     for (auto& [key, cube] : R->cubeSnapshots)
     {
         vkDestroyImageView(R->device, cube.image.view, nullptr);
@@ -26200,6 +27591,19 @@ void VkRenderer_DumpStats()
         return;
     fprintf(stderr, "[vk] --- renderer stats (frame %llu) ---\n",
             (unsigned long long)R->frame);
+    // THE MEMO'S OWN REPORT, and it lives HERE because its first home could not fire.
+    // Part 109 put this line inside the LIVE RESCALE path — a function a headless crowd
+    // run never calls — so the verifier arm ran a whole route and printed nothing, and
+    // "0 disagreements" and "the instrument never spoke" were the same output. Every
+    // recipe in this project ends on a `timeout` SIGTERM, and this function is what that
+    // handler calls; a counter reported anywhere else is a counter nobody reads.
+    Pm4_RegRunCensusReport();
+    if (g_texMemoHits || g_texMemoMiss)
+        fprintf(stderr, "[texmemo] %llu hits, %llu misses (%.1f%% served), %llu "
+                        "disagreements, final gen %llu\n",
+                (unsigned long long)g_texMemoHits, (unsigned long long)g_texMemoMiss,
+                100.0 * double(g_texMemoHits) / double(g_texMemoHits + g_texMemoMiss),
+                (unsigned long long)g_texMemoDisagree, (unsigned long long)g_texGen);
     // OPEN ITEM 0w — the worst frames of the run and what was inside them.
     {
         SlowFrameRec t[12];
@@ -26813,7 +28217,7 @@ void VkRenderer_DumpStats()
                     full ? 100.0 * double(full - bnd) / double(full) : 0.0,
                     double(hwB) / 1e6,
                     full ? 100.0 * double(full - hwB) / double(full) : 0.0,
-                    Pm4_VsPaletteHighWater(),
+                    DrawVsPaletteHighWater(),
                     double(t.extentSum - l.extentSum) / double(n));
             std::string hg = "[palcensus]   bound histogram (regs):";
             for (int b = 0; b < 32; ++b)
@@ -27142,6 +28546,89 @@ void VkRenderer_DumpStats()
                 double(g_gcPumpNs) / f / 1e6, (unsigned long long)g_gcPumpNs,
                 g_gcPumpCount ? double(g_gcPumpNs) / double(g_gcPumpCount) : 0.0,
                 g_gcPumpNs ? double(g_gcPumpBytes) / double(g_gcPumpNs) : 0.0);
+    }
+    if ((g_pzHits || g_pzMisses || g_prezeroOff) && R->frame)
+    {
+        const double f = double(R->frame);
+        const uint64_t served = g_pzHits, inl = g_pzMisses;
+        fprintf(stderr,
+                "[vk]   SHARED-BLOCK PRE-ZERO (part 111 B1)%s: %.1f%% of draws served "
+                "pre-zeroed (%llu of %llu)\n"
+                "[vk]     moved off the pump %.2f MB/frame; still inline %.2f MB/frame\n"
+                "[vk]     the OTHER side of the bill: workers %.3f ms/frame zeroing, pump "
+                "%.3f ms/frame draining (%llu helped, %llu yields) and %.3f ms/frame "
+                "waiting on a busy chunk (%llu waits)\n"
+                "[vk]     chunks: %llu posted over %llu dispatches (%.1f a frame), %llu "
+                "claimed by the PUMP first (workers skipped %llu), %llu slots past the "
+                "watermark, %llu region overflows\n",
+                g_prezeroOff ? " — OFF (the default; CW_VK_PREZERO=1 engages it)" : "",
+                (served + inl) ? 100.0 * double(served) / double(served + inl) : 0.0,
+                (unsigned long long)served, (unsigned long long)(served + inl),
+                double(g_pzBytesPre) / f / 1048576.0,
+                double(g_pzBytesInline) / f / 1048576.0,
+                double(g_pzWorkerNsA.load()) / f / 1e6, double(g_pzDrainNs) / f / 1e6,
+                (unsigned long long)g_pzDrainHelped, (unsigned long long)g_pzDrainWaits,
+                double(g_pzWaitNs) / f / 1e6, (unsigned long long)g_pzWaits,
+                (unsigned long long)g_pzChunksPosted,
+                (unsigned long long)g_pzDispatches,
+                g_pzDispatches ? double(g_pzChunksPosted) / double(g_pzDispatches) : 0.0,
+                (unsigned long long)g_pzPumpClaims,
+                (unsigned long long)g_pzWorkerSkips.load(),
+                (unsigned long long)g_pzBeyondWatermark,
+                (unsigned long long)g_pzOverflow);
+    }
+    if (g_pardrawCensus && R->frame)
+    {
+        const double f = double(R->frame);
+        const double d = double(R->skips.draws ? R->skips.draws : 1);
+        const uint64_t streamTot = g_pdc.streamFinds;
+        fprintf(stderr,
+                "[vk]   PER-DRAW MUTATION CENSUS over %llu frames / %llu draws — part 111 "
+                "§3, item B's ask-first step\n"
+                "[vk]     arena bump      %9.0f/frame (%.2f/draw), %7.2f MB/frame — ours, "
+                "serial, NOT timed (a clock read is 5x the op)\n"
+                "[vk]     persist bump    %9.0f/frame, %7.2f MB/frame\n"
+                "[vk]     stream cache    %9.0f finds/frame, %7.0f inserts/frame = "
+                "%.2f%% MUTATIONS, insert cost %.3f ms/frame\n"
+                "[vk]     persist store   %9.0f finds/frame, %7.0f inserts/frame + %.0f "
+                "mirror pushes, mutation cost %.3f ms/frame\n"
+                "[vk]     texture table   %9.0f finds/frame (EACH STAMPS lastUsedFrame — a "
+                "read-modify-WRITE), %.1f inserts/frame, %.3f ms/frame\n"
+                "[vk]     descriptor set  %9.0f writes/frame, %.3f ms/frame — vkUpdate* is "
+                "externally synchronised and cannot leave the pump unguarded\n"
+                "[vk]     pipeline cache  %9.0f finds/frame, %.2f inserts/frame\n"
+                "[vk]     READS OF g_regs %9.0f const-window copies/frame (%.2f/draw) + "
+                "%.0f fetch walks/frame (%.2f/draw) — B3's source race, counted\n",
+                (unsigned long long)R->frame, (unsigned long long)R->skips.draws,
+                double(g_pdc.arenaAllocs) / f, double(g_pdc.arenaAllocs) / d,
+                double(g_pdc.arenaBytes) / f / 1048576.0,
+                double(g_pdc.persistAllocs) / f,
+                double(g_pdc.persistAllocBytes) / f / 1048576.0,
+                double(g_pdc.streamFinds) / f, double(g_pdc.streamInserts) / f,
+                streamTot ? 100.0 * double(g_pdc.streamInserts) / double(streamTot) : 0.0,
+                double(g_pdc.streamInsertNs) / f / 1e6,
+                double(g_pdc.persistFinds) / f, double(g_pdc.persistInserts) / f,
+                double(g_pdc.mirrorPushes) / f, double(g_pdc.persistMutNs) / f / 1e6,
+                double(g_pdc.texFinds) / f, double(g_pdc.texInserts) / f,
+                double(g_pdc.texInsertNs) / f / 1e6,
+                double(g_pdc.descWrites) / f, double(g_pdc.descWriteNs) / f / 1e6,
+                double(g_pdc.pipeFinds) / f, double(g_pdc.pipeInserts) / f,
+                double(g_pdc.constWindowCopies) / f, double(g_pdc.constWindowCopies) / d,
+                double(g_pdc.fetchWalks) / f, double(g_pdc.fetchWalks) / d);
+        // THE ONE LINE THE PLAN ASKED FOR. `S` is what stays on the pump however good the
+        // sharding is; the read share is what says whether a read-mostly table is enough.
+        const uint64_t mutNs = g_pdc.streamInsertNs + g_pdc.persistMutNs +
+                               g_pdc.texInsertNs + g_pdc.descWriteNs;
+        const uint64_t reads = g_pdc.streamFinds + g_pdc.persistFinds + g_pdc.texFinds;
+        const uint64_t writes = g_pdc.streamInserts + g_pdc.persistInserts +
+                                g_pdc.mirrorPushes + g_pdc.texInserts + g_pdc.descWrites;
+        fprintf(stderr,
+                "[vk]     => S (TIMED mutations that must stay serial or shard) = %.3f "
+                "ms/frame; shared-table traffic is %.1f%% reads (%llu reads, %llu writes "
+                "per run). The arena bump is counted, not timed, and is excluded from S.\n",
+                double(mutNs) / f / 1e6,
+                (reads + writes) ? 100.0 * double(reads) / double(reads + writes) : 0.0,
+                (unsigned long long)reads, (unsigned long long)writes);
     }
     if (g_streamDedupCensus && R->skips.draws)
         fprintf(stderr,

@@ -20,6 +20,7 @@
 #include "../cpu/fence_wait.h"   // part 107: wake the parked Draw Thread on a fence store
 #include "../cpu/timebase.h"
 #include "../host/window.h"
+#include "pump_split.h"   // part 117: the walk on one core, the renderer on another
 #include "vk_renderer.h"
 #include "xenos.h"   // register indices, for the bin trace's window scissor
 
@@ -848,7 +849,10 @@ void BindShader(uint32_t type, uint32_t ucodeVa, const uint8_t* code, uint32_t s
         // D.4: first sight of this hash — if the renderer's cache cannot answer it,
         // this is where the in-process translation starts. Inside the announce-once
         // block on purpose: one call per distinct shader per run, not per bind.
-        VkRenderer_OnShaderBind(type, hash, code, sizeDwords);
+        if (split::g_on)
+            split::EnqueueShaderBind(type, hash, code, sizeDwords);
+        else
+            VkRenderer_OnShaderBind(type, hash, code, sizeDwords);
     }
 
     DumpShader(type, hash, code, sizeDwords);
@@ -879,7 +883,34 @@ struct Source
     // dwords at ~17.8 ns each**, i.e. 50-70 cycles for what should be a load, a bswap
     // and a store, and a per-dword `i % wrapDwords` on a runtime divisor is 20-26 cycles
     // of that on its own. `docs/perf-plan-part47.md` §2.1.
-    void Read(uint32_t i, uint32_t count, uint32_t* dst) const
+    //
+    // PART 109: THIS LOOP IS THE SINGLE HOTTEST LINE ON THE PUMP THREAD, AND
+    // VECTORISING IT WAS WORTH NOTHING. WRITTEN DOWN SO NOBODY BUYS IT TWICE.
+    //
+    // A flat `perf` profile of the operator's own crowd put the `bswap` line at **69.9%
+    // of `WriteRegisterRun` = 7.25% of the pump thread = ~0.76 ms of a 10.8 ms frame**,
+    // in one line, and the disassembly agreed there was headroom: clang emits plain
+    // scalar `bswap` 4x-unrolled and not one vector instruction, because a 4-byte
+    // `memcpy` in a loop it cannot prove non-aliasing for does not vectorise. The census
+    // agreed too (`CW_PM4_REGRUN_CENSUS=1`): mean **19.3 dwords a run** and **90.3% of
+    // all dwords in runs of 16 or more**, so a 32-byte-wide swap covers essentially the
+    // whole population — and when built, it did: the arm reported **90.6% of run dwords
+    // vectorised**, against a control reporting 0.0%.
+    //
+    // **It measured +0.14 ms — a null, or very slightly slower.** Three runs an arm,
+    // alternated, matched draw bands. And the re-profile says why, which is the part
+    // worth keeping: with the vector path in, `SwapRunAvx2Impl` (6.06%) plus what was
+    // left of `WriteRegisterRun` (3.75%) came to **9.81% of the pump against the scalar
+    // loop's 10.37%**. The work did not move. It was never the byte swap.
+    //
+    // THE TRANSFERABLE FORM: a hot LINE in a flat profile is not a hot OPERATION. On an
+    // out-of-order core the sample lands on the instruction that CONSUMES a slow load,
+    // so a line can read as 70% of its symbol while being 70% *waiting* — here, for the
+    // packet stream arriving from memory and for the `g_regs` stores. Replacing its
+    // arithmetic with a wider instruction changes the arithmetic, and the arithmetic was
+    // free. What would move this is fetching less or fetching it earlier, not swapping
+    // it faster. (gotcha 545)
+        void Read(uint32_t i, uint32_t count, uint32_t* dst) const
     {
         if (wrapDwords)
         {
@@ -1058,6 +1089,14 @@ bool StoreGpuRaw(uint8_t* base, uint32_t physAddr, uint32_t value)
                     "(phys=%08X -> va=%08X value=%08X)\n",
                     physAddr, va, value);
         return false;
+    }
+    // Part 117: under the split the store is D's, in order with the draws before it —
+    // a fence written here would tell the guest the GPU is done with streams D has not
+    // yet copied (pump_split.h, design point 1).
+    if (split::g_on)
+    {
+        split::EnqueueStore(va, value);
+        return true;
     }
     GuestStore32(base, va, value);
     // Part 107: the Draw Thread's fence wait PARKS on the fence-completion word instead
@@ -1366,6 +1405,8 @@ void WriteRegister(uint8_t* base, uint32_t index, uint32_t value)
     if (index >= kFetchLo && index < kFetchHi)
         ++g_fetchConstVersion;
     g_regs[index] = value;
+    if (split::g_on)
+        split::LogRun(index, 1, &value);   // part 117: D's replica follows every write
 
     // Scratch-register writeback: when SCRATCH_UMSK enables a scratch register, each
     // write to it is mirrored to SCRATCH_ADDR + reg*4. This is a real reporting
@@ -1412,6 +1453,42 @@ void WriteRegister(uint8_t* base, uint32_t index, uint32_t value)
 // are incremented once per RUN, not per dword, so a relaxed add costs nothing measurable.
 std::atomic<uint64_t> g_regRunBulk{ 0 };   // dwords taken by the bulk copy
 std::atomic<uint64_t> g_regRunSlow{ 0 };   // ...and by the per-dword fallback
+// CW_PM4_REGRUN_CENSUS=1 — HOW LONG IS A REGISTER RUN? ASK BEFORE VECTORISING IT.
+//
+// Part 109's symbol profile put `Source::Read`'s scalar byte-swap loop (pm4.cpp, the
+// `dst[k] = __builtin_bswap32(raw)` line) at **69.9% of `WriteRegisterRun` = 7.25% of
+// the pump thread = ~0.78 ms of a 10.8 ms crowd frame**, in one line, and the
+// disassembly confirms the compiler emitted plain scalar `bswap` with a 4x unroll and no
+// vector instruction anywhere. That reads like an obvious AVX2 item — and it is only
+// obvious if the runs are LONG. A `vpshufb` path 8 dwords wide is worth nothing on a run
+// of 3, and this title's own arithmetic is not encouraging: ~815,000 register dwords a
+// frame against ~90,000 packets is 9 dwords a packet on average, and an average is not a
+// distribution. So count the distribution first. Building the SIMD path and then
+// measuring it would have cost a build and three runs an arm to learn what one run
+// answers (this project's own rule; §6eb §3 refuted a whole item by measuring the
+// quantity underneath it instead of quoting a share).
+//
+// A plain non-atomic pair of counters behind an env bool: the walk is single-threaded on
+// the pump, `g_regRunBulk` is already an atomic add on this exact path, so this costs
+// strictly less than what is already there and nothing at all when off.
+const bool g_regRunCensus = getenv("CW_PM4_REGRUN_CENSUS") != nullptr;
+uint64_t g_regRunCalls = 0;
+uint64_t g_regRunHist[10] = {};   // 1, 2-3, 4-7, 8-15, 16-31, 32-63, 64-127, 128-255,
+uint64_t g_regRunDwords[10] = {}; // 256-1023, 1024+ — and the DWORDS in each bucket,
+                                  // which is the number that decides, not the call count
+inline uint32_t RegRunBucket(uint32_t count)
+{
+    if (count <= 1) return 0;
+    if (count <= 3) return 1;
+    if (count <= 7) return 2;
+    if (count <= 15) return 3;
+    if (count <= 31) return 4;
+    if (count <= 63) return 5;
+    if (count <= 127) return 6;
+    if (count <= 255) return 7;
+    if (count <= 1023) return 8;
+    return 9;
+}
 // Dwords the bulk path got WRONG, as judged by the per-dword path it replaced. Only
 // counted under CW_PM4_VERIFY_BULK_REGS; it must be 0, and the check must be shown able
 // to report a positive before a 0 from it means anything (gotcha 30).
@@ -1455,6 +1532,13 @@ void WriteRegisterRun(uint8_t* base, const Source& fetch, uint32_t srcPos,
         return;
     }
     g_regRunBulk.fetch_add(count, std::memory_order_relaxed);
+    if (g_regRunCensus)
+    {
+        const uint32_t b = RegRunBucket(count);
+        ++g_regRunCalls;
+        ++g_regRunHist[b];
+        g_regRunDwords[b] += count;
+    }
     // One overlap test per RUN, not per dword — this path exists precisely because the
     // per-dword path was too slow, and a per-dword check here would give that back.
     if (index < kAluHi && index + count > kAluLo)
@@ -1528,6 +1612,10 @@ void WriteRegisterRun(uint8_t* base, const Source& fetch, uint32_t srcPos,
             }
         }
     }
+    // Part 117: the run, as it now stands in g_regs (poison and repair included), for
+    // D's replica. A memcpy of dwords that are in L1 — the run was just written.
+    if (split::g_on)
+        split::LogRun(index, count, g_regs + index);
 }
 
 bool EvalWaitCondition(uint32_t func, uint32_t value, uint32_t mask, uint32_t ref)
@@ -1988,20 +2076,48 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t pos, uint32_
                 // (low two bits of the ADDRESS, as every other address in this stream
                 // does it, or the top two bits of the SIZE dword), and only the packet
                 // can answer it.
+                //
+                // AND THE COUNTDOWN MUST NOT RUN PAST ZERO. `if (left-- > 0)` decrements
+                // on EVERY call whether it prints or not, so with the trace off `left`
+                // starts at 0 and counts DOWN forever — and at 2^31 calls it wraps to
+                // INT_MAX and the trace turns itself ON, permanently, in a build nobody
+                // armed. That shipped in v1.0.2. This is the hottest path in the
+                // renderer (one DRAW_INDX per draw, ~4,900 draws a frame here), so it
+                // took about 80 minutes of play to get there: the operator's session
+                // reached it at vblank #4,832,000, after which the frame rate roughly
+                // halved and cw_runtime.log grew to 98 GB. A disabled trace has to cost
+                // nothing forever, not for the first two billion calls.
                 static int left = getenv("CW_PM4_DRAW_TRACE") ? 24 : 0;
-                if (left-- > 0)
+                if (left > 0)
+                {
+                    --left;
                     fprintf(stderr,
                             "[pm4draw] init=%08X prim=%u count=%u i32=%u addr=%08X "
                             "size=%08X  addr&3=%u  size>>30=%u  size&0xFFFFFF=%u\n",
                             init, d.primType, d.indexCount, d.index32 ? 1u : 0u,
                             addrDword, sizeDword, addrDword & 3, sizeDword >> 30,
                             sizeDword & 0xFFFFFF);
+                }
             }
             else if (d.indexed)
             {
                 d.indexed = false; // a DMA draw with no address is not one we can honour
             }
-            g_drawSink(base, d);
+            if (split::g_on)
+            {
+                // Part 117: the draw and everything DoDraw read off this module's
+                // globals at the packet, captured for D. The palette take here has the
+                // same semantic as the renderer's own take on the one-thread pump: D
+                // accumulates what it is handed until the renderer takes it.
+                const Pm4VsPaletteWrites pal = Pm4_TakeVsPaletteWrites();
+                split::DrawCtx ctx{ { g_aluConstVersion[0], g_aluConstVersion[1] },
+                                    g_fetchConstVersion,
+                                    pal.coverExtent, pal.partialExtent, pal.coverBursts,
+                                    pal.partialBursts, g_vsPalHighWater };
+                split::EnqueueDraw(d, g_boundShaders[0], g_boundShaders[1], ctx);
+            }
+            else
+                g_drawSink(base, d);
             break;
         }
 
@@ -2075,9 +2191,24 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t pos, uint32_
             // because that guest thread is very likely the one waiting for us to make
             // progress. Holding means returning and retrying next tick — see below.
             uint32_t value;
+            bool pendingUsed = false;
             if (isMemory)
             {
                 value = LoadGpu(base, poll);
+                // Part 117: under the split a store the walk already passed may not have
+                // landed yet (D executes it in order, later). The word's value AT THIS
+                // POINT IN THE STREAM is that pending store's, not memory's — so it
+                // replaces the memory read. Satisfied, the walk runs ahead of D at the
+                // driver's pipeline-drain blocks (EVENT_WRITE then WAIT on the same
+                // word); unsatisfied, the walk holds exactly as hardware's CP would,
+                // and memory becomes the truth again once D lands the store
+                // (pump_split.h, PendingStoreValue).
+                uint32_t raw = 0;
+                if (split::g_on && split::PendingStoreValue(PhysToVa(poll & ~3u), &raw))
+                {
+                    value = GpuSwapResidual(raw, poll);
+                    pendingUsed = true;
+                }
             }
             else
             {
@@ -2085,10 +2216,19 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t pos, uint32_
                 // Coherency requests complete instantly on a GPU with no caches: the
                 // driver sets bit 31 (pending) and waits for it to clear.
                 if (reg == kRegCoherStatusHost)
+                {
                     g_regs[reg] &= ~0x80000000u;
+                    if (split::g_on)
+                        split::LogRun(reg, 1, &g_regs[reg]);
+                }
                 value = reg < kRegCount ? g_regs[reg] : 0;
             }
-            if (!EvalWaitCondition(info, value, mask, ref))
+            const bool met = EvalWaitCondition(info, value, mask, ref);
+            if (met && pendingUsed)
+                split::NoteWaitSatisfiedByPending();
+            if (!met && split::g_on && isMemory)
+                split::NoteWaitUnmet(PhysToVa(poll & ~3u));
+            if (!met)
             {
                 const uint64_t n = g_waitUnmet.fetch_add(1) + 1;
                 if (n <= 8 || (n & 0xFFFF) == 0)
@@ -2156,7 +2296,9 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t pos, uint32_
 
         case 0x54: // INTERRUPT: delivered HERE rather than after the walk — see pm4.h.
             g_interrupts.fetch_add(1, std::memory_order_relaxed);
-            if (g_interruptSink)
+            if (split::g_on)
+                split::EnqueueInterrupt();   // delivered by THIS thread at D's position
+            else if (g_interruptSink)
                 g_interruptSink();
             break;
 
@@ -2184,6 +2326,11 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t pos, uint32_
                 // frame's pixels with this frame's descriptor once per swap — a
                 // one-frame lag that is invisible in a still and looks like input lag
                 // in motion.
+                if (split::g_on)
+                {
+                    split::EnqueueSwap(body(1), body(2), body(3));
+                    break;
+                }
                 VkRenderer_OnSwap(base, body(1), body(2), body(3));
                 Host_Present(body(1), body(2), body(3));
                 // The deterministic-clock instrument steps here, at the guest's own
@@ -2415,6 +2562,8 @@ uint32_t ExecuteLinear(uint8_t* base, uint32_t va, uint32_t sizeDwords, int dept
     Census& cs = g_atomicCounters ? g_censusUnused : ThreadCensus();
     while (pos < sizeDwords)
     {
+        if (split::g_on)
+            split::ServiceInterrupts();   // part 117: D may be waiting at an INTERRUPT op
         const uint32_t header = fetch(pos);
         // The filler fast path (item 1a). 100% of this title's type-2 dwords arrive here
         // rather than at ring level, and they are ~30% of every packet walked, so the one
@@ -2647,6 +2796,8 @@ uint32_t Pm4_Execute(uint8_t* base, uint32_t writePtr)
     uint32_t guard = g_ringDwords + 1; // never walk more than one lap per call
     while (g_cursor != target && guard--)
     {
+        if (split::g_on)
+            split::ServiceInterrupts();
         const uint32_t avail = (target + g_ringDwords - g_cursor) % g_ringDwords;
         const uint32_t consumed = ExecutePacket(base, fetch, g_cursor, avail, 0);
         if (!consumed)
@@ -2760,6 +2911,15 @@ uint32_t Pm4_Execute(uint8_t* base, uint32_t writePtr)
 }
 
 void Pm4_SetInterruptSink(void (*sink)()) { g_interruptSink = sink; }
+
+// Part 117: the source-1 delivery D asks W for (pump_split.h, design point 2). The
+// packet's own counter was already bumped at the packet.
+static void DeliverForSplit()
+{
+    if (g_interruptSink)
+        g_interruptSink();
+}
+bool Pm4_StartSplit(uint8_t* base) { return split::Start(base, DeliverForSplit); }
 void Pm4_SetDrawSink(void (*sink)(uint8_t*, const Pm4Draw&)) { g_drawSink = sink; }
 
 const Pm4ShaderBinding& Pm4_BoundShader(uint32_t stage)
@@ -2814,6 +2974,34 @@ uint64_t Pm4_RegisterWriteCount()
 // destination range touched the scratch mirror or the const-watch window. The share is
 // what says whether the bulk path is worth what it is estimated at (perf-plan-part47
 // §2.1); a fallback share near 100% would mean it is worth nothing.
+// THE CENSUS'S REPORT, ON THE RUN'S OWN EXIT PATH. Every recipe here ends on a `timeout`
+// SIGTERM and `VkRenderer_DumpStats()` is what that handler calls; a counter reported
+// anywhere else is a counter nobody reads (gotcha 543, which cost part 109 a whole route).
+void Pm4_RegRunCensusReport()
+{
+    if (!g_regRunCensus || !g_regRunCalls)
+        return;
+    static const char* kNames[10] = { "1", "2-3", "4-7", "8-15", "16-31", "32-63",
+                                      "64-127", "128-255", "256-1023", "1024+" };
+    uint64_t totalD = 0;
+    for (uint64_t d : g_regRunDwords)
+        totalD += d;
+    fprintf(stderr, "[regrun] %llu bulk runs, %llu dwords, mean %.1f dwords/run\n",
+            (unsigned long long)g_regRunCalls, (unsigned long long)totalD,
+            g_regRunCalls ? double(totalD) / double(g_regRunCalls) : 0.0);
+    for (uint32_t i = 0; i < 10; i++)
+    {
+        if (!g_regRunHist[i])
+            continue;
+        fprintf(stderr, "[regrun]   %8s dwords: %10llu runs (%5.1f%%)  %12llu dwords "
+                        "(%5.1f%% of all dwords)\n",
+                kNames[i], (unsigned long long)g_regRunHist[i],
+                100.0 * double(g_regRunHist[i]) / double(g_regRunCalls),
+                (unsigned long long)g_regRunDwords[i],
+                totalD ? 100.0 * double(g_regRunDwords[i]) / double(totalD) : 0.0);
+    }
+}
+
 uint64_t Pm4_RegRunBulkDwords() { return g_regRunBulk.load(); }
 uint64_t Pm4_RegRunSlowDwords() { return g_regRunSlow.load(); }
 uint64_t Pm4_RegRunMismatches() { return g_regRunMismatch.load(); }

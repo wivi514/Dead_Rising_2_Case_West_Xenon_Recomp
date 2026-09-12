@@ -138,6 +138,9 @@ message(STATUS "Recompiled image: ${PPC_TU_COUNT} translation units")
 # runtime-only edit does not risk a rebuild of 227 TUs, and so the link step is
 # visibly a *link* of the image rather than a compile of it.
 add_library(ppc_image STATIC ${PPC_SOURCES})
+# Link options the codegen arms below need on the EXECUTABLE (declared further down);
+# an INTERFACE target carries them there without reordering this file.
+add_library(cw_runtime_pgo_iface INTERFACE)
 
 target_include_directories(ppc_image PUBLIC
     ${PPC_DIR}                       # ppc_recomp_shared.h, ppc_context.h, ppc_config.h
@@ -154,6 +157,54 @@ target_include_directories(ppc_image PUBLIC
 target_compile_options(ppc_image PRIVATE
     -msse4.1 -mavx
     -Wno-unused-variable -Wno-unused-but-set-variable)
+
+# ---------------------------------------------------------------------------
+# CODEGEN ARMS ON THE RECOMPILED TUs ONLY (docs/perf-plan-part116.md item 3)
+#
+# The title's own recompiled code is the 8.8 ms floor of the frame (part 110), and
+# nothing about how it is COMPILED has ever been measured: -O2 is the level every
+# number in this project was taken at (see the build-type block above), and that is a
+# reason to measure at -O2, not a reason never to measure anything else. These three
+# knobs apply to ppc_image alone, so the runtime's own code — and therefore every
+# renderer A/B ever recorded — is untouched, and each is OFF by default so a plain
+# configure builds the binary it always built. Each is an ARM: its milliseconds are in
+# perf-plan-part116 §4, and none becomes a default without them.
+#
+#   -DCW_PPC_OPT=-O3                  the optimisation level for the recompiled TUs
+#   -DCW_PPC_PGO=generate             instrument (the profile lands in
+#                                     LLVM_PROFILE_FILE at run time; llvm-profdata
+#                                     merge -> .profdata)
+#   -DCW_PPC_PGO=/path/to/x.profdata  use that profile (-fprofile-instr-use)
+#   -DCW_PPC_LTO=ON                   ThinLTO on the recompiled TUs (lld)
+set(CW_PPC_OPT "" CACHE STRING "Optimisation flag for the recompiled TUs (default: the build type's)")
+set(CW_PPC_PGO "" CACHE STRING "generate | <path>.profdata | empty")
+option(CW_PPC_LTO "ThinLTO across the recompiled TUs" OFF)
+if(CW_PPC_OPT)
+    # Appended, so it comes AFTER the build type's -O2 on the command line and wins.
+    target_compile_options(ppc_image PRIVATE ${CW_PPC_OPT})
+    message(STATUS "ppc_image: optimisation override ${CW_PPC_OPT} (ARM)")
+endif()
+if(CW_PPC_PGO STREQUAL "generate")
+    target_compile_options(ppc_image PRIVATE -fprofile-instr-generate)
+    # The profiling runtime is pulled in by the LINK, so the flag goes on the exe too.
+    target_link_options(cw_runtime_pgo_iface INTERFACE -fprofile-instr-generate)
+    message(STATUS "ppc_image: PGO INSTRUMENTED (ARM; LLVM_PROFILE_FILE selects the output)")
+elseif(CW_PPC_PGO)
+    if(NOT EXISTS "${CW_PPC_PGO}")
+        message(FATAL_ERROR "CW_PPC_PGO=${CW_PPC_PGO}: no such profile")
+    endif()
+    target_compile_options(ppc_image PRIVATE
+        "-fprofile-instr-use=${CW_PPC_PGO}"
+        # The recompiled sources are regenerated verbatim, so a hash mismatch means a
+        # stale ppc/ and should stop the build rather than silently drop the profile.
+        -Werror=profile-instr-unprofiled -Wno-profile-instr-out-of-date)
+    message(STATUS "ppc_image: PGO-optimised from ${CW_PPC_PGO} (ARM)")
+endif()
+if(CW_PPC_LTO)
+    target_compile_options(ppc_image PRIVATE -flto=thin)
+    target_link_options(cw_runtime_pgo_iface INTERFACE -flto=thin -fuse-ld=lld)
+    message(STATUS "ppc_image: ThinLTO (ARM)")
+endif()
 
 # cpu/timebase.h is force-included over the RECOMPILED sources ONLY. `mftb` is
 # lowered to __rdtsc(), which on this host runs ~70x faster than the console's
@@ -292,6 +343,7 @@ add_executable(cw_runtime
     cpu/camera_fov.cpp               # Case Zero parts 62/108 (imported part 11): the game-side fov substitution — the ultrawide/16:10 CULLING fix; addresses re-derived here
     cpu/fence_wait.cpp               # Case Zero part 107 (imported part 11): the Draw Thread fence wait parked on a futex — addresses re-derived here
     cpu/rumble_guest.cpp             # Case Zero part 108 (imported part 11): the rumble tick at 30 Hz (CW_RUMBLE_TICK_HZ) + the probe (CW_RUMBLE_TRACE) — addresses re-derived here
+    cpu/havok_threads.cpp            # Case Zero part 118 (imported part 12): the Havok worker count (CW_HAVOK_WORKERS) — addresses re-derived here
     kernel/klog.cpp
     kernel/memory.cpp
     kernel/heap.cpp
@@ -314,6 +366,7 @@ add_executable(cw_runtime
     kernel/seat_trace.cpp            # the co-op seating trace, CW_SEAT_LOG=1 (temporary)
     gpu/vd.cpp
     gpu/pm4.cpp
+    gpu/pump_split.cpp               # Case Zero part 117 (imported part 12): the PM4 pump on two cores (CW_PUMP_SPLIT)
     # gpu/parallel_record.cpp — part 7's per-range secondaries + deferred replay, PARKED
     # (part 8): superseded by Case Zero's part-89 recorder ("resolve serial, record
     # parallel"), which subsumes the deferred-replay win and adds worker recording that
@@ -426,6 +479,14 @@ if(CW_XLIVE_OVERLAY)
     endif()
     add_subdirectory("${XLIVE_LAUNCHER_ROOT}/overlay" "${CMAKE_CURRENT_BINARY_DIR}/xlive_overlay")
     target_link_libraries(cw_runtime PRIVATE xlive::overlay)
+    # clang-cl: SDL_endian.h defines _m_prefetch itself unless <intrin.h>'s
+    # prfchwintrin.h got there first, and newer clang has it as a builtin —
+    # "definition of builtin function '_m_prefetch'". The runtime never sees it
+    # because win_compat.h force-includes windows.h (which pulls intrin.h) into
+    # every TU; the overlay's TUs get the same guard the cheap way.
+    if(MSVC)
+        target_compile_options(xlive_overlay PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/FIintrin.h>")
+    endif()
     target_compile_definitions(cw_runtime PRIVATE CW_HAVE_XLIVE_OVERLAY=1)
     message(STATUS "XenonLive overlay: on (${XLIVE_LAUNCHER_ROOT}/overlay)")
 else()
@@ -521,7 +582,7 @@ target_include_directories(cw_runtime PRIVATE
     ${XENON_ROOT}/XenonUtils         # image.h (loader), xbox.h (guest structs), xex.h
 )
 
-target_link_libraries(cw_runtime PRIVATE ppc_image)
+target_link_libraries(cw_runtime PRIVATE ppc_image cw_runtime_pgo_iface)
 
 # Windows: VirtualAlloc2 / MapViewOfFile3 / UnmapViewOfFileEx are the placeholder
 # mapping API kernel/memory.cpp uses for the guest's three aliased physical views.

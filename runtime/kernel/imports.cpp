@@ -56,6 +56,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+#if !defined(_WIN32)
+#include <pthread.h>
+#include <unistd.h> // gettid(); win_compat.h supplies the Windows spelling
+#endif
 
 #include "../cpu/crash_report.h"
 #include "../cpu/guest_thread.h"
@@ -67,6 +71,7 @@
 // intrinsics headers are read) because timebase.h pulls <x86intrin.h> in itself
 // before shadowing, which sets the guard; nothing below re-declares __rdtsc.
 #include "../cpu/timebase.h"
+#include "../gpu/pump_split.h"   // part 117: the wait-any wake follows the two-core pump
 #include "../gpu/vk_renderer.h" // the exit paths save the pipeline cache (part 99)
 #include "../host/log_file.h"  // the exit paths drain the log file's tee (part 105)
 #include "../host/settings.h"
@@ -821,12 +826,88 @@ static uint32_t GuestTimeoutToMs(be<int64_t>* timeout)
     return static_cast<uint32_t>((-t) / 10000);
 }
 
+// THE SPIN BEFORE THE PARK (part 117 §4.6). Under the two-core pump the frame's longest
+// term is the guest's Main Thread, and its [guestwait] columns read ~90 us per
+// single-object wait and ~150 us per wait-any — wake-latency-sized, ~11 a frame. A
+// condvar wake on Linux is a futex syscall, an IPI and a scheduler decision, tens of
+// microseconds a time; a waiter that spins that long first sees the signal the moment
+// it lands. The spin is on the waiting thread's own core (the critical path — the time
+// was sleep, not work) and bounded, so an oversubscribed box pays at most the bound.
+// CW_WAIT_SPIN_US=N sets it; 0 is the plain park.
+static inline unsigned WaitSpinUs()
+{
+    static const unsigned us = [] {
+        const char* e = getenv("CW_WAIT_SPIN_US");
+        return e ? unsigned(atoi(e)) : 0u;
+    }();
+    return us;
+}
+static inline void WaitPause()
+{
+#if defined(__x86_64__) || defined(_M_X64)
+    __builtin_ia32_pause();
+#endif
+}
+static inline bool SpinDeadlinePassed(const std::chrono::steady_clock::time_point& until)
+{
+    return std::chrono::steady_clock::now() >= until;
+}
+
+// One parked wait-any: the objects it registered on notify THIS block (kobject.h).
+struct WaitAnyBlock
+{
+    std::mutex m;
+    std::condition_variable cv;
+    std::atomic<uint64_t> gen{ 0 }; // bumped under m (the condvar handshake), read lock-free by the spin
+    void Signal()
+    {
+        {
+            std::lock_guard lk(m);
+            gen.fetch_add(1, std::memory_order_release);
+        }
+        cv.notify_all();
+    }
+    // Wait until the generation differs from `seen` or `ms` elapse; returns the
+    // generation observed on the way out. Spins first (WaitSpinUs), then parks.
+    uint64_t WaitForChange(uint64_t seen, unsigned ms)
+    {
+        if (const unsigned spin = WaitSpinUs())
+        {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(spin);
+            for (;;)
+            {
+                const uint64_t g = gen.load(std::memory_order_acquire);
+                if (g != seen)
+                    return g;
+                for (int i = 0; i < 16; ++i)
+                    WaitPause();
+                if (SpinDeadlinePassed(until))
+                    break;
+            }
+        }
+        std::unique_lock lk(m);
+        cv.wait_for(lk, std::chrono::milliseconds(ms),
+                    [&] { return gen.load(std::memory_order_acquire) != seen; });
+        return gen.load(std::memory_order_acquire);
+    }
+    uint64_t Generation() { return gen.load(std::memory_order_acquire); }
+};
+
+// The per-object list of parked wait-anys, guarded by the object's own mutex. A
+// vector because it is almost always empty and rarely holds more than two.
+static inline void NotifyAnyWaiters(std::vector<WaitAnyBlock*>& waiters)
+{
+    for (WaitAnyBlock* w : waiters)
+        w->Signal();
+}
+
 struct Event final : KernelObject
 {
     std::mutex m;
     std::condition_variable cv;
     bool manualReset;
     bool signaled;
+    std::vector<WaitAnyBlock*> anyWaiters; // under m
 
     Event(XKEVENT* header) : manualReset(header->Type == 0), signaled(header->SignalState != 0) {}
     Event(bool manualReset, bool initialState) : manualReset(manualReset), signaled(initialState) {}
@@ -834,6 +915,27 @@ struct Event final : KernelObject
 
     uint32_t Wait(uint32_t timeoutMs) override
     {
+        if (const unsigned spin = WaitSpinUs(); spin && timeoutMs != 0)
+        {
+            // The spin: a try_lock and a look, then a breath, until the bound.
+            const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(spin);
+            for (;;)
+            {
+                {
+                    std::unique_lock lock(m, std::try_to_lock);
+                    if (lock.owns_lock() && signaled)
+                    {
+                        if (!manualReset)
+                            signaled = false;
+                        return STATUS_SUCCESS;
+                    }
+                }
+                for (int i = 0; i < 16; ++i)
+                    WaitPause();
+                if (SpinDeadlinePassed(until))
+                    break;
+            }
+        }
         std::unique_lock lock(m);
         if (timeoutMs == WAIT_TIMEOUT_INFINITE)
             cv.wait(lock, [&] { return signaled; });
@@ -854,6 +956,18 @@ struct Event final : KernelObject
         // every frame — Fable 2's finding 44 livelock, where the render workers kept
         // eating the wakeup meant for the init thread.
         cv.notify_all();
+        NotifyAnyWaiters(anyWaiters); // and every wait-ANY parked on this event
+    }
+
+    void AddAnyWaiter(WaitAnyBlock* w) override
+    {
+        std::lock_guard lock(m);
+        anyWaiters.push_back(w);
+    }
+    void RemoveAnyWaiter(WaitAnyBlock* w) override
+    {
+        std::lock_guard lock(m);
+        anyWaiters.erase(std::remove(anyWaiters.begin(), anyWaiters.end(), w), anyWaiters.end());
     }
 
     void Reset()
@@ -869,6 +983,7 @@ struct Semaphore final : KernelObject
     std::condition_variable cv;
     uint32_t count;
     uint32_t maximum;
+    std::vector<WaitAnyBlock*> anyWaiters; // under m
 
     Semaphore(XKSEMAPHORE* sem) : count(sem->Header.SignalState), maximum(sem->Limit) {}
     Semaphore(uint32_t count, uint32_t maximum) : count(count), maximum(maximum) {}
@@ -876,6 +991,25 @@ struct Semaphore final : KernelObject
 
     uint32_t Wait(uint32_t timeoutMs) override
     {
+        if (const unsigned spin = WaitSpinUs(); spin && timeoutMs != 0)
+        {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(spin);
+            for (;;)
+            {
+                {
+                    std::unique_lock lock(m, std::try_to_lock);
+                    if (lock.owns_lock() && count > 0)
+                    {
+                        count--;
+                        return STATUS_SUCCESS;
+                    }
+                }
+                for (int i = 0; i < 16; ++i)
+                    WaitPause();
+                if (SpinDeadlinePassed(until))
+                    break;
+            }
+        }
         std::unique_lock lock(m);
         auto ready = [&] { return count > 0; };
         if (timeoutMs == WAIT_TIMEOUT_INFINITE)
@@ -926,7 +1060,19 @@ struct Semaphore final : KernelObject
             *previous = count;
         count += releaseCount;
         cv.notify_all();
+        NotifyAnyWaiters(anyWaiters); // and every wait-ANY parked on this semaphore
         return STATUS_SUCCESS;
+    }
+
+    void AddAnyWaiter(WaitAnyBlock* w) override
+    {
+        std::lock_guard lock(m);
+        anyWaiters.push_back(w);
+    }
+    void RemoveAnyWaiter(WaitAnyBlock* w) override
+    {
+        std::lock_guard lock(m);
+        anyWaiters.erase(std::remove(anyWaiters.begin(), anyWaiters.end(), w), anyWaiters.end());
     }
 };
 
@@ -1221,6 +1367,7 @@ static void ReportStuckMultiWait(uint32_t count, const uint32_t* ids, int second
 
 static uint32_t WaitObject(KernelObject* obj, uint32_t timeoutMs, uint32_t id)
 {
+    GuestThread::WaitScope ws(GuestThread::kWaitSingle);
     const bool waitTrace = WaitTraceOn();
     if (!waitTrace || timeoutMs != WAIT_TIMEOUT_INFINITE)
         return obj->Wait(timeoutMs);
@@ -1358,12 +1505,46 @@ static uint32_t NtWaitForSingleObjectEx_x(uint32_t handle, uint32_t mode, uint32
 //
 // Turn it on with CW_MULTIWAIT_APC=1. If a real APC-starvation bug ever turns up,
 // promote it then — with the gate numbers taken from both binaries on the same day.
-template <typename Poll, typename Id>
+template <typename Poll, typename Id, typename Obj>
 static uint32_t WaitAnyPoll(uint32_t count, uint32_t timeoutMs, uint32_t alertable, Poll poll,
-                            Id id)
+                            Id id, Obj obj)
 {
+    GuestThread::WaitScope ws(GuestThread::kWaitMulti);
     static const bool drainApcs = getenv("CW_MULTIWAIT_APC") != nullptr;
+    // THE DEFAULT FOLLOWS THE TWO-CORE PUMP (part 117). Part 116 measured the wake both
+    // ways — the game's own floor 8.1 -> 7.0 ms, the shipped frame +0.3 — and the
+    // operator parked it OFF until "the pump is under ~8 ms". CW_PUMP_SPLIT (gpu/
+    // pump_split.h) is what got the renderer thread there (8.6-9.1 ms/frame with ~0.9 of
+    // it idle), and the frame's longest term became the guest's Main Thread with 2.2 ms
+    // of it in THIS poll — so under the split the wake is ON (part 117 §4.2: the pair
+    // measured −1.19 ms, monotone) and on the one-thread pump it stays the poll the
+    // operator chose. CW_WAITANY_WAKE=1 / =0 force either, on either pump.
+    static const int wakeEnv = [] {
+        const char* e = getenv("CW_WAITANY_WAKE");
+        return !e || !*e ? -1 : (*e == '0' ? 0 : 1);
+    }();
+    const bool pollOnly = wakeEnv == 0 || (wakeEnv < 0 && !split::g_on);
     const auto start = std::chrono::steady_clock::now();
+    // Register this wait on every object that supports it (kobject.h, wait-any
+    // wake-ups) BEFORE the first poll, so a signal between poll and park bumps the
+    // block's generation and the park returns at once. Unregistered on every exit.
+    WaitAnyBlock block;
+    struct Reg
+    {
+        WaitAnyBlock* b; Obj& obj; uint32_t n; bool on;
+        ~Reg()
+        {
+            if (!on) return;
+            for (uint32_t i = 0; i < n; i++)
+                if (KernelObject* o = obj(i))
+                    o->RemoveAnyWaiter(b);
+        }
+    } reg{ &block, obj, count, !pollOnly };
+    if (!pollOnly)
+        for (uint32_t i = 0; i < count; i++)
+            if (KernelObject* o = obj(i))
+                o->AddAnyWaiter(&block);
+    uint64_t gen = pollOnly ? 0 : block.Generation();
     for (uint64_t tick = 0;; tick++)
     {
         if (alertable && drainApcs && (DrainThreadApcs() | (int)FireDueTimerApcs()))
@@ -1395,7 +1576,14 @@ static uint32_t WaitAnyPoll(uint32_t count, uint32_t timeoutMs, uint32_t alertab
                 ids[i] = id(i);
             ReportStuckMultiWait(n, ids, int(tick / 1000));
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        // Park until one of OUR objects is signalled, bounded by the old 1 ms
+        // quantum; the generation was read BEFORE the poll above, so a signal that
+        // landed during the poll returns immediately (kobject.h, wait-any wake-ups).
+        // The poll is the default; CW_WAITANY_WAKE=1 engages the wake (see above).
+        if (pollOnly)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        else
+            gen = block.WaitForChange(gen, 1);
     }
 }
 
@@ -1438,11 +1626,21 @@ static uint32_t KeWaitForMultipleObjects_x(uint32_t count, xpointer<XDISPATCHER_
             WaitDispatcher(objects[i], timeoutMs);
         return STATUS_SUCCESS;
     }
-    // wait-any: poll. Simple and safe; revisit if it shows up hot in a profile.
+    // wait-any: poll, parked on the objects' own wake-ups (kobject.h). It showed up
+    // in the part-116 wait census at 2.2 ms/frame on the Main Thread.
     return WaitAnyPoll(
         count, timeoutMs, alertable,
         [&](uint32_t i) { return WaitDispatcher(objects[i], 0) == STATUS_SUCCESS; },
-        [&](uint32_t i) { return g_memory.MapVirtual(static_cast<void*>(objects[i])); });
+        [&](uint32_t i) { return g_memory.MapVirtual(static_cast<void*>(objects[i])); },
+        [&](uint32_t i) -> KernelObject* {
+            XDISPATCHER_HEADER* h = objects[i];
+            switch (h->Type)
+            {
+                case 0: case 1: return QueryKernelObject<Event>(*h);
+                case 5: return QueryKernelObject<Semaphore>(*h);
+                default: return nullptr;
+            }
+        });
 }
 
 static uint32_t NtWaitForMultipleObjectsEx_x(uint32_t count, be<uint32_t>* handles,
@@ -1452,6 +1650,7 @@ static uint32_t NtWaitForMultipleObjectsEx_x(uint32_t count, be<uint32_t>* handl
     const uint32_t timeoutMs = GuestTimeoutToMs(timeout);
     if (waitType == 0)
     {
+        GuestThread::WaitScope ws(GuestThread::kWaitMulti);
         for (uint32_t i = 0; i < count; i++)
             if (IsKernelObject(handles[i]) && IsLiveKernelHandle(handles[i]))
                 GetKernelObject(handles[i])->Wait(timeoutMs);
@@ -1463,7 +1662,12 @@ static uint32_t NtWaitForMultipleObjectsEx_x(uint32_t count, be<uint32_t>* handl
             return IsKernelObject(handles[i]) && IsLiveKernelHandle(handles[i]) &&
                    GetKernelObject(handles[i])->Wait(0) == STATUS_SUCCESS;
         },
-        [&](uint32_t i) { return uint32_t(handles[i]); });
+        [&](uint32_t i) { return uint32_t(handles[i]); },
+        [&](uint32_t i) -> KernelObject* {
+            return IsKernelObject(handles[i]) && IsLiveKernelHandle(handles[i])
+                       ? GetKernelObject(handles[i])
+                       : nullptr;
+        });
 }
 
 static uint32_t NtClose_x(uint32_t handle)
@@ -1826,6 +2030,7 @@ static uint32_t KeDelayExecutionThread_x(uint32_t mode, uint32_t alertable,
         return STATUS_USER_APC;
 
     const uint32_t ms = GuestTimeoutToMs(interval);
+    GuestThread::WaitScope ws(GuestThread::kWaitDelay);
     if (ms == 0)
         std::this_thread::yield();
     else if (ms != WAIT_TIMEOUT_INFINITE)
@@ -2431,10 +2636,32 @@ PPC_FUNC(__imp__RtlRaiseException)
 
     if (code == 0x406D1388) // MS_VC_EXCEPTION: "SetThreadName", debugger-only, continuable
     {
+        // THREADNAME_INFO sits in ExceptionInformation[0..3] (record + 0x14):
+        // {dwType=0x1000, szName, dwThreadID, dwFlags}. dwThreadID is -1 for "the
+        // calling thread"; the title only ever names itself this way (A1: 19 raises,
+        // each on the thread being named), and the other case is logged, not guessed.
         const uint32_t namePtr =
             __builtin_bswap32(*reinterpret_cast<const uint32_t*>(record + 0x18));
+        const uint32_t who =
+            __builtin_bswap32(*reinterpret_cast<const uint32_t*>(record + 0x1C));
         const char* name = namePtr ? reinterpret_cast<const char*>(base + namePtr) : "?";
-        KLOG("thread named '%s' (r13=%08X)\n", name, g_ppcContext ? g_ppcContext->r13.u32 : 0);
+        const uint32_t self = GuestThread::GetCurrentThreadId();
+        const uint32_t target = (who == 0xFFFFFFFFu) ? self : who;
+        // Bind the guest's name to the HOST thread (part 116). Until now the name
+        // went only into the kcall trace and every per-thread instrument — `perf`,
+        // `top -H`, tools/part50_thread_cpu.py — reported the guest's threads as
+        // anonymous tids, so "which thread is the 8.8 ms" needed a debugger to
+        // answer (part111-kickoff §1 question 1). On this title every one of the
+        // 19 boot-era raises comes from the MAIN thread naming a thread it just
+        // created (dwThreadID = the new thread's id, never -1), so the binding goes
+        // through the guest-tid registry rather than pthread_self().
+        const bool bound = GuestThread::BindHostName(target, name);
+        if (bound)
+            GuestThread::PinHostByName(name);   // CW_GUEST_PIN (part 118), else a no-op
+        // Always logged: a dozen lines a boot, and it is the only place the guest
+        // tid and the title's own name for the thread meet.
+        fprintf(stderr, "[kernel] thread named '%s' guest tid=%08X (by %08X)%s\n",
+                name, target, self, bound ? "" : " — NOT BOUND to a host thread");
         return;
     }
 
@@ -4266,6 +4493,21 @@ static uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags,
     // forever. The packet number is then a constant because the state genuinely never
     // changes — which is the contract, not a shortcut.
     if (fakeStartMs <= 0)
+    {
+        state->packetNumber = 1;
+        return 0;
+    }
+
+    // SYNTHETIC INPUT IS PAD 0 ONLY. Until co-op part 2 (2026-09-11) the arm below
+    // answered every pad index, so one synthetic START was four controllers pressing
+    // START at once, and the title's title-screen handler fired ProfileChange for pad
+    // 0 and then pad 1 — making PAD 1 the active profile, whose matchmaking object
+    // asks XamUserGetSigninState(1), which is 0 (no such user). Every co-op predicate
+    // downstream refused on it, and no windowed run could have shown it: a real
+    // player presses on one pad. Pads 1-3 report the same connected-idle state the
+    // no-synthetic branch above reports, so the fake arm now differs from a human
+    // only in WHAT pad 0 presses.
+    if (userIndex != 0)
     {
         state->packetNumber = 1;
         return 0;

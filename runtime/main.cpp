@@ -45,6 +45,15 @@
 #include "cpu/fe_probe.h"
 #include "cpu/guest_thread.h"
 #include "cpu/timebase.h"
+
+// The LLVM profiling runtime's flush, resolved only in a -fprofile-instr-generate build
+// (see the SIGTERM handler). Weak, so a normal link leaves it null. GNU-only: the
+// codegen arms are Linux measurements and COFF weak externals are a different mechanism.
+#if !defined(_WIN32)
+extern "C" int __llvm_profile_write_file(void) __attribute__((weak));
+#else
+static int (*const __llvm_profile_write_file)(void) = nullptr;
+#endif
 #include "gpu/shader_prebuild.h"
 #include "gpu/shader_translator.h"
 #include "gpu/vk_renderer.h"
@@ -549,6 +558,12 @@ int main(int argc, char** argv)
             ::GapProbe_Report();
             ::FeProbe_Report();
             ::VkRenderer_SavePipelineCache();
+            // A PGO-instrumented build (-DCW_PPC_PGO=generate, part 116) writes its
+            // profile from an atexit hook, and _Exit skips those — so the first
+            // profiling run produced a 0-byte .profraw. The symbol is weak: absent in
+            // every ordinary build, present only when the profiling runtime is linked.
+            if (__llvm_profile_write_file)
+                __llvm_profile_write_file();
             fflush(nullptr);
             LogFile::Flush(2000);
             std::_Exit(128 + s);
@@ -571,6 +586,9 @@ int main(int argc, char** argv)
     // what makes a run's parallelism visible in its own log rather than inferred from the
     // machine it happened to run on. See runtime/cpu/thread_budget.h.
     ThreadBudget_Report();
+    // CW_GUEST_PIN (part 118): from the process's main thread, before anything spawns,
+    // because affinity is inherited — see thread_budget.cpp.
+    ThreadBudget_PinProcessAway();
 
     // Before any guest code: the title reads the XMA context-array base out of the
     // decoder's register aperture exactly once (sub_8285EDF8) and caches it, so a

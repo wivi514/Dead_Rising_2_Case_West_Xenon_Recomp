@@ -104,6 +104,53 @@ struct GuestThread
     // precisely the open question in finding 38. Returns 0 for an unknown PCR.
     static uint32_t ThreadIdForPcr(uint32_t pcr);
 
+    // Give the HOST thread behind a guest thread id the guest's own name for it
+    // (part 116). The title names its threads from the MAIN thread by id — the
+    // SetThreadName exception's dwThreadID is the created thread's, not -1 — so
+    // the name has to be applied to another thread, which pthread_setname_np can
+    // do given its pthread_t. Registered when the host thread is spawned, so it
+    // cannot lose the race against the parent naming it immediately after
+    // ExCreateThread returns. Returns false when the id is unknown or the platform
+    // cannot name another thread (macOS); the caller logs which.
+    static bool BindHostName(uint32_t threadId, const char* name);
+
+    // CPU seconds consumed so far by the guest thread the title named `name` ("Main
+    // Thread", "Draw Thread"), or a negative number if no thread of that name has been
+    // bound or the platform cannot read another thread's clock. One
+    // pthread_getcpuclockid + clock_gettime; the [fps] line reads it once per window
+    // so the guest's own CPU per frame is on the same line, over the same window, as
+    // the pump's (part 116 — the quantity a guest-side change is measured by).
+    static double CpuSecondsOf(const char* name);
+    // CW_GUEST_PIN (part 118): move the host thread the title just named onto its
+    // reserved core, if the arm reserves one for that name. No-op otherwise.
+    static void PinHostByName(const char* name);
+
+    // WHERE A GUEST THREAD'S NON-CPU TIME GOES (part 116 item 4). The Main Thread's
+    // CPU per frame is 6.5 ms and the wall under CW_VK_NO_DODRAW is 8.1: the gap is
+    // time the thread is NOT running, and every blocking wait it can make goes
+    // through our kernel — a single-object wait, a wait-any poll, a sleep, or the
+    // fence park. Each thread accumulates wall nanoseconds and calls per KIND in a
+    // thread_local the [fps] line reads by thread NAME, once a window, so a run
+    // says "main waits 1.6 ms/frame in 3 multi-object waits" without a tracer.
+    enum WaitKind { kWaitSingle = 0, kWaitMulti, kWaitDelay, kWaitFence, kWaitKinds };
+    struct WaitStats
+    {
+        std::atomic<uint64_t> ns[kWaitKinds];
+        std::atomic<uint64_t> calls[kWaitKinds];
+    };
+    // The CALLING thread's accumulator (registered under its guest tid at Run()).
+    static WaitStats& MyWaitStats();
+    // The accumulator of the thread the title named `name`, or null.
+    static const WaitStats* WaitStatsOf(const char* name);
+    // RAII: one timed wait of `kind` on the calling thread.
+    struct WaitScope
+    {
+        WaitKind kind;
+        uint64_t t0;
+        explicit WaitScope(WaitKind k);
+        ~WaitScope();
+    };
+
     // The calling thread's own kernel object, minted on first use and cached for the
     // life of the thread. Null only if the guest heap cannot satisfy it.
     static GuestThreadSelf* Self();

@@ -65,6 +65,7 @@
 // machine it was derived from and every share handed out are printed once at start-up.
 
 #include <cstdint>
+#include <thread>
 
 // The machine, counted rather than assumed. Both are cached after the first call.
 unsigned ThreadBudget_PhysicalCores();
@@ -111,3 +112,25 @@ void ThreadBudget_Note(const char* pool, unsigned threads, const char* how);
 // per-thread). `CW_NO_LOW_PRIORITY=1` is the same-binary control arm — every call is then
 // a counted no-op. Returns whether the priority actually changed.
 bool ThreadBudget_SetLowPriority(bool low);
+
+// Name the CALLING thread for the profiler and the per-thread census (part 116). Every
+// host thread this runtime spawns inherits its creator's comm at clone time, so once
+// the guest named its main thread "Main Thread" the pump, the guard pool and the
+// pipeline workers all reported as "Main Thread" too, and a thread census could not
+// tell the game's threads from ours. Linux keeps 15 characters; on Windows and macOS
+// this is a no-op (the per-thread readers this exists for are Linux tools).
+void ThreadBudget_NameSelf(const char* name);
+
+// CW_GUEST_PIN (part 118): reserve two physical cores (with their SMT siblings) for the
+// title's Main Thread and Draw Thread. Call PinProcessAway from the process's main
+// thread BEFORE any thread is spawned (affinity is inherited), and PinNamedThread when
+// the title names a thread. Both are no-ops unless the arm is set; see thread_budget.cpp.
+void ThreadBudget_PinProcessAway();
+// Move every thread that is not one of the two pinned ones onto the rest mask; a no-op
+// unless the arm is on. Cheap; called after each pin and once per [fps] window.
+void ThreadBudget_PinSweep();
+// The host thread the title just named (its std::thread handle: pthread_t on POSIX, a
+// HANDLE on Windows), and a thread just spawned by anyone — the latter gets the rest
+// mask, because a spawn inherits its creator's (Linux) or the process's (Windows).
+bool ThreadBudget_PinNamedThread(const char* name, std::thread::native_handle_type h);
+void ThreadBudget_PinRest(std::thread::native_handle_type h);

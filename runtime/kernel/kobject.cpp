@@ -1,6 +1,9 @@
 #include "kobject.h"
 
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <mutex>
 #include <unordered_set>
 
 std::recursive_mutex g_kernelLock;

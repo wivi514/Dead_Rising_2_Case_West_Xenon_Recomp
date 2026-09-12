@@ -39,6 +39,8 @@
 #define STATUS_NOT_IMPLEMENTED        0xC0000002
 #define WAIT_TIMEOUT_INFINITE         0xFFFFFFFFu
 
+struct WaitAnyBlock; // wait-any wake-ups, kobject.h bottom
+
 struct KernelObject
 {
     // NtDuplicateObject shares one host object across handles; NtClose destroys at 0.
@@ -51,6 +53,11 @@ struct KernelObject
         assert(false && "Wait not implemented for this kernel object.");
         return STATUS_TIMEOUT;
     }
+
+    // Wait-any registration (kobject.h, bottom). Default: not supported, so a
+    // wait-any that includes this object falls back to the bounded poll.
+    virtual void AddAnyWaiter(WaitAnyBlock*) {}
+    virtual void RemoveAnyWaiter(WaitAnyBlock*) {}
 };
 
 extern std::recursive_mutex g_kernelLock;
@@ -131,3 +138,31 @@ T* QueryKernelObject(XDISPATCHER_HEADER& header)
     }
     return static_cast<T*>(g_memory.Translate(header.WaitListHead.Blink.get()));
 }
+
+// ---------------------------------------------------------------------------
+// WAIT-ANY WAKE-UPS (part 116 item 4)
+//
+// A wait-ANY over several objects has no single condition variable to park on, so
+// WaitAnyPoll polled the objects and slept 1 ms between polls — "simple and safe;
+// revisit if it shows up hot in a profile". It did: the title's Main Thread makes ~5
+// multi-object waits a frame and spends 1.6-2.6 ms/frame in them ([guestwait]), and
+// every one of them ends up to a millisecond AFTER the object it waited for was
+// signalled, because the sleep quantum is the wake-up resolution. That latency is
+// serial on the guest's critical path.
+//
+// The first version was a process-wide generation counter bumped by every signal —
+// and it measured WORSE (+0.9 ms on the wall, the pump +0.8): every Set in the process
+// woke every parked wait-any, which re-polled all its objects and parked again, a
+// thundering herd whose cache traffic the pump paid for. So the wake is PER OBJECT: a
+// wait-any registers a WaitAnyBlock on each object it waits on, and only a signal on
+// one of THOSE objects bumps that block's generation and notifies its condvar. An
+// object with no registered wait-any waiter pays one empty-vector check under a mutex
+// it already holds. Object kinds that do not register (a file handle, a content
+// enumerator) keep the old 1 ms poll through the bounded wait.
+//
+// The DEFAULT FOLLOWS THE PUMP (part 117): under the two-core pump (gpu/pump_split.h,
+// on by default from six physical cores) the wake is ON — the frame's longest term is
+// then the guest's Main Thread with 2.2 ms of it in this poll, and the pair measured
+// −1.19 ms; on the one-thread pump the 1 ms poll stays the default (the operator's call
+// after part 116: −1.1 ms on the game's floor, +0.3 on that pump-bound frame).
+// CW_WAITANY_WAKE=1 / =0 force either, on either pump.

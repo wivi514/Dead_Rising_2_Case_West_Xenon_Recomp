@@ -1507,6 +1507,7 @@ void ScanForGlyphs(uint8_t* base, bool physOnly)
 
 void DeviceWorker(uint8_t* base)
 {
+    ThreadBudget_NameSelf("cw-kbm-scan");
     // Below the pump and the workers: this thread's work is a memory sweep and a
     // handful of memcpys, none of it on the frame path (part 107).
     ThreadBudget_SetLowPriority(true);

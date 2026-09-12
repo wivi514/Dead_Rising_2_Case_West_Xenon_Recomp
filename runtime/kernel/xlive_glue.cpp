@@ -1,5 +1,7 @@
 #include "xlive_glue.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -8,6 +10,7 @@
 
 #include <xlive/client.h>
 
+#include "content.h"
 #include "klog.h"
 #include "xlive_overlay_glue.h"
 #include "xlive_session.h"
@@ -44,6 +47,40 @@ bool g_started = false;
 
 // CW_XLIVE_ONLINE=1, read once. See CwXlive_SignedInToLive.
 bool g_onlineAllowed = false;
+
+// A GATEWAY DROP IS NOT A SIGN-OUT UNTIL IT HAS LASTED. libxlive's access
+// token expires hourly; the gateway websocket is closed on the expiry,
+// refused once with 401, and reopened a few seconds later once the token is
+// refreshed. The first co-op session ended exactly there: the runtime posted
+// XN_SYS_SIGNINCHANGED on the close, the title re-read XamUserGetSigninState,
+// got 1, logged "HW MM session found account: 0 is not signed in to xbox
+// live!" and closed the session on both machines — every ~60-90 s of play,
+// which had read as a 120 s join timeout in the headless runs. On the
+// console a Live blip that short never reached the title either.
+//
+// So a drop is held for kSigninGraceMs: the title keeps reading 2 and hears
+// nothing; if the gateway is back inside the grace the drop never happened
+// from its point of view; only a drop that outlasts the grace is announced,
+// by the first sign-in read after it expires (a guest thread, like the
+// worker thread the immediate post used). CW_XLIVE_SIGNIN_GRACE_MS=N sets
+// it; 0 restores the immediate post as the control arm.
+std::atomic<long long> g_dropSinceMs{-1};   // -1: no drop pending
+std::atomic<bool> g_dropAnnounced{false};
+
+long long NowMs()
+{
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+long long SigninGraceMs()
+{
+    static const long long v = [] {
+        const char* e = std::getenv("CW_XLIVE_SIGNIN_GRACE_MS");
+        return e && *e ? std::strtoll(e, nullptr, 10) : 30000LL;
+    }();
+    return v;
+}
 
 void PublishGamertag(const std::string& tag)
 {
@@ -114,8 +151,32 @@ void OnEvent(const xlive::Event& event)
         // Live one its own listener handles beside the invite.
         if (g_onlineAllowed)
         {
-            PostGuestNotification(XN_SYS_SIGNINCHANGED, 1);
-            XliveSocial_OnConnectionChanged(xlive::Client::Instance().online());
+            const bool online = xlive::Client::Instance().online();
+            const long long grace = SigninGraceMs();
+            if (grace <= 0)
+            {
+                PostGuestNotification(XN_SYS_SIGNINCHANGED, 1);
+            }
+            else if (!online)
+            {
+                // Hold it. CwXlive_SignedIn keeps answering true meanwhile,
+                // and XamUserGetSigninState announces the drop if it lasts.
+                g_dropAnnounced.store(false);
+                g_dropSinceMs.store(NowMs());
+                KLOG("[xlive] gateway dropped; the title is not told for %lld ms "
+                     "(CW_XLIVE_SIGNIN_GRACE_MS)\n", grace);
+            }
+            else
+            {
+                const long long since = g_dropSinceMs.exchange(-1);
+                const bool announced = g_dropAnnounced.exchange(false);
+                if (since >= 0 && !announced)
+                    KLOG("[xlive] gateway back after %lld ms; inside the grace, the title "
+                         "never heard it drop\n", NowMs() - since);
+                else
+                    PostGuestNotification(XN_SYS_SIGNINCHANGED, 1);
+            }
+            XliveSocial_OnConnectionChanged(online);
         }
         break;
 
@@ -139,8 +200,8 @@ void OnEvent(const xlive::Event& event)
 #else
         XliveSocial_OnInviteReceived(event.invite_id, event.xuid, event.title_id,
                                      event.session_id, /*accept=*/true);
-#endif
         break;
+#endif
 
     case xlive::EventKind::InviteAccepted:
         // The player said yes in the launcher; this is the title's cue.
@@ -182,10 +243,24 @@ void CwXlive_Start(uint32_t titleId)
         return;
     }
 
+    // THE XENONLIVE LAUNCHER IS THE WAY ONLINE (operator decision, v1.1.0). The
+    // launcher signs the player in and starts the game with CW_XLIVE_ONLINE=1
+    // (and CW_XLIVE_COOP=1); a game started any other way is the DEFAULT
+    // PROFILE, offline — libxlive is not even started, so no cached account
+    // leaks in as a gamertag, no achievement is recorded against anyone, and
+    // nothing online can be reached. It used to load the cached identity and
+    // show its gamertag while telling the title it was signed out, which was
+    // neither one thing nor the other.
     if (const char* on = std::getenv("CW_XLIVE_ONLINE"); on && on[0] == '1')
     {
         g_onlineAllowed = true;
         KLOG("[xlive] CW_XLIVE_ONLINE: the title will be told it is signed in to Live\n");
+    }
+    else
+    {
+        KLOG("[xlive] not started through the XenonLive launcher (CW_XLIVE_ONLINE is "
+             "unset): the default profile, offline — no account, no co-op\n");
+        return;
     }
 
     xlive::Options options;
@@ -206,7 +281,15 @@ void CwXlive_Start(uint32_t titleId)
     // the first successful round trip.
     const xlive::Identity identity = xlive::Client::Instance().identity();
     if (identity.xuid != xlive::kOfflineXuid)
+    {
         PublishGamertag(identity.gamertag);
+        // SAVES ARE PER PROFILE (operator decision, v1.1.0): this account's
+        // saves live in its own folder under the saved-games location, named
+        // by the gamertag; the offline default profile keeps "default". Set
+        // here, before any guest code runs, so the title's first save
+        // enumeration already looks in the right place.
+        ContentSetProfile(identity.gamertag);
+    }
 
     KLOG("[xlive] %s\n", xlive::Client::Instance().status().c_str());
 
@@ -227,7 +310,24 @@ void CwXlive_Start(uint32_t titleId)
 
 bool CwXlive_SignedIn()
 {
-    return g_started && xlive::Client::Instance().online();
+    if (!g_started)
+        return false;
+    if (xlive::Client::Instance().online())
+        return true;
+    // Inside a held gateway drop the answer is still yes; past it, the first
+    // reader announces the sign-out the immediate post would have made.
+    const long long since = g_dropSinceMs.load();
+    if (since < 0)
+        return false;
+    if (NowMs() - since < SigninGraceMs())
+        return true;
+    if (!g_dropAnnounced.exchange(true))
+    {
+        KLOG("[xlive] gateway drop outlasted the grace; telling the title it is signed out\n");
+        if (g_onlineAllowed)
+            PostGuestNotification(XN_SYS_SIGNINCHANGED, 1);
+    }
+    return false;
 }
 
 bool CwXlive_SignedInToLive()
