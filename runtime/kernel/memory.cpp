@@ -230,7 +230,9 @@ void Memory::Init()
     //     memory the renderer actually streams (vertex data, textures, the ring).
     // CW_NO_HUGEPAGES=1 is the control arm. The policy is printed so a run's log says
     // which of the two it got.
-    if (!getenv("CW_NO_HUGEPAGES"))
+    if (getenv("CW_NO_HUGEPAGES"))
+        fprintf(stderr, "[mem] MADV_HUGEPAGE: not advised (CW_NO_HUGEPAGES=1, the control arm)\n");
+    else
     {
         const int a = madvise(base + 0x10000, kPhysicalViews[0] - 0x10000, MADV_HUGEPAGE);
         int b = 0;

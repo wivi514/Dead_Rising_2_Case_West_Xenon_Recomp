@@ -384,6 +384,11 @@ bool Start(uint8_t* base, void (*deliverInterrupt)())
             fprintf(stderr, "[split] one-thread pump: %u physical cores / %u logical "
                             "(the default needs 6 physical or 8 logical); CW_PUMP_SPLIT=1 "
                             "forces the two-core pump\n", physical, logical);
+        else
+            // The control arm says so too (gotcha 151): a bisection log with no [split]
+            // line at all cannot be told from a build without the split.
+            fprintf(stderr, "[split] one-thread pump: CW_PUMP_SPLIT=0 (the control arm; "
+                            "%u physical cores would have taken the split)\n", physical);
         return false;
     }
     if (getenv("CW_D3D_DRAW"))
