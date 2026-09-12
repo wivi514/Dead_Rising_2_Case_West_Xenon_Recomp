@@ -3,20 +3,52 @@
 #if CW_HAVE_XLIVE_OVERLAY
 #include <xlive_overlay/overlay.h>
 
+#include <SDL.h>
+
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
+
+// NO CLIENT, NO OVERLAY. Since online became launcher-only (part 12, the sibling's
+// a03a7af) an offline start returns from CwXlive_Start BEFORE SetClient, and the
+// overlay's Render returns false without a client — but its QueueSdlEvent still
+// toggled `open` on Shift+Tab, so the player got an INVISIBLE overlay that owned the
+// pad and the mouse: "I lost control of the game" on the AMD test machine, the first
+// v1.1.0 sitting. Before that change libxlive started on every run, so the overlay
+// always had a client and this could not happen. The seam is here rather than in the
+// launcher repo: the glue knows whether it ever handed a client over.
+static std::atomic<bool> g_haveClient{ false };
 
 bool CwOverlay_QueueSdlEvent(const SDL_Event& e)
 {
+    if (!g_haveClient.load(std::memory_order_acquire))
+    {
+        // Say why, once, on the hotkey the player actually pressed.
+        static bool said = false;
+        if (!said && e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_TAB &&
+            (e.key.keysym.mod & KMOD_SHIFT))
+        {
+            said = true;
+            fprintf(stderr, "[overlay] Shift+Tab ignored: the XenonLive overlay has no client "
+                            "— this game was not started through the XenonLive launcher "
+                            "(offline default profile), so there is nothing to show\n");
+        }
+        return false;
+    }
     return xlive_overlay::Overlay::Instance().QueueSdlEvent(e);
 }
 void CwOverlay_SetWindowSize(int w, int h)
 {
     xlive_overlay::Overlay::Instance().SetWindowSize(w, h);
 }
-bool CwOverlay_Open() { return xlive_overlay::Overlay::Instance().open(); }
+bool CwOverlay_Open()
+{
+    return g_haveClient.load(std::memory_order_acquire) && xlive_overlay::Overlay::Instance().open();
+}
 void CwOverlay_SetClient(xlive::Client* client, uint32_t titleId)
 {
     xlive_overlay::Overlay::Instance().SetClient(client, titleId);
+    g_haveClient.store(client != nullptr, std::memory_order_release);
     // CW_XLIVE_OVERLAY_OPEN=1: start with the overlay open, so a headless run
     // with CW_VK_SWAPCHAIN_DUMP can photograph it without anyone pressing
     // Shift+Tab. A test arm, like every other switch in this runtime.
