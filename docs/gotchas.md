@@ -3264,3 +3264,41 @@ file names, temp paths, window titles, save locations, environment prefixes. The
 compiler renames nothing inside quotes. And when two things must be distinct per
 title, key them on something the title owns (its own name), never on a path component
 both titles happen to spell the same way.
+
+## 326. A SIBLING'S CAPTURE IS NOT THIS TITLE'S CAPTURE, EVEN WHEN THE CODE IS THE SAME — AND A TRANSPLANTED "A1 SHOWS" SENTENCE IS THE SIBLING'S A1
+
+`kernel/imports.cpp` said, above `RtlRaiseException`: "A1 raises 19 exceptions in the
+boot, and Xenia decodes every one of them as SetThreadName — SetThreadName(6, Main
+Thread), (7, cAsyncFileSystem), (8, JobThread0) ... JobThread5 ...". That is Case
+Zero's A1. Case West's A1 — the file in this repo's `Xenia logs/` — has EXACTLY TWO
+such raises, both `HavokWorkerThread` (Havok's library names its own workers; the
+title names nothing). The sentence came across in part 1's transplant and sat there
+for four weeks, unread against the capture it named, because nothing keyed on thread
+names — until part 118's thread placement, the per-thread CPU columns and the wait
+census were imported and all three keyed on exactly those names. First boot: `guest
+main -1.00 draw -1.00`, two of four `[pin]` lines missing, the process confined to
+four cores with the two guest threads that mattered left in the crowd.
+
+Two lessons. **The instrument's spelling of "unbound" saved the day**: −1.00 is a
+number whose absence has a face; had the column read 0.00 or been omitted, the pin
+would have shipped half-engaged with a green log. **And the grep that catches this
+class is cheap**: search transplanted comments for "A1 shows", "the capture says",
+"Xenia decodes" — every one is a claim about a file, and the file is on disk. Run the
+same grep on OUR capture before believing the sentence. Gotcha 3's fourth dress:
+after a tool's constants, a generated config's bounds and a runtime cache path, a
+COMMENT's measurement.
+
+## 327. NAME A THREAD BY WHAT IT DOES, THEN CHECK THE CENSUS — "FIRST TO ARRIVE" IS AN ORDER, NOT AN IDENTITY
+
+The fix for 326 needed the Draw Thread bound to a name without the title's help. The
+first rule tried — "the first guest thread to reach the D3D ring-space wait" — bound
+the MAIN Thread, which reaches that wait during the boot's own D3D setup; a second
+tid (F08) followed; the title's Draw Thread (F34) arrived third. The pin sweep then
+found two host threads under one name and moved both. Identity came from the thread's
+ENTRY POINT (`0x8276FAC8`, the sibling's Draw Thread stub by shape, its body theirs
+instruction for instruction, the second-busiest guest thread of the boot) — a fact
+about WHAT the thread is, not WHEN it showed up. What survives of the wrong rule is a
+one-line-per-tid census of who reaches the wait, so the binding is checkable in every
+log rather than trusted once. Corollary of 322 (identify by what the guest itself
+wrote — here, its `ExCreateThread` argument) and of 151 (an arm needs a counter; a
+binding needs a census).

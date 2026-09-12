@@ -17,14 +17,18 @@ three before it before re-deriving anything:
 - `~/GithubRepo/Asuras_Wrath_Xenon_Recomp` — the second port, which proved the template
   transfers and consolidated the gotchas into a numbered list.
 
-**Multiplayer / co-op is OUT OF SCOPE for now** (operator's call, 2026-08-15). Case
-West's headline feature is two-player co-op and the image is full of it; nothing may
-block single-player on it. `docs/port-plan.md` W7 explains why deferring it is
-low-risk — the import table says so.
+~~**Multiplayer / co-op is OUT OF SCOPE for now** (operator's call, 2026-08-15).~~
+**REVERSED 2026-09-10: co-op over XenonLive is the live work on the `xlive-integration`
+branch** (this port wrote the Live surface — sessions, sockets, QoS, invites, friends,
+the overlay — and the sibling mirrored it; two-machine sessions have been played).
+The record of that work is the XenonLive repo's `docs/co-op.md` and
+`integrating-a-port.md`, not this file. The original deferral note survives for the
+reason it gave: `docs/port-plan.md` W7 — the import table said deferring could not
+introduce an unimplemented import, and it did not.
 
 ## Status — and where a new conversation starts
 
-> **THE LIVE HAND-OFF IS `docs/part11-kickoff.md`.** Read it first in a new conversation:
+> **THE LIVE HAND-OFF IS `docs/part12-kickoff.md`.** Read it first in a new conversation:
 > it says what already exists (so it is not rebuilt), names where to start, and lists the
 > gates that are run and owed. When a part ends, write the next `part<N>-kickoff.md`,
 > demote this pointer to it, and refresh the memory directory.
@@ -33,6 +37,27 @@ low-risk — the import table says so.
 > **`docs/part2-kickoff.md` is superseded** and is kept as the cautionary example: its
 > problem statement was false and part 2 refuted it with the measurement that section
 > itself asked for.
+
+## Status: PART 12 IMPORTED CASE ZERO PARTS 109-118 (2026-09-12) — the two-core pump, thread placement, XenonLive launcher-only
+
+The operator: *"Did a bunch of thing on case zero need you to do it here too."*
+`docs/imported-fixes.md` §13 is the record; `docs/part12-kickoff.md` the hand-off.
+The part-8 three-way merge over CZ `a9e7d95..5102330` (125 commits, 26 conflicts, all
+at kept seams). **New DEFAULTS**: the **two-core PM4 pump** (`gpu/pump_split.cpp`;
+`CW_PUMP_SPLIT=0` control), **thread placement** from 8 physical cores with SMT
+(`CW_GUEST_PIN=0`), the wait-any wake under the split, `MADV_HUGEPAGE`, the log cap
+(256 MB), the trace re-arm fix, guest thread CPU/waits on the `[fps]` line,
+**XenonLive ONLY through its launcher and saves PER PROFILE** (a game started
+without `CW_XLIVE_ONLINE=1` is the offline default profile), the sign-in grace. Two
+guest addresses re-derived with the new **`tools/shape_match.py`** (the Havok pool
+and job-queue constructors, `CW_HAVOK_WORKERS`, stock default). **One measured
+divergence changed code: this title never names its threads** (A1: two
+`SetThreadName` raises, both Havok's, against the sibling's 19), so Main Thread and
+Draw Thread are bound BY IDENTITY — the entry thread and the thread created at
+`0x8276FAC8` — and a transplanted `imports.cpp` comment asserting the sibling's list
+is retracted in place (gotchas 326-327). NOT taken: co-op parts 1-5 (Case Zero adding
+the co-op this title ships with). Owed: the operator's sitting, a co-op session,
+czwin, the old-base build with the static curl, the artifacts.
 
 ## Status: v1.0.0 IS STAGED AND TAGGED — AWAITING PLAYER ISSUES (2026-09-06)
 
@@ -282,7 +307,8 @@ attribution to another, and a name is not a call site.** Both are in
 
 **THE FULL NUMBERED LEDGER IS `docs/gotchas.md` — entries 1–319 copied verbatim from Case
 Zero on 2026-08-15, and every "gotcha N" reference resolves there.** New entries from this
-port continue at **321**; **320 is the first written here rather than inherited.** (An
+port continue at **328**; **320 is the first written here rather than inherited** (320-327
+so far). (An
 earlier version of this paragraph said "315 entries, continue at 316" — the file already ran
 to 319. Gotcha 13 applies to this file too.) Read it **before making a measurement claim,
 adding an instrument, believing a zero, or trusting a number an earlier session wrote down**;

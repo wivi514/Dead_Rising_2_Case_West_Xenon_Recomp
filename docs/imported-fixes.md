@@ -1032,3 +1032,145 @@ per-window numbers would have supported either conclusion. Their own culling evi
 (draws 4,984 -> 5,309 at 43->60°) stands as the mechanism's proof on the sibling.
 
 **Backlog item 1 is closed.** The remaining deferred item is skip-intro-logos.
+
+## §13 — Case Zero parts 109-118 and the co-op release round (2026-09-12, part 12)
+
+| | |
+|---|---|
+| **Imported** | 2026-09-12 (part 12), on the `xlive-integration` branch |
+| **Source** | Case Zero `a9e7d95..5102330` — 125 commits (their parts 109-118 plus the co-op parts 1-5 and the v1.1.0 release round), of which 76 files / ~21,000 lines touch `runtime/` and `tools/` |
+| **Why now** | Operator: *"Did a bunch of thing on case zero need you to do it here too"* |
+| **Method** | The part-8/§8 three-way merge: base = CZ@`a9e7d95` renamed, theirs = CZ@`5102330` renamed, ours = the working tree, `git merge-file` per file. The rename gained three entries the xlive work needed (`CzXlive`→`CwXlive`, `CzOverlay`→`CwOverlay`, `CzLanguage`→`CwLanguage`); the other `Cz*` identifiers (`CzDisplayMode`, `CzGuestFunc`, …) were never renamed here and stay. **26 conflicts in 6 files**, every one at a kept seam (below). The `xlive_*` files were NOT merged that way — they flowed the OTHER direction (this port wrote them; the sibling's "Mirror Case West" commits copied them) — so for those the sibling's renamed HEAD was diffed straight against ours and the three deltas taken by hand |
+| **Re-measured here?** | Engagement of every default and every control arm, one headless boot each (below); **two guest-address re-derivations by a new tool** (`tools/shape_match.py`, positive-controlled on two of §8's pairs); and **one measured divergence from the sibling that changed the code** — this title does not name its threads |
+
+### What came across, and what proved it here
+
+| fix / feature | source | state on this image | gate run here |
+|---|---|---|---|
+| **`cw_runtime.log` capped at 256 MB** (166 GB of it reached a player's disk there) | `3500a64` | Present, shared code. `CW_LOG_MAX_MB=N` raises, `=0` removes | Build; the cap line is the sibling's, not exercisable in a 40 s boot (136 KB) |
+| **A disabled trace re-armed itself after 2^31 draws and halved the frame rate** | `0dc554a` | Present, shared code — the same signed counter was here | Build |
+| **THE TWO-CORE PUMP** (`gpu/pump_split.{h,cpp}`): the PM4 walk stays on `cw-pump`; draws, stores, swaps, interrupts and first-sight shader binds execute in stream order on `cw-draw` from ONE ordered stream against a replica register file. **ON by default from 6 physical cores or 8 logical CPUs** | `2ec17a9` `51807ff` `c4798e9` `f870eac` `4d761bf` | Present. New file, no per-title content (PM4 level). `CW_PUMP_SPLIT=0` is the one-thread control — **and it now announces itself** (the sibling's forced-off arm printed nothing; a bisection log with no `[split]` line could not be told from a build without the split) | `[split] two-core pump by default (8 physical cores)…`; per-frame `[split]` census; `[fps]` gains `walk cpu`. `CW_PUMP_SPLIT=0`: `[split] one-thread pump: CW_PUMP_SPLIT=0 (the control arm…)`, `walk cpu -1.00` |
+| **Wait-any wakes per OBJECT, on the signal** instead of a 1 ms poll; **ON under the split**, the poll on the one-thread pump | `de0fd3c` `35ec03a` `f674b3d` | Present (`kobject.h` grows `AddAnyWaiter`/`RemoveAnyWaiter`; Event/Semaphore notify their parked wait-anys). `CW_WAITANY_WAKE=1/0` forces either | Build; boots on both arms |
+| **The spin before the park** (`CW_WAIT_SPIN_US`, their item 4 — built, measured, KILLED, knob kept at 0) | `59fc0a9` | Present at 0 | Build |
+| **THREAD PLACEMENT** (`CW_GUEST_PIN`): Main Thread, Draw Thread, `cw-pump`, `cw-draw` each on a physical core with its SMT sibling kept empty, everything else confined to the other four; a `/proc/self/task` sweep catches inherited masks. **ON by default from 8 physical cores with SMT** | `28ca89c` `a6d2c22` `30f4415` `0f726ff` | **Present — but it could not engage as imported. See the divergence below.** `CW_GUEST_PIN=0` control | `[pin] thread placement mode 2 …`, `[pin] 'Main Thread' -> cpu 15 (ok)`, `[pin] 'Draw Thread' -> cpu 14 (ok)`, `'cw-pump' -> 13`, `'cw-draw' -> 12`; `CW_GUEST_PIN=0` prints `thread placement OFF` |
+| **Guest threads named on the host; their CPU per frame and their waits on the `[fps]` line** (`guest main N draw N ms/frame`, the `[guestwait]` census by kind, `CW_WAIT_CALLERS=1` by guest caller) | `fc60b48` `b01756e` `68f521e` | Present — with the same divergence: the names are bound by IDENTITY here | `guest main 7.84 draw 4.09 ms/frame`; `[guestwait] … draw: multi 5.61/2.0 fence 0.14/4.6` — the sibling's three-stage shape |
+| **`CW_HAVOK_WORKERS=N`** — the title's Havok pool size hooked at its two constructors (stock 2; 4 measured there and KILLED: Main CPU −0.21 but waits +0.5, wall +0.46) | `d60a79e` | **Both constructors RE-DERIVED** (`cpu/havok_threads.cpp`): pool ctor `sub_828B9E70` (theirs `sub_828B5B60`, 155 instrs, 1.000, unique), job-queue ctor `sub_828B1CD0` (theirs `sub_828ADA60`, 309, 1.000, unique); the ONE caller of both is the physics init `sub_8282D6F0` with the same `li r30,3` / `li r29,2` at +0x68/+0xB0; **0 struct-offset differences** (the only immediate diffs are vtable `lis/addi` pairs). Stock default | `[havok] thread pool: 2 workers (stock)`; `CW_HAVOK_WORKERS=4`: `thread pool: 4 workers (stock 2)` + `job queue: 5 cpu threads (stock 3)` |
+| **`MADV_HUGEPAGE` on the guest map** (the views need root's `shmem_enabled=advise`) | `c4798e9` | Present. `CW_NO_HUGEPAGES=1` control — **now announces itself** | `[mem] MADV_HUGEPAGE: private range advised, physical views advised \| THP policy: always [madvise] never \| shmem: … [never]` — so on this box the private range takes it and the views do not, as there |
+| **`ProfScope`'s off-check inlined**; the phase profiler states its own coverage; the pump's CPU per frame on the `[fps]` line; `CW_VK_NO_DODRAW=1` (the serial-floor probe); `-DCW_WHOLEFUNC=1` sampled whole-function timers | `c4798e9` `ee616d2` `c1c8b1d` `514be3b` | Present, shared renderer code | `pump cpu 7.04 ms/frame (72% of a core)` on every `[fps]` line |
+| **Part 109-111 opt-ins**: per-fetch-slot texture memo (`CW_VK_TEXMEMO=1`, −0.33 ms there, under its kill rule), scoped shared-constant zero (`CW_VK_SCOPED_SHARED_ZERO=1`, −0.21), the pre-zero worker (`CW_VK_PREZERO`), the pardraw census, the AVX2 register-run swap **built, gated and REVERTED there** (`03823a3` — the line was never the byte swap) | `e0f30b7` `6c9d045` `1bc3e07` `9aa3591` `4a64839`/`03823a3` | Present, all OFF by default as there | Build |
+| **`CW_VK_GUARD_NTA=1`** (prefetchnta ahead of the content guard's fold — a null there) | `e6e31da` | Present, OFF | Build |
+| **Codegen arms on the recompiled TUs** (`-DCW_PPC_OPT`, `-DCW_PPC_PGO`, `-DCW_PPC_LTO` — LTO and -O3 measured as nulls there) and the PGO flush hook (GNU-only) | `b01756e` `3be52ca` | Present, OFF | Configure |
+| **XenonLive ONLY through its launcher, and saves PER PROFILE** (operator decision, their v1.1.0): a game started without `CW_XLIVE_ONLINE=1` is the default profile, offline — libxlive is not even started; a signed-in account's saves live in `<SavedGames>/<gamertag>/`, the offline default keeps the root | `a03a7af` | Present (`xlive_glue.cpp`, `content.cpp` `ContentSetProfile`). **Behaviour change for this port**: it used to load the cached identity and show its gamertag while telling the title it was signed out | `[kernel] [xlive] not started through the XenonLive launcher (CW_XLIVE_ONLINE is unset): the default profile, offline — no account, no co-op` |
+| **A gateway drop is not a sign-out until it has lasted** (30 s grace; the token's hourly refresh closed the first co-op session on both machines) | `33dd91c` | Present (`xlive_glue.cpp`). `CW_XLIVE_SIGNIN_GRACE_MS=0` is the immediate-post control | Build; a co-op session of over an hour is the behavioural gate — **owed** |
+| **The friends-only session search filter** (`XliveSession_SetSearchHostFilter`) | `3646327` | Present and **inert**: its caller is their `coop_friends.cpp`, a Case Zero screen. Kept so the file stays byte-identical to the sibling's | — |
+| **Both release legs carry XenonLive** — static libcurl+OpenSSL built in the old-base container (the launcher's recipe; distributions disagree about libcurl's symbol versioning), the overlay checkout mounted and REQUIRED, curl-for-win's DLL beside the Windows exe, the licence rows | `823a3b8` `767b009` `c23138a` | Present, renamed. `C:\cw\curl` is the sibling's own path too (the curl lives in this port's tree on czwin) | **NOT run** — the next artifact build's first step |
+| `.gitignore`: every `runtime/build-*/` and `*.configure.log` | `b86f6cc` | Present | — |
+| The part-109/110/116/117/118 probe and campaign scripts, `phase_vs_perf.py`, `read_crowd.py`, `func_strings.py`, `tools/windows/crowd_ab.ps1` | various | Present, renamed, **untested here** — most drive the crowd route, which is stale on this port (§8) | — |
+
+### THE DIVERGENCE: this title does not name its threads
+
+The sibling's placement, per-thread CPU columns and wait census all key on the names
+the TITLE gives its threads through the `SetThreadName` exception (`RtlRaiseException`
+with code `0x406D1388`): "Main Thread", "Draw Thread", "JobThread0..5",
+"cAsyncFileSystem". Case Zero's A1 capture has 19 such raises. **Case West's A1 has
+exactly two, both `HavokWorkerThread`** (Havok names its own workers; the title names
+nothing), and a boot here prints the same two. So the first boot after the merge read
+
+```
+[pin] 'cw-pump' -> cpu 13, 'cw-draw' -> cpu 12          (and no Main/Draw line)
+[fps] … guest main -1.00 draw -1.00 ms/frame
+```
+
+— the process confined to four cores with the two guest threads that matter left in
+the crowd. And a comment in our own `imports.cpp` said "A1 raises 19 exceptions …
+SetThreadName(6, Main Thread)": **a Case Zero sentence transplanted in part 1 and
+never re-measured here** (gotcha 3 in a new dress; the comment is corrected in place).
+
+The names are now bound BY IDENTITY, with the log line saying so:
+
+* **Main Thread** = the thread that runs the XEX entry point. `GuestThreadParams`
+  gained `hostName`; `main.cpp` passes "Main Thread"; `GuestThread::Run` binds it
+  after registering the host thread. `[kernel] thread named 'Main Thread' guest
+  tid=00000F00 (by IDENTITY — this title never names it)`.
+* **Draw Thread** = the guest thread created with entry `0x8276FAC8`. Derived, not
+  guessed: the sibling's Draw Thread (their tid F34, named by the title) starts at
+  `0x827D3B40`, a 9-instruction stub whose shape matches `0x8276FAC8` here uniquely,
+  and the body it calls — `sub_8276F820`, their `sub_827D3898` — agrees instruction
+  for instruction over its whole length and reads the same `+0x9b0` their Main
+  Thread's frame-boundary wait keys on. It is also the CPU's answer: the
+  second-busiest guest thread of a boot (our tid F34 as well, 60% of the Main Thread's
+  time). `ExCreateThread` sets the name at creation.
+* **A first attempt was wrong and is recorded**: "the first guest thread on the D3D
+  ring-space wait" bound the MAIN Thread, which reaches that wait during the boot's
+  own D3D setup; the title's Draw Thread arrived third (F00, F08, F34). The pin sweep
+  then chased two threads under one name. What survives of that attempt is a
+  one-line-per-tid census in `fence_wait.cpp` of who actually reaches the ring-space
+  wait (`[fencewait] guest tid 00000F34 reached the D3D ring-space wait (the Draw
+  Thread)`), so the binding is checkable against behaviour in every log.
+
+With both bound, the `[fps]` line reads the sibling's shape at the title screen's
+attract demo (~5,700 draws, ~100 fps): `guest main 7.84 draw 4.09 ms/frame`,
+`[guestwait] … main: single 0.07/5.9 multi 0.82/5.0 fence 0.00/1.0 | draw: multi
+5.61/2.0 fence 0.14/4.6` — Main busy, Draw waiting on Main.
+
+### Kept seams (where the 26 conflicts were)
+
+`CMakeLists.txt` (their source list names `boot_skip`, `shadow_distance`, `pc_options`,
+`guest_probe`, `debug_tunables`, `online_log`, the seven `coop_*` — none taken);
+`vk_renderer.cpp` (the golden texture store and `pit_gravel_tex.h`, never taken);
+`imports.cpp` (the `KobjActivity`/`CW_KOBJ_DUMP` bookkeeping — their part-99/100
+boot-hang probe, declined in §11 and declined again: the wait-any and spin blocks
+were taken WITHOUT the `act.*` lines; the four address blocks and comments that are
+this port's own); `import_stubs.cpp` (generated, ours: 247 imports); `window.cpp`
+(the 458-tall nine-row launcher); `overlay_gen.cpp` (**resolved to OURS entirely** —
+every change there is the co-op DATA patch, below).
+
+### Not imported from this range, and why
+
+* **Co-op parts 1-5** (`coop_host/join/friends/call/transport/outfit.cpp`,
+  `online_log.cpp`, `patch_coop_menu.py`, `patch_coop_outfit.py`, the overlay_gen
+  co-op data). Case Zero shipped without co-op and those parts ADD it: a data-patched
+  JOIN CO-OP GAME row, a JoinGame screen driven from the host side, the partner's
+  missing chest piece, a connection-listener site their release byte NULLs. **Case
+  West ships with co-op** — its own menus, its own join flow, its own outfits — and
+  its Live surface is the ORIGIN of theirs (their commits say "as in Case West"; their
+  `coop-plan.md` closes with *"For Case West this whole doc's shape transfers — it
+  already got past step 3"*). Their `online_log.cpp` is the twin of our
+  `guest_log.cpp` (`CW_GUEST_LOG=1`). What a Case West co-op session may still want
+  from that range is the sign-in grace — taken.
+* **`kBoardView`** in `xlive_stats.cpp`: theirs is 4, ours stays 1 — a per-title
+  leaderboard view id, each measured on its own title.
+* **`imports.cpp.orig`** — a merge artefact they committed.
+* `part47_gates.sh`, `part50_thread_cpu.py`, `part53_symbols.py` — Case Zero tools that
+  predate the range and were never here.
+
+### Measured here, and what was NOT
+
+* **Every default and every control arm engaged** in a headless boot at 16:9, on this
+  box (Ryzen 7 5700, 8c/16t): the lines in the table.
+* **RETRACTED IN PLACE — "the attract demo is a crowd".** Three of the engagement
+  boots reached a ~5,000-6,000-draw scene (pump 7 ms/frame, Main 7.8 ms) about 50 s
+  in, and this section first called it an attract demo the title plays on its own.
+  It is not: those boots ran in the FOREGROUND with the window focused (`mouse camera
+  CAPTURED`) and an Xbox controller attached, and their kcall trace has
+  `XamShowDeviceSelectorUI` — PRESS START was accepted, so the scene past it was
+  reached by INPUT (a pad at the desk or a click on the focused window), not by the
+  title. The four background A/B runs, identical env, sat at the title screen's 751
+  draws for 110 s. **There is still no crowd this port can reach headlessly**; the
+  soak route is stale (§8) and this was a presence read off the wrong cause — the
+  mirror image of gotcha "an absence is about what was looked at". The per-thread
+  numbers quoted above are still real measurements of that scene; only the claim
+  about how it was reached is withdrawn.
+* **The frame-time verdict is the sibling's**, not this port's: −1.19 ms wall median at
+  their crowd (split), a further −0.5 ms per stage (pin), operator-verified there
+  ("feels smoother, above 100 fps almost all the time"). **No admissible A/B was
+  obtained here**: the six background runs (three a side, new defaults vs
+  `CW_PUMP_SPLIT=0 CW_GUEST_PIN=0 CW_WAITANY_WAKE=0`) all stayed at the title screen
+  (~751 draws, ~2.5 ms), where the pump is 1.3 ms of a core and there is nothing for
+  a second core or a placement to move; `docs/part12-kickoff.md` §2c records the
+  title-screen numbers for what they are. The crowd verdict is owed to the operator's
+  sitting.
+* **Windows**: the placement's Windows spelling and the thread clocks came across
+  (`a6d2c22`, `30f4415`, `0f726ff`) but the czwin compile is **owed**.
+* **The old-base build with the static curl** is **owed** — it is the next artifact
+  build.
