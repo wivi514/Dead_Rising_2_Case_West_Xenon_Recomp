@@ -14,8 +14,23 @@ namespace
 
 struct State
 {
+    // THE STEAM DECK VARIANT (v1.0.2-steamdeck, CW_DECK=ON). Every Deck model — LCD
+    // and OLED — has a 1280x800 panel, so that is the shipped default here rather than
+    // the desktop build's 1280x720 windowed one, and the window is fullscreen-desktop
+    // because a Deck has no desktop to be a window on. 1280x800 is exactly the narrowest
+    // aspect Settings_ValidInternalRes admits (w*10 >= h*16), so it is a rung the panel
+    // and the launcher ladder already offer on this hardware, not a new special case.
+    //
+    // These are DEFAULTS, not pins. The moment the in-game options screen writes
+    // cw_settings.txt that file wins, exactly as on a desktop build — a player who
+    // wants 720p to buy frame rate still gets it, and keeps it.
+#ifdef CW_DECK_DEFAULTS
+    CzDisplayMode displayMode = CzDisplayMode::Borderless;
+    uint32_t resW = 1280, resH = 800;   // the INTERNAL resolution (primary since rev 3)
+#else
     CzDisplayMode displayMode = CzDisplayMode::Windowed;
     uint32_t resW = 1280, resH = 720;   // the INTERNAL resolution (primary since rev 3)
+#endif
     uint32_t renderScale = 1;           // legacy mirror, kept in sync for old readers
     bool vsync = false;         // false = MAILBOX (the part-54 default), true = FIFO
     int shadowTier = 2;         // the title rendered at full shadow resolution until now
@@ -108,8 +123,20 @@ void Settings_Load(const std::string& path)
     FILE* f = fopen(path.c_str(), "r");
     if (!f)
     {
-        fprintf(stderr, "[settings] no %s yet — using defaults (windowed, 1280x720, "
-                        "vsync off, shadow high)\n", path.c_str());
+        // Printed FROM the defaults rather than as a fixed string: this line said
+        // "windowed, 1280x720" whatever the build's defaults actually were, and a
+        // variant build (CW_DECK) would have had it stating the wrong resolution on
+        // the one run where the player has nothing else to read.
+        // Four entries for a three-value enum: the index is masked, so the unused
+        // slot is what keeps a future fourth mode from reading off the end here.
+        static const char* const kModeName[4] = { "windowed", "borderless fullscreen",
+                                                  "fullscreen", "?" };
+        fprintf(stderr, "[settings] no %s yet — using defaults (%s, %ux%u, "
+                        "vsync %s, shadow %s)\n", path.c_str(),
+                kModeName[int(g_state.displayMode) & 3], g_state.resW, g_state.resH,
+                g_state.vsync ? "on" : "off",
+                g_state.shadowTier == 2 ? "high" : g_state.shadowTier == 1 ? "medium"
+                                                                          : "low");
         return;
     }
     char line[256];

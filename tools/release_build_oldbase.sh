@@ -111,6 +111,20 @@ RUN=(podman run --rm -i
      -e CW_OLDBASE_SKIP_DEPS="${CW_OLDBASE_SKIP_DEPS:-}"
      -e TAR_OPTIONS=--no-same-owner
      -e CW_OLDBASE_INSIDE=1
+     # THE VARIANT SWITCHES (v1.0.2-steamdeck). Every one is empty on a normal release
+     # build, and an empty value reproduces the desktop artifact exactly — the variant
+     # adds a path, it does not change this one. CW_BUILD_TAG keeps the two variants'
+     # build trees apart so a Deck build cannot clobber the desktop one's .text and
+     # quietly invalidate its identity gate.
+     -e CW_DECK="${CW_DECK:-}"
+     -e CW_BUILD_TAG="${CW_BUILD_TAG:-}"
+     -e CW_PKG_SUFFIX="${CW_PKG_SUFFIX:-}"
+     -e CW_PKG_TARGZ="${CW_PKG_TARGZ:-}"
+     -e CW_PKG_NO_LAUNCHER="${CW_PKG_NO_LAUNCHER:-}"
+     -e CW_PKG_SYSTEM_CXX="${CW_PKG_SYSTEM_CXX:-}"
+     -e CW_PKG_README="${CW_PKG_README:-}"
+     -e CW_PKG_OUT="${CW_PKG_OUT:-}"
+     -e CW_PKG_EXTRA_DEFAULTS="${CW_PKG_EXTRA_DEFAULTS:-}"
      -w "$ROOT" "$IMAGE")
 
 if [ "${1:-}" = "--shell" ]; then
@@ -165,20 +179,29 @@ cfg() {
         -DXENOS_ROOT="$XENOS_ROOT" -DXENON_ROOT="$XENON_ROOT" -DXENON_BUILD="$XB" \
         -DXLIVE_ROOT="$XLIVE_ROOT" -DCMAKE_PREFIX_PATH="$OB/curl" -DOPENSSL_USE_STATIC_LIBS=ON \
         -DXLIVE_LAUNCHER_ROOT="$XLIVE_LAUNCHER_ROOT" -DCW_XLIVE_OVERLAY=ON \
+        -DCW_DECK="${CW_DECK:-OFF}" \
         > "$1.configure.log" 2>&1 || { tail -30 "$1.configure.log"; exit 1; }
     grep -q "XenonLive overlay: on" "$1.configure.log" || { echo "FAIL: the overlay did not configure ON"; exit 1; }
 }
-echo "==> configuring + building runtime/build-release-oldbase (Release)"
-cfg runtime/build-release-oldbase Release
-cmake --build runtime/build-release-oldbase -j"$(nproc)" 2>&1 | tail -2
+# Empty on a normal release build, so the tree names below are the ones they have
+# always been; set for a variant so the two cannot share a build directory.
+TAG=${CW_BUILD_TAG:-}
+REL=runtime/build-release-oldbase$TAG
+MATCH=runtime/build-relmatch-oldbase$TAG
+echo "==> configuring + building $REL (Release)"
+cfg "$REL" Release
+cmake --build "$REL" -j"$(nproc)" 2>&1 | tail -2
 echo "==> the matched RelWithDebInfo build for the identity gate (same toolchain)"
-cfg runtime/build-relmatch-oldbase RelWithDebInfo
-cmake --build runtime/build-relmatch-oldbase -j"$(nproc)" 2>&1 | tail -2
+cfg "$MATCH" RelWithDebInfo
+cmake --build "$MATCH" -j"$(nproc)" 2>&1 | tail -2
 echo "==> tools/release_text_identity.sh (build type is a null on THIS toolchain)"
-tools/release_text_identity.sh runtime/build-relmatch-oldbase runtime/build-release-oldbase
+tools/release_text_identity.sh "$MATCH" "$REL"
 
 echo "==> packaging (ldd resolved INSIDE the old base, so the bundled libstdc++ is the base's)"
-tools/release_package_linux.sh runtime/build-release-oldbase dist
+# A variant packages into its OWN dist directory: the stage is $OUT/CaseWestRecomp in
+# both cases (players should find the same folder name inside either archive), so sharing
+# an $OUT would have one build silently overwrite the other's staged tree.
+tools/release_package_linux.sh "$REL" "${CW_PKG_OUT:-dist}"
 IN
 
 echo

@@ -2431,6 +2431,30 @@ bool Host_WindowInit()
     {
         uint32_t rw = 0, rh = 0;
         Settings_InternalRes(rw, rh);
+        // ...but CW_VK_RES pins the resolution the RENDERER will use, and it beats the
+        // settings file there (vk_renderer.cpp's InternalRes says so out loud). Read it
+        // here too, or the two disagree: the Steam Deck bundle ships CW_VK_RES=1280x800
+        // in cw_defaults.env, and on a box that also had a settings file from a desktop
+        // install this line opened a 3012x1260 window and announced it as being "for
+        // internal resolution 3440x1440" while the renderer rendered 1280x800 into it.
+        //
+        // Only the explicit WxH form is read. CW_VK_RES_SCALE is deliberately not: it is
+        // a measurement arm, its consumer owns the fallback order, and a second parser
+        // for it here would be a second place to drift. The VALIDATOR is the shared one,
+        // which is the half that matters — a string this refuses is a string the
+        // renderer refuses too.
+        const char* resPin = getenv("CW_VK_RES");
+        if (resPin)
+        {
+            uint32_t pw = 0, ph = 0;
+            if (sscanf(resPin, "%ux%u", &pw, &ph) == 2 && Settings_ValidInternalRes(pw, ph))
+            {
+                rw = pw;
+                rh = ph;
+            }
+            else
+                resPin = nullptr; // the renderer will refuse it too, and say so there
+        }
         if (rw && rh)
         {
             int tw = int(rw), th = int(rh);
@@ -2448,7 +2472,8 @@ bool Host_WindowInit()
             startW = tw;
             startH = th;
             fprintf(stderr, "[host] windowed: opening at %dx%d for internal resolution "
-                            "%ux%u%s\n", startW, startH, rw, rh,
+                            "%ux%u%s%s\n", startW, startH, rw, rh,
+                    resPin ? " (pinned by CW_VK_RES)" : "",
                     (startW != int(rw) || startH != int(rh)) ? " (clamped to the display's usable bounds)" : "");
         }
     }

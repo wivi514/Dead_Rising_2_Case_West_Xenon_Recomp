@@ -10,9 +10,14 @@ run turns it into everything else it needs.
 
 **The port is essentially complete**: the single-player game is playable start to
 finish and should look right in nearly all places. A few minor known issues remain;
-none block progress. **Two-player co-op is not supported** — Case West's co-op is
-online-only on the 360 and this port is single-player (Frank still appears in the
-story as the game directs).
+none block progress. **Two-player online co-op works (v1.1.0)** through the game's
+own co-op menus, over [XenonLive](https://github.com/wivi514/XenonLive): start the
+game from the [XenonLive launcher](https://github.com/wivi514/XenonLive_Launcher) and
+you are signed in — gamertag, achievements, friends, co-op, and Shift+Tab for the
+in-game overlay. Started any other way, the game is the **offline default profile**:
+single-player, no account. **Saves are per profile** — each XenonLive account has its
+own save folder under the saved-games location below, named by gamertag; the offline
+default profile keeps the folder you already have.
 
 ## Requirements
 

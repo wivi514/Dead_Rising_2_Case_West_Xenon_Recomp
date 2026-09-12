@@ -34,6 +34,18 @@ BUILD=${1:-$ROOT/runtime/build-release}
 OUT=${2:-$ROOT/dist}
 NAME=CaseWestRecomp
 STAGE=$OUT/$NAME
+# THE VARIANT KNOBS (v1.1.0-steamdeck, Case Zero's v1.0.2-steamdeck). All default to the
+# desktop artifact's behaviour, so an unset environment produces exactly the archive this
+# script has always produced — the variant is additive and the normal release path is
+# untouched.
+#   CW_PKG_SUFFIX      archive name suffix; empty = "linux-x86_64"
+#   CW_PKG_TARGZ=1     write .tar.gz instead of .tar.zst (a Deck extracts .gz by
+#                      double-click in Dolphin; zstd needs a terminal)
+#   CW_PKG_NO_LAUNCHER=1   cw_defaults.env says CW_LAUNCHER=0
+#   CW_PKG_SYSTEM_CXX=1    do NOT bundle libstdc++/libgcc_s (see the bundling block)
+#   CW_PKG_README=path     ship this README.md instead of tools/release/README.md
+#   CW_PKG_EXTRA_DEFAULTS  extra KEY=VALUE lines appended to cw_defaults.env
+PKG_SUFFIX=${CW_PKG_SUFFIX:-linux-x86_64}
 # Where the ffmpeg source and the SDL2 prefix are: the host scripts' defaults, or wherever
 # tools/release_build_oldbase.sh put them for a container build (it exports both).
 FFWORK=${CW_FFMPEG_WORK:-/var/tmp/cw-ffmpeg-build}
@@ -94,6 +106,18 @@ cp "$BUILD/cw_runtime" "$STAGE/"
 # player reports a missing library; ldd cannot drift.
 echo "==> bundling libraries"
 BUNDLE_RE='libSDL2|libavcodec|libavutil|libstdc\+\+|libgcc_s'
+# CW_PKG_SYSTEM_CXX=1 — leave the C++ runtime to the system. Bundling libstdc++ puts our
+# copy on $ORIGIN/lib, and because cw_runtime links it directly it is ALREADY LOADED under
+# that soname by the time SDL dlopens the GL driver — so Mesa gets OUR libstdc++ instead of
+# the distribution's, whatever the distribution's is. On the dev box that never shows,
+# because its GL driver is NVIDIA's and does not link libstdc++ at all; on an AMD box
+# (radeonsi, RADV) Mesa is C++ and does. The bundled copy is the base's GLIBCXX_3.4.30.
+# Dropping it is only safe where the target's own libstdc++ is NEWER — true of SteamOS,
+# not true in general, which is why this is a variant switch and not the default.
+if [ -n "${CW_PKG_SYSTEM_CXX:-}" ]; then
+    BUNDLE_RE='libSDL2|libavcodec|libavutil'
+    echo "    CW_PKG_SYSTEM_CXX: libstdc++ and libgcc_s are NOT bundled (system's are used)"
+fi
 ldd "$BUILD/cw_runtime" | awk '/=>/ {print $3}' | grep -E "$BUNDLE_RE" | while read -r so; do
     [ -f "$so" ] || continue
     # Copy the real file AND recreate the SONAME symlink, because the DT_NEEDED entry
@@ -159,7 +183,7 @@ directory; the unpacked files are written to ../game/ on first run.
 TXT
 
 cp "$ROOT/LICENSE" "$STAGE/"
-cp "$ROOT/tools/release/README.md" "$STAGE/"
+cp "${CW_PKG_README:-$ROOT/tools/release/README.md}" "$STAGE/README.md"
 
 # THE PRE-WARM SEED (part 85): pipeline keys from an operator playthrough, read by
 # the renderer only when the player has no per-user key file yet — i.e. exactly once,
@@ -212,12 +236,19 @@ echo "    kbm_chips/                      26 key-cap prompt icons (our art)"
 # every renderer claim. A player gets the opposite default from this file, which
 # main.cpp applies only for variables the environment leaves unset — so the shipped
 # binary stays byte-identical to the dev one and CW_VKDRAW=0 still works.
-cat > "$STAGE/cw_defaults.env" <<'ENV'
+cat > "$STAGE/cw_defaults.env" <<ENV
 # Defaults for a shipped build. KEY=VALUE, one per line, # comments.
 # Anything set in your environment overrides these.
 CW_VKDRAW=1
-CW_LAUNCHER=1
+CW_LAUNCHER=$([ -n "${CW_PKG_NO_LAUNCHER:-}" ] && echo 0 || echo 1)
 ENV
+# Variant lines, appended rather than templated in, so the base file above stays the one
+# thing every artifact ships and a variant can only ADD to it.
+if [ -n "${CW_PKG_EXTRA_DEFAULTS:-}" ]; then
+    printf '%s\n' "$CW_PKG_EXTRA_DEFAULTS" >> "$STAGE/cw_defaults.env"
+    echo "    cw_defaults.env carries variant lines:"
+    printf '%s\n' "$CW_PKG_EXTRA_DEFAULTS" | sed 's/^/        /'
+fi
 
 # THIRD_PARTY.md, GENERATED (release-plan E.3). Written from what the binary actually
 # links so it cannot drift away from the artifact it describes — an attribution file
@@ -277,13 +308,21 @@ fi
 
 echo "==> archive"
 mkdir -p "$OUT"
-TAR=$OUT/$NAME-linux-x86_64.tar.zst
+if [ -n "${CW_PKG_TARGZ:-}" ]; then
+    TAR=$OUT/$NAME-$PKG_SUFFIX.tar.gz
+else
+    TAR=$OUT/$NAME-$PKG_SUFFIX.tar.zst
+fi
 rm -f "$TAR"
 # Part 105: the runtime writes cw_runtime.log (and --diag writes cw_diag.txt) beside its
 # data root, which for the stage IS the stage — so a gate that ran the staged exe leaves
 # a log in it, and a re-package after a gate would ship someone's log. Never archive one.
 rm -f "$STAGE"/cw_runtime.log "$STAGE"/cw_runtime.log.1 "$STAGE"/cw_diag.txt "$STAGE"/cw_diag.txt.1
-tar --zstd -cf "$TAR" -C "$OUT" "$NAME"
+if [ -n "${CW_PKG_TARGZ:-}" ]; then
+    tar -czf "$TAR" -C "$OUT" "$NAME"
+else
+    tar --zstd -cf "$TAR" -C "$OUT" "$NAME"
+fi
 sha256sum "$TAR" > "$TAR.sha256"
 
 printf '    %s  %s MB\n' "$(basename "$TAR")" "$(( $(stat -c%s "$TAR") / 1024 / 1024 ))"

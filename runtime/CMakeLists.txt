@@ -683,6 +683,23 @@ if(CW_BUNDLE_RPATH AND NOT WIN32)
         INSTALL_RPATH "\$ORIGIN/lib")
 endif()
 
+# CW_DECK — the Steam Deck variant of the release artifact (v1.0.2-steamdeck).
+#
+# It changes exactly one thing in the binary: the settings store's DEFAULTS, used only
+# on a run that finds no cw_settings.txt (1280x800 fullscreen-desktop, the Deck's native
+# panel on every model, instead of 1280x720 windowed). Everything else that makes the
+# Deck artifact different — no launcher, no bundled libstdc++ — lives in the packaging,
+# not here, so the two halves can be reverted independently.
+#
+# It is OFF by default and must stay that way: the desktop artifact's binary is gated on
+# a .text identity comparison, and a variant that quietly became the default would move
+# the defaults of every build in the project.
+option(CW_DECK "Steam Deck variant: native-resolution settings defaults" OFF)
+if(CW_DECK)
+    message(STATUS "CW_DECK: settings defaults are 1280x800 fullscreen-desktop")
+    target_compile_definitions(cw_runtime PRIVATE CW_DECK_DEFAULTS)
+endif()
+
 if(CW_SPLIT_DEBUG)
     find_program(CW_OBJCOPY NAMES llvm-objcopy objcopy)
     if(NOT CW_OBJCOPY)

@@ -14,8 +14,11 @@ keyboard/mouse support.
 > to finish** — it has been completed end to end — and should look right in
 > nearly all places. Verified on both NVIDIA and AMD, on Windows and Linux. A
 > few minor issues remain (listed below); none block progress.
-> **Two-player co-op is not supported**: Case West's co-op is online-only on the
-> 360, and this port plays the single-player game.
+> **Two-player online co-op works (v1.1.0)** over
+> [XenonLive](https://github.com/wivi514/XenonLive), through its
+> [launcher](https://github.com/wivi514/XenonLive_Launcher) — the game's own co-op
+> menus, the way the 360 version played it. Started outside the launcher the game
+> is offline and single-player.
 
 **No game data is included** in this repository or the downloads. You must own
 Dead Rising 2: Case West and supply your own copy of the game package. This
@@ -141,8 +144,8 @@ game folder at any time without losing progress.
   and what to send back; a report from a Deck owner is genuinely useful.
 - **No macOS build yet** — nothing blocks it in principle; it awaits test
   hardware.
-- **No co-op** — Case West's second player is online-only on the 360 (see the
-  status note above).
+- **Co-op needs the XenonLive launcher** — the game only goes online when the
+  launcher starts it (see the status note above); a plain launch is single-player.
 
 ## The sibling port
 
