@@ -112,3 +112,33 @@ exercise the sign-in grace (over an hour).
 Same-binary arms; state the prediction; one change per experiment; ask the oracle;
 an arm without an announcement line has not been shown to engage. **Plus**: under
 `CW_FPS_CAP=500` read per-stage CPU, not the wall median (sibling's gotcha 572).
+
+---
+
+## Addendum — the title-screen A/B (2026-09-12, evening), and the validation gate
+
+**Scene**: the title screen, ~752 draws, every run; matched windows (draws 700-820,
+the first three windows of each run dropped). Background runs, `CW_FPS_CAP=500
+CW_FPS_LOG=5`, this box (8c/16t). Medians over the windows.
+
+| arm | runs × windows | wall median | fps | p99 | pump cpu | Main cpu | Draw cpu |
+|---|---|---|---|---|---|---|---|
+| **new defaults** (split + pin + wake) | 3 × 18 | **2.90 ms** | 345 | 3.95 | 1.55 | 0.88 | 0.90 |
+| pre-import arms (`CW_PUMP_SPLIT=0 CW_GUEST_PIN=0 CW_WAITANY_WAKE=0`) | 3 × 18 | **2.59 ms** | 385 | 3.52 | 1.50 | 0.93 | 0.94 |
+| `CW_PUMP_SPLIT=0` alone (pin + wake on) | 2 × 12 | 2.66 ms | 376 | 3.93 | 1.36 | 0.89 | 0.92 |
+| `CW_GUEST_PIN=0` alone (split + wake on) | 2 × 12 | 2.95 ms | 339 | 3.99 | 1.60 | 0.90 | 0.95 |
+
+**Reading**: at this LIGHT scene the new defaults cost **+0.3 ms of a 2.6 ms frame**,
+and the one-factor arms put it on the **split** (2.66 with the split off, 2.95 with
+only the pin off) — a second-thread hand-off for 750 draws that the one-thread pump
+did not need. The pin is a null here (nothing contends). This is the sibling's own
+expectation of the split — its −1.19 ms is a crowd number — and at 345 vs 385 fps it
+is invisible under the shipped 60 fps cap; **it is recorded so the crowd verdict,
+which is the operator's sitting, is not the first number anyone sees for the split
+on this port.** Two-run arms are two runs (gotcha 159); the three-run arms agree
+with them in direction.
+
+**Validation gate**: `CW_VK_VALIDATION=1`, 90 s boot, new binary vs the pre-import
+`build-release/cw_runtime` run NOW: **both report the same single VUID
+(`VkGraphicsPipelineCreateInfo-topology-08773`, 8 lines each) and nothing else** —
+the standing baseline (§6/§8: "clean of anything new").

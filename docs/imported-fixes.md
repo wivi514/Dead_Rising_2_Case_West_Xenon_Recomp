@@ -1169,7 +1169,12 @@ every change there is the co-op DATA patch, below).
   (~751 draws, ~2.5 ms), where the pump is 1.3 ms of a core and there is nothing for
   a second core or a placement to move; `docs/part12-kickoff.md` §2c records the
   title-screen numbers for what they are. The crowd verdict is owed to the operator's
-  sitting.
+  sitting. What WAS measured at the title screen (the kickoff's addendum): the new
+  defaults cost +0.3 ms of a 2.6 ms frame there, and the one-factor arms put it on
+  the split, not the pin — a light-scene hand-off cost the sibling's crowd number
+  does not show. Invisible under the 60 fps cap; recorded.
+* **Validation**: same single VUID as the pre-import binary run NOW (topology-08773,
+  8 lines each), nothing new.
 * **Windows**: the placement's Windows spelling and the thread clocks came across
   (`a6d2c22`, `30f4415`, `0f726ff`) but the czwin compile is **owed**.
 * **The old-base build with the static curl** is **owed** — it is the next artifact
