@@ -1,5 +1,7 @@
 #include "fence_wait.h"
 
+#include <atomic>
+
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -224,6 +226,31 @@ PPC_FUNC(sub_825B5FB8)
     // entry in the per-thread wait census the [fps] line prints (part 116 item 4),
     // on both arms, so the Draw Thread's non-CPU time has a name.
     GuestThread::WaitScope ws(GuestThread::kWaitFence);
+    // WHO REACHES THE RING-SPACE WAIT — a census, not a binding. A first attempt named
+    // the Draw Thread here as "the first thread on this wait", and the first thread on
+    // it is the MAIN Thread (F00), during the boot's own D3D setup; the title's Draw
+    // Thread (F34) arrives later and a third tid (F08) between them. The name is bound
+    // by the thread's ENTRY POINT instead (kernel/imports.cpp, ExCreateThread). What
+    // stays is the fact that took the wrong rule apart: one line per distinct tid that
+    // ever waits here, so "the Draw Thread's fence wait" can be checked against who
+    // actually waits.
+    {
+        static std::atomic<uint32_t> seen[8];
+        const uint32_t tid = GuestThread::GetCurrentThreadId();
+        for (auto& slot : seen)
+        {
+            uint32_t cur = slot.load(std::memory_order_acquire);
+            if (cur == tid)
+                break;
+            if (cur == 0 && slot.compare_exchange_strong(cur, tid))
+            {
+                fprintf(stderr, "[fencewait] guest tid %08X reached the D3D ring-space wait%s\n",
+                        tid, tid == GuestThread::ThreadIdOfName("Draw Thread") ? " (the Draw Thread)"
+                           : tid == GuestThread::ThreadIdOfName("Main Thread") ? " (the Main Thread)" : "");
+                break;
+            }
+        }
+    }
     if (!FenceWait_Enabled())
     {
         __imp__sub_825B5FB8(ctx, base);

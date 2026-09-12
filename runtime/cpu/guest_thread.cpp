@@ -141,6 +141,13 @@ static std::map<uint32_t, GuestThread::WaitStats*> g_waitStatsByTid;   // under 
 
 GuestThread::WaitStats& GuestThread::MyWaitStats() { return t_waitStats; }
 
+uint32_t GuestThread::ThreadIdOfName(const char* name)
+{
+    std::lock_guard lk(g_hostThreadMutex);
+    auto it = g_tidByName.find(name);
+    return it == g_tidByName.end() ? 0 : it->second;
+}
+
 const GuestThread::WaitStats* GuestThread::WaitStatsOf(const char* name)
 {
     std::lock_guard lk(g_hostThreadMutex);
@@ -326,6 +333,25 @@ uint32_t GuestThread::Run(const GuestThreadParams& params)
     {
         std::lock_guard lk(g_hostThreadMutex);
         g_waitStatsByTid[GuestThread::GetCurrentThreadId()] = &t_waitStats;
+    }
+    if (params.hostName)
+    {
+        // THE NAME BY IDENTITY, NOT BY THE TITLE'S SAY-SO. Case Zero's build names its
+        // Main Thread, Draw Thread and JobThreads through the SetThreadName exception
+        // and the pin, the per-thread CPU columns and the wait census all key on those
+        // names; Case West's build names only Havok's workers (the A1 capture has
+        // exactly two SetThreadName raises, both HavokWorkerThread — and so does a boot
+        // here), so the two threads the placement cares about would have gone unbound.
+        // The thread that runs the XEX entry point IS the title's main thread; the
+        // spawner passes the name, and the same log line the exception path prints
+        // says how the binding was made, so a reader does not take it for the title's.
+        const uint32_t tid = GuestThread::GetCurrentThreadId();
+        const bool bound = GuestThread::BindHostName(tid, params.hostName);
+        if (bound)
+            GuestThread::PinHostByName(params.hostName);   // CW_GUEST_PIN, else a no-op
+        fprintf(stderr, "[kernel] thread named '%s' guest tid=%08X (by IDENTITY — this "
+                        "title never names it)%s\n",
+                params.hostName, tid, bound ? "" : " — NOT BOUND to a host thread");
     }
     ctx.ppcContext.r3.u64 = params.arg0;
     ctx.ppcContext.r4.u64 = params.arg1;

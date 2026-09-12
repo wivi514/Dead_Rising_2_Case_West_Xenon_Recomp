@@ -1789,6 +1789,23 @@ static uint32_t ExCreateThread_x(be<uint32_t>* handle, uint32_t stackSize,
     }
     params.flags = creationFlags;
     params.stackSize = stackSize;
+    // THE DRAW THREAD, NAMED BY ITS ENTRY POINT. Case Zero's build names this thread
+    // through the SetThreadName exception (tid F34, "Draw Thread", raised by the Main
+    // Thread right after creating it); this build raises that exception for its two
+    // Havok workers and nothing else (A1: two raises; the same in every boot here), so
+    // the placement (CW_GUEST_PIN), the [fps] line's `draw` column and the wait census
+    // had nothing to key on. The thread's identity is its entry: 0x8276FAC8 is the
+    // sibling's Draw Thread stub 0x827D3B40 by shape (9 instructions, unique), and the
+    // body it calls, sub_8276F820, is their sub_827D3898 instruction for instruction
+    // (1.000 over the whole body; it reads the same +0x9b0 the Main Thread's
+    // frame-boundary wait keys on). It is also what the CPU says: the second-busiest
+    // guest thread of a boot here (tid F34, 60% of the Main Thread's time), the one
+    // that runs the D3D ring-space wait alongside the Main Thread. A first attempt
+    // bound the name to "the first thread on the ring-space wait" and got the Main
+    // Thread, which reaches it during boot — the entry cannot be misread that way.
+    constexpr uint32_t kDrawThreadEntry = 0x8276FAC8;
+    if (startAddress == kDrawThreadEntry)
+        params.hostName = "Draw Thread";
 
     uint32_t hostId = 0;
     GuestThreadHandle* h = GuestThread::Start(params, &hostId);
@@ -2616,16 +2633,22 @@ PPC_FUNC(__imp__XamLoaderLaunchTitle)
     TitleRequestedExit(who);
 }
 
-// A1 raises 19 exceptions in the boot, and Xenia decodes every one of them as
-// SetThreadName — the log lines pair up exactly:
-//   RtlRaiseException(...) / SetThreadName(6, Main Thread)
-//                           SetThreadName(7, cAsyncFileSystem)
-//                           SetThreadName(8, JobThread0) ... JobThread5
-//                           SetThreadName(E, BigFile Decompress Thread)
-//                           SetThreadName(F, Controller Hardware Update)
-// so on this title RtlRaiseException is, in the boot era, entirely a thread-naming
-// channel. That is a statement about this drive, not about the export: any other
-// exception code still reaches the abort below, which is where a real SEH
+// RETRACTED IN PLACE (part 12): the paragraph below described CASE ZERO's A1 — 19
+// raises, "Main Thread", "cAsyncFileSystem", "JobThread0..5" — and was transplanted
+// in part 1 without being re-measured. CASE WEST's A1 has EXACTLY TWO SetThreadName
+// raises, both `HavokWorkerThread` (Havok names its own workers; the title names
+// nothing), and every boot here prints the same two. The consequence surfaced when
+// part 118's thread placement was imported keyed on the title's names: nothing to
+// bind. The Main Thread and the Draw Thread are now named BY IDENTITY — the entry
+// thread (main.cpp) and the thread created at 0x8276FAC8 (ExCreateThread, above).
+//
+// ~~A1 raises 19 exceptions in the boot, and Xenia decodes every one of them as
+// SetThreadName — the log lines pair up exactly: SetThreadName(6, Main Thread),
+// (7, cAsyncFileSystem), (8, JobThread0) ... JobThread5, (E, BigFile Decompress
+// Thread), (F, Controller Hardware Update)~~ — that is the sibling's list. What is
+// true of both titles: RtlRaiseException is, in the boot era, entirely a
+// thread-naming channel. That is a statement about the drives, not about the export:
+// any other exception code still reaches the abort below, which is where a real SEH
 // requirement would announce itself.
 PPC_FUNC(__imp__RtlRaiseException)
 {
@@ -2638,8 +2661,9 @@ PPC_FUNC(__imp__RtlRaiseException)
     {
         // THREADNAME_INFO sits in ExceptionInformation[0..3] (record + 0x14):
         // {dwType=0x1000, szName, dwThreadID, dwFlags}. dwThreadID is -1 for "the
-        // calling thread"; the title only ever names itself this way (A1: 19 raises,
-        // each on the thread being named), and the other case is logged, not guessed.
+        // calling thread"; here the two raises name the thread just CREATED (A1 and
+        // every boot: dwThreadID = the Havok worker's id), and the other case is
+        // logged, not guessed.
         const uint32_t namePtr =
             __builtin_bswap32(*reinterpret_cast<const uint32_t*>(record + 0x18));
         const uint32_t who =
@@ -2651,10 +2675,10 @@ PPC_FUNC(__imp__RtlRaiseException)
         // went only into the kcall trace and every per-thread instrument — `perf`,
         // `top -H`, tools/part50_thread_cpu.py — reported the guest's threads as
         // anonymous tids, so "which thread is the 8.8 ms" needed a debugger to
-        // answer (part111-kickoff §1 question 1). On this title every one of the
-        // 19 boot-era raises comes from the MAIN thread naming a thread it just
-        // created (dwThreadID = the new thread's id, never -1), so the binding goes
-        // through the guest-tid registry rather than pthread_self().
+        // answer (the sibling's part111-kickoff §1 question 1). Here the only two
+        // raises are the Main Thread naming the Havok workers it just created
+        // (dwThreadID = the new thread's id, never -1), so the binding goes through
+        // the guest-tid registry rather than pthread_self().
         const bool bound = GuestThread::BindHostName(target, name);
         if (bound)
             GuestThread::PinHostByName(name);   // CW_GUEST_PIN (part 118), else a no-op

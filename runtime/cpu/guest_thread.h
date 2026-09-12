@@ -44,6 +44,11 @@ struct GuestThreadParams
     uint32_t arg1;     // r4 (ExCreateThread's XAPI startup wrapper takes two args)
     uint32_t flags;
     uint32_t stackSize;
+    // A host-side name bound BY IDENTITY when Run() starts, for a thread the title
+    // never names itself (this title raises SetThreadName for its two Havok workers and
+    // nothing else — A1, and the same boot here). Null for the ordinary case, where the
+    // title's own RtlRaiseException naming binds the name (kernel/imports.cpp).
+    const char* hostName = nullptr;
 };
 
 struct GuestThreadHandle : KernelObject
@@ -113,6 +118,9 @@ struct GuestThread
     // ExCreateThread returns. Returns false when the id is unknown or the platform
     // cannot name another thread (macOS); the caller logs which.
     static bool BindHostName(uint32_t threadId, const char* name);
+    // The guest tid a name was bound to, or 0 — so a binding made by identity
+    // (cpu/fence_wait.cpp's Draw Thread) can exclude a thread already named.
+    static uint32_t ThreadIdOfName(const char* name);
 
     // CPU seconds consumed so far by the guest thread the title named `name` ("Main
     // Thread", "Draw Thread"), or a negative number if no thread of that name has been

@@ -741,6 +741,10 @@ int main(int argc, char** argv)
     GuestThreadParams params{};
     params.function = uint32_t(image.entry_point);
     params.stackSize = kDefaultGuestStackSize;
+    // The title's own name for this thread, bound by identity because this build never
+    // raises SetThreadName for it (cpu/guest_thread.cpp, Run). It is what the pin
+    // (CW_GUEST_PIN), the [fps] line's `guest main` column and the wait census key on.
+    params.hostName = "Main Thread";
 
     // WHY THE GUEST ENTRY MOVED OFF THE PROCESS'S MAIN THREAD (phase 3).
     //
