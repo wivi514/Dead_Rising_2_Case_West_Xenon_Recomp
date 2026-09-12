@@ -1179,3 +1179,27 @@ every change there is the co-op DATA patch, below).
   (`a6d2c22`, `30f4415`, `0f726ff`) but the czwin compile is **owed**.
 * **The old-base build with the static curl** is **owed** — it is the next artifact
   build.
+
+### §13 addendum — the first v1.1.0 sitting (AMD, 2026-09-12, evening)
+
+**The invisible overlay.** The operator on czamd (RX 6600, Windows 10, keyboard/mouse):
+*"I lost control of the game clicking on start game"* — then the cause, found by
+them: *"I tried Shift+Tab that should show up the overlay but it did not show up but
+it gave me the mouse control of it."* Mechanism: since online became launcher-only
+(the `a03a7af` import above) an offline start returns from `CwXlive_Start` BEFORE
+`CwOverlay_SetClient`; the overlay's `Render` returns false without a client, but its
+`QueueSdlEvent` still toggled `open` on Shift+Tab, so an invisible overlay owned the
+pad and the mouse. Before that change libxlive started on every run and the overlay
+always had a client. Fixed in `aae9fca` in this port's glue (no client → every event
+refused, `Open()` false, one log line naming the launcher). **The sibling has the
+same two commits and, as far as this port can see, the same bug in its v1.1.0** —
+told to the operator, not fixed there from here.
+
+**The performance report was the same thing**: with the invisible overlay gone the
+operator's verdict on the default arms (two-core pump ON at 6 physical cores, the
+placement OFF below 8) was *"now it's good"*. The `[fps]` lines from that sitting,
+1080p, RX 6600: **77-100 fps median at 4,000-6,600 draws, p99 14-22 ms** — the
+sibling's v1.0.2 on the same machine read 70 fps median / p99 19-21 at 7,861 draws.
+A headless title-screen A/B there (split vs one-thread) read identical medians
+(201 fps, the 5 ms timer quantum) with p99 7.0 vs 6.2 — the split's light-scene cost,
+as on the dev box, invisible in play.

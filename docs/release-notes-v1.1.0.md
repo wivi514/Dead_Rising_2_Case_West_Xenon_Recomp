@@ -4,7 +4,7 @@
 `---`). All four v1.1.0 artifacts are staged for upload at
 `~/Release/Case West/1.1.0/` with a `SHA256SUMS` beside them.
 
-**Built 2026-09-12 at source `be065f7`** (branch `xlive-integration`; the docs commits
+**Built 2026-09-12 at source `aae9fca`** (rebuilt the same evening after the first AMD sitting found the invisible-overlay bug — the notes below say what; all four artifacts are at that commit) (branch `xlive-integration`; the docs commits
 after it change no code). Linux on the OLD BASE (Ubuntu 22.04 in a podman container,
 clang 15, SDL2 + LGPL ffmpeg + a static libcurl/OpenSSL compiled inside it); Windows
 on czwin (clang-cl, curl-for-win's DLL beside the exe). The overlay comes from the
@@ -16,10 +16,10 @@ port calls it); the Windows overlay is from the clean `e718507`.
 
 | artifact | bytes | sha256 |
 |---|---|---|
-| `CaseWestRecomp-linux-x86_64.tar.zst` | 31,605,373 | `f1829d4fa2331aa5a2200b68431b9ea3947fda4c8c09286e59dab861fbc5d219` |
-| `CaseWestRecomp-linux-x86_64.AppImage` | 30,222,840 | `05f5c348e1c6ee3d0e3c96182102d2872b66a98430d2d3aa99fcc2f117c85d34` |
-| `CaseWestRecomp-steamdeck-x86_64.tar.gz` | 31,710,648 | `a154e132913f2f9b59f20ac76960688b0a7579a13dd87806617809e6108ce4ec` |
-| `CaseWestRecomp-windows-x86_64.zip` | 24,649,587 | `29d446274610ccc06766d7f029eb0d0e8fb86ca7f6f0bbe0bb63b29c2fb1a251` |
+| `CaseWestRecomp-linux-x86_64.tar.zst` | 31,609,251 | `ec81e020d2ecdfad385cef04f792befbfeb88b1ce198dceb61c74f128f27b7b9` |
+| `CaseWestRecomp-linux-x86_64.AppImage` | 30,218,744 | `0b2b3c93f54795b99f89faa368f2b4994d2f3d40a8e209fd2346d0bb32860c8b` |
+| `CaseWestRecomp-steamdeck-x86_64.tar.gz` | 31,710,489 | `995eeaa558df68483b7aff8eb8c4b998b51911f0ff31071a91e4b5f93604cfa4` |
+| `CaseWestRecomp-windows-x86_64.zip` | 24,650,170 | `7b969e4bbe61f602b7231678da9fc238651f999a0691716fccd84ced3944d350` |
 
 **Gates run:**
 * **`.text` identity** between the Release and matched RelWithDebInfo configures, both
@@ -42,9 +42,11 @@ port calls it); the Windows overlay is from the clean `e718507`.
   bundle skips the launcher, comes up borderless with `internal resolution 1280x800
   from CW_VK_RES (env wins over cw_settings.txt)`, and links the system libstdc++.
 
-**Owed**: the operator's sitting on these builds (the crowd verdict for the pump/pin
-defaults — `docs/part12-kickoff.md` §3), a co-op session on them, and the one check
-no script here makes — the staged Windows zip on a machine with no dev tree (czamd).
+**The AMD sitting is done** (czamd, RX 6600, no dev tree — the check the packaging
+script says it cannot make): the first build lost the player's input on Shift+Tab
+(fixed, `aae9fca`, below); on the rebuilt one the operator's verdict was "now it's
+good" — 77-100 fps median at 4,000-6,600 draws, p99 14-22 ms at 1080p.
+**Owed**: a co-op session on these builds, the crowd verdict on an 8-core box.
 Nobody here owns a Steam Deck; the Deck build is the sibling's recipe re-run on this
 title and gated in a container, not played on a Deck.
 
@@ -77,6 +79,9 @@ the XenonLive section before you look for yours.
   account's folder once it exists.
 - **The in-game overlay: Shift+Tab.** Friends, invites and notifications over the
   game; the pad and the mouse belong to the overlay while it is open.
+- **Shift+Tab does nothing when the game was not started from the launcher** (there
+  is no account to show) — and says so in the log. The first v1.1.0 build opened an
+  invisible overlay there that took the mouse and pad; fixed before publishing.
 - **A brief Live drop no longer ends a session**: the connection is held for 30 s
   before the game hears a sign-out (the token's hourly refresh used to close a co-op
   session on both machines).
@@ -140,8 +145,8 @@ Built on hedge-dev's XenonRecomp and XenosRecomp.
 ### Checksums (SHA-256)
 
 ```
-f1829d4fa2331aa5a2200b68431b9ea3947fda4c8c09286e59dab861fbc5d219  CaseWestRecomp-linux-x86_64.tar.zst
-05f5c348e1c6ee3d0e3c96182102d2872b66a98430d2d3aa99fcc2f117c85d34  CaseWestRecomp-linux-x86_64.AppImage
-a154e132913f2f9b59f20ac76960688b0a7579a13dd87806617809e6108ce4ec  CaseWestRecomp-steamdeck-x86_64.tar.gz
-29d446274610ccc06766d7f029eb0d0e8fb86ca7f6f0bbe0bb63b29c2fb1a251  CaseWestRecomp-windows-x86_64.zip
+ec81e020d2ecdfad385cef04f792befbfeb88b1ce198dceb61c74f128f27b7b9  CaseWestRecomp-linux-x86_64.tar.zst
+0b2b3c93f54795b99f89faa368f2b4994d2f3d40a8e209fd2346d0bb32860c8b  CaseWestRecomp-linux-x86_64.AppImage
+995eeaa558df68483b7aff8eb8c4b998b51911f0ff31071a91e4b5f93604cfa4  CaseWestRecomp-steamdeck-x86_64.tar.gz
+7b969e4bbe61f602b7231678da9fc238651f999a0691716fccd84ced3944d350  CaseWestRecomp-windows-x86_64.zip
 ```

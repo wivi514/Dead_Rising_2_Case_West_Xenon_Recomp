@@ -104,7 +104,14 @@ an uncommitted additive overlay patch (Notify/Dismiss, 47 lines, used by the sib
 in-flight co-op call) that the Linux overlays were compiled with; Windows's is clean
 `e718507`. It was not stashed because the other session is using that tree.
 
-**Still owed**: the operator's sitting and a co-op session (item 1-2 below), czamd
+**The AMD sitting happened the same evening** (§13 addendum): it found the INVISIBLE
+OVERLAY (offline start + Shift+Tab = an overlay with no client owning the input;
+`aae9fca`), and with that gone the operator's verdict on the new defaults was "now
+it's good" (77-100 fps at the crowd on the RX 6600). All four artifacts were rebuilt
+at `aae9fca`; the notes carry the new hashes. **The sibling almost certainly ships
+the same overlay bug in its v1.1.0** — say so to whoever runs it next.
+
+**Still owed**: a co-op session (item 2 below), the crowd verdict on an 8-core box
 (the no-dev-tree Windows first run), the Deck itself (nobody here owns one), the
 GitHub clicks, and the branch → master merge (the notes say `xlive-integration`).
 
