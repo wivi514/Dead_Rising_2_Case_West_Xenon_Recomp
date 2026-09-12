@@ -73,6 +73,41 @@ pin, operator-verified there). Windows (czwin compile of the placement's Windows
 spelling). The old-base build with the static curl. A co-op session long enough to
 exercise the sign-in grace (over an hour).
 
+## 2d. v1.1.0 IS BUILT, GATED AND STAGED (2026-09-12, evening)
+
+Operator: *"Do all the build and include a build for steam deck ... force resolution at
+1280x800 and doesn't include the little launcher"*, *"it is v1.1.0"*, *"put all the
+build in here /home/wivi514/Release/Case West/1.1.0/"*. Done — four artifacts at
+source `be065f7`, `docs/release-notes-v1.1.0.md` is the paste-ready body with every
+hash and every gate. What landed on the way:
+
+* **The Steam Deck variant** (`38fb882`): Case Zero's `663210c` + `0f4e24e` (their
+  `steamdeck-v1.0.2` branch — NOT on their master), renamed. `CW_DECK` (settings
+  defaults 1280x800 borderless), `tools/release_build_steamdeck.sh` (no launcher,
+  `CW_VK_RES=1280x800` pinned in `cw_defaults.env`, system libstdc++, `.tar.gz`,
+  `dist-steamdeck/`), the gate's `CW_GATE_SYSTEM_CXX=1`, the windowed sizing that
+  follows the pin. Booted on this box: launcher skipped, `internal resolution
+  1280x800 from CW_VK_RES`, system libstdc++ — but **no Deck was involved**.
+* **The Windows timer fix** (`be065f7`): the sibling's part-118 `timeBeginPeriod(1)`
+  landed there WHILE this part ran (their master moved 5102330 → f1022a3 mid-import:
+  another session is working the sibling concurrently — re-check its HEAD before
+  quoting "imported through X"). czamd there: 46.8 → 13.0 ms a frame.
+* **The READMEs** no longer say co-op is unsupported.
+* The base image: `cw-oldbase:jammy` was 4 days old and lacked libssl-dev; the
+  Containerfiles are byte-identical after the rename, so `cz-oldbase:jammy` (21 h old,
+  with it) was re-tagged. The old cw image is gone.
+* **czwin** builds the branch at `be065f7` with the overlay
+  (`C:\cw\build_cw_xlive.ps1`, the sibling's recipe) and its play copy is staged.
+
+**A provenance wrinkle, recorded in the notes**: `~/GithubRepo/XenonLive_Launcher` has
+an uncommitted additive overlay patch (Notify/Dismiss, 47 lines, used by the sibling's
+in-flight co-op call) that the Linux overlays were compiled with; Windows's is clean
+`e718507`. It was not stashed because the other session is using that tree.
+
+**Still owed**: the operator's sitting and a co-op session (item 1-2 below), czamd
+(the no-dev-tree Windows first run), the Deck itself (nobody here owns one), the
+GitHub clicks, and the branch → master merge (the notes say `xlive-integration`).
+
 ## 3. WHAT IS OWED, IN ORDER
 
 1. **The operator's sitting on this build** — the thing every import owes. What

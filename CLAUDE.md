@@ -57,7 +57,14 @@ Draw Thread are bound BY IDENTITY — the entry thread and the thread created at
 `0x8276FAC8` — and a transplanted `imports.cpp` comment asserting the sibling's list
 is retracted in place (gotchas 326-327). NOT taken: co-op parts 1-5 (Case Zero adding
 the co-op this title ships with). Owed: the operator's sitting, a co-op session,
-czwin, the old-base build with the static curl, the artifacts.
+czwin, the old-base build with the static curl, the artifacts — **and the same
+evening: v1.1.0 BUILT, GATED (all three Linux bundles at the floor image, the Windows
+exe smoked and booted on czwin) AND STAGED at `~/Release/Case West/1.1.0/`** — four
+artifacts, including the **Steam Deck build** (Case Zero's `steamdeck-v1.0.2` branch
+recipe: no launcher, `CW_VK_RES=1280x800` pinned, system libstdc++) and the
+sibling's Windows `timeBeginPeriod(1)` fix. `docs/release-notes-v1.1.0.md` is the
+paste-ready body. Owed: the operator's sitting, a co-op session, czamd, a real Deck,
+the GitHub clicks, the merge to master.
 
 ## Status: v1.0.0 IS STAGED AND TAGGED — AWAITING PLAYER ISSUES (2026-09-06)
 
