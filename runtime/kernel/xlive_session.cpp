@@ -483,6 +483,12 @@ void CopyContextsAndProperties(xlive::Client::SessionCreateRequest& out)
 
 void Complete(const Pending& pending, uint32_t status, uint32_t length)
 {
+    // CW_XSESSION_TRACE: the status each session overlapped resolves to, and how long
+    // after it was begun — an overlapped that resolves to a non-zero status is exactly
+    // the "0x3e5 cleared to an error" the teardown watches for (part 12).
+    if (getenv("CW_XSESSION_TRACE"))
+        KLOG("[xgi] complete message %08X overlapped=%08X status=%u length=%u\n",
+             pending.message, pending.overlappedVa, status, length);
     if (pending.overlappedVa)
         Xam_CompleteOverlapped(pending.overlappedVa, status, length);
 }
@@ -1038,6 +1044,13 @@ bool XliveSession_Dispatch(uint32_t message, void* buffer, uint32_t bufferLength
 {
     if (!g_enabled || !result)
         return false;
+
+    // CW_XSESSION_TRACE=1 (part 12, the co-op 330 s teardown): every XGI/XSession
+    // message the title sends, so the call that arms the teardown at session-start
+    // and the PATCH that ends it are both on the timeline. Off unless set.
+    if (getenv("CW_XSESSION_TRACE"))
+        KLOG("[xgi] message %08X overlapped=%08X buflen=%u\n", message, overlappedVa,
+             bufferLength);
 
     switch (message)
     {
