@@ -47,15 +47,24 @@ bool CwOverlay_Open()
 }
 void CwOverlay_SyncTextInput()
 {
-    static bool on = false;
-    const bool want = CwOverlay_Open() && xlive_overlay::Overlay::Instance().wants_text_input();
-    if (want == on)
-        return;
-    on = want;
-    if (want)
-        SDL_StartTextInput();
-    else
-        SDL_StopTextInput();
+    // DELIBERATELY A NO-OP now (part 12, the first v1.1.0 overlay sitting). This used
+    // to SDL_StartTextInput() while an overlay text box was focused so real
+    // SDL_TEXTINPUT events (IME-composed) reached it. Two things make that the wrong
+    // call here:
+    //   * The game window keeps SDL text input OFF on purpose (host/window.cpp's
+    //     SDL_StopTextInput at start — "a game window wants scancodes, not composed
+    //     text", the part-91/92 IME-lag lesson). Turning it back on reintroduces that
+    //     lag for the overlay.
+    //   * On WAYLAND (this project's default driver) SDL_StartTextInput on the Vulkan
+    //     window yields NO SDL_TEXTINPUT at all, while SDL_IsTextInputActive() still
+    //     reports true — so on the released build typing in the overlay was simply
+    //     dead (the operator's report), and the overlay's own keydown->character
+    //     fallback (XenonLive_Launcher 6cb2944) is suppressed by its `!IsTextInputActive`
+    //     guard exactly when it is needed.
+    // Leaving text input off (as the game already does) makes IsTextInputActive() false,
+    // so that fallback drives typing on every platform. The overlay only takes a
+    // gamertag and a short message, so its ASCII coverage is enough; a port that truly
+    // wanted IME here would manage it itself and this would step aside.
 }
 void CwOverlay_SetClient(xlive::Client* client, uint32_t titleId)
 {
