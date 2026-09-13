@@ -157,6 +157,16 @@ the XenonLive section before you look for yours.
   cutscenes. **Alt-tab out and back, or press Win+PrintScreen** — either clears it. It
   does not affect gameplay or progress; the sibling port shows the same on the same
   hardware.
+- **Steam controllers are not picked up**, even though the rest of the SDL controller
+  support works and this should not need Steam Input. Any other controller SDL
+  recognises (Xbox layout) works; a Steam controller needs Steam Input as a workaround
+  for now.
+- **Black textures or black boxes when a lot of fading gore is on screen**, and the
+  same thing when an NPC clips very close to the camera (reported on NVIDIA, on the
+  right-hand side of the screen). It clears on its own as the scene changes.
+- **Mouse-wheel scrolling in menus can miss steps.** It looks frame-rate dependent —
+  at high frame rates (~120 fps) it registers reliably, lower down it sometimes does
+  not. The arrow keys and WASD are unaffected.
 - The occasional spot may shade slightly differently than the console.
 - **No macOS build yet** — awaits test hardware, nothing structural.
 
