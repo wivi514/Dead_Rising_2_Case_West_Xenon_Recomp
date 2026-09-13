@@ -52,6 +52,12 @@ title and gated in a container, not played on a Deck.
 
 ---
 
+> **Artifacts refreshed 2026-09-13.** If you downloaded v1.1.0 before this date, please
+> re-download: the files were rebuilt to add the co-op session fix (sessions used to end
+> themselves after about 5½ minutes), in-game bug reports on F9/F8, and the Steam Deck
+> build's resolution becoming a changeable default. The checksums at the bottom of this
+> page describe the current files.
+
 Two-player online co-op, the XenonLive account underneath it, a Steam Deck build, and
 the sibling port's latest performance work — on both platforms.
 
