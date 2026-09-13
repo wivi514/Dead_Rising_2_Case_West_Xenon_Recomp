@@ -20,10 +20,11 @@
 # THREE CHANGES, each revertible on its own, so the report that comes back can name
 # which one mattered:
 #   1. cw_defaults.env says CW_LAUNCHER=0                        (CW_PKG_NO_LAUNCHER)
-#   2. settings defaults are 1280x800 fullscreen-desktop, the    (CW_DECK -> CW_DECK_DEFAULTS)
-#      Deck's native panel, instead of 1280x720 windowed, AND
-#      cw_defaults.env PINS CW_VK_RES=1280x800 so an existing    (CW_PKG_EXTRA_DEFAULTS)
-#      or migrated settings file cannot put it back
+#   2. settings DEFAULTS are 1280x800 fullscreen-desktop, the    (CW_DECK -> CW_DECK_DEFAULTS)
+#      Deck's native panel, instead of 1280x720 windowed. A
+#      DEFAULT ONLY: the in-game RESOLUTION row still works, so
+#      a player can pick 1920x1080 or anything else the Deck
+#      supports and it is remembered (no CW_VK_RES pin)
 #   3. libstdc++/libgcc_s are NOT bundled, so Mesa gets SteamOS's  (CW_PKG_SYSTEM_CXX)
 #      newer copy instead of our GLIBCXX_3.4.30 one shadowing it
 #
@@ -52,19 +53,17 @@ export CW_PKG_SYSTEM_CXX=1
 export CW_PKG_README=$ROOT/tools/release/README.steamdeck.md
 export CW_PKG_OUT=dist-steamdeck
 # THE RESOLUTION PIN (operator instruction). CW_DECK's 1280x800 is only a DEFAULT — it
-# applies on a run that finds no cw_settings.txt, and the first test launch showed
-# exactly how that is not enough: the save relocation carried a settings file in from an
-# existing install and the run came up at 3440x1440. CW_VK_RES is the lever that wins
-# over the settings file (the env-wins rule every consumer enforces), so the shipped
-# defaults file pins it and a Deck starts at its native panel whatever a migrated or
-# hand-edited settings file says.
+# applies on a run that finds no cw_settings.txt — which is exactly what we want here
+# (operator's call, 2026-09-13): the Deck's FIRST launch comes up at its native
+# 1280x800, and the in-game settings menu can then change it to anything the Deck
+# supports (1920x1080 and the rest), with the choice remembered in cw_settings.txt.
 #
-# WHAT IT COSTS, said out loud: while this line is present the in-game settings screen's
-# RESOLUTION row does nothing — env beats the file, and the renderer says so on stdout
-# ("internal resolution 1280x800 from CW_VK_RES (env wins over ...)"). The README tells
-# the player to delete the line if they want that row back, which is a plain-text edit
-# next to the executable and not a rebuild.
-export CW_PKG_EXTRA_DEFAULTS='CW_VK_RES=1280x800'
+# NO CW_VK_RES PIN. An earlier build shipped `CW_VK_RES=1280x800` in cw_defaults.env so
+# a settings file migrated from a PC install could not bring a desktop resolution with
+# it — but env beats the settings file everywhere, so that line ALSO made the in-game
+# RESOLUTION row do nothing, and a Deck owner could not raise or lower it without
+# editing a file. The default alone gives the same good first launch and keeps the row
+# working, so the pin is gone.
 # The SDL2/ffmpeg/XenonUtils prefixes under thirdparty/oldbase are the desktop build's
 # and are variant-independent — rebuilding them would cost 20 minutes and change nothing.
 export CW_OLDBASE_SKIP_DEPS=${CW_OLDBASE_SKIP_DEPS:-1}

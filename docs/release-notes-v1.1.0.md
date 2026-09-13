@@ -4,7 +4,7 @@
 `---`). All four v1.1.0 artifacts are staged for upload at
 `~/Release/Case West/1.1.0/` with a `SHA256SUMS` beside them.
 
-**Built 2026-09-12 at source `466edd1`** (all four artifacts at that commit; rebuilt after the AMD sitting's invisible-overlay fix and the co-op keyboard-accept fix below) (branch `xlive-integration`; the docs commits
+**Built 2026-09-13 at source `bfd0c45`** (all four artifacts at that commit; rebuilt after a two-machine co-op session found and fixed the 330 s session teardown — see the co-op notes below) (branch `xlive-integration`; the docs commits
 after it change no code). Linux on the OLD BASE (Ubuntu 22.04 in a podman container,
 clang 15, SDL2 + LGPL ffmpeg + a static libcurl/OpenSSL compiled inside it); Windows
 on czwin (clang-cl, curl-for-win's DLL beside the exe). The overlay comes from the
@@ -83,6 +83,20 @@ the XenonLive section before you look for yours.
 - **Shift+Tab does nothing when the game was not started from the launcher** (there
   is no account to show) — and says so in the log. The first v1.1.0 build opened an
   invisible overlay there that took the mouse and pad; fixed before publishing.
+- **Co-op sessions no longer end themselves after ~5½ minutes.** The title asks the
+  system to flush its session stats 330 s in; that call was unhandled and failed, and
+  the game read the failure as "you are not signed in to Xbox Live" and closed the
+  session on both machines — the host reverted to the AI partner, the guest dropped to
+  a black screen. Found on a two-machine session and fixed; a co-op game now runs
+  indefinitely (verified across five of those 330 s cycles).
+- **In-game voice chat**: the voice endpoint exists so the co-op session registers you
+  properly, but it carries no audio — **use Discord or party chat**. Without it the game
+  could not add you to its chat at all, which was part of the same failure above.
+- **A join request can be accepted with the keyboard.** The "wants to join your game"
+  prompt is answered with the **right arrow** (or the controller's d-pad right); before,
+  only a controller could accept it.
+- **Typing works in the Shift+Tab overlay** (adding a friend, sending a message) on
+  Linux/Wayland, where it previously did nothing.
 - **A brief Live drop no longer ends a session**: the connection is held for 30 s
   before the game hears a sign-out (the token's hourly refresh used to close a co-op
   session on both machines).
@@ -107,8 +121,10 @@ the XenonLive section before you look for yours.
 - A **Steam Deck build** (`CaseWestRecomp-steamdeck-x86_64.tar.gz`, extracts by
   double-click in Dolphin), the same three changes as Case Zero's: **no launcher**
   (drop your package in `assets/package/` and run `./cw_runtime`; every setting is
-  in the in-game menu), **renders at 1280x800**, pinned by a line in `cw_defaults.env`
-  you can delete, and **uses SteamOS's own C++ runtime**. Its README says how to add
+  in the in-game menu), **starts at the Deck's native 1280x800** — a first-launch
+  default, not a lock, so you can switch to 1920x1080 or any other supported
+  resolution in the in-game settings and it sticks — and **uses SteamOS's own C++
+  runtime**. Its README says how to add
   it to Game Mode. Untested on a real Deck — a report either way is what we most want.
 
 ### Requirements

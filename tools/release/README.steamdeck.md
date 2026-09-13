@@ -17,19 +17,13 @@ Steam Deck build made):
   SteamOS that window is where Case Zero's reported crash happened, so this build skips it and
   goes straight to the game. Everything the launcher offered — resolution, display
   mode, shadows, FOV, language — is in the in-game settings menu instead.
-* **Always renders at 1280x800**, the Deck's panel on every model, instead of the
-  desktop build's 1280x720. This one is a **pin, not a default**: `cw_defaults.env`
-  next to the executable carries the line `CW_VK_RES=1280x800`, and that beats anything
-  in your settings file — including a settings file carried over from a PC install,
-  which is how a Deck could otherwise come up trying to render at a desktop monitor's
-  resolution.
+* **Starts at 1280x800**, the Deck's panel on every model, instead of the desktop
+  build's 1280x720. This is the **default for your first launch, not a lock**: open the
+  in-game settings menu (Help & Options -> Visuals) and pick any resolution the Deck
+  supports — 1920x1080 and the rest are all there — and your choice is remembered from
+  then on. Everything else in that menu (shadows, MSAA, FOV, frame cap, display mode)
+  works normally too.
 
-  The cost of pinning it is worth knowing: **while that line is there, the RESOLUTION
-  row in the in-game settings menu does nothing.** If you want that row back — to drop
-  below native for more frame rate, say — open `cw_defaults.env` in a text editor and
-  delete the `CW_VK_RES` line. Everything else in the settings menu (shadows, MSAA, FOV,
-  frame cap, display mode) works normally either way. The startup log says which is in
-  force: `internal resolution 1280x800 from CW_VK_RES (env wins over ...)`.
 * **It uses SteamOS's own C++ runtime** instead of carrying its own copy. The bundled
   copy is older than the one Mesa expects and could be reaching the AMD graphics driver
   ahead of it — a suspected cause of the crash, and the reason this build does not
