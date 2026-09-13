@@ -4,7 +4,7 @@
 `---`). All four v1.1.0 artifacts are staged for upload at
 `~/Release/Case West/1.1.0/` with a `SHA256SUMS` beside them.
 
-**Built 2026-09-13 at source `8dabd63`** (all four artifacts at that commit; rebuilt after a two-machine co-op session found and fixed the 330 s session teardown — see the co-op notes below) (branch `xlive-integration`; the docs commits
+**Built 2026-09-13 at source `ab5faf3`** (all four artifacts at that commit; rebuilt after a two-machine co-op session found and fixed the 330 s session teardown — see the co-op notes below) (branch `xlive-integration`; the docs commits
 after it change no code). Linux on the OLD BASE (Ubuntu 22.04 in a podman container,
 clang 15, SDL2 + LGPL ffmpeg + a static libcurl/OpenSSL compiled inside it); Windows
 on czwin (clang-cl, curl-for-win's DLL beside the exe). The overlay comes from the
@@ -16,10 +16,10 @@ port calls it); the Windows overlay is from the clean `e718507`.
 
 | artifact | bytes | sha256 |
 |---|---|---|
-| `CaseWestRecomp-linux-x86_64.tar.zst` | 31,610,503 | `85356192e62de7a21c41ed1fb8b09513571f6555112f481f83ea3dbec2e25ae4` |
-| `CaseWestRecomp-linux-x86_64.AppImage` | 30,231,032 | `28543cd521e6c4d198a1e4a85e47d6ffbd510d4af2952eb91fda11d106fb525a` |
-| `CaseWestRecomp-steamdeck-x86_64.tar.gz` | 31,714,591 | `85b1700cc3939795e20572a532bb1ae516673a8ac8c601c0d6ab47d286b9f784` |
-| `CaseWestRecomp-windows-x86_64.zip` | 24,654,556 | `a5653e45b04fea9c11978182a43baa3736cff0d150b7563751f3e7876832a990` |
+| `CaseWestRecomp-linux-x86_64.tar.zst` | 31,656,621 | `a00c9c14568711f462a5dd5381f9edbe0a1e1860da692e2a7bfb09e54f51f4c5` |
+| `CaseWestRecomp-linux-x86_64.AppImage` | 30,276,088 | `752699294971fe3dcbf5ebb5b5b62fb5c38c52e8b6f161e08ba978cb93a6a25c` |
+| `CaseWestRecomp-steamdeck-x86_64.tar.gz` | 31,757,027 | `d6c72753380c338edd6a363f1c7efb3d4c8651baa2cbedee48308e5403b3f22b` |
+| `CaseWestRecomp-windows-x86_64.zip` | 24,689,925 | `d5a6193459cb49b8223680362936404bf6c88aa151eb9057eec6966d41ba0ad9` |
 
 **Gates run:**
 * **`.text` identity** between the Release and matched RelWithDebInfo configures, both
@@ -168,8 +168,8 @@ Built on hedge-dev's XenonRecomp and XenosRecomp.
 ### Checksums (SHA-256)
 
 ```
-85356192e62de7a21c41ed1fb8b09513571f6555112f481f83ea3dbec2e25ae4  CaseWestRecomp-linux-x86_64.tar.zst
-28543cd521e6c4d198a1e4a85e47d6ffbd510d4af2952eb91fda11d106fb525a  CaseWestRecomp-linux-x86_64.AppImage
-85b1700cc3939795e20572a532bb1ae516673a8ac8c601c0d6ab47d286b9f784  CaseWestRecomp-steamdeck-x86_64.tar.gz
-a5653e45b04fea9c11978182a43baa3736cff0d150b7563751f3e7876832a990  CaseWestRecomp-windows-x86_64.zip
+a00c9c14568711f462a5dd5381f9edbe0a1e1860da692e2a7bfb09e54f51f4c5  CaseWestRecomp-linux-x86_64.tar.zst
+752699294971fe3dcbf5ebb5b5b62fb5c38c52e8b6f161e08ba978cb93a6a25c  CaseWestRecomp-linux-x86_64.AppImage
+d6c72753380c338edd6a363f1c7efb3d4c8651baa2cbedee48308e5403b3f22b  CaseWestRecomp-steamdeck-x86_64.tar.gz
+d5a6193459cb49b8223680362936404bf6c88aa151eb9057eec6966d41ba0ad9  CaseWestRecomp-windows-x86_64.zip
 ```
