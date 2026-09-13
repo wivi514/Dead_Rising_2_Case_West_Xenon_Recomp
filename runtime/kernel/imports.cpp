@@ -3820,6 +3820,85 @@ GUEST_FUNCTION_HOOK(__imp__XamUserGetXUID, XamUserGetXUID_x)
 GUEST_FUNCTION_HOOK(__imp__XamUserCheckPrivilege, XamUserCheckPrivilege_x)
 
 // ---------------------------------------------------------------------------
+// Voice / in-game chat — a SILENT no-op endpoint (part 12, the co-op teardown)
+// ---------------------------------------------------------------------------
+//
+// Single-player never touches voice, so these were honest-failure stubs. But a
+// CO-OP session does: the title builds its voice-chat object (session+0x3040)
+// ONLY if XamVoiceCreate succeeds, and the stub returned STATUS_NOT_IMPLEMENTED
+// (0xC0000002, a negative HRESULT). The call site (sub_825FA7A8) checks only
+// `result >= 0`; a negative sent it down the failure branch, the chat object
+// stayed null, "User 0 cannot be added to the chat" spammed every frame, and
+// 330 s after the session started the title's periodic LIVE_STATE_FLUSH_STATS
+// re-validation read that incomplete voice/Live state as "account 0 is not
+// signed in to xbox live!" and tore the session down on BOTH peers (host -> bot,
+// guest -> frontend quits -> black screen). Captured on a two-machine session,
+// teardown at a rock-steady 330 s ±2 s after the remote-gamer add, no gateway,
+// server, or kernel-signin cause.
+//
+// We do NOT implement real voice — players use Discord/party chat, and the whole
+// mic->encode->P2P->mix->playback stack would duplicate it. What co-op needs is
+// only that the endpoint EXIST so the local user registers in chat and the
+// session validates. So: XamVoiceCreate writes a non-zero handle and returns
+// S_OK, and the rest accept-and-discard. This is a real (minimal) service, not a
+// fake-success stub — the service it provides is "a voice channel that carries no
+// audio", which is exactly what a build with no in-game voice should present.
+//
+// XamVoiceCreate(context, flags, HANDLE* out): the title reads *out as the handle
+// on success (sub_825FA7A8: r5 = &handle at r31+0xc), and closes/zeroes it on the
+// failure path — so a non-zero handle here is what it keeps.
+constexpr uint32_t kSilentVoiceHandle = 0xF0000001u;
+
+static uint32_t XamVoiceCreate_x(uint32_t context, uint32_t flags, be<uint32_t>* outHandle)
+{
+    (void)context;
+    (void)flags;
+    if (outHandle)
+        *outHandle = kSilentVoiceHandle;
+    static bool announced = false;
+    if (!announced)
+    {
+        announced = true;
+        KLOG("[voice] XamVoiceCreate -> a SILENT no-op voice endpoint (handle %08X): co-op "
+             "chat registration succeeds, no audio is carried — use Discord/party chat\n",
+             kSilentVoiceHandle);
+    }
+    return 0;
+}
+GUEST_FUNCTION_HOOK(__imp__XamVoiceCreate, XamVoiceCreate_x)
+
+// The handle is the silent endpoint; there is nothing to tear down.
+static uint32_t XamVoiceClose_x(uint32_t handle)
+{
+    (void)handle;
+    return 0;
+}
+GUEST_FUNCTION_HOOK(__imp__XamVoiceClose, XamVoiceClose_x)
+
+// Accept every outgoing local packet and drop it (no headset is reported, so the
+// title should not produce any; if it ever does, discarding is the silent-voice
+// contract). Args beyond the handle are ignored.
+static uint32_t XamVoiceSubmitPacket_x(uint32_t handle, uint32_t a1, uint32_t a2, uint32_t a3)
+{
+    (void)handle;
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    return 0;
+}
+GUEST_FUNCTION_HOOK(__imp__XamVoiceSubmitPacket, XamVoiceSubmitPacket_x)
+
+// No local microphone/headset — honest for a silent endpoint, and it keeps the
+// title from waiting on mic input. The chat object still exists, so the co-op
+// user still registers in the session.
+static uint32_t XamVoiceHeadsetPresent_x(uint32_t handle)
+{
+    (void)handle;
+    return 0;
+}
+GUEST_FUNCTION_HOOK(__imp__XamVoiceHeadsetPresent, XamVoiceHeadsetPresent_x)
+
+// ---------------------------------------------------------------------------
 // The profile settings block — a layout read off the guest, not off the SDK
 // ---------------------------------------------------------------------------
 //
