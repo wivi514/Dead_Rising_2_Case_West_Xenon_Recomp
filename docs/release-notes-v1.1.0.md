@@ -4,7 +4,7 @@
 `---`). All four v1.1.0 artifacts are staged for upload at
 `~/Release/Case West/1.1.0/` with a `SHA256SUMS` beside them.
 
-**Built 2026-09-12 at source `aae9fca`** (rebuilt the same evening after the first AMD sitting found the invisible-overlay bug — the notes below say what; all four artifacts are at that commit) (branch `xlive-integration`; the docs commits
+**Built 2026-09-12 at source `466edd1`** (all four artifacts at that commit; rebuilt after the AMD sitting's invisible-overlay fix and the co-op keyboard-accept fix below) (branch `xlive-integration`; the docs commits
 after it change no code). Linux on the OLD BASE (Ubuntu 22.04 in a podman container,
 clang 15, SDL2 + LGPL ffmpeg + a static libcurl/OpenSSL compiled inside it); Windows
 on czwin (clang-cl, curl-for-win's DLL beside the exe). The overlay comes from the
@@ -16,10 +16,10 @@ port calls it); the Windows overlay is from the clean `e718507`.
 
 | artifact | bytes | sha256 |
 |---|---|---|
-| `CaseWestRecomp-linux-x86_64.tar.zst` | 31,609,251 | `ec81e020d2ecdfad385cef04f792befbfeb88b1ce198dceb61c74f128f27b7b9` |
-| `CaseWestRecomp-linux-x86_64.AppImage` | 30,218,744 | `0b2b3c93f54795b99f89faa368f2b4994d2f3d40a8e209fd2346d0bb32860c8b` |
-| `CaseWestRecomp-steamdeck-x86_64.tar.gz` | 31,710,489 | `995eeaa558df68483b7aff8eb8c4b998b51911f0ff31071a91e4b5f93604cfa4` |
-| `CaseWestRecomp-windows-x86_64.zip` | 24,650,170 | `7b969e4bbe61f602b7231678da9fc238651f999a0691716fccd84ced3944d350` |
+| `CaseWestRecomp-linux-x86_64.tar.zst` | 31,612,015 | `bdc556862c7457e29dc5a768a0a74127060e8006046be2e357499933dd39df8e` |
+| `CaseWestRecomp-linux-x86_64.AppImage` | 30,235,128 | `823b00f0a51a92514df649b4e8a7f093dd5da82afa6f4eb1aaef292e0828c7e7` |
+| `CaseWestRecomp-steamdeck-x86_64.tar.gz` | 31,713,745 | `0d601100209d29e35c7905896d9084233ad058e65c6428838cb0a37f7949f7e9` |
+| `CaseWestRecomp-windows-x86_64.zip` | 24,651,797 | `30ed4ec241313f05b8f744fb990378c10e6c3e5b86f89321b112ec1ab767d405` |
 
 **Gates run:**
 * **`.text` identity** between the Release and matched RelWithDebInfo configures, both
@@ -79,6 +79,7 @@ the XenonLive section before you look for yours.
   account's folder once it exists.
 - **The in-game overlay: Shift+Tab.** Friends, invites and notifications over the
   game; the pad and the mouse belong to the overlay while it is open.
+- **A co-op join request can be accepted with the keyboard's right arrow**, not just the controller's d-pad (the walkie-talkie prompt polls the raw d-pad, which the native keyboard path had not fed).
 - **Shift+Tab does nothing when the game was not started from the launcher** (there
   is no account to show) — and says so in the log. The first v1.1.0 build opened an
   invisible overlay there that took the mouse and pad; fixed before publishing.
@@ -145,8 +146,8 @@ Built on hedge-dev's XenonRecomp and XenosRecomp.
 ### Checksums (SHA-256)
 
 ```
-ec81e020d2ecdfad385cef04f792befbfeb88b1ce198dceb61c74f128f27b7b9  CaseWestRecomp-linux-x86_64.tar.zst
-0b2b3c93f54795b99f89faa368f2b4994d2f3d40a8e209fd2346d0bb32860c8b  CaseWestRecomp-linux-x86_64.AppImage
-995eeaa558df68483b7aff8eb8c4b998b51911f0ff31071a91e4b5f93604cfa4  CaseWestRecomp-steamdeck-x86_64.tar.gz
-7b969e4bbe61f602b7231678da9fc238651f999a0691716fccd84ced3944d350  CaseWestRecomp-windows-x86_64.zip
+bdc556862c7457e29dc5a768a0a74127060e8006046be2e357499933dd39df8e  CaseWestRecomp-linux-x86_64.tar.zst
+823b00f0a51a92514df649b4e8a7f093dd5da82afa6f4eb1aaef292e0828c7e7  CaseWestRecomp-linux-x86_64.AppImage
+0d601100209d29e35c7905896d9084233ad058e65c6428838cb0a37f7949f7e9  CaseWestRecomp-steamdeck-x86_64.tar.gz
+30ed4ec241313f05b8f744fb990378c10e6c3e5b86f89321b112ec1ab767d405  CaseWestRecomp-windows-x86_64.zip
 ```
