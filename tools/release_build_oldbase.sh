@@ -95,6 +95,16 @@ done
 HOMEDIR=$OB/home
 mkdir -p "$HOMEDIR"
 
+# ONE version string for BOTH configures (runtime/CMakeLists.txt explains why): computed
+# on the host, before the container starts, so a tree that changes mid-build cannot make
+# the release and matched configures bake different strings — the only .text difference
+# that would be, and it fails the identity gate for a reason that is not code generation.
+# Computed here rather than in the container because git refuses a repo it sees as
+# owned by another user ("dubious ownership") and would quietly fall back to "dev".
+CW_GAME_VERSION=$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null || echo dev)
+export CW_GAME_VERSION
+echo "==> game version for bug reports: $CW_GAME_VERSION"
+
 RUN=(podman run --rm -i
      -v "$ROOT:$ROOT:Z"
      -v "$DXC_SRC:/opt/dxc/libdxcompiler.so:ro,Z"
@@ -117,6 +127,7 @@ RUN=(podman run --rm -i
      # build trees apart so a Deck build cannot clobber the desktop one's .text and
      # quietly invalidate its identity gate.
      -e CW_DECK="${CW_DECK:-}"
+     -e CW_GAME_VERSION="${CW_GAME_VERSION:-}"
      -e CW_BUILD_TAG="${CW_BUILD_TAG:-}"
      -e CW_PKG_SUFFIX="${CW_PKG_SUFFIX:-}"
      -e CW_PKG_TARGZ="${CW_PKG_TARGZ:-}"
@@ -179,7 +190,7 @@ cfg() {
         -DXENOS_ROOT="$XENOS_ROOT" -DXENON_ROOT="$XENON_ROOT" -DXENON_BUILD="$XB" \
         -DXLIVE_ROOT="$XLIVE_ROOT" -DCMAKE_PREFIX_PATH="$OB/curl" -DOPENSSL_USE_STATIC_LIBS=ON \
         -DXLIVE_LAUNCHER_ROOT="$XLIVE_LAUNCHER_ROOT" -DCW_XLIVE_OVERLAY=ON \
-        -DCW_DECK="${CW_DECK:-OFF}" \
+        -DCW_DECK="${CW_DECK:-OFF}" -DCW_GAME_VERSION="$CW_GAME_VERSION" \
         > "$1.configure.log" 2>&1 || { tail -30 "$1.configure.log"; exit 1; }
     grep -q "XenonLive overlay: on" "$1.configure.log" || { echo "FAIL: the overlay did not configure ON"; exit 1; }
 }

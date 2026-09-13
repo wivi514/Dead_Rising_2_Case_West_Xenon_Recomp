@@ -77,6 +77,12 @@ the XenonLive section before you look for yours.
   default profile keeps the folder you already have. **Your existing saves are the
   default profile's**: to carry them onto your account, copy the save files into the
   account's folder once it exists.
+- **F9 / F8 capture a bug report.** Press **F9** (one frame) or **F8** (three frames
+  over a second) and the game writes a folder the XenonLive launcher's **Issues** tab
+  lists: the screenshot, the log for the 60 s before the key and the 15 s after, and
+  your machine (OS, CPU, GPU, driver, RAM, game version and settings). Nothing is sent
+  anywhere — the launcher shows you the capture and you decide whether to send or
+  delete it. The folder is size-bounded and prunes itself.
 - **The in-game overlay: Shift+Tab.** Friends, invites and notifications over the
   game; the pad and the mouse belong to the overlay while it is open.
 - **A co-op join request can be accepted with the keyboard's right arrow**, not just the controller's d-pad (the walkie-talkie prompt polls the raw d-pad, which the native keyboard path had not fed).

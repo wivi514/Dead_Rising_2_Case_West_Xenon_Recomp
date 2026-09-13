@@ -735,7 +735,14 @@ target_compile_definitions(cw_runtime PRIVATE MINIZ_NO_ARCHIVE_APIS MINIZ_NO_ARC
 # build between tags, "-dirty" when the tree has uncommitted changes. "dev" when git
 # cannot answer (a tarball, a container without git). Configure-time, so a release
 # configured at its tag says the tag and nothing else.
+# The release scripts compute this ONCE and pass -DCW_GAME_VERSION to BOTH configures
+# (release and the matched RelWithDebInfo), because `git describe --dirty` is evaluated
+# at configure time: if the tree changes between the two configures — editing the release
+# notes while the build runs will do it — one bakes "v1.1.0" and the other
+# "v1.1.0-dirty", the only .text difference in the binary, and the identity gate fails
+# for a reason that has nothing to do with code generation. Found exactly that way.
 find_package(Git QUIET)
+if(NOT DEFINED CW_GAME_VERSION OR CW_GAME_VERSION STREQUAL "")
 set(CW_GAME_VERSION "dev")
 if(GIT_FOUND)
     execute_process(COMMAND ${GIT_EXECUTABLE} describe --tags --always --dirty
@@ -744,6 +751,7 @@ if(GIT_FOUND)
     if(_cw_rc EQUAL 0 AND NOT "${_cw_ver}" STREQUAL "")
         set(CW_GAME_VERSION "${_cw_ver}")
     endif()
+endif()
 endif()
 message(STATUS "Game version for bug reports: ${CW_GAME_VERSION}")
 set_source_files_properties(host/bug_report.cpp PROPERTIES COMPILE_DEFINITIONS "CW_GAME_VERSION=\"${CW_GAME_VERSION}\"")
