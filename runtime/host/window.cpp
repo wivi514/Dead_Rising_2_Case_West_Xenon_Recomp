@@ -1358,35 +1358,36 @@ HostPadState ReadKeyboard()
                 s.buttons |= XI_LEFT_SHOULDER;
             if (keys[SDL_SCANCODE_2] || keys[SDL_SCANCODE_3])
                 s.buttons |= XI_RIGHT_SHOULDER;
-            // THE D-PAD — OFF BY DEFAULT, and the reason is a regression this
-            // caused (part 12). The co-op "<name> wants to join your game" call is
-            // answered by the walkie-talkie's own handler polling the raw XInput
-            // D-pad RIGHT, which the native path never fed, so the right arrow could
-            // not accept a join. Feeding the four d-pad bits fixed that — and broke
-            // every menu: kbm_default_map.h binds COMMAND_FRONTEND_UP/DOWN/LEFT/RIGHT
-            // to KEY_UP/DOWN/LEFT/RIGHT already, so an arrow drove menu navigation
-            // through the command layer AND, now, through the pad's own nav path —
-            // two moves per press, which is exactly what the operator reported
-            // ("often double scroll with mouse and keyboard"). The earlier reasoning
-            // that the OR combiner would edge-fire once holds for PAUSEMENU_*, whose
-            // lines pair the arrow WITH WASD; it does not hold for the FRONTEND_*
-            // lines, where the arrow is the whole binding and the pad is a separate
-            // route to the same screen.
+            // THE D-PAD — LEFT AND RIGHT ONLY, and on by default (part 12).
             //
-            // Menus are used in every session and the join prompt by two people in a
-            // co-op host's game, so the default is the one that keeps menus correct.
-            // CW_KBM_DPAD=1 restores the feed for a host who wants to accept a join
-            // from the keyboard and can live with double navigation; the real fix is
-            // to drive the title's own answered-call handler from a key instead of
-            // synthesising a pad, which is how the sibling does it.
+            // Why it exists: the co-op "<name> wants to join your game" call is
+            // answered by the walkie-talkie's own handler polling the raw XInput
+            // D-pad RIGHT, which the native path never feeds, so without this the
+            // right arrow cannot accept a join.
+            //
+            // Why only two of the four: kbm_default_map.h already binds
+            // COMMAND_FRONTEND_UP/DOWN/LEFT/RIGHT to the arrow keys, so feeding the
+            // pad from the same key gives menu navigation a SECOND route and every
+            // press moves twice — the double-scroll the first version of this caused.
+            // Menu movement is overwhelmingly UP/DOWN, so those two are never fed and
+            // scrolling is single again; LEFT/RIGHT are fed because that is what the
+            // join prompt needs (operator's call: "just make it for left and right
+            // arrow since up and down is just for menu").
+            //
+            // WHAT THIS STILL COSTS, said plainly: a menu that moves HORIZONTALLY on
+            // the arrows — stepping a value in the Visuals panel, switching a tab —
+            // can still take two steps per press. That is the deliberate trade for a
+            // join prompt that can be answered from the keyboard. CW_KBM_DPAD=0 turns
+            // even left/right off (the control arm, and the fix for anyone who hits
+            // the horizontal case and does not host co-op). The real repair is to
+            // drive the title's answered-call handler from a key instead of
+            // synthesising a pad press, which is how the sibling does it.
             static const bool dpadKeys = [] {
                 const char* e = std::getenv("CW_KBM_DPAD");
-                return e && *e && *e != '0';
+                return !(e && e[0] == '0');
             }();
             if (dpadKeys)
             {
-                if (keys[SDL_SCANCODE_UP])    s.buttons |= XI_DPAD_UP;
-                if (keys[SDL_SCANCODE_DOWN])  s.buttons |= XI_DPAD_DOWN;
                 if (keys[SDL_SCANCODE_LEFT])  s.buttons |= XI_DPAD_LEFT;
                 if (keys[SDL_SCANCODE_RIGHT]) s.buttons |= XI_DPAD_RIGHT;
             }
