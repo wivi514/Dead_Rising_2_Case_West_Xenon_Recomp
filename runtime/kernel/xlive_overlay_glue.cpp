@@ -81,6 +81,31 @@ void CwOverlay_OnEvent(const xlive::Event& event)
 {
     xlive_overlay::Overlay::Instance().OnEvent(event);
 }
+
+// The CW_XLIVE_OVERLAY=0 off switch, plus the no-client rule the rest of this file
+// follows: with no XenonLive client there is no overlay to draw a toast on.
+static bool OverlayOff()
+{
+    static const bool off = [] {
+        const char* v = std::getenv("CW_XLIVE_OVERLAY");
+        return v && v[0] == '0';
+    }();
+    return off || !g_haveClient.load(std::memory_order_acquire);
+}
+
+bool CwOverlay_Notify(const char* text, double seconds, const char* tag)
+{
+    if (OverlayOff() || !text)
+        return false;
+    xlive_overlay::Overlay::Instance().Notify(text, seconds, tag ? tag : "");
+    return true;
+}
+void CwOverlay_Dismiss(const char* tag)
+{
+    if (!OverlayOff())
+        xlive_overlay::Overlay::Instance().Dismiss(tag ? tag : "");
+}
+
 bool CwOverlay_Render(const CwOverlayVulkan& vk, VkCommandBuffer cmd, VkImage image,
                       uint32_t width, uint32_t height, uint64_t generation)
 {
@@ -110,6 +135,8 @@ void CwOverlay_Shutdown() { xlive_overlay::Overlay::Instance().Shutdown(); }
 bool CwOverlay_QueueSdlEvent(const SDL_Event&) { return false; }
 void CwOverlay_SetWindowSize(int, int) {}
 bool CwOverlay_Open() { return false; }
+bool CwOverlay_Notify(const char*, double, const char*) { return false; }
+void CwOverlay_Dismiss(const char*) {}
 void CwOverlay_SyncTextInput() {}
 void CwOverlay_SetClient(xlive::Client*, uint32_t) {}
 void CwOverlay_OnEvent(const xlive::Event&) {}

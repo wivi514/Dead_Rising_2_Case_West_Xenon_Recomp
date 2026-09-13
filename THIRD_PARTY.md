@@ -62,6 +62,7 @@ stand as written and must be revisited BEFORE the first line is copied.
 |---|---|---|
 | **UnleashedRecomp** (hedge-dev) | **GPLv3** | **Architecture and findings only. No code copied, and none may be** — see above. Structural reference; port the method, write our own. |
 | **plume** (the RHI UnleashedRecomp renders through) | **MIT — licence VERIFIED** (recorded in CLAUDE.md) | Not vendored. MIT, so it carries no copyleft obligation if adopted. |
+| **miniz** (Rich Geldreich / RAD Game Tools) | **public domain / Unlicense** — licence text vendored at `runtime/thirdparty/miniz/LICENSE` | **Vendored** at `runtime/thirdparty/miniz/`, compiled into the runtime. Only its deflate + PNG writer is used (the F8/F9 bug-report capture's screenshot); the archive, stdio and zlib-compatible-name halves are compiled out. |
 
 ### Used, and NOT part of this repository
 
@@ -76,7 +77,7 @@ stand as written and must be revisited BEFORE the first line is copied.
 
 | item | note |
 |---|---|
-| `assets/` | Retail *Dead Rising 2: Case Zero* data. Copyrighted by its owners. Gitignored; never distributed. |
+| `assets/` | Retail *Dead Rising 2: Case West* data. Copyrighted by its owners. Gitignored; never distributed. |
 | `ppc/` | Generated C++ recompiled from the retail executable — a derivative of copyrighted material. Gitignored; regenerated locally from a legally-obtained copy. |
 
 ---

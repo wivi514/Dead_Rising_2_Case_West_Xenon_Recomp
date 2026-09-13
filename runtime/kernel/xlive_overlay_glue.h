@@ -32,6 +32,16 @@ void CwOverlay_SyncTextInput();
 void CwOverlay_SetClient(xlive::Client* client, uint32_t titleId);
 void CwOverlay_OnEvent(const xlive::Event& event);
 
+// -- any thread ---------------------------------------------------------------
+// A notice of the game's own, shown as a toast for `seconds` whether or not the
+// overlay is open; `tag` lets CwOverlay_Dismiss take it down early. Used by the
+// F8/F9 bug-report capture to say a report was written. Returns false when there
+// is no overlay to show it on — not built in, switched off (CW_XLIVE_OVERLAY=0),
+// or no XenonLive client (the offline default profile, where the overlay has
+// nothing to draw). Callers treat it as advisory: the work happens either way.
+bool CwOverlay_Notify(const char* text, double seconds, const char* tag);
+void CwOverlay_Dismiss(const char* tag);
+
 // -- the render thread ---------------------------------------------------------
 struct CwOverlayVulkan
 {
