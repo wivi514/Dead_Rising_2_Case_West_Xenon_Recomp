@@ -1339,6 +1339,23 @@ HostPadState ReadKeyboard()
                 s.buttons |= XI_LEFT_SHOULDER;
             if (keys[SDL_SCANCODE_2] || keys[SDL_SCANCODE_3])
                 s.buttons |= XI_RIGHT_SHOULDER;
+            // THE D-PAD, same reasoning as the shoulder keys above (part 12). The
+            // native path routes the arrow keys into the title's own command layer
+            // (COMMAND_PAUSEMENU_* etc., kbm_default_map.h), which covers menus — but
+            // some elements poll the raw XInput D-PAD BUTTON, not a command, and those
+            // the reduced merge never fed from the keyboard: the co-op "<name> wants to
+            // join your game" call is answered by D-pad RIGHT (the walkie-talkie's own
+            // answered handler), so on a controller RIGHT accepts and on the keyboard
+            // the right arrow did nothing — the operator's report, reproduced in a
+            // two-machine session. Feeding the four d-pad bits makes an arrow press
+            // indistinguishable from the pad press that is known to work. It does NOT
+            // double menu navigation: the PAUSEMENU_* commands OR the arrow key with
+            // WASD and edge-fire on the combined result, so a single arrow reaching the
+            // command via both its key source and this d-pad bit is still one press.
+            if (keys[SDL_SCANCODE_UP])    s.buttons |= XI_DPAD_UP;
+            if (keys[SDL_SCANCODE_DOWN])  s.buttons |= XI_DPAD_DOWN;
+            if (keys[SDL_SCANCODE_LEFT])  s.buttons |= XI_DPAD_LEFT;
+            if (keys[SDL_SCANCODE_RIGHT]) s.buttons |= XI_DPAD_RIGHT;
             return s;
         }
 
