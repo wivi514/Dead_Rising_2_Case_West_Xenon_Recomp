@@ -1358,23 +1358,38 @@ HostPadState ReadKeyboard()
                 s.buttons |= XI_LEFT_SHOULDER;
             if (keys[SDL_SCANCODE_2] || keys[SDL_SCANCODE_3])
                 s.buttons |= XI_RIGHT_SHOULDER;
-            // THE D-PAD, same reasoning as the shoulder keys above (part 12). The
-            // native path routes the arrow keys into the title's own command layer
-            // (COMMAND_PAUSEMENU_* etc., kbm_default_map.h), which covers menus — but
-            // some elements poll the raw XInput D-PAD BUTTON, not a command, and those
-            // the reduced merge never fed from the keyboard: the co-op "<name> wants to
-            // join your game" call is answered by D-pad RIGHT (the walkie-talkie's own
-            // answered handler), so on a controller RIGHT accepts and on the keyboard
-            // the right arrow did nothing — the operator's report, reproduced in a
-            // two-machine session. Feeding the four d-pad bits makes an arrow press
-            // indistinguishable from the pad press that is known to work. It does NOT
-            // double menu navigation: the PAUSEMENU_* commands OR the arrow key with
-            // WASD and edge-fire on the combined result, so a single arrow reaching the
-            // command via both its key source and this d-pad bit is still one press.
-            if (keys[SDL_SCANCODE_UP])    s.buttons |= XI_DPAD_UP;
-            if (keys[SDL_SCANCODE_DOWN])  s.buttons |= XI_DPAD_DOWN;
-            if (keys[SDL_SCANCODE_LEFT])  s.buttons |= XI_DPAD_LEFT;
-            if (keys[SDL_SCANCODE_RIGHT]) s.buttons |= XI_DPAD_RIGHT;
+            // THE D-PAD — OFF BY DEFAULT, and the reason is a regression this
+            // caused (part 12). The co-op "<name> wants to join your game" call is
+            // answered by the walkie-talkie's own handler polling the raw XInput
+            // D-pad RIGHT, which the native path never fed, so the right arrow could
+            // not accept a join. Feeding the four d-pad bits fixed that — and broke
+            // every menu: kbm_default_map.h binds COMMAND_FRONTEND_UP/DOWN/LEFT/RIGHT
+            // to KEY_UP/DOWN/LEFT/RIGHT already, so an arrow drove menu navigation
+            // through the command layer AND, now, through the pad's own nav path —
+            // two moves per press, which is exactly what the operator reported
+            // ("often double scroll with mouse and keyboard"). The earlier reasoning
+            // that the OR combiner would edge-fire once holds for PAUSEMENU_*, whose
+            // lines pair the arrow WITH WASD; it does not hold for the FRONTEND_*
+            // lines, where the arrow is the whole binding and the pad is a separate
+            // route to the same screen.
+            //
+            // Menus are used in every session and the join prompt by two people in a
+            // co-op host's game, so the default is the one that keeps menus correct.
+            // CW_KBM_DPAD=1 restores the feed for a host who wants to accept a join
+            // from the keyboard and can live with double navigation; the real fix is
+            // to drive the title's own answered-call handler from a key instead of
+            // synthesising a pad, which is how the sibling does it.
+            static const bool dpadKeys = [] {
+                const char* e = std::getenv("CW_KBM_DPAD");
+                return e && *e && *e != '0';
+            }();
+            if (dpadKeys)
+            {
+                if (keys[SDL_SCANCODE_UP])    s.buttons |= XI_DPAD_UP;
+                if (keys[SDL_SCANCODE_DOWN])  s.buttons |= XI_DPAD_DOWN;
+                if (keys[SDL_SCANCODE_LEFT])  s.buttons |= XI_DPAD_LEFT;
+                if (keys[SDL_SCANCODE_RIGHT]) s.buttons |= XI_DPAD_RIGHT;
+            }
             return s;
         }
 
