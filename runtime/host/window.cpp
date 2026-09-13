@@ -2945,6 +2945,8 @@ void Host_WindowRun()
         if (const char* why = g_quitReason.load(std::memory_order_acquire))
             Shutdown(why);
 
+        // Text input follows the overlay's text boxes; off otherwise (above).
+        CwOverlay_SyncTextInput();
         SDL_Event e;
         while (SDL_PollEvent(&e))
         {

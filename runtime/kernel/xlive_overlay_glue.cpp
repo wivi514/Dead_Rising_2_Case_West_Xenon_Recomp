@@ -45,6 +45,18 @@ bool CwOverlay_Open()
 {
     return g_haveClient.load(std::memory_order_acquire) && xlive_overlay::Overlay::Instance().open();
 }
+void CwOverlay_SyncTextInput()
+{
+    static bool on = false;
+    const bool want = CwOverlay_Open() && xlive_overlay::Overlay::Instance().wants_text_input();
+    if (want == on)
+        return;
+    on = want;
+    if (want)
+        SDL_StartTextInput();
+    else
+        SDL_StopTextInput();
+}
 void CwOverlay_SetClient(xlive::Client* client, uint32_t titleId)
 {
     xlive_overlay::Overlay::Instance().SetClient(client, titleId);
@@ -89,6 +101,7 @@ void CwOverlay_Shutdown() { xlive_overlay::Overlay::Instance().Shutdown(); }
 bool CwOverlay_QueueSdlEvent(const SDL_Event&) { return false; }
 void CwOverlay_SetWindowSize(int, int) {}
 bool CwOverlay_Open() { return false; }
+void CwOverlay_SyncTextInput() {}
 void CwOverlay_SetClient(xlive::Client*, uint32_t) {}
 void CwOverlay_OnEvent(const xlive::Event&) {}
 bool CwOverlay_Render(const CwOverlayVulkan&, VkCommandBuffer, VkImage, uint32_t, uint32_t, uint64_t)

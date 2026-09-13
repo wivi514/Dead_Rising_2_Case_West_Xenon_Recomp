@@ -21,6 +21,12 @@ bool CwOverlay_QueueSdlEvent(const SDL_Event& e);
 void CwOverlay_SetWindowSize(int w, int h);
 // The overlay owns keyboard, mouse and pad while it is open.
 bool CwOverlay_Open();
+// Keeps SDL's text input on exactly while an overlay text box has the
+// focus. The window turns text input OFF at start (composed text through
+// the IME lagged raw keys — see window.cpp), so typing a gamertag or a
+// message needs it turned on for the duration, and off again after. Call
+// once per event loop pass.
+void CwOverlay_SyncTextInput();
 
 // -- the library's worker ----------------------------------------------------
 void CwOverlay_SetClient(xlive::Client* client, uint32_t titleId);
