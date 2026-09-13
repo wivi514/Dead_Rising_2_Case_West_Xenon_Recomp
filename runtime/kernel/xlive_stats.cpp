@@ -590,7 +590,31 @@ void XliveStats_Shutdown()
 bool XliveStats_Dispatch(uint32_t message, void* buffer, uint32_t bufferLength,
                          uint32_t overlappedVa, uint32_t* result)
 {
-    if (!g_enabled || message != 0x000B0021)
+    if (!g_enabled)
+        return false;
+
+    // XGI 0x000B0026 — XSessionFlushStats, the commit half of the WriteStats/Flush
+    // pair (part 12, the co-op teardown). The title sends it at LIVE_STATE_FLUSH_STATS,
+    // which runs 330 s after a co-op session starts; it is the ONLY message that path
+    // sends that this runtime did not handle, so DispatchAppMessage fell to its default
+    // and returned E_FAIL (0x80004005). The title reuses that overlapped as the
+    // session's validity word, read the E_FAIL as "account 0 is not signed in to xbox
+    // live!", and tore the co-op session down on both peers at a rock-steady 330 s.
+    // Captured on a two-machine session: `[xgi] message 000B0026 ... overlapped=X`
+    // immediately followed by that overlapped becoming 0x80004005 and the teardown.
+    //
+    // We already persist stats on WriteStats (0x000B0025) via libxlive, so the flush
+    // has nothing to commit here — it only has to SUCCEED so the stats-flush state
+    // completes and the session survives. Complete its overlapped with success.
+    if (message == 0x000B0026)
+    {
+        if (overlappedVa)
+            Xam_CompleteOverlapped(overlappedVa, kErrorSuccess, 0);
+        *result = kErrorSuccess;
+        return true;
+    }
+
+    if (message != 0x000B0021)
         return false;
     if (!buffer || bufferLength < sizeof(GuestReadStats))
     {
