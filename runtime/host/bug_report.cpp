@@ -489,7 +489,7 @@ void WriteReport(std::unique_ptr<Pending> p)
     std::string j = "{\n  \"version\": 1,\n";
     {
         char b[512];
-        snprintf(b, sizeof b, "  \"title_id\": \"58410a8d\",\n  \"game\": \"Dead Rising 2: Case West\",\n"
+        snprintf(b, sizeof b, "  \"title_id\": \"58410b00\",\n  \"game\": \"Dead Rising 2: Case West\",\n"
                               "  \"game_version\": \"%s\",\n  \"captured_at\": \"%s\",\n"
                               "  \"trigger\": \"%s\",\n  \"files\": [\n",
                  JsonEscape(CW_GAME_VERSION).c_str(), Rfc3339(p->wall).c_str(),
