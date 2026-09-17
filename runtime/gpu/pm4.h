@@ -129,6 +129,13 @@ struct Pm4VsPaletteWrites
 };
 Pm4VsPaletteWrites Pm4_TakeVsPaletteWrites();  // returns and RESETS (the consume)
 uint32_t Pm4_VsPaletteHighWater();             // highest reg ever written; never reset
+// The display controller's 256-entry gamma LUT as the title loaded it through the ring
+// (DC_LUT_30_COLOR, blue 0:9 / green 10:19 / red 20:29; part 119). Returns the table's
+// VERSION: 0 = never loaded, otherwise the count of colour writes so far, so a consumer
+// re-snapshots only when it changes. `Pm4_GammaRampWrites(true)` counts the PWL /
+// SEQ_COLOR writes this runtime does not model.
+uint32_t Pm4_GammaRampSnapshot(uint32_t out[256]);
+uint64_t Pm4_GammaRampWrites(bool pwl);
 uint32_t Pm4_Cursor();
 uint32_t Pm4_ScratchAddr();
 uint32_t Pm4_ScratchUmsk();
@@ -173,6 +180,12 @@ void Pm4_SetFenceWord(uint32_t va);
 // Pm4_RptrMidwalkStores is the engagement counter.
 void Pm4_SetRptrPublishSlot(uint32_t va);
 uint64_t Pm4_RptrMidwalkStores();
+// Tile replays whose shader bindings were restored to the first replay's (player
+// issue #3). Zero on a tiled route with the default arm is a defect.
+uint64_t Pm4_ReplayRestores();
+// Draws handed a tile window offset because their own was zero inside a tile replay
+// (player issue #3's depth rect). Printed beside the replay restores.
+uint64_t Pm4_TileOffsetDraws();
 uint64_t Pm4_FenceRegressionCount();
 
 // The microcode bound by the last IM_LOAD/IM_LOAD_IMMEDIATE for a stage. `hash` is
@@ -213,6 +226,14 @@ struct Pm4Draw
     // Both readings are carried so an arm can switch between them in one binary.
     uint32_t indexEndianTop;
     uint32_t indexSizeDword;
+    // THE TILE THIS DRAW IS A REPLAY FOR when its own PA_SC_WINDOW_OFFSET is zero
+    // (player issue #3). D3D's Clear inside a tiling bracket is an EDRAM-space rect: it
+    // sets the window offset to 0, draws, and re-applies the tile's offset — so on
+    // hardware the rect covers the tile being replayed, and in our full-size EDRAM
+    // stand-in it must land where that tile lives. This is the last non-zero window
+    // offset seen on a draw under the SAME bin select (the tile's predication era);
+    // zero outside a tile replay and for the first tile.
+    uint32_t tileWindowOffset;
 };
 void Pm4_SetDrawSink(void (*sink)(uint8_t* base, const Pm4Draw&));
 

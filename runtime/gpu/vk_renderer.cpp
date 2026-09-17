@@ -7,6 +7,7 @@
 #include "shader_translator.h"
 #include "drawid_ps_spv.h"
 #include "null_ps_spv.h"   // CW_VK_NULL_PS (part 106's measurement arm)
+#include "gamma_ramp_spv.h" // CW_VK_GAMMA_RAMP=1 (the DC_LUT display ramp, OFF by default)
 #include "xenos.h"
 #include "../kernel/xlive_overlay_glue.h"
 #include "../host/bug_report.h"
@@ -97,6 +98,18 @@ constexpr uint32_t kSharedTessGrid = 280;
 // 4x MSAA — the only configuration in which our sample-per-sample dither is the right
 // emulation. The last free dword before the 1D alias table at 288.
 constexpr uint32_t kSharedAlphaToMask = 284;
+
+// FNV-1a over a dword block, for the draw census's constant-file columns.
+static uint32_t CensusHash(const uint32_t* words, size_t count)
+{
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < count; i++)
+    {
+        h ^= words[i];
+        h *= 16777619u;
+    }
+    return h;
+}
 constexpr uint32_t kSharedTex1D = 288;
 constexpr uint32_t kSharedPosScale = 352;
 constexpr uint32_t kSharedPosOffset = 360;
@@ -2970,6 +2983,9 @@ bool LoadShaderMeta(const std::filesystem::path& path, ShaderMeta& meta)
 // draw quietly using the previous draw's blend mode.
 constexpr uint32_t kPassDrawId = 1u << 0;
 constexpr uint32_t kPassRtShadow = 1u << 1;
+// bit 2: the draw's RB_COLORCONTROL alpha-to-mask bit, honoured as Vulkan
+// alpha-to-coverage on the multisampled EDRAM (player issue #2, the hair flicker).
+constexpr uint32_t kPassAlphaToCoverage = 1u << 2;
 
 struct PipelineKey
 {
@@ -4747,6 +4763,33 @@ struct FrameSlot
     // recorded, and checked against `frame` at the retire — see the check for why an
     // md5-shaped canary could not do this job.
     uint64_t pixelFrame = ~0ull;
+
+    // RESOLVES THE CPU READS (part 120). The title's exposure controller reads its
+    // luminance chain's final 1x1 16_FLOAT resolve back with a plain `lwz` of the
+    // destination address (`sub_825D65A8` there — Case Zero's address, imported 2026-09-17; its
+    // Case West twin is not derived yet, the engagement counter is the gate here), and this renderer never wrote a resolve back
+    // to guest memory — so the guest read 0, took the `lum == 0 -> 1.0` sentinel, and the
+    // exposure collapsed to the lighting table's minimum at every hour of the day (0.35 in
+    // the safehouse by day, 0.10 at night: the black night interiors of open-item 0zc).
+    // Xenia with `readback_resolve = "none"` — the operator's canary — does the same, which
+    // is why hardware(Xenia) agreed with us and a real console did not.
+    //
+    // The bytes for the frame's tiny colour resolves are copied into `wb` in the frame's
+    // own command buffer and written into guest memory at the retire, after the fence —
+    // the earliest moment the value exists. See DoResolve for the rule and the encoding.
+    struct GuestWriteback
+    {
+        uint32_t dest = 0;      // RB_COPY_DEST_BASE
+        uint32_t w = 0, h = 0;  // guest pixels copied (the pass's window)
+        uint32_t pitch = 0;     // the destination surface's pitch, in pixels
+        uint32_t hw = 0, hh = 0;// host pixels copied (the snapshot is resolution-scaled)
+        uint32_t destFmt = 0;   // RB_COPY_DEST_INFO format (30 = 16_FLOAT, 6 = 8_8_8_8)
+        uint32_t endian = 0;    // RB_COPY_DEST_INFO endian (1 = 8-in-16, 2 = 8-in-32)
+        VkDeviceSize offset = 0;// into `wb`
+    };
+    std::vector<GuestWriteback> writebacks;
+    Buffer wb;
+    VkDeviceSize wbUsed = 0;
 };
 // Two is the whole design: the CPU records one frame while the GPU executes one. Deeper
 // pipelining buys nothing here and costs a whole arena each — the GPU is 16.5 ms against
@@ -5402,6 +5445,11 @@ struct Renderer
     // CW_VK_DRAW_CENSUS — the frame whose every draw is being listed, and the file it
     // goes to. Zero means disarmed, which is every frame until F9 is pressed.
     uint64_t drawCensusFrame = 0;
+    // CW_VK_DEPTH_HALVES: the probe saw a seam cut on this frame and wants the full
+    // capture (picture, census, every snapshot) of the next frame it can arm.
+    bool depthHalvesTrigger = false;
+    uint64_t depthHalvesLastTrigger = 0;
+    unsigned depthHalvesTriggers = 0;
     uint64_t capturePictureFrame = 0;   // CW_CAPTURE_KEY: write this frame's picture
     // THE EDGE-TRIGGERED PRESENT READBACK (part 76, item 1). Frames up to and including
     // this number take the present readback even in the swapchain arm; zero means never,
@@ -5517,6 +5565,10 @@ struct Renderer
 
     uint64_t frame = 0;
     uint64_t drawsThisFrame = 0;
+    // Near-actor early prepass draws (mode 5, the null pixel shader, a tile scissor)
+    // this frame — the CW_VK_DEPTH_HALVES probe prints it so "no depth in either half"
+    // can be told apart from "no near actor this frame".
+    uint32_t prepassDrawsThisFrame = 0, lastPrepassDraws = 0;
     // The previous frame's final count — the only complete denominator available
     // mid-frame, and what tells an instrument firing at draw N whether N is early.
     uint64_t lastFrameDraws = 0;
@@ -11889,6 +11941,11 @@ static PipelineBuildResult BuildPipelineObject(const PipelineKey& key, const Sha
     // attachments). The RT trace/factor pipelines below have their own 1x state —
     // they render into single-sample images and RT is refused under MSAA anyway.
     ms.rasterizationSamples = R->msaaSamples;
+    // The guest's alpha-to-mask, natively (see kPassAlphaToCoverage). Never on the
+    // draw-ID pass: an index painted at fractional coverage is a different index.
+    ms.alphaToCoverageEnable =
+        ((key.passFlags & kPassAlphaToCoverage) && !(key.passFlags & kPassDrawId))
+            ? VK_TRUE : VK_FALSE;
 
     // RB_DEPTHCONTROL: stencil_enable:1, z_enable:1, z_write_enable:1, ?:1,
     // zfunc:3 @4, backface_enable:1 @7.
@@ -13658,6 +13715,8 @@ void BeginFrame()
     }
     R->lastFrameDraws = R->drawsThisFrame;
     R->drawsThisFrame = 0;
+    R->lastPrepassDraws = R->prepassDrawsThisFrame;
+    R->prepassDrawsThisFrame = 0;
     // The scene-camera pick is PER FRAME. Left latched, it would hold the largest draw
     // of the whole RUN, so a .pose would carry a camera from some frame minutes earlier
     // while looking exactly like this frame's — a stale value that announces nothing
@@ -14829,6 +14888,10 @@ void PresentSwapchain()
 // is that it collapses towards zero in a crowd while `submitCall` and every draw-path
 // column stay where they were. If `fenceWait` does not move, the frames are not
 // overlapping and nothing else in the profile is worth reading.
+// The guest memory base, learned from the first resolve that records a write-back
+// (DoResolve is handed it; the retire is not).
+static uint8_t* g_guestBase = nullptr;
+
 int RetireOldestFrame()
 {
     // Slots are used strictly in ring order, so when the frame just submitted is `s` the
@@ -14856,6 +14919,99 @@ int RetireOldestFrame()
         vkWaitForFences(R->device, 1, &fs.fence, VK_TRUE, UINT64_MAX);
         g_fenceWaitNs += CycNow() - tFence;
     }
+    // THE RESOLVES THE CPU READS land in guest memory here (part 120; see
+    // FrameSlot::GuestWriteback). After the fence, so the bytes are the GPU's, and on this
+    // thread, which is the one that executes every other guest-visible store of the
+    // stream. RB_COPY_DEST_BASE is a PHYSICAL address and the CPU reads the surface
+    // through the 0xA0000000 view (`UserTexture` entry 349 of the title's RT table held
+    // B97CE000 for a resolve to 197CE000) — the first build of this wrote to
+    // `base + phys`, which in our map is a different page, and the controller went on
+    // reading its stale 0.5 (gotcha 267, the third time it has cost a part).
+    // The host pixel is R8G8B8A8_UNORM whatever the guest asked for (our EDRAM
+    // stand-in has one colour format), so a 16_FLOAT destination gets the UNORM channel
+    // re-encoded as a half at its BUCKET CENTRE — (R + 0.5) / 255 for R < 255 — rather
+    // than at R / 255: the chain's real destination is a float16 that never reads exactly
+    // zero for a lit scene, and the title's controller special-cases zero as "no data"
+    // (lum = 1.0), so a black bucket handed over as 0.0 would pin the exposure to its
+    // FLOOR in exactly the scenes where it should be at its ceiling. The quantisation
+    // itself (1/255 of the chain's range) is a stated limitation of the 8-bit EDRAM, not
+    // of this path.
+    if (!fs.writebacks.empty() && g_guestBase)
+    {
+        auto halfOf = [](float f) -> uint16_t {
+            uint32_t u;
+            memcpy(&u, &f, 4);
+            const uint32_t sign = (u >> 16) & 0x8000u;
+            int32_t exp = int32_t((u >> 23) & 0xFF) - 127 + 15;
+            uint32_t mant = u & 0x7FFFFFu;
+            if (exp <= 0)
+            {
+                if (exp < -10)
+                    return uint16_t(sign);
+                mant |= 0x800000u;
+                const uint32_t shift = uint32_t(14 - exp);
+                return uint16_t(sign | (mant >> shift));
+            }
+            if (exp >= 31)
+                return uint16_t(sign | 0x7C00u);
+            return uint16_t(sign | (uint32_t(exp) << 10) | (mant >> 13));
+        };
+        for (const auto& g : fs.writebacks)
+        {
+            const uint8_t* px = fs.wb.mapped + g.offset;
+            for (uint32_t y = 0; y < g.h; ++y)
+                for (uint32_t x = 0; x < g.w; ++x)
+                {
+                    // The host pixel a guest pixel maps to under the resolution scale.
+                    const uint32_t hx = std::min(g.hw - 1, x * g.hw / std::max(1u, g.w));
+                    const uint32_t hy = std::min(g.hh - 1, y * g.hh / std::max(1u, g.h));
+                    const uint8_t* p = px + (VkDeviceSize(hy) * g.hw + hx) * 4;
+                    // Tiny surfaces only: pixel (0,0) is at offset 0 of a tiled surface
+                    // as well as of a linear one, and the CPU consumer reads only that.
+                    // The rest of the window is laid out LINEARLY at the surface pitch,
+                    // which is exact for a linear surface and a stated approximation
+                    // for a tiled one.
+                    const uint32_t idx = y * g.pitch + x;
+                    if (g.destFmt == 30)
+                    {
+                        const float v = p[0] == 255 ? 1.0f : (float(p[0]) + 0.5f) / 255.0f;
+                        const uint16_t hv = halfOf(v);
+                        uint8_t* dst = g_guestBase + PhysToVa(g.dest) + idx * 2;
+                        if (g.endian == 1)
+                        {
+                            dst[0] = uint8_t(hv >> 8);
+                            dst[1] = uint8_t(hv);
+                        }
+                        else
+                        {
+                            dst[0] = uint8_t(hv);
+                            dst[1] = uint8_t(hv >> 8);
+                        }
+                    }
+                    else
+                    {
+                        uint8_t* dst = g_guestBase + PhysToVa(g.dest) + idx * 4;
+                        if (g.endian == 2)
+                        {
+                            dst[0] = p[3];
+                            dst[1] = p[2];
+                            dst[2] = p[1];
+                            dst[3] = p[0];
+                        }
+                        else
+                        {
+                            dst[0] = p[0];
+                            dst[1] = p[1];
+                            dst[2] = p[2];
+                            dst[3] = p[3];
+                        }
+                    }
+                }
+            Count("resolve: bytes written back to guest memory");
+        }
+    }
+    fs.writebacks.clear();
+    fs.wbUsed = 0;
     // THE TIMESTAMPS FOR THIS SLOT ARE NOW GUARANTEED AVAILABLE — its fence has just been
     // waited on. Read them WITHOUT VK_QUERY_RESULT_WAIT_BIT: if they are somehow not ready
     // the read is skipped rather than stalling, because an instrument that blocks to
@@ -18407,7 +18563,29 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
                 Count(msg);
             }
         }
-        else if (!noAlphaTest && (cc & 0x10))
+        // ALPHA-TO-MASK AS VULKAN ALPHA-TO-COVERAGE (player issue #2, 2026-09-14).
+        // Since part 93 the EDRAM is a real multisampled image (msaa=2 in
+        // cw_settings.txt by default), so the hardware feature has a native spelling:
+        // the fragment's alpha becomes a sample-coverage mask and the resolve
+        // averages it. Chuck's hair is 96 such draws a frame (A2M + alpha test GREATER),
+        // and with the mask declined the strands were a hard alpha test popping in and
+        // out of pixel coverage as the head idles — a one-frame dropout flicker on
+        // every burst, absent on Xenia, which honours the mask. Gated on the host
+        // target really being multisampled AND the guest surface being multisampled
+        // (RB_SURFACE_INFO msaa != 0), because coverage over one sample is just a
+        // second alpha test. The shader-side dither (CW_VK_A2M_MODE, the part-46 arm
+        // caches) is the single-sample stand-in and is unaffected. CW_VK_NO_A2C=1 is
+        // the control.
+        static const bool noA2c = EnvOn("CW_VK_NO_A2C");
+        if (!noAlphaTest && !noA2c && (cc & 0x10) && R->msaaSamples != VK_SAMPLE_COUNT_1_BIT &&
+            ((regs[xenos::kRbSurfaceInfo] >> 16) & 3) != 0)
+        {
+            key.passFlags |= kPassAlphaToCoverage;
+            COUNT("draw: ALPHA-TO-MASK as Vulkan alpha-to-coverage on the MSAA EDRAM");
+        }
+        if (!noAlphaTest && (cc & 0x10) && !(key.passFlags & kPassAlphaToCoverage) && (cc & 0x8))
+            COUNT("draw: ALPHA-TO-MASK declined (single-sample host or guest surface)");
+        else if (!noAlphaTest && (cc & 0x10) && !(cc & 0x8))
         {
             // A2M with the alpha test DISABLED. The clip is the only channel we have
             // for it, and the shader only compiles the clip when this key bit is set,
@@ -18468,6 +18646,72 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
             if (skip && strstr(skip, hex))
             {
                 Count("draw: filtered out (CW_VK_SKIP_VS)");
+                return;
+            }
+        }
+        // CW_VK_SKIP_LATE_ACTOR=1 — DIAGNOSTIC (player issue #3): drop the near
+        // actors' LATE passes — the per-part depth-only draws with a material pixel
+        // shader (mode 5, not the null shader) and the EQUAL-depth blended colour
+        // passes — so the resolved depth at the tile's end is the EARLY prepass plus
+        // the world, and the picture shows a black hole wherever the early prepass
+        // blocked the world and nothing at all where it did not.
+        static const bool skipLateActor = EnvOn("CW_VK_SKIP_LATE_ACTOR");
+        if (skipLateActor)
+        {
+            const uint32_t mc = regs[0x2208] & 7;
+            const uint32_t dcv = regs[xenos::kRbDepthControl];
+            const bool depthOnlyMaterial =
+                mc == 5 && psBind.hash != 0x438c2af84c78a133ull &&
+                (regs[xenos::kRbColorMask] & 0xF) == 0;
+            const bool equalBlend = ((dcv >> 4) & 7) == 2 && !((dcv >> 2) & 1);
+            if (depthOnlyMaterial || equalBlend)
+            {
+                Count("draw: filtered out (CW_VK_SKIP_LATE_ACTOR)");
+                return;
+            }
+            // CW_VK_SKIP_WORLD=1 on top: drop every colour-writing tile draw as well,
+            // so the tile's resolved depth is the clear plus the early prepass alone.
+            static const bool skipWorld = EnvOn("CW_VK_SKIP_WORLD");
+            const uint32_t scBr = regs[xenos::kPaScWindowScissorBr];
+            if (skipWorld && mc == 4 && (regs[xenos::kRbColorMask] & 0xF) != 0 &&
+                (scBr == 0x02D00280u || scBr == 0x02D00500u))
+            {
+                Count("draw: filtered out (CW_VK_SKIP_WORLD)");
+                return;
+            }
+        }
+        // CW_VK_SKIP_DEPTHRECT=1 — DIAGNOSTIC (player issue #3): drop the depth-only
+        // rect that follows each tile's early actor prepass (prim 8, mode 5,
+        // RB_DEPTHCONTROL 0x76 = ALWAYS + z-write, mask 0, z = 1.0 over the whole
+        // tile). If the prepass depth survives to the tile's end with this skipped and
+        // not without, that rect is what wipes it.
+        static const bool skipDepthRect = EnvOn("CW_VK_SKIP_DEPTHRECT");
+        if (skipDepthRect && draw.primType == 8 && (regs[0x2208] & 7) == 5 &&
+            regs[xenos::kRbDepthControl] == 0x76)
+        {
+            Count("draw: filtered out (CW_VK_SKIP_DEPTHRECT)");
+            return;
+        }
+        // ...and the same two by PIXEL shader (player issue #3's bisection: the
+        // early actor prepass is a pixel-shader-identified pass). CW_VK_SKIP_PS_DEPTHONLY
+        // narrows the skip to depth-only draws (RB_MODECONTROL mode 5), so a shader
+        // shared between a prepass and a colour pass loses only the prepass.
+        static const char* onlyPs = Env("CW_VK_ONLY_PS");
+        static const char* skipPs = Env("CW_VK_SKIP_PS");
+        static const bool skipPsDepthOnly = EnvOn("CW_VK_SKIP_PS_DEPTHONLY");
+        if (onlyPs || skipPs)
+        {
+            char hex[24];
+            snprintf(hex, sizeof hex, "%016llx", (unsigned long long)psBind.hash);
+            if (onlyPs && !strstr(onlyPs, hex))
+            {
+                Count("draw: filtered out (CW_VK_ONLY_PS)");
+                return;
+            }
+            if (skipPs && strstr(skipPs, hex) &&
+                (!skipPsDepthOnly || (regs[0x2208] & 7) == 5))
+            {
+                Count("draw: filtered out (CW_VK_SKIP_PS)");
                 return;
             }
         }
@@ -19439,7 +19683,13 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
             ? snprintf(psbindLine, sizeof psbindLine,
                        "draw %llu verts=%u prim=%u vs=%016llx ps=%016llx mask=%X "
                        "blend=%08X po=%u/%g/%g su=%08X dc=%08X sr=%08X cl=%08X ucp=%g/%g/%g/%g"
-                       " xf=%d bEff=%.4f n0=%.4f n1=%.4f n3=%.4f",
+                       " xf=%d bEff=%.4f n0=%.4f n1=%.4f n3=%.4f"
+                       // THE TILE (player issue #3): the window offset and scissor say
+                       // which half of the screen this draw is a replay for, so two
+                       // copies of one draw can be read side by side when only one of
+                       // them looks right. RB_COLORCONTROL and RB_ALPHA_REF beside them
+                       // because the blend/alpha inputs are what such a pair differs in.
+                       " wo=%08X sc=%08X/%08X cc=%08X aref=%g vsc=%08X psc=%08X psva=%08X/%u vsva=%08X/%u si=%08X ci=%08X di=%08X mc=%X vc255=(%g,%g,%g,%g) vte=%X vp=(%g,%g,%g,%g,%g,%g)",
                        (unsigned long long)R->drawsThisFrame, draw.indexCount, draw.primType,
                        (unsigned long long)vsBind.hash, (unsigned long long)psBind.hash,
                        regs[xenos::kRbColorMask] & 0xF, regs[xenos::kRbBlendControl0],
@@ -19492,7 +19742,37 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
                        // re-examining before a line of shader work is done for it.
                        F32(regs[xenos::kPaClUcp0X]), F32(regs[xenos::kPaClUcp0X + 1]),
                        F32(regs[xenos::kPaClUcp0X + 2]), F32(regs[xenos::kPaClUcp0X + 3]),
-                       xfForm, xfB, xfN0, xfN1, xfN3)
+                       xfForm, xfB, xfN0, xfN1, xfN3,
+                       regs[xenos::kPaScWindowOffset], regs[xenos::kPaScWindowScissorTl],
+                       regs[xenos::kPaScWindowScissorBr], regs[xenos::kRbColorControl],
+                       F32(regs[xenos::kRbAlphaRef]),
+                       // A hash of each constant file (VS c0..255, PS c0..255): the
+                       // blend state can match between two tile replays while the
+                       // ALPHA the shader emits does not, and the alpha comes from here.
+                       CensusHash(&regs[xenos::kAluConstantBase], 256 * 4),
+                       CensusHash(&regs[xenos::kAluConstantBase + 256 * 4], 256 * 4),
+                       // Where each microcode was loaded FROM (0 = inline in the
+                       // packet), so a tile replay binding a different shader for
+                       // the same draw can be told apart as "same address, different
+                       // bytes" versus "a different load".
+                       psBind.ucodeVa, psBind.sizeDwords, vsBind.ucodeVa, vsBind.sizeDwords,
+                       // The SURFACES: RB_SURFACE_INFO, RB_COLOR_INFO, RB_DEPTH_INFO and
+                       // RB_MODECONTROL's mode — which EDRAM tiles a draw writes, and
+                       // whether it is a depth-only pass (5) or a colour one (4).
+                       regs[xenos::kRbSurfaceInfo], regs[xenos::kRbColorInfo],
+                       regs[xenos::kRbDepthInfo], regs[0x2208] & 7,
+                       // VS c255: the prepass vertex shader's kill switch (§6fa follow-up
+                       // — `abs(vertexIndex) >= c255.x` feeds the position's w).
+                       F32(regs[xenos::kAluConstantBase + 255 * 4]),
+                       F32(regs[xenos::kAluConstantBase + 255 * 4 + 1]),
+                       F32(regs[xenos::kAluConstantBase + 255 * 4 + 2]),
+                       F32(regs[xenos::kAluConstantBase + 255 * 4 + 3]),
+                       // The viewport transform: a depth range collapsed to the far
+                       // plane is one way a title parks a pass.
+                       regs[xenos::kPaClVteCntl], F32(regs[xenos::kPaClVportXScale]),
+                       F32(regs[xenos::kPaClVportXOffset]), F32(regs[xenos::kPaClVportYScale]),
+                       F32(regs[xenos::kPaClVportYOffset]), F32(regs[xenos::kPaClVportZScale]),
+                       F32(regs[xenos::kPaClVportZOffset]))
         : psbind ? snprintf(psbindLine, sizeof psbindLine,
                             "[psbind] frame=%llu ps=%016llx mask=%X blend=%08X",
                             (unsigned long long)R->frame,
@@ -19539,6 +19819,26 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
             psbindAt += snprintf(psbindLine + psbindAt, sizeof psbindLine - psbindAt,
                                  " va=%08X v0=%g/%g/%g", sva, double(v[0]),
                                  double(v[1]), double(v[2]));
+            // A RECT LIST's extent is its vertex data — D3D's clears are rect draws
+            // with the viewport transform OFF (vte=300) and XY already in pixels — so
+            // the other two vertices are printed too (stride from the fetch constant).
+            const uint32_t stride = a.strideDwords * 4;
+            if (draw.primType == 8 && stride >= 12 && GuestRangeOk(sva, stride * 2 + 12))
+            {
+                for (int vi = 1; vi < 3; vi++)
+                {
+                    const uint32_t* q = reinterpret_cast<const uint32_t*>(base + sva + stride * vi);
+                    float w[3];
+                    for (int k = 0; k < 3; k++)
+                    {
+                        const uint32_t d = __builtin_bswap32(q[k]);
+                        memcpy(&w[k], &d, 4);
+                    }
+                    psbindAt += snprintf(psbindLine + psbindAt, sizeof psbindLine - psbindAt,
+                                         " v%d=%g/%g/%g", vi, double(w[0]), double(w[1]),
+                                         double(w[2]));
+                }
+            }
             break;
         }
     }
@@ -20037,7 +20337,12 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
         }
         if (drawCensus)
         {
-            if (R->drawCensusFile)
+            // CW_VK_DRAW_CENSUS_MINVERTS=N keeps a periodic census (the _EVERY arm)
+            // to the draws big enough to be a body or a floor; a roam's worth of
+            // whole censuses is gigabytes of HUD quads otherwise.
+            static const uint32_t censusMinVerts = Env("CW_VK_DRAW_CENSUS_MINVERTS")
+                ? uint32_t(strtoul(Env("CW_VK_DRAW_CENSUS_MINVERTS"), nullptr, 10)) : 0u;
+            if (R->drawCensusFile && draw.indexCount >= censusMinVerts)
             {
                 fprintf(R->drawCensusFile, "%s\n", psbindLine);
                 ++R->drawCensusLines;
@@ -20508,7 +20813,21 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
         // it must not be credited with anything, and the counter is what says so
         // (gotcha 151). It stays because the alternative is rediscovering the rule the
         // next time a title puts a window-coordinate draw inside a tile.
-        const uint32_t wo = regs[xenos::kPaScWindowOffset];
+        // ...AND IT EXECUTES NOW (player issue #3, 2026-09-14): the counter below was
+        // zero because the one window-coordinate draw this title puts INSIDE a tile
+        // — D3D's Clear(Z) after the near-actor prepass, a rect over the whole tile
+        // with the window offset reset to ZERO for the duration of the clear — carries
+        // no offset of its own. On hardware it covers whichever tile is in EDRAM; here
+        // it landed on the left half of the stand-in during BOTH replays, so the right
+        // tile's prepass depth was never cleared, the world behind the near zombie was
+        // rejected there, and its blended colour pass composited onto the clear colour:
+        // opaque and dark on the right of the seam, translucent (correct) on the left.
+        // The executor names the tile (`tileWindowOffset`); the offset is undone the
+        // same way. CW_PM4_NO_TILE_OFFSET=1 is the control arm.
+        const uint32_t wo = regs[xenos::kPaScWindowOffset] ? regs[xenos::kPaScWindowOffset]
+                                                            : draw.tileWindowOffset;
+        if (!regs[xenos::kPaScWindowOffset] && draw.tileWindowOffset)
+            COUNT("draw: EDRAM-space draw inside a tile replay placed at the tile's origin");
         auto signed15 = [](uint32_t v) {
             return int32_t(v & 0x7FFF) - int32_t((v & 0x4000) ? 0x8000 : 0);
         };
@@ -22097,6 +22416,10 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     }
     ++R->drawsThisFrame;
     ++R->drawsThisPass;
+    if ((regs[0x2208] & 7) == 5 && psBind.hash == 0x438c2af84c78a133ull &&
+        (regs[xenos::kPaScWindowScissorBr] == 0x02D00280u ||
+         regs[xenos::kPaScWindowScissorBr] == 0x02D00500u))
+        ++R->prepassDrawsThisFrame;
     // Unconditional, and it costs exactly what the line above it costs. Gating it on the
     // instrument would put a static-init guard load on the per-draw path, which is the
     // shape part 76 had to take back off it (gotcha 453).
@@ -22885,6 +23208,61 @@ void DoResolve(uint8_t* base, const uint32_t* regs)
             // samples this surface, and the layout it expects is the one the
             // descriptor was written with.
             }
+            // WRITE THE BYTES BACK FOR THE SURFACES THE CPU READS (part 120). The rule is
+            // deliberately narrow — a COLOUR resolve of a surface of at most 64 pixels,
+            // copied whole, in a destination format we can encode — because it is the
+            // luminance chain's tail (5x2, 2x1, 1x1 16_FLOAT) and the two 1x1 8_8_8_8
+            // surfaces beside it that the title's CPU reads, and writing a full-size
+            // surface back would be the tiling round trip the Snapshot comment declines.
+            // The copy is recorded HERE, into this frame's command buffer, and the guest
+            // memory store happens at the retire once the fence says the pixels exist.
+            // `CW_VK_NO_RESOLVE_WRITEBACK=1` is the same-binary control arm: the renderer
+            // of parts 5-119, in which the exposure sat on its floor.
+            static const bool noWriteback = EnvOn("CW_VK_NO_RESOLVE_WRITEBACK");
+            // `w`/`h` are the destination SURFACE (RB_COPY_DEST_PITCH: 32x1 for the
+            // 1x1, since a pitch is padded to a tile) and `copyW`/`copyH` the window the
+            // pass rendered (8x1 there): the copied window is what gets written, at
+            // the surface's pitch.
+            if (!fromDepth && !noWriteback && uint64_t(w) * h <= 64 && dstX == 0 &&
+                dstY == 0 && copyW && copyH)
+            {
+                const uint32_t destFmt = (regs[xenos::kRbCopyDestInfo] >> 7) & 0x3F;
+                const uint32_t destEndian = regs[xenos::kRbCopyDestInfo] & 7;
+                FrameSlot& slot = R->frames[R->frameSlot];
+                const uint32_t hw = RZx(copyW), hh = RZ(copyH);
+                const VkDeviceSize need = VkDeviceSize(hw) * hh * 4;
+                if (destFmt != 30 && destFmt != 6)
+                    Count("resolve: write-back declined (destination format not encoded)");
+                else if (slot.wbUsed + need > slot.wb.size)
+                    Count("resolve: write-back declined (staging full)");
+                else
+                {
+                    GpuSeg _gwb(kGpResolveCopy);
+                    Barrier(R->cmd, it->second.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            aspect);
+                    VkBufferImageCopy c{};
+                    c.bufferOffset = slot.wbUsed;
+                    c.imageSubresource = { aspect, 0, 0, 1 };
+                    c.imageExtent = { hw, hh, 1 };
+                    vkCmdCopyImageToBuffer(R->cmd, it->second.image.image,
+                                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                           slot.wb.buffer, 1, &c);
+                    g_guestBase = base;
+                    FrameSlot::GuestWriteback g;
+                    g.dest = dest;
+                    g.w = copyW;
+                    g.h = copyH;
+                    g.pitch = w;
+                    g.hw = hw;
+                    g.hh = hh;
+                    g.destFmt = destFmt;
+                    g.endian = destEndian;
+                    g.offset = slot.wbUsed;
+                    slot.writebacks.push_back(g);
+                    slot.wbUsed += (need + 15) & ~VkDeviceSize(15);
+                    Count("resolve: write-back to guest memory recorded");
+                }
+            }
             {
             GpuSeg _gb2(kGpResolveBarrier);
             Barrier(R->cmd, it->second.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -23628,6 +24006,15 @@ bool InitCommon()
             fprintf(stderr, "[vk] present readback buffer %u allocation FAILED\n", i);
             return false;
         }
+        // The guest write-back staging (part 120): a few tiny surfaces a frame, 4 bytes a
+        // host pixel; 64 KB is ~40 of them at a 4x resolution scale. A frame that needs
+        // more declines the rest and counts it.
+        if (!CreateBuffer(R->frames[i].wb, 64 * 1024, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                          ReadbackMemoryProps(), false))
+        {
+            fprintf(stderr, "[vk] resolve write-back buffer %u allocation FAILED\n", i);
+            return false;
+        }
     }
 
     // The cross-frame store is allocated SEPARATELY from the chain above, and its failure
@@ -24188,6 +24575,339 @@ void VkRenderer_DrawQueued(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
 }
 
 namespace {
+
+// ===================================================================================
+// THE DISPLAY GAMMA RAMP AT PRESENT (part 119) — `CW_VK_GAMMA_RAMP=1`, an ARM, off.
+//
+// Hardware routes the 8-bit front buffer through the display controller's 256-entry
+// LUT on the way to the screen, and this title loads a NON-identity one at boot
+// (pm4.cpp captures it at DC_LUT_30_COLOR; `tools/xtr_gamma_ramp.py` prints the same
+// table out of any R2/R4 capture). Xenia applies it at swap, so every Xenia screenshot
+// this project has ever compared against is table[front buffer] — verified to within a
+// level on the eight R4 frames by `tools/xtr_frame_extract.py`. This runtime has always
+// presented the front buffer as resolved, i.e. the picture a type-1 (sRGB) display
+// would show, because Direct3D loads IDENTITY for that answer to
+// VdGetCurrentDisplayGamma and rec709_encode(srgb_decode(x)) for the type-2 answer
+// our stub (and Xenia's config) gives. Both are "correct"; they are pictures for two
+// different displays.
+//
+// So this pass is the Xenia-equivalent output, built as an arm so the operator can
+// hold it next to the default and next to a console — and it is OFF because the ramp
+// DARKENS (median luma -14 outdoors, x0.5 in the R2 interiors) while the report it was
+// built to investigate says ours is already too dark. docs/phase5-notes.md §6fb.
+//
+// One full-screen triangle, the front buffer Loaded per pixel, the table in a 1 KB
+// uniform buffer, into an image of the presented size that then feeds both the
+// readback (so every picture instrument sees what the screen sees) and the swapchain
+// blit. Nothing in the scene is touched; `CW_VK_GAMMA_RAMP` unset is the exact
+// pre-part-119 path (a null pair at the menu is gate (d) of the plan).
+// ===================================================================================
+namespace gammaramp
+{
+bool g_on = false;
+bool g_failed = false;
+VkDescriptorSetLayout g_setLayout = VK_NULL_HANDLE;
+VkPipelineLayout g_pipeLayout = VK_NULL_HANDLE;
+VkPipeline g_pipe = VK_NULL_HANDLE;
+VkDescriptorPool g_pool = VK_NULL_HANDLE;
+VkDescriptorSet g_sets[kMaxFramesInFlight] = {};
+Buffer g_ubo[kMaxFramesInFlight];
+uint32_t g_uboVersion[kMaxFramesInFlight] = {};
+Image g_out;
+uint32_t g_table[256];
+uint32_t g_version = 0;        // the pm4 table version this copy holds; 0 = none
+uint64_t g_loads = 0;          // distinct tables seen — the "ramp loads per run" counter
+uint64_t g_applied = 0;
+
+bool Init()
+{
+    if (g_pipe)
+        return true;
+    if (g_failed)
+        return false;
+    VkDescriptorSetLayoutBinding b[2]{};
+    b[0].binding = 0;
+    b[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    b[0].descriptorCount = 1;
+    b[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    b[1].binding = 1;
+    b[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    b[1].descriptorCount = 1;
+    b[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo li{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    li.bindingCount = 2;
+    li.pBindings = b;
+    if (vkCreateDescriptorSetLayout(R->device, &li, nullptr, &g_setLayout) != VK_SUCCESS)
+    {
+        g_failed = true;
+        return false;
+    }
+    VkDescriptorPoolSize ps[2] = {
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxFramesInFlight },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxFramesInFlight },
+    };
+    VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    pci.maxSets = kMaxFramesInFlight;
+    pci.poolSizeCount = 2;
+    pci.pPoolSizes = ps;
+    if (vkCreateDescriptorPool(R->device, &pci, nullptr, &g_pool) != VK_SUCCESS)
+    {
+        g_failed = true;
+        return false;
+    }
+    for (uint32_t i = 0; i < kMaxFramesInFlight; ++i)
+    {
+        VkDescriptorSetAllocateInfo ai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        ai.descriptorPool = g_pool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &g_setLayout;
+        if (vkAllocateDescriptorSets(R->device, &ai, &g_sets[i]) != VK_SUCCESS ||
+            !CreateBuffer(g_ubo[i], sizeof g_table, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                          false, nullptr) ||
+            !g_ubo[i].mapped)
+        {
+            g_failed = true;
+            return false;
+        }
+    }
+    VkPipelineLayoutCreateInfo pli{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &g_setLayout;
+    if (vkCreatePipelineLayout(R->device, &pli, nullptr, &g_pipeLayout) != VK_SUCCESS)
+    {
+        g_failed = true;
+        return false;
+    }
+    auto makeModule = [&](const uint32_t* words, size_t bytes) {
+        VkShaderModuleCreateInfo mi{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+        mi.codeSize = bytes;
+        mi.pCode = words;
+        VkShaderModule m = VK_NULL_HANDLE;
+        vkCreateShaderModule(R->device, &mi, nullptr, &m);
+        return m;
+    };
+    VkShaderModule vs = makeModule(kGammaRampVsSpv, sizeof kGammaRampVsSpv);
+    VkShaderModule fs = makeModule(kGammaRampPsSpv, sizeof kGammaRampPsSpv);
+    if (!vs || !fs)
+    {
+        g_failed = true;
+        return false;
+    }
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vs;
+    stages[0].pName = "VsMain";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = fs;
+    stages[1].pName = "PsMain";
+    VkPipelineVertexInputStateCreateInfo vi{
+        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO
+    };
+    VkPipelineInputAssemblyStateCreateInfo ia{
+        VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO
+    };
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{
+        VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO
+    };
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{
+        VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO
+    };
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{
+        VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO
+    };
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo ds{
+        VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO
+    };
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cb{
+        VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO
+    };
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cba;
+    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dsi{
+        VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO
+    };
+    dsi.dynamicStateCount = uint32_t(std::size(dyn));   // never hardcode the count
+    dsi.pDynamicStates = dyn;
+    const VkFormat cf = VK_FORMAT_R8G8B8A8_UNORM;
+    VkPipelineRenderingCreateInfo pri{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
+    pri.colorAttachmentCount = 1;
+    pri.pColorAttachmentFormats = &cf;
+    VkGraphicsPipelineCreateInfo gp{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+    gp.pNext = &pri;
+    gp.stageCount = 2;
+    gp.pStages = stages;
+    gp.pVertexInputState = &vi;
+    gp.pInputAssemblyState = &ia;
+    gp.pViewportState = &vp;
+    gp.pRasterizationState = &rs;
+    gp.pMultisampleState = &ms;
+    gp.pDepthStencilState = &ds;
+    gp.pColorBlendState = &cb;
+    gp.pDynamicState = &dsi;
+    gp.layout = g_pipeLayout;
+    const VkResult r =
+        vkCreateGraphicsPipelines(R->device, R->pipeCache, 1, &gp, nullptr, &g_pipe);
+    vkDestroyShaderModule(R->device, vs, nullptr);
+    vkDestroyShaderModule(R->device, fs, nullptr);
+    if (r != VK_SUCCESS)
+    {
+        fprintf(stderr, "[vk] gamma ramp: pipeline creation failed (%d) — the arm is "
+                        "IDLE and the front buffer is presented as resolved\n",
+                int(r));
+        g_failed = true;
+        return false;
+    }
+    return true;
+}
+
+// Ramp `source` (the image about to be presented, `w` x `h` host pixels) into the pass's
+// own image and return it, or nullptr when the arm is off, no table has been loaded
+// yet, or the pass cannot run — every one of which is counted, because a present that
+// silently skipped the ramp is indistinguishable from one that applied identity.
+Image* Apply(Image& source, uint32_t w, uint32_t h)
+{
+    static const bool on = EnvOn("CW_VK_GAMMA_RAMP");
+    if (!on)
+        return nullptr;
+    uint32_t fresh[256];
+    const uint32_t v = Pm4_GammaRampSnapshot(fresh);
+    if (v == 0)
+    {
+        Count("gamma ramp: no DC_LUT table loaded yet, presented as resolved");
+        return nullptr;
+    }
+    // CW_VK_GAMMA_RAMP_FIRST=1: keep the FIRST table the title loaded and ignore later
+    // loads. Our runtime sees a SECOND, darker table ~2 minutes into a boot (D3D's
+    // mode-change path re-applying a stored ramp, Case Zero's `sub_828470A0`; [128] = 305 against
+    // the first load's 462) that no Xenia gameplay capture carries — so the first table
+    // is the Xenia-equivalent picture and the second is what the operator called "too
+    // intense". Which one hardware runs with is an open question (phase5-notes §6fb).
+    static const bool firstOnly = EnvOn("CW_VK_GAMMA_RAMP_FIRST");
+    if (v != g_version && !(firstOnly && g_version != 0))
+    {
+        memcpy(g_table, fresh, sizeof g_table);
+        g_version = v;
+        ++g_loads;
+        // The INSTRUMENT: print what was decoded, not just that it was. Entry i unpacks
+        // as (r, g, b) 10-bit; identity would read i * 1023 / 255, and hardware's table
+        // for this title reads 66/193/462 at 32/64/128 — a wrong 10:10:10 decode cannot
+        // hide behind "applied" when the numbers are on the line.
+        auto rgb = [&](uint32_t i) {
+            const uint32_t e = g_table[i];
+            return std::array<uint32_t, 3>{ (e >> 20) & 0x3FF, (e >> 10) & 0x3FF, e & 0x3FF };
+        };
+        bool identity = true;
+        for (uint32_t i = 0; i < 256 && identity; ++i)
+        {
+            const auto e = rgb(i);
+            const uint32_t ideal = i * 1023 / 255;
+            for (uint32_t c = 0; c < 3; ++c)
+                if (e[c] + 2 < ideal || e[c] > ideal + 2)
+                    identity = false;
+        }
+        const auto e0 = rgb(0), e32 = rgb(32), e64 = rgb(64), e128 = rgb(128), e255 = rgb(255);
+        fprintf(stderr,
+                "[vk] gamma ramp: %s table loaded (version %u, load #%llu, %llu PWL writes "
+                "not modelled): [0]=%u/%u/%u [32]=%u/%u/%u [64]=%u/%u/%u [128]=%u/%u/%u "
+                "[255]=%u/%u/%u of 1023 (identity would be 0 128 257 513 1023)\n",
+                identity ? "IDENTITY" : "NON-identity", v, (unsigned long long)g_loads,
+                (unsigned long long)Pm4_GammaRampWrites(true), e0[0], e0[1], e0[2], e32[0],
+                e32[1], e32[2], e64[0], e64[1], e64[2], e128[0], e128[1], e128[2], e255[0],
+                e255[1], e255[2]);
+    }
+    if (!Init())
+    {
+        Count("gamma ramp: pass unavailable, presented as resolved");
+        return nullptr;
+    }
+    if (!w || !h)
+        return nullptr;
+    if (g_out.width != w || g_out.height != h)
+    {
+        RetireImage(g_out);
+        if (!CreateImage(g_out, w, h, VK_FORMAT_R8G8B8A8_UNORM,
+                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                             VK_IMAGE_USAGE_SAMPLED_BIT,
+                         VK_IMAGE_ASPECT_COLOR_BIT))
+        {
+            Count("gamma ramp: output image creation FAILED, presented as resolved");
+            g_out = Image{};
+            return nullptr;
+        }
+    }
+    const uint32_t slot = R->frameSlot;
+    if (g_uboVersion[slot] != g_version)
+    {
+        memcpy(g_ubo[slot].mapped, g_table, sizeof g_table);
+        g_uboVersion[slot] = g_version;
+    }
+    // The set is rewritten every present: the source is a different image on the
+    // fallback frames, and a set is only ever rebound after its slot's fence retired.
+    VkDescriptorImageInfo di{};
+    di.imageView = source.view;
+    di.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkDescriptorBufferInfo bi{ g_ubo[slot].buffer, 0, sizeof g_table };
+    VkWriteDescriptorSet wr[2]{};
+    wr[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    wr[0].dstSet = g_sets[slot];
+    wr[0].dstBinding = 0;
+    wr[0].descriptorCount = 1;
+    wr[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    wr[0].pImageInfo = &di;
+    wr[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    wr[1].dstSet = g_sets[slot];
+    wr[1].dstBinding = 1;
+    wr[1].descriptorCount = 1;
+    wr[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    wr[1].pBufferInfo = &bi;
+    vkUpdateDescriptorSets(R->device, uint32_t(std::size(wr)), wr, 0, nullptr);
+
+    Barrier(R->cmd, source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_IMAGE_ASPECT_COLOR_BIT);
+    Barrier(R->cmd, g_out, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_ASPECT_COLOR_BIT);
+    VkRenderingAttachmentInfo att{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+    att.imageView = g_out.view;
+    att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo ri{ VK_STRUCTURE_TYPE_RENDERING_INFO };
+    ri.renderArea = { { 0, 0 }, { w, h } };
+    ri.layerCount = 1;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &att;
+    vkCmdBeginRendering(R->cmd, &ri);
+    VkViewport vpp{ 0.0f, 0.0f, float(w), float(h), 0.0f, 1.0f };
+    VkRect2D sc{ { 0, 0 }, { w, h } };
+    vkCmdSetViewport(R->cmd, 0, 1, &vpp);
+    vkCmdSetScissor(R->cmd, 0, 1, &sc);
+    vkCmdBindPipeline(R->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe);
+    vkCmdBindDescriptorSets(R->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeLayout, 0, 1,
+                            &g_sets[slot], 0, nullptr);
+    vkCmdDraw(R->cmd, 3, 1, 0, 0);
+    vkCmdEndRendering(R->cmd);
+    // The main path's state cache now describes bindings this pass replaced.
+    R->bound = {};
+    ++g_applied;
+    Count("gamma ramp: applied at present");
+    return &g_out;
+}
+} // namespace gammaramp
 
 // The shared swap body — everything from "record the front buffer" to the frame
 // stats line. The PM4 feed calls it from the XE_SWAP packet, the D3D feed from the
@@ -24804,6 +25524,12 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
                           1, &rv);
         Count("swap: EDRAM fallback resolved for present (CW_VK_MSAA)");
     }
+    // The display gamma ramp (part 119, `CW_VK_GAMMA_RAMP=1`): the image the readback
+    // and the swapchain blit consume is the RAMPED one when the arm is on, so every
+    // picture instrument downstream sees what the screen sees — which is what Xenia's
+    // screenshots are. Unset, `present` is `source` and nothing below changes.
+    Image* rampedPresent = gammaramp::Apply(source, width0, height0);
+    Image& present = rampedPresent ? *rampedPresent : source;
 
     // WHETHER THE READBACK STILL HAPPENS AT ALL. In the CW_VK_SWAPCHAIN arm the window
     // gets its pixels from the swapchain blit below and nothing needs them in host
@@ -24906,12 +25632,12 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
         // armed that the run did not mean to arm, which is exactly the defect part 76
         // found in `play_session.sh`.
         GpuSeg _g(kGpReadback);
-        Barrier(R->cmd, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        Barrier(R->cmd, present, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_IMAGE_ASPECT_COLOR_BIT);
         VkBufferImageCopy copy{};
         copy.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
         copy.imageExtent = { width0, height0, 1 };
-        vkCmdCopyImageToBuffer(R->cmd, source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        vkCmdCopyImageToBuffer(R->cmd, present.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                rec.present.buffer, 1, &copy);
     }
     // The swapchain blit goes LAST in the command buffer, after the readback copy when
@@ -24932,7 +25658,7 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
         // The letterbox clear, the aspect-fit blit and the F4 overlay — all of it, because
         // "the present" is one region as far as a fix is concerned.
         GpuSeg _g(kGpPresent);
-        RecordSwapchainBlit(source, width0, height0);
+        RecordSwapchainBlit(present, width0, height0);
     }
     else if (R->wantSwapchain)
         Count("swap: no acquire (CW_VK_NO_SUBMIT or nothing recorded) — nothing presented");
@@ -25908,7 +26634,21 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
     // frame, and a press with no destination SAYS SO rather than doing nothing visible —
     // an instrument that silently declines is the failure shape this project keeps paying
     // for (gotchas 7, 151).
-    const bool snapKey = Host_ConsumeSnapDumpPressed();
+    bool snapKey = Host_ConsumeSnapDumpPressed();
+    // CW_VK_DRAW_CENSUS_EVERY=N — a census of every N-th frame, unattended, for the
+    // defects that only a ROAM reaches (player issue #3 reproduced on frame 17472 of an
+    // AutoChuck run that nobody could have pressed F9 on). Aligned with the frame dump's
+    // own period so a dumped picture and a census share a frame number. The press's
+    // whole path is reused: it arms the NEXT frame, so N-1 is the frame that trips it.
+    static const uint64_t censusEvery =
+        Env("CW_VK_DRAW_CENSUS_EVERY") ? strtoull(Env("CW_VK_DRAW_CENSUS_EVERY"), nullptr, 10) : 0;
+    if (censusEvery && ((R->frame + 1) % censusEvery) == 0)
+        snapKey = true;
+    if (R->depthHalvesTrigger)
+    {
+        R->depthHalvesTrigger = false;
+        snapKey = true;
+    }
     bool snapKeyNow = snapKey;   // see the CW_CAPTURE_KEY note at the dump
     // The SAME press also arms the per-draw census for the NEXT frame — next, not this
     // one, because this frame's draws are already recorded by the time a present is
@@ -26135,7 +26875,23 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
                         lo = std::min(lo, v);
                         hi = std::max(hi, v);
                     }
-                    const double span = hi > lo ? hi - lo : 1.0;
+                    const double span = hi > lo ? (hi - lo) : 1.0;
+                    // The two halves' own ranges as well — a tile question (player
+                    // issue #3) is a per-half question, and the stretch hides the
+                    // absolute value entirely.
+                    {
+                        const size_t rowBytes = size_t(snap.image.width) * 4;
+                        double lo0 = 1e30, hi0 = -1e30, lo1 = 1e30, hi1 = -1e30;
+                        for (size_t i = 0; i < n; i += 4)
+                        {
+                            const double d = readNorm(i);
+                            const bool right = (i % rowBytes) >= rowBytes / 2;
+                            if (right) { lo1 = std::min(lo1, d); hi1 = std::max(hi1, d); }
+                            else       { lo0 = std::min(lo0, d); hi0 = std::max(hi0, d); }
+                        }
+                        fprintf(stderr, "[vksnap] depth %s: all %.6f..%.6f | left %.6f..%.6f | "
+                                        "right %.6f..%.6f\n", path, lo, hi, lo0, hi0, lo1, hi1);
+                    }
                     for (size_t i = 0; i < n; i += 4)
                     {
                         const uint8_t g = uint8_t(255.0 * (readNorm(i) - lo) / span);
@@ -26158,6 +26914,87 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
         fprintf(stderr, "[vk] dumped %zu resolve snapshots to %s%s\n",
                 R->snapshots.size(), snapDir,
                 wroteOne ? "" : "  — NONE OF THEM WERE WRITTEN");
+    }
+
+    // CW_VK_DEPTH_HALVES=<guest addr> — EVERY frame, the min/max depth of each half of
+    // that depth snapshot, one line a frame. A sampled dump (every 64th frame) showed the
+    // near-actor prepass's depth landing in the LEFT half on one sample and the RIGHT on
+    // the next (player issue #3), and a period cannot be read off a 64-frame stride. A
+    // readback stall a frame: diagnostic only.
+    static const uint32_t depthHalvesAddr =
+        Env("CW_VK_DEPTH_HALVES") ? uint32_t(strtoul(Env("CW_VK_DEPTH_HALVES"), nullptr, 16)) : 0;
+    if (depthHalvesAddr)
+    {
+        for (const auto& [dest, snap] : R->snapshots)
+        {
+            if ((dest & 0x1FFFFFFF) != depthHalvesAddr || !snap.fromDepth)
+                continue;
+            const size_t n = size_t(snap.image.width) * snap.image.height * 4;
+            if (n > R->readback.size)
+                continue;
+            // A named reference, not the structured binding: the release leg's clang
+            // 15 refuses a structured binding captured by a lambda (C++20 P1091,
+            // which it does not implement); the dev box's clang 22 accepts it.
+            const Image& snapImage = snap.image;
+            RunImmediate([&](VkCommandBuffer cb) {
+                Image& img = const_cast<Image&>(snapImage);
+                Barrier(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+                VkBufferImageCopy c{};
+                c.imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 };
+                c.imageExtent = { img.width, img.height, 1 };
+                vkCmdCopyImageToBuffer(cb, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                       R->readback.buffer, 1, &c);
+                Barrier(cb, img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+            });
+            const bool isFloat = R->depth.format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+            const size_t rowBytes = size_t(snap.image.width) * 4;
+            double lo0 = 1e30, hi0 = -1e30, lo1 = 1e30, hi1 = -1e30;
+            size_t near0 = 0, near1 = 0;
+            // The column extent of the near pixels on each side: an object straddling the
+            // seam populates column W/2-1 on the left AND W/2 on the right; one that
+            // stops dead at the seam on one side is the tile defect.
+            long colMin0 = 1 << 30, colMax0 = -1, colMin1 = 1 << 30, colMax1 = -1;
+            for (size_t i = 0; i < n; i += 4)
+            {
+                double d;
+                if (isFloat) { float fv; memcpy(&fv, R->readback.mapped + i, 4); d = fv; }
+                else { uint32_t v; memcpy(&v, R->readback.mapped + i, 4); d = double(v & 0xFFFFFFu) / 16777215.0; }
+                const long col = long((i % rowBytes) / 4);
+                if ((i % rowBytes) >= rowBytes / 2)
+                {
+                    lo1 = std::min(lo1, d); hi1 = std::max(hi1, d);
+                    if (d < 0.999) { ++near1; colMin1 = std::min(colMin1, col); colMax1 = std::max(colMax1, col); }
+                }
+                else
+                {
+                    lo0 = std::min(lo0, d); hi0 = std::max(hi0, d);
+                    if (d < 0.999) { ++near0; colMin0 = std::min(colMin0, col); colMax0 = std::max(colMax0, col); }
+                }
+            }
+            fprintf(stderr, "[vkdepth] f%06llu %08X prepass=%u left %.6f..%.6f (%zu px <0.999, cols %ld..%ld) | right "
+                            "%.6f..%.6f (%zu px <0.999, cols %ld..%ld)\n",
+                    (unsigned long long)R->frame, depthHalvesAddr,
+                    R->prepassDrawsThisFrame ? R->prepassDrawsThisFrame : R->lastPrepassDraws,
+                    lo0, hi0, near0,
+                    near0 ? colMin0 : -1, colMax0, lo1, hi1, near1, near1 ? colMin1 : -1, colMax1);
+            // A CUT: a big near object touching the seam on one side with the other side
+            // not touching it. Arm the full capture of a coming frame (the cut lasts
+            // frames), at most 8 a run, 200 frames apart.
+            const bool cutR = near1 > 2000 && colMin1 == long(snap.image.width / 2) &&
+                              colMax0 != long(snap.image.width / 2 - 1);
+            const bool cutL = near0 > 2000 && colMax0 == long(snap.image.width / 2 - 1) &&
+                              colMin1 != long(snap.image.width / 2);
+            if ((cutR || cutL) && R->depthHalvesTriggers < 8 &&
+                R->frame > R->depthHalvesLastTrigger + 200)
+            {
+                R->depthHalvesTrigger = true;
+                R->depthHalvesLastTrigger = R->frame;
+                ++R->depthHalvesTriggers;
+                fprintf(stderr, "[vkdepth] f%06llu SEAM CUT (%s side empty) — capturing the "
+                                "frame after next\n",
+                        (unsigned long long)R->frame, cutR ? "left" : "right");
+            }
+        }
     }
 
     static const uint64_t statsEvery =
@@ -26577,16 +27414,26 @@ void DoSwapImpl(uint8_t* base, uint32_t frontBuffer, uint32_t width, uint32_t he
             lastEager = p.eagerTicks;
             lastMidwalk += dMidwalk;
             lastHeldFast = p.heldFastTicks;
+            static uint64_t lastReplayRestores = 0, lastTileOffsetDraws = 0;
+            const uint64_t dReplay = Pm4_ReplayRestores() - lastReplayRestores;
+            lastReplayRestores += dReplay;
+            const uint64_t dTileOff = Pm4_TileOffsetDraws() - lastTileOffsetDraws;
+            lastTileOffsetDraws += dTileOff;
             fprintf(stderr,
                     "[vkprof]   ring latency arms: eager ticks %llu of %llu (%.1f%%) | "
                     "mid-walk rptr stores %llu (%.1f/frame) | held-fast naps %llu "
-                    "(%.1f/frame)\n",
+                    "(%.1f/frame) | tile-replay shader restores %llu (%.2f/frame) | "
+                    "EDRAM-space draws given the tile's offset %llu (%.2f/frame)\n",
                     (unsigned long long)dEager, (unsigned long long)dTicks,
                     dTicks ? 100.0 * double(dEager) / double(dTicks) : 0.0,
                     (unsigned long long)dMidwalk,
                     frames ? double(dMidwalk) / double(frames) : 0.0,
                     (unsigned long long)dHeldFast,
-                    frames ? double(dHeldFast) / double(frames) : 0.0);
+                    frames ? double(dHeldFast) / double(frames) : 0.0,
+                    (unsigned long long)dReplay,
+                    frames ? double(dReplay) / double(frames) : 0.0,
+                    (unsigned long long)dTileOff,
+                    frames ? double(dTileOff) / double(frames) : 0.0);
 
             // Part 107 item 2: the Draw Thread's fence wait, parked. Every episode
             // is classified, so "the park never engaged" (all readyAtEntry / spin) and
