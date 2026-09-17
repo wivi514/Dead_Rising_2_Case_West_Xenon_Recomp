@@ -382,6 +382,7 @@ add_executable(cw_runtime
     host/overlay_gen.cpp             # release §0: first-run KB/M overlay generation
     gpu/d3d_draw_stub.cpp
     host/settings.cpp                # the Visuals panel's persistent store (imported from Case Zero part 60)
+    host/ui_strings.cpp              # the launcher's and settings panel's strings in the subtitle language (Case Zero 8c43c27, imported 2026-09-17)
     host/window.cpp                  # phase 3; compiles to stubs without CW_HAVE_SDL
     host/png_icon.cpp                # the window icon from the player's own X_IMAGEID_GAME.PNG
     host/log_file.cpp                # part 105: stderr tee'd to cw_runtime.log beside the root
