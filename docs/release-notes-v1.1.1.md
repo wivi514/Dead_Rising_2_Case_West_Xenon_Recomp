@@ -1,4 +1,4 @@
-# Release notes — v1.1.1 (DRAFT — hashes filled in when the artifacts are built)
+# Release notes — v1.1.1 (ALL FOUR ARTIFACTS BUILT AND GATED; GitHub release DRAFTED)
 
 **This is the text to paste into the GitHub Release body** (everything below the
 `---`). The four v1.1.1 artifacts are staged for upload at `~/Release/Case West/1.1.1/`
@@ -13,14 +13,30 @@ at `1034bcc`; the overlay from the XenonLive_Launcher checkout at `e59d3ed` (Lin
 
 | artifact | bytes | sha256 |
 |---|---|---|
-| `CaseWestRecomp-linux-x86_64.tar.zst` | TBD | `TBD` |
-| `CaseWestRecomp-linux-x86_64.AppImage` | TBD | `TBD` |
-| `CaseWestRecomp-steamdeck-x86_64.tar.gz` | TBD | `TBD` |
-| `CaseWestRecomp-windows-x86_64.zip` | TBD | `TBD` |
+| `CaseWestRecomp-linux-x86_64.tar.zst` | 31,861,812 | `939da2c0abd1a85e047a47bf09fe97d3b4deb8e647adee2f74cfe58435082cd7` |
+| `CaseWestRecomp-linux-x86_64.AppImage` | 30,472,696 | `0db2eebc8108e6880c1f765353a675732c42329dad064764a2b2c222880868d9` |
+| `CaseWestRecomp-steamdeck-x86_64.tar.gz` | 31,970,995 | `6782317fa4327fa93946e2476d7390b8b109a19c92b73e8b823da1dacfca5d3a` |
+| `CaseWestRecomp-windows-x86_64.zip` | 24,891,116 | `09b45d8456280c2760ec5d1e897faca0d6d63493b250b2f2e65d187c3e4fb073` |
 
-**Gates run:** TBD (filled at build time — `.text` identity, glibc floor, the
-clean-container gate at the floor for all three Linux bundles, `--smoke` on the staged
-Windows exe).
+**Gates run:**
+* **`.text` identity** between the Release and matched RelWithDebInfo configures, both
+  Linux variants: OK (40,954,834 bytes of `.text`, identical).
+* **glibc floor 2.35** (libavutil), unchanged.
+* **Clean-container gate AT THE FLOOR** (`ubuntu:22.04`): the tarball stage, the
+  AppImage and the Steam Deck bundle (`CW_GATE_SYSTEM_CXX=1`) — **all three GATE
+  PASSED**, each with the whole first-run flow: the real package extracted, 1,322 pixel
+  shaders translated (1,429 with the vertex pass) with 0 failures, overlay generation,
+  a boot reading 261 `.big` archives in 45 s, the honest refusal from a container with
+  no game.
+* **The staged Windows exe passed `--smoke`** and a 70 s headless boot on czwin
+  (14c/20t): `timeBeginPeriod(1) -> ok`, the two-core pump and the placement on, both
+  guest threads named, 166-174 fps at the title screen; the leaderboard timer and the
+  F8/F9 lines present. Zip hash verified after transfer.
+* **Host boots of both Linux bundles on the dev box** against the dev tree's game data:
+  the desktop tarball at 200 fps (title screen, `CW_FPS_CAP=500`); the Deck bundle
+  links the system libstdc++ and honours an existing settings file (its 1280x800 is a
+  first-run default).
+* **Validation layer**: the same single standing VUID as v1.1.0's binary, nothing new.
 
 **What is measured and what is not** (`docs/imported-fixes.md` §14): every new default
 engages on the headless DebugJump route and has a same-binary control arm; the tile
@@ -135,8 +151,8 @@ Built on hedge-dev's XenonRecomp and XenosRecomp.
 ### Checksums (SHA-256)
 
 ```
-TBD  CaseWestRecomp-linux-x86_64.tar.zst
-TBD  CaseWestRecomp-linux-x86_64.AppImage
-TBD  CaseWestRecomp-steamdeck-x86_64.tar.gz
-TBD  CaseWestRecomp-windows-x86_64.zip
+939da2c0abd1a85e047a47bf09fe97d3b4deb8e647adee2f74cfe58435082cd7  CaseWestRecomp-linux-x86_64.tar.zst
+0db2eebc8108e6880c1f765353a675732c42329dad064764a2b2c222880868d9  CaseWestRecomp-linux-x86_64.AppImage
+6782317fa4327fa93946e2476d7390b8b109a19c92b73e8b823da1dacfca5d3a  CaseWestRecomp-steamdeck-x86_64.tar.gz
+09b45d8456280c2760ec5d1e897faca0d6d63493b250b2f2e65d187c3e4fb073  CaseWestRecomp-windows-x86_64.zip
 ```
