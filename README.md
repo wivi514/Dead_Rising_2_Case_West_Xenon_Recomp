@@ -1,6 +1,6 @@
 # Dead Rising 2: Case West — Native PC Port
 
-To play with online feature download Case West from the XenonLive launcher
+**To play with online feature download Case West from the [XenonLive launcher](https://github.com/wivi514/XenonLive_Launcher)**
 
 Play **Dead Rising 2: Case West** (Capcom / Blue Castle Games, 2010 — the Xbox
 360 exclusive epilogue to Dead Rising 2, where Chuck Greene and Frank West break
