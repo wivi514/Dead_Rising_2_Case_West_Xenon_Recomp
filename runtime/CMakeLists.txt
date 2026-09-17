@@ -344,6 +344,7 @@ add_executable(cw_runtime
     cpu/fence_wait.cpp               # Case Zero part 107 (imported part 11): the Draw Thread fence wait parked on a futex — addresses re-derived here
     cpu/rumble_guest.cpp             # Case Zero part 108 (imported part 11): the rumble tick at 30 Hz (CW_RUMBLE_TICK_HZ) + the probe (CW_RUMBLE_TRACE) — addresses re-derived here
     cpu/havok_threads.cpp            # Case Zero part 118 (imported part 12): the Havok worker count (CW_HAVOK_WORKERS) — addresses re-derived here
+    cpu/leaderboard_flush.cpp        # Case Zero 8f23fb6 (imported 2026-09-17): the PP board flush timer 360 s -> 2 s (CW_LEADERBOARD_FLUSH_S) + its trace — five addresses and both struct offsets re-derived here (board 0, not 1)
     kernel/klog.cpp
     kernel/memory.cpp
     kernel/heap.cpp
