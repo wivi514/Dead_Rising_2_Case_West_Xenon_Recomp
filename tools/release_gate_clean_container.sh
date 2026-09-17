@@ -24,6 +24,11 @@
 #   3. `cw_runtime --smoke` runs — the phase 0.2 link gate, in the packaged binary.
 #   4. The first-run refusal fires with the right message, since a fresh container has
 #      no game and that is exactly the state a player is in.
+#      CW_GATE_SYSTEM_CXX=1 adds libstdc++/libgcc_s to the permitted list, for a bundle
+#      packaged with CW_PKG_SYSTEM_CXX=1 (the Steam Deck variant) where using the
+#      system's C++ runtime is the POINT rather than a packaging slip. It must be opt-in:
+#      the desktop artifact bundles both, and a gate that shrugged at their absence would
+#      stop being able to catch the packaging defect it was written for.
 #
 # Usage:  tools/release_gate_clean_container.sh [stageDir] [image]
 set -uo pipefail
