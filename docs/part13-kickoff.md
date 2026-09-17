@@ -17,7 +17,9 @@ measurements are the ones that exist.
 ## 1. WHERE THE PORT IS
 
 * **Branch: `xlive-integration`**, v1.1.0 published from it (`49f8383`), master at
-  `bf076e7`. Part 13's commits are on top, **unreleased**.
+  `bf076e7`. **v1.1.1 is built at tag `e05460c` and DRAFTED on GitHub** (2026-09-17) —
+  four artifacts, all gates run (`docs/release-notes-v1.1.1.md`); publishing is the
+  operator's approval click.
 * **v1.1.0 is live** (2026-09-13, four artifacts). The player reports from its thread
   are in `docs/release-notes-v1.1.0.md`'s known-issues list.
 * **New since v1.1.0, all DEFAULT unless said** (§14): tiny colour resolves written
