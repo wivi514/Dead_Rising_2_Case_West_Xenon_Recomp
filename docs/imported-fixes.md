@@ -1203,3 +1203,124 @@ sibling's v1.0.2 on the same machine read 70 fps median / p99 19-21 at 7,861 dra
 A headless title-screen A/B there (split vs one-thread) read identical medians
 (201 fps, the 5 ms timer quantum) with p99 7.0 vs 6.2 — the split's light-scene cost,
 as on the dev box, invisible in play.
+
+## §14 — Case Zero parts 119-120 and the v1.1.1 fix round, plus the F4 debug menu (2026-09-17, part 13)
+
+| | |
+|---|---|
+| **Imported** | 2026-09-17 (part 13), on the `xlive-integration` branch |
+| **Source** | Case Zero `5102330..4860435` — 77 commits (their v1.1.0 release round, the six player reports of 2026-09-13, co-op part 6, parts 119-120's lighting work, the v1.1.1 staging), of which 63 files / ~15,000 lines touch `runtime/` and `tools/` (7,800 of them miniz, already here) |
+| **Why now** | Operator: *"Did some update to case zero can you grab the ones that also applies to you. Also implement that F4 open the in game debug menu like case zero"* — and, mid-import: *"For the co-op stuff don't implement the new thing in 1.1.1 of case zero it's only for case zero issues since it didn't release with co-op"* |
+| **Method** | The §8/§13 three-way merge: base = CZ@`5102330` renamed, theirs = CZ@`4860435` renamed, ours = the working tree, `git merge-file` per file. The rename sed is now written down (this section's "Reproducing the merge"). **28 conflicts in 12 files, every one at a kept seam** (the RT/golden-store/deck-skip/skip-intro/shadow-distance/co-op absences, our own instruments, our own Deck defaults). Files that flowed the OTHER way (`bug_report`, `xlive_*`, the overlay glue, the release scripts) were diffed straight against ours and the deltas taken or declined by hand |
+| **Re-measured here?** | Engagement of every default arm on the DebugJump route (`tools/cw_hud_capture.sh`, three runs: default, `CW_VK_NO_RESOLVE_WRITEBACK=1`, default with the profiler); **eleven guest addresses re-derived** (five for the leaderboard, three hooks and four vtables for the F4 menu — `tools/shape_match.py` plus the string/constant referrers and a vtable enumeration); **the consumer of the resolve write-back found here as a unique 1.000 shape match**; the validation gate (below) |
+
+### What came across, and what proved it here
+
+| fix / feature | source | state on this image | gate run here |
+|---|---|---|---|
+| **TINY COLOUR RESOLVES ARE WRITTEN BACK TO GUEST MEMORY** (their part 120): the title's auto-exposure reads its luminance chain's final 1x1 16_FLOAT resolve with a plain `lwz`; this renderer never wrote a resolve back, so the guest read 0, took the `lum == 0 -> 1.0` sentinel, and the exposure sat on the lighting table's minimum at every hour — their "black night interiors", 5.8 -> 32.1 mean luma at midnight. PM4-level code: colour resolves of <= 64 pixels, copied whole, in 16_FLOAT or 8_8_8_8, staged in the frame's command buffer and stored at the retire after the fence, at `PhysToVa(dest)` (gotcha 267) with the UNORM channel re-encoded as a half at its bucket centre so a black bucket is never the sentinel | `6f4b4b7` | Present, shared code. **The consumer exists here**: their `sub_825D65A8` is our `sub_825A8F78`, a unique 1.000 shape match, 22 instructions, the same `lwz`/`lha` of the resolve's first word and the same constant on zero. `CW_VK_NO_RESOLVE_WRITEBACK=1` is the control | **Engaged**: `resolve: write-back to guest memory recorded 92720` / `bytes written back 92715` on a DebugJump run (86k on the second); the counter is ABSENT on the control arm. **The picture effect is NOT measured here**: mean luma of the four F9 captures reads 57.1-58.3 (default, two runs) vs 54.0-56.7 (control) at the DebugJump safehouse by day — a difference inside one animated scene's sample noise (gotcha 133), and the sibling's effect was at the NIGHT floor, which no headless route here reaches. The consumer being identical is the evidence the mechanism transfers; the operator's sitting in a dark room is the gate |
+| **A tile replay begins with the shader bindings its first run began with** (their player issue #3a): the title's tiled command buffer carries no PS load before its early actor prepass (D3D filtered it as redundant at record time), so tile 0 replayed it with the null shader and tile 1 with the last material shader of tile 0 — the operator's hard vertical edge through a near zombie there. The executor keeps, per frame, the bindings in force when each ring-level indirect buffer first ran and restores them on a replay (`CW_PM4_NO_REPLAY_RESTORE=1` the control) | `3aee6a0` | Present, shared PM4 code. The null pixel shader it names, `ps_438c2af84c78a133`, is D3D's, and **it is in this title's own shader cache** (501 entries) | **Engaged: `tile-replay shader restores 893 (1.00/frame)`** and `1226 (1.00/frame)` on the two profiled runs — this title replays a tiled buffer with the same once-per-frame drift. Whether the drift ever showed as a seam here is unmeasured (no report); the restore is what hardware does at BeginTiling |
+| **An EDRAM-space draw inside a tile replay lands on the tile being replayed** (their #3b): D3D's Clear(Z) after the prepass resets the window offset to 0, and our full-width EDRAM stand-in wiped the LEFT half twice. `Pm4Draw::tileWindowOffset` carries the tile's offset; the window-coordinate path uses it when the draw's own is zero (`CW_PM4_NO_TILE_OFFSET=1`) | `0e0b8b4` | Present, shared code | **Not exercised**: `EDRAM-space draws given the tile's offset 0 (0.00/frame)` on every run — the DebugJump levels here spawn no near actors (they spawn nothing: `autochuck-is-the-heavy-scene` memory), so the prepass + Clear(Z) sequence never occurs on the route. Rides on the sibling's measurement (350 control frames, 140 right-only survivals -> 0) until a crowd sitting |
+| **Alpha-to-mask as Vulkan alpha-to-coverage on the MSAA EDRAM** (their #2, hardware-faithful; it did NOT close their hair flicker) | `0e0b8b4` | Present. `CW_VK_NO_A2C=1` the control | **Engaged**: `draw: ALPHA-TO-MASK as Vulkan alpha-to-coverage on the MSAA EDRAM 125673` (2x MSAA default) |
+| **The display gamma ramp** captured off the ring (`DC_LUT_30_COLOR`) and applied at present under `CW_VK_GAMMA_RAMP=1`; `CW_VK_GAMMA_RAMP_FIRST=1` holds the first table (their part 119: the Xenia-equivalent output, **OFF by default because it darkens** — their part 120 then found the real cause above) | `d5baba6` `fc3e68f` | Present, OFF. `gpu/gamma_ramp.hlsl` + the prebuilt `gamma_ramp_spv.h` (their `build_rt_shaders.sh` is not here — RT is out; the header is committed as built there). Every `sub_` in those comments is the sibling's and is marked so in place | Build only |
+| **F8 = TWENTY CONSECUTIVE presented frames**, the whole burst written full-size to `../bursts/<name>/` beside the captures (a flicker is a frame-to-frame diff) | `790ed92` | Present (`host/bug_report.cpp` is byte-identical to theirs after the rename bar one line: **`title_id` stays `58410b00`** — the rename sed does not know title IDs, and their copy of our file carries THEIR id; caught by the grep this section prescribes) | `[bugreport] F9 (one frame) / F8 (twenty consecutive frames)` on every boot |
+| **Launcher + settings-panel labels in the subtitle language** (EN/FR/IT/ES; JA/KO read as English — the 5x7 font is Latin-only), `host/ui_strings.{h,cpp}` | `8c43c27` | Present. Merge seams: the panel's shadow row stays `% 3` (no RT rungs), no SKIP INTRO LOGOS row (never taken), our part-11 language-measurement comment kept | Build; `[launcher] labels in English (the SUBTITLES language, id 1 …)` |
+| **XMA: the loop fields of a context's first three hardware loops** under `CW_XMA_DECODE_LOG=1` | `7a922f5` | Present | Build |
+| **THE PP LEADERBOARD FLUSH TIMER 360 s -> 2 s** (their player issue #4: a player who saves and opens the board sees the old number for up to six minutes) | `8f23fb6` | **`cpu/leaderboard_flush.cpp`, every address RE-DERIVED** — and one of them is a genuine per-title difference: the PP board is **index 0 here, index 1 there** (Case Zero's name table has a `LEADERBOARD_GAME_1` in front; this title's has three boards, not four), which the Update's own `li r4, 0` says. Update `sub_82537660`, WriteBoard `sub_825375E8`, WriteStats `sub_8259FD90` (unique 1.000 matches; WriteStats' three trace offsets identical); the constructor `sub_82549838` (0.70 lead confirmed as the ONLY other reader of the 360.0 constant and a 3-board loop at stride 0x68); CacheStat `sub_825374C8` (the one referrer of "caching a stat to leaderboard %s"). The constant is `0x820757BC` (two readers, as there); the dirty byte is `+0x80` (theirs `+0xE8`), the timer `+0x168` (`+0x1D8`) — one board's worth less. The trial byte the trace prints is `enable_trial_experience` from OUR table (0x82A744F2) and here it gates CacheStat, not WriteBoard | `[leaderboard] PP board flush timer 360 s -> 2 s` at the constructor; `CW_LEADERBOARD_TRACE=1` shows the update ticking (`timer 32.1 s, dirty 0 -> 0`). The write itself needs a save on a signed-in profile — owed to a sitting |
+| Tools: `d3d9_disasm.py` (DX9 SM2/3 disassembler — DR2 PC's shaders as the readable second implementation of this engine's math), `guest_poke.py` (live guest reads/pokes, u8/u16/u32/float), `xtr_frame_extract.py` (hardware's front buffer out of a capture), `xtr_gamma_ramp.py`, `xtr_resolve_census.py` (format pair + swap), `xtr_draw_bindings.py --dump-texture` creating its dir | various | Present. **`xenia_poke.py` REFUSES TO RUN**: its five guest addresses (the `DISABLE TIME OF DAY` byte, the pinned-hour float, the gamma meter, the clock vtable, the string anchor) are Case Zero's and are not re-derived; the script exits with the message until `ADDRESSES_RE_DERIVED_FOR_CASE_WEST` is flipped. `guest_poke.py`'s addresses are command-line arguments; only its docstring examples are the sibling's | `python3 tools/xenia_poke.py` prints the refusal |
+| Release README: the F9/F8 paragraph; the Windows THIRD_PARTY row for miniz; the clean-container gate's `CW_GATE_SYSTEM_CXX` comment | `69423cc` `790ed92` | Present (F8 wording updated to twenty frames) | — |
+
+### THE F4 DEBUG MENU (the operator's second ask)
+
+Case Zero's F4 is its host-rendered copy of the title's own `cDebugMenu` tree (their
+`debug_tunables.cpp`, 2,600 lines, parked here unbuilt in `port-pending/` since part 1
+because its 29 hook addresses are that title's). The host half — the overlay renderer,
+Up/Down/Enter/Left/Right, the input gate that keeps those presses from the game —
+was already here as shared code in `host/window.cpp`; `imports.cpp` already routed
+F4 to `DebugTunables_ToggleFullDebugMenu`, which printed "not ported". What was
+missing was the guest half, and it is in `cpu/debug_tunables_cw.cpp` now with every
+address derived on this image (the file's header is the derivation record):
+
+* constructor `sub_824AB2E0` (theirs `sub_824AAEB8`): found by the "System Menu"
+  string's one referrer (the sibling's builder maps at +0x428) and a mnemonic diff at
+  the same shift — the same function minus a 48-instruction block of item insertions
+  their tree has and ours does not (0.76 ratio, every other block identical). Reads
+  `limited_debug_menu` (0x82A7433F, our table) right after storing the cDebugMenu
+  vtable `0x8206CBEC`;
+* node base `sub_824A8528` (theirs `sub_824A8120`): `stw r28, 0x14(r27)` — the label
+  at node+0x14 the sibling reads — the 0x12c bound and the `twui` assert; it ends in a
+  tail `b`, which is why `shape_match.py`'s blr-terminated pattern missed it;
+* destructor `sub_824AA970` (theirs `sub_824A8FE0`): one of two 1.000 matches, the one
+  whose vtable stores land in the debug-menu region;
+* the six node vtables (`8206C690/C738/C768/C798/C8A4/C8E4` ↔ their
+  `8206FF34/82070018/48/78/184/1C4`): enumerated by their shared slots, bool/int/action
+  confirmed by unique 1.000 matches of the slot functions the sibling's differ in.
+
+**Measured on the first boot** (`CW_DEBUG_MENU=1`): `captured cDebugMenu object AAE39030
+(158 nodes, 45 labelled: 17 bool, 4 int, 14 action, 2 selector, 8 other)` — the 8 are 5
+submenus and 3 floats, the same shape as the sibling's dump. Two synthetic F4 edges ->
+two toggles, the mouse camera released while the menu is up.
+
+**A divergence, measured rather than assumed.** The sibling's retail DESTROYS its startup
+menu before gameplay, and its hook preserves it. Here, through a DebugJump level load,
+**the destructor hook ran on zero objects and the menu was INTACT** (vtable word and first
+label checked at the F4 toggle, which now prints both plus the destructor count) — this
+title keeps the tree alive itself, or tears it down through a path that is not that
+function. Either way the menu works past a load; the preserve hook stays as a guard, and
+the toggle line is the instrument that would say if that ever changed.
+
+**Not ported, deliberately**: AutoChuck, the zombie sweep, PP awards, the level cap — a
+per-title surface with no addresses here (and the DebugJump levels spawn nothing to
+drive). The five curated categories of the title's OWN tunables ARE here, resolved by
+NAME into this title's extracted table (41 of the sibling's 46; five have no name in one
+table or the other and are not offered). `CW_DEBUG_MENU_DUMP=1` lists every node.
+
+### Not imported from this range, and why
+
+* **Co-op part 6 and every player-issue fix on it** — operator's instruction. That is
+  `coop_outfit_default.cpp` (the save-less joiner's outfit), `prop_attach_guard.cpp` (the
+  military-arrival crash), `trial_flag.cpp` (rode in with the call fix), the friend join
+  (`coop_friends.cpp`), the fall guard and the slow-zone-open dev arm (#7),
+  `ContentHasAnySave`, the coop pair harnesses, the KB/M map's `KEY_RIGHT` for the phone
+  (this port's join prompt already answers on the d-pad feed, `466edd1`/`c140339`).
+* **Player issue #6 (the string-follow read str_en's offsets)** — **already fixed here by
+  another mechanism**: part 11 (§7) made `LoadStrSwap` read `str_<lang>.bcs` by the
+  language mapping measured on this image, operator-confirmed in fr/ko/ja. The sibling's
+  version follows the bank the VFS served instead; equivalent here, since the settings
+  language IS what the title opens. Not taken, so the two ports differ in this file.
+* **Player issue #1 (the gas-station deck skip by shader, not address)** — Still Creek;
+  the skip was never here.
+* **`main.cpp`** — no delta (the timer fix came in part 12).
+* `release_build_oldbase.sh`, the Deck README/script, the oldbase Deck knobs — ours are
+  the originals; theirs were ported back from here and the Deck README is Case Zero's
+  text renamed (its title ID, "the military arrival").
+* `build_rt_shaders.sh` — RT is out of scope; the one shader it now also builds is
+  committed as its header.
+
+### Validation gate
+
+New binary vs the pre-import `build-release/cw_runtime` (2026-09-14), both
+`CW_VK_VALIDATION=1`, 100 s, run NOW: **the same single VUID
+(`VkGraphicsPipelineCreateInfo-topology-08773`, 8 lines each) and nothing else** — the
+standing baseline (§6/§8/§13). Two things learned running it, so the next part does not
+relearn them: the Khronos layer prints to STDOUT (this renderer installs no messenger), so
+a run with stdout to `/dev/null` reads as "zero VUIDs" — an absence about what was looked
+at — and under the layer the process outlives `timeout`'s SIGTERM by minutes (a slow
+teardown, not a hang in play); `timeout -s KILL` is the spelling.
+
+### Reproducing the merge
+
+The rename applied to both sibling revisions before `git merge-file` (this is the sed
+that earlier sections called "the rename"; it lives here so the next part does not
+reconstruct it):
+
+```
+sed -e 's/CZ_/CW_/g' -e 's/cz_/cw_/g' -e 's/cz-recomp/cw-recomp/g' \
+    -e 's/CzXlive/CwXlive/g' -e 's/CzOverlay/CwOverlay/g' -e 's/CzLanguage/CwLanguage/g' \
+    -e 's/cz-pump/cw-pump/g' -e 's/cz-draw/cw-draw/g' \
+    -e 's/Case Zero/Case West/g' -e 's/CASE ZERO/CASE WEST/g' -e 's/CaseZero/CaseWest/g' \
+    -e 's/cz-oldbase/cw-oldbase/g' -e 's/CzDeck/CwDeck/g'
+```
+
+Then, on what came across: `grep` the diff for `CZ_|cz_|Case Zero|sub_82......|0x82......|58410`
+— that is how the `title_id` and the five comment addresses were caught this time.

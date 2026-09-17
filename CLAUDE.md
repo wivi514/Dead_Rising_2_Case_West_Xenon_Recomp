@@ -28,7 +28,7 @@ introduce an unimplemented import, and it did not.
 
 ## Status — and where a new conversation starts
 
-> **THE LIVE HAND-OFF IS `docs/part12-kickoff.md`.** Read it first in a new conversation:
+> **THE LIVE HAND-OFF IS `docs/part13-kickoff.md`.** Read it first in a new conversation:
 > it says what already exists (so it is not rebuilt), names where to start, and lists the
 > gates that are run and owed. When a part ends, write the next `part<N>-kickoff.md`,
 > demote this pointer to it, and refresh the memory directory.
@@ -37,6 +37,29 @@ introduce an unimplemented import, and it did not.
 > **`docs/part2-kickoff.md` is superseded** and is kept as the cautionary example: its
 > problem statement was false and part 2 refuted it with the measurement that section
 > itself asked for.
+
+## Status: PART 13 IMPORTED CASE ZERO'S v1.1.1 ROUND AND PARTS 119-120, AND THE F4 DEBUG MENU IS IN (2026-09-17)
+
+The operator: *"Did some update to case zero can you grab the ones that also applies
+to you. Also implement that F4 open the in game debug menu like case zero"* — and
+*"for the co-op stuff don't implement the new thing in 1.1.1 of case zero"*.
+`docs/imported-fixes.md` §14 is the record; `docs/part13-kickoff.md` the hand-off.
+Three-way merge over CZ `5102330..4860435` (77 commits, 28 conflicts, all at kept
+seams). **New DEFAULTS**: tiny colour resolves WRITTEN BACK to guest memory (the
+title's auto-exposure reads its 1x1 luminance resolve with a `lwz` — the sibling's
+black-night-interiors fix; the consumer is here as a unique 1.000 match,
+`sub_825A8F78`; `CW_VK_NO_RESOLVE_WRITEBACK=1`), the tile-replay shader-binding
+restore (engages 1.00/frame here), the EDRAM-space draw at its tile (unexercised on
+the headless route), alpha-to-coverage on the MSAA EDRAM, the **PP leaderboard flush
+at 2 s** (five addresses re-derived — **the PP board is index 0 here, index 1
+there**, gotcha 328), F8 = twenty consecutive frames, launcher labels in the subtitle
+language. **THE F4 DEBUG MENU**: the title's own cDebugMenu tree (158 nodes, 45
+labelled) on the host overlay under `CW_DEBUG_MENU=1`, three hooks and four node
+vtables derived here; this title does NOT tear the menu down before gameplay
+(measured, gotcha 329). NOT taken: co-op part 6 and its player-issue fixes
+(operator), issue #6 (already fixed here by part 11's mechanism), the deck skip.
+Owed: the operator's dark-room sitting (the one visible claim), the F4 navigation
+sitting, czwin, a leaderboard check.
 
 ## Status: PART 12 IMPORTED CASE ZERO PARTS 109-118 (2026-09-12) — the two-core pump, thread placement, XenonLive launcher-only
 
@@ -314,7 +337,7 @@ attribution to another, and a name is not a call site.** Both are in
 
 **THE FULL NUMBERED LEDGER IS `docs/gotchas.md` — entries 1–319 copied verbatim from Case
 Zero on 2026-08-15, and every "gotcha N" reference resolves there.** New entries from this
-port continue at **328**; **320 is the first written here rather than inherited** (320-327
+port continue at **330**; **320 is the first written here rather than inherited** (320-329
 so far). (An
 earlier version of this paragraph said "315 entries, continue at 316" — the file already ran
 to 319. Gotcha 13 applies to this file too.) Read it **before making a measurement claim,

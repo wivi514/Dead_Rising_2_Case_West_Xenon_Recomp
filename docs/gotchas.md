@@ -3302,3 +3302,37 @@ one-line-per-tid census of who reaches the wait, so the binding is checkable in 
 log rather than trusted once. Corollary of 322 (identify by what the guest itself
 wrote — here, its `ExCreateThread` argument) and of 151 (an arm needs a counter; a
 binding needs a census).
+
+## 328. A 1.000 SHAPE MATCH PROVES THE CODE, NOT THE ENUM — THE SIBLING'S "BOARD 1" IS THIS TITLE'S "BOARD 0"
+
+Case Zero's leaderboard-flush module hooks five functions and names the PP board as
+index 1. Three of the five matched here at 1.000 over their whole length, and a
+reader who stopped there would have carried "board 1" across. The Update's own body
+disagreed: `li r4, 0` where the sibling has `li r4, 1`, `addi r5, r3, 0x20` where it
+has `0x88` — one board's worth of offset, everywhere. The cause is a per-title ENUM:
+this title's leaderboard name table has three boards (PRESTIGE_POINTS first) where
+the sibling's has four (a LEADERBOARD_GAME_1 in front), so every board index, the
+dirty byte (+0x80 vs +0xE8) and the timer (+0x168 vs +0x1D8) all shift by exactly
+one 0x68-byte board record. `shape_match.py` masks every D-form immediate BY DESIGN
+(its own header says so), so a perfect score is silent about exactly the values that
+encode an enum or a struct layout. The rule its header already states and this entry
+makes a gotcha: **after a 1.000 match, diff the immediates** — a `lis/addi` pair that
+differs is a relocated global (fine), a load/store displacement that differs is a
+struct that changed (not fine), and an `li` that differs is an enum value (the
+sibling's constant is WRONG here even though the code is right). Sixth dress of
+gotcha 3 (after a tool's constants, a config's bounds, a cache path, a comment's
+capture, a thread name): a hooked function's ARGUMENT.
+
+## 329. A DESTRUCTOR HOOK THAT NEVER FIRES IS NOT A TEARDOWN THAT NEVER HAPPENS — CHECK THE OBJECT, NOT THE HOOK
+
+The F4 menu keeps the title's startup cDebugMenu alive by refusing its destructor,
+because the sibling's retail destroys it before gameplay. Here the hook never fired
+through a level load. Two readings fit: this title never destroys it, or it destroys
+it through a function that is not the one matched (two candidates scored 1.000). A
+hook that never fires cannot tell those apart (gotcha 151 — an arm with no counter
+cannot be shown to have engaged, and a hook on the wrong function counts nothing).
+What can: the OBJECT. The toggle now reads the object's vtable word and its first
+node's label at every open, and counts destructor calls on ANY object; "INTACT,
+INTACT, 0 objects" is a fact about the menu, "never preserved" was only a fact about
+the hook. Same shape as 30 (a test that has never failed has not been shown able to)
+and 322 (identify things by what the guest itself wrote — here, the vtable it stored).
