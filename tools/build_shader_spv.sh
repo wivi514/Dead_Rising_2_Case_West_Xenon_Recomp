@@ -10,7 +10,7 @@
 # Xenia's idea of where the microcode ends. The runtime looks a shader up by hashing
 # the bytes its own IM_LOAD handler read, so any disagreement about the length is not a
 # wrong picture — it is a total, silent cache miss. Dump from the runtime
-# (`CZ_SHADER_DUMP=<dir>`), build the cache from that, and the question cannot arise.
+# (`CW_SHADER_DUMP=<dir>`), build the cache from that, and the question cannot arise.
 #
 # Xenia's dumps stay useful as a cross-check and as free disassembly: the `.ucode.*`
 # text files beside them are what a shader actually does, which is worth reading before
@@ -51,18 +51,25 @@ for x in "$SYNTH"/*.xshd; do
   # vk_renderer.cpp's viewport note), so adding the invert here would flip the whole
   # frame a second time. Kept as one comment in one place rather than a flag nobody
   # can re-derive: Fable 2 spent a session on exactly this double flip.
-  # CZ_DXC_DEFINES="-D NAME=1 ..." — extra preprocessor defines, so an ARM of the shader
+  # CW_DXC_DEFINES="-D NAME=1 ..." — extra preprocessor defines, so an ARM of the shader
   # cache can be built from the same emitter and the same microcode into a second
-  # directory, and selected at run time with CZ_SHADER_SPV. That is what makes a shader
+  # directory, and selected at run time with CW_SHADER_SPV. That is what makes a shader
   # change a same-binary A/B rather than a rebuild you cannot go back from.
   # Each module learns its OWN identity: the low 16 bits of the hash its filename already
   # carries. Costs nothing when unused (a define no emitted code reads), and it is what
   # lets an instrument paint a colour a decoder can turn back into a shader NAME instead
   # of a human inferring which material a green patch belonged to.
   tag=$(( 0x${n#*_} & 0xFFFF ))
+  # USER CLIP PLANES, on by default and VERTEX-ONLY, matching the runtime translator
+  # exactly (runtime/gpu/shader_translator.cpp) — the two implementations are kept
+  # byte-identical by `cw_runtime --translate-shaders`, so a default that differs here
+  # would read as a translator defect rather than as the config difference it is.
+  # CW_NO_CLIP_SHADERS=1 builds the pre-issue-#10 cache: the control arm.
+  clipdef=""
+  case "$n:${CW_NO_CLIP_SHADERS:-0}" in vs_*:0) clipdef="-D XE_USER_CLIP_PLANES=1" ;; esac
   if LD_LIBRARY_PATH="$DXCLIB" "$DXC" -T "$target" -HV 2021 \
       -all-resources-bound -spirv -fvk-use-dx-layout -Qstrip_debug \
-      -D "XE_SHADER_TAG=$tag" ${CZ_DXC_DEFINES:-} \
+      -D "XE_SHADER_TAG=$tag" $clipdef ${CW_DXC_DEFINES:-} \
       -Fo "$OUT/$n.spv" "$SYNTH/$n.hlsl" > "$SYNTH/$n.dxc.log" 2>&1; then
     cp "$SYNTH/$n.meta.json" "$OUT/"
     ok=$((ok + 1))

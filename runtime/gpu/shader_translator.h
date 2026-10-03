@@ -31,6 +31,42 @@ struct Result
     std::string hlsl;            // the intermediate, kept because it is the debuggable one
 };
 
+// THE TRANSLATE-TIME RECIPE (Case Zero's player issue #10, 2026-09-21; imported here
+// 2026-10-03, docs/imported-fixes.md §15).
+//
+// PROVENANCE. The narrative below is CASE ZERO'S, kept as written there: its "eighteen
+// parts", its play_session.sh, its 104-shader census. HERE the history is simpler and
+// worse: this port never had a clip cache at all, operator sessions included — the
+// epilogue was never built into any Case West cache until this import. Measured here at
+// the import: 0 of 109 vertex modules in the installed first-run cache declared
+// ClipDistance, while the guest DOES enable user clip plane 0 (33,548 draws published in
+// one operator sitting). Translating the 500-shader dump set both ways: 391 of 391 pixel
+// modules byte-identical, 109 of 109 vertex modules different. End to end,
+// CW_VK_CLIP_POISON=1 on the DebugJump route: clip cache luma 0.0, the old cache 58.
+//
+// A cached module is not just a function of its microcode — it is a function of the
+// microcode AND the preprocessor defines the HLSL was compiled with. That second half
+// was invisible for eighteen parts: the clip-plane epilogue that makes zombie slicing
+// work (part 57) lives behind `XE_USER_CLIP_PLANES`, every operator play session
+// selected a cache built with it (tools/play_session.sh), and every RELEASE built its
+// own cache here with no defines at all. Census: 0 of 104 vertex shaders in
+// assets/shader_spv declared BuiltIn ClipDistance against 104 of 104 in
+// assets/shader_spv_clip. So no player has ever had user clip planes, and a sliced
+// zombie rendered as TWO WHOLE BODIES — exactly the part-56 symptom part 57 fixed.
+//
+// The cure for the class, not just the instance: the recipe is part of the cache's
+// identity, stamped into the cache directory, and a cache whose stamp does not match
+// this build is rebuilt (shader_prebuild.h). Anything added here that changes a
+// module's bytes must change RecipeId() too, or players keep the old bytes for ever.
+//
+// CW_NO_CLIP_SHADERS=1 drops the epilogue: the same-binary control arm for the fix,
+// and the escape hatch for a device without `shaderClipDistance`.
+bool ClipPlanesWanted();
+
+// A short, stable line naming the recipe this build translates under, e.g. "clip=1".
+// Written into the cache as `shader_recipe.txt` and compared on every boot.
+std::string RecipeId();
+
 // Translate one shader's raw Xenos microcode. `name` is the runtime's cache key,
 // "vs_<hash16>" / "ps_<hash16>" — the hash's low 16 bits become XE_SHADER_TAG, the
 // identity each module carries so an instrument can paint a colour a decoder can turn
