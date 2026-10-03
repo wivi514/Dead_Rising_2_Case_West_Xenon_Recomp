@@ -1324,3 +1324,39 @@ sed -e 's/CZ_/CW_/g' -e 's/cz_/cw_/g' -e 's/cz-recomp/cw-recomp/g' \
 
 Then, on what came across: `grep` the diff for `CZ_|cz_|Case Zero|sub_82......|0x82......|58410`
 — that is how the `title_id` and the five comment addresses were caught this time.
+
+## §15 — Case Zero's post-v1.1.1 fix round (2026-10-03)
+
+| | |
+|---|---|
+| **Imported** | 2026-10-03, on the `xlive-integration` branch |
+| **Source** | Case Zero `4860435..8fa89ca` — 81 commits, of which **six** were taken. Most of the range is their co-op (player issue #9, co-op part 13) |
+| **Why now** | Operator: *"Also did multiple fix on dead rising 2 case zero bring the ones that would fix things in case west"* |
+| **Method** | Per COMMIT this time, not per range: `git merge-file` with base = CZ@`c^` renamed, theirs = CZ@`c` renamed (§14's sed), ours = the tree, applied in source order so each import is its own commit. Two conflicts (`main.cpp`: ours already had `--gen-overlays`; `build_shader_spv.sh`: ours still read the sibling's `CZ_DXC_DEFINES`), one at a kept seam (`overlay_gen.cpp`'s generator version — ours 2 -> 3). The split commits were checked equal to the tested tree (`cmp` on the two files that carry several imports) |
+
+### What came across, and what proved it here
+
+| fix | source | here | gate run here |
+|---|---|---|---|
+| **User clip planes are the translator's default**; the cache's recipe is stamped (`shader_recipe.txt`, "clip=1") and a mismatched or absent stamp drops and rebuilds the vertex half; `shaderClipDistance` REQUIRED; `--shader-cache-status` (their player issue #10: a sliced zombie rendered as two whole bodies) | `dbc17ef` | **The defect is present, measured**: the guest enables user clip plane 0 (33,548 draws in the part-13 F4 sitting) and 0 of 109 vertex modules in the installed cache declared ClipDistance. Unlike Case Zero, no Case West cache ever had the epilogue, operator sessions included. `CW_NO_CLIP_SHADERS=1` | Dump set both ways: 391/391 PS identical, 109/109 VS different; shell vs in-process 500/500. Installed-cache copy: OWED -> rebuild arms dropped 219/215/215/0, ClipDistance 107/107, 0/107, 107/107, 107/107. `CW_VK_CLIP_POISON=1`: clip cache luma 0.0 (4/4), old cache 57.6-58.7. **A sliced zombie is NOT seen** — owed to the operator |
+| **The resolve write-back averages the host footprint** instead of one corner texel (their "overexposed in shadow" at 3440x1440) | `91ee0c1` | Identical code here; default internal res is 2x. `CW_VK_WB_POINT_SAMPLE=1` | **No visible difference** at the DebugJump safehouse, 2560x1440, two runs an arm (56.8-59.2 vs 57.3-58.9). Engagement is arithmetic; effect owed to a dark-room sitting |
+| **Widescreen: full-screen fills keep their overscan margin** (above 2.1333:1 the logos showed the scene behind in the flanks) | `e9c51b6` | Present. `CW_VK_NO_WIDE_FILL=1` | 3440x1440 boot, two runs an arm: control shows the Blue Castle logo over the frontend scene (flanks 37.0) in 3 frames of one run; fix 0 of 78 captures |
+| **KB/M: x_button_ig and RTbutton_ig keep stock art** (both LEFT MOUSE -> identical chips -> one address claimed by both; X read RT after a pad flip) | `fe775c0` | Present: every logged scan here read "26 of 26 (29 copies)", the sibling's signature | Python == C++ generators byte-identical (24 of 139 patched, was 26); boot: "26 of 26 glyphs located (27 copies, 0 ambiguous claims refused)" |
+| **`--debug-menu`** (a Windows shortcut can switch F4 on) + README routes | `426acf1` | Present | Flag in either order with `--smoke`; `[option] --debug-menu -> CW_DEBUG_MENU=1` |
+| **CI clones libxlive over a deploy key; skips without it** | `ca4c0ce` | Our CI has failed every push the same way since co-op | **Owed: the `XLIVE_DEPLOY_KEY` secret on this repo** (the operator's) |
+
+**The dev tree's own cache** (`assets/shader_spv`, a dump-built developer cache the stamp
+logic never touches by design) was switched to the clip translation: 109/109 VS with
+ClipDistance; the previous one is `assets/shader_spv_noclip` (the control, gitignored). Two
+first-sight VS not in the dump set were removed so they re-translate with the epilogue.
+
+### Not imported, and why
+
+* **Issue #9 and co-op part 13** (item replication, the found flag, the clothing repair,
+  `coop_items.cpp`) — Case Zero's ADDED co-op; operator rule (§14).
+* **The EXPOSURE row and `CZ_VK_LUM_SCALE`** — a player-choice control over a trade Case
+  Zero measured between ITS daylight and night; not a fix, and this title has no outdoors.
+  Revisit only if a Case West player reports exposure.
+* **The debug menu's TIME OF DAY submenu / mission clock** — Case Zero addresses, a feature.
+* **The speedrun block** — a Case Zero feature and published contract.
+* **Gotcha 615** (docs only).
