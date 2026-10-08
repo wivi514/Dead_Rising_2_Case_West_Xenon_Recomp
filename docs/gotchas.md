@@ -3336,3 +3336,22 @@ node's label at every open, and counts destructor calls on ANY object; "INTACT,
 INTACT, 0 objects" is a fact about the menu, "never preserved" was only a fact about
 the hook. Same shape as 30 (a test that has never failed has not been shown able to)
 and 322 (identify things by what the guest itself wrote — here, the vtable it stored).
+
+## 330. A MOD LAYER THAT SERVES WHOLE FILES MUST BE CHECKED FIRST, AND ITS FILES BUILT ON TOP OF THE LAYERS BELOW — OR A MOD SILENTLY UNDOES A RECOMP PATCH
+
+`assets/game_mods/` (the DR2 CZ/CW modding toolkit's deploy target; `runtime/kernel/vfs.cpp`,
+"THE MODS OVERLAY") swaps whole files like every other overlay. Below `game_patched` it could
+never override a patched file; above it, a naive mod copy of a patched archive would drop the
+recomp's own patch without a word. The split: the runtime checks `game_mods` FIRST (exact case,
+then case-insensitive) and stays a whole-file swap; the toolkit (`dr2 mod deploy -g cw`) builds
+each mod file from `game_patched`'s copy when one exists, and warns when a mod carries a
+`game_kbm` file (a run-time toggle layer it cannot build on). `CW_NO_MODS=1` is the off switch,
+independent of `CW_NO_PATCHED_ASSETS`; every served file is logged ("served from the MODS
+overlay").
+
+**Verified 2026-10-08, headless** (`CW_NO_WINDOW=1 CW_VKDRAW=1 CW_VK_FRAME_DUMP`, START,A,A into
+a copy of the save): a recoloured `npcs.big/chest_default.tex/cr_jacket_cm`, inside an
+LZX-compressed `.tex` re-encoded by the toolkit, puts Chuck in a green IJIEK jacket at frame
+6144; `CW_NO_MODS=1` on the same binary shows the shipped yellow one and logs no MODS line. The
+game accepts the toolkit's LZX streams (verbatim blocks only) for a model `.tex`. Same layer,
+same test in Case Zero: its gotcha 634.
