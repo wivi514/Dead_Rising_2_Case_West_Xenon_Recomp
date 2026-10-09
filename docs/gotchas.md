@@ -3355,3 +3355,29 @@ LZX-compressed `.tex` re-encoded by the toolkit, puts Chuck in a green IJIEK jac
 6144; `CW_NO_MODS=1` on the same binary shows the shipped yellow one and logs no MODS line. The
 game accepts the toolkit's LZX streams (verbatim blocks only) for a model `.tex`. Same layer,
 same test in Case Zero: its gotcha 634.
+
+## 331. AN AUDIO MOD CANNOT BE "WHICH FILE IS THIS BUFFER FROM?" — MAKE EVERY XMA PACKET SAY WHERE IT IS
+
+The DR2 CZ/CW modding toolkit replaces sounds (no XMA encoder can be shipped), so this runtime
+substitutes PCM: `runtime/kernel/audio.cpp`, block "AUDIO MODS: PCM SUBSTITUTION",
+`XmaSubstApply` after each `Xma_DecodePacket`. Mapping a context's input buffer back to a `.big`
+entry through VFS read tracking breaks on how the title handles audio (streams re-armed in place
+with new pointers, banks read whole and copied, contexts reused). Instead `dr2 mod deploy -g cw`
+writes `game_mods/dr2kit_audio/substitutions.txt` listing EVERY packet of a replaced stream by
+its 64-bit FNV-1a hash with the decoded-sample position its output starts at (the toolkit decodes
+packet by packet through the same ffmpeg decoder, which gives the whole-file samples exactly).
+Each decoded packet is hashed; a hit says which replacement samples overwrite the PCM it just
+produced. No VFS state; loops, streaming and reused contexts need no special case. Packets that
+also occur in another sound are marked `c` (continue only); only unique `u` packets start a
+substitution. The guest sees nothing different but the PCM. Off switch `CW_NO_AUDIO_MODS=1`
+(and `CW_NO_MODS=1`): the table is never read. Logs `[xma] audio mods: …` at decode-thread start
+and when a replaced sound (re)starts.
+
+**Verified 2026-10-09, headless** (`CW_NO_WINDOW=1 CW_VKDRAW=1`, no input, 90 s at the title,
+`SDL_AUDIODRIVER=disk` recording the output): `music.big/PressStartDR2.xma` replaced by
+`MercenariesBattleUnderground`'s audio logs `audio mods: ctx0 plays … from sample 0 (start #1)`
+and the recording follows the replacement at the right positions; `CW_NO_AUDIO_MODS=1` on the
+same binary logs nothing and plays PressStartDR2. (That control run ignored SIGTERM at exit and
+needed SIGKILL; substitution was off, so it is not this change.) Same change, same test in Case
+Zero: its gotcha 635, which also records that an edited audio scene script fails the digest
+check there and faults.
