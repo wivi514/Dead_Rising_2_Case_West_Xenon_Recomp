@@ -3403,6 +3403,11 @@ reading `0x0000001C` after a failed allocation (backtrace in the allocator aroun
 where one brought pixel shader and four brought vertex shaders loaded. Growing both: the 14 load
 and the game plays. A pool that runs out can show up as a null pointer far from the pool.
 
+**A third: the shader description pool** (`0x82A00D24`, renderer `+3484`): the boot budget
+function `sub_825A6000` stores **231**, exactly the descriptions Case West ships, none free.
+Case Zero's matching pool (228 for 223) ran out with Case West's gas zombie (its gotcha 643),
+so it is grown here too (2026-10-13; logged `231 -> 4096`).
+
 **Verified 2026-10-12, headless** (a copy of the save, Storage Pens): both lines logged; no mod,
 14 brought pixel shaders alone, and Case Zero's Parasol (placed, its 14 pixel shaders) all play
 (frames past 30,000).

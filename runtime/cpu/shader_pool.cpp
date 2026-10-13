@@ -33,7 +33,8 @@ extern "C" PPC_FUNC(__imp__sub_8275A168);
 
 namespace
 {
-// The two pools sized 1340 in this image's table, each read by the builder below.
+// The pools grown, each read by the builder below (two 1340s of the image's table, and
+// the description pool the boot sets to 231).
 struct PoolWord
 {
     uint32_t address;
@@ -43,6 +44,10 @@ struct PoolWord
 constexpr PoolWord kPools[] = {
     {0x82A00D34, 1340, "shader constant sets (read at 0x8275AA94, renderer +3504)"},
     {0x82A00D2C, 1340, "the pool read at 0x8275A9F8 (renderer +3492)"},
+    // One per shader DESCRIPTION (.sdo): the boot budget function sub_825A6000 stores
+    // 231 here, exactly the 231 descriptions Case West ships (none free); Case Zero's
+    // matching pool ran out with Case West's gas zombie (its gotcha 643).
+    {0x82A00D24, 231, "shader descriptions (read at 0x8275A990, renderer +3484)"},
 };
 constexpr uint32_t kDefaultGrownSize = 4096;
 
