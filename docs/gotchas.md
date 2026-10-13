@@ -3381,3 +3381,21 @@ same binary logs nothing and plays PressStartDR2. (That control run ignored SIGT
 needed SIGKILL; substitution was off, so it is not this change.) Same change, same test in Case
 Zero: its gotcha 635, which also records that an edited audio scene script fails the digest
 check there and faults.
+
+## 332. THE SHADER CONSTANT SET POOL CAPS HOW MANY PIXEL SHADERS A MOD CAN ADD — GROWN TO 4096
+
+The renderer keeps one shader constant set per loaded pixel shader in a pool sized from the
+word at `0x82A00D34` (the second entry of its size table at `0x82A00D30`; read by the pool
+builder `sub_8275A168` at `0x8275AA94`, pool kept at renderer `+3504`). Case West ships 1,337
+pixel shaders against 1,340 sets, so the DR2 CZ/CW modding toolkit could add three of Case
+Zero's before the title asserts `"Shader constant set overflow."`. `runtime/cpu/shader_pool.cpp`
+hooks the builder and raises the size to 4096 just before it reads it (both arrays, the sets
+and the count*8 free list, are allocated from the count). Nothing in this image stores to
+that word (a scan of every store through a `lis 0x82A0` base; the same scan finds Case Zero's
+boot store of 1300, its gotcha 643), but hooking the reader keeps the two ports the same
+shape. Off switch `CW_NO_SHADER_POOL_GROWTH=1`; `CW_SHADER_POOL=N` (1340..65535); logs
+`[shaderpool] shader constant sets: 1340 -> 4096 …`, or `NOT growing` when the word is not 1340.
+
+**Verified 2026-10-12, headless** (a copy of the save, Storage Pens): the line is logged and the
+game plays (frames to 35,100).
+
