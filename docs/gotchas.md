@@ -3396,6 +3396,14 @@ boot store of 1300, its gotcha 643), but hooking the reader keeps the two ports 
 shape. Off switch `CW_NO_SHADER_POOL_GROWTH=1`; `CW_SHADER_POOL=N` (1340..65535); logs
 `[shaderpool] shader constant sets: 1340 -> 4096 …`, or `NOT growing` when the word is not 1340.
 
-**Verified 2026-10-12, headless** (a copy of the save, Storage Pens): the line is logged and the
-game plays (frames to 35,100).
+**A second pool runs out the same way, and it does not assert.** The word before the size table,
+`0x82A00D2C` (also 1340; pool kept at renderer `+3492`, read at `0x8275A9F8`), limits brought pixel
+shaders too: with only `0x82A00D34` grown, 14 brought pixel shaders faulted while the save loaded,
+reading `0x0000001C` after a failed allocation (backtrace in the allocator around `0x827919EC`),
+where one brought pixel shader and four brought vertex shaders loaded. Growing both: the 14 load
+and the game plays. A pool that runs out can show up as a null pointer far from the pool.
+
+**Verified 2026-10-12, headless** (a copy of the save, Storage Pens): both lines logged; no mod,
+14 brought pixel shaders alone, and Case Zero's Parasol (placed, its 14 pixel shaders) all play
+(frames past 30,000).
 
