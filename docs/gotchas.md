@@ -3412,3 +3412,19 @@ so it is grown here too (2026-10-13; logged `231 -> 4096`).
 14 brought pixel shaders alone, and Case Zero's Parasol (placed, its 14 pixel shaders) all play
 (frames past 30,000).
 
+## 333. THE ZOMBIE HEAP CAPS HOW MANY ZOMBIE TYPES A MOD CAN LOAD AT ONCE — GROWN BY 16 MiB FROM THE SW TEXTURE HEAP
+
+The title carves its memory into fixed named heaps; the **Zombie heap** (the loaded zombie
+types' models and textures) is a constant 30,177,280 bytes, built at `0x82588978`, the same
+as Case Zero's, where the DR2 CZ/CW modding toolkit's brought zombie types ran it out and
+faulted the load (Case Zero's gotcha 644: how the heap was found with gdb, and the
+measurements). `runtime/cpu/zombie_heap.cpp` takes 16 MiB off the SW Texture heap (its size
+function `sub_82484BF8`, one caller at boot: 205,054,976 → 188,277,760) and gives them to the
+Zombie heap (its block `sub_82792530` and heap `sub_82790278`, only from the return
+addresses `0x82588994` / `0x825889AC` with the title's size, and only after the texture heap
+shrank). Off switch `CW_NO_ZOMBIE_HEAP_GROWTH=1`; `CW_ZOMBIE_HEAP_GROWTH_MB=N` (1..64).
+
+**Verified 2026-10-13, headless** (a copy of the save, Storage Pens, no mods): both
+`[zombieheap]` lines, no fault, zombies drawn in play past frame 24,000. Case West's own
+levels' use of the two heaps is not measured here.
+
