@@ -154,9 +154,14 @@ target_include_directories(ppc_image PUBLIC
 #
 # -Wno-unused-* silences the recompiler's own temporaries (`ea`, unused `temp`), not
 # our code. They are emitted per-function by design and there are tens of thousands.
+#
+# On arm64 (macOS, milestone C) simde lowers the same intrinsics to NEON with no flag
+# at all, and -msse4.1 is an error there, so the x86 flags are x86-only.
 target_compile_options(ppc_image PRIVATE
-    -msse4.1 -mavx
     -Wno-unused-variable -Wno-unused-but-set-variable)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64" AND NOT CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+    target_compile_options(ppc_image PRIVATE -msse4.1 -mavx)
+endif()
 
 # ---------------------------------------------------------------------------
 # CODEGEN ARMS ON THE RECOMPILED TUs ONLY (docs/perf-plan-part116.md item 3)
@@ -661,8 +666,13 @@ endforeach()
 # link cleanly and the gate would pass while proving nothing. --whole-archive forces
 # every object in. Keep this even once the runtime references most of the image on
 # its own: "most" is not "every".
-target_link_options(cw_runtime PRIVATE
-    "-Wl,--whole-archive" "$<TARGET_FILE:ppc_image>" "-Wl,--no-whole-archive")
+# ld64 (macOS) has no --whole-archive; -force_load is its per-archive spelling.
+if(APPLE)
+    target_link_options(cw_runtime PRIVATE "-Wl,-force_load,$<TARGET_FILE:ppc_image>")
+else()
+    target_link_options(cw_runtime PRIVATE
+        "-Wl,--whole-archive" "$<TARGET_FILE:ppc_image>" "-Wl,--no-whole-archive")
+endif()
 
 # CW_BUNDLE_RPATH — look for the bundled libraries beside the executable first
 # (Case Zero release-plan A.4, imported). $ORIGIN is resolved by the loader against
