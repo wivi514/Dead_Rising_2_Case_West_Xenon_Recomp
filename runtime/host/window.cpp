@@ -2937,6 +2937,21 @@ std::vector<const char*> Host_VulkanInstanceExtensions()
     std::vector<const char*> out;
     if (!Host_VulkanSwapchainWanted())
         return out;
+#if defined(__APPLE__)
+    // macOS builds its surface itself from the main-thread CAMetalLayer
+    // (Host_VulkanCreateSurface), so the two extensions that needs are known and SDL is
+    // not asked. Asking it FAILED with real SDL2 2.32 — "The specified window isn't a
+    // Vulkan window", after SDL_Metal_CreateView on a window created WITH
+    // SDL_WINDOW_VULKAN — while sdl2-compat (the dev build's Homebrew SDL) answered, so the
+    // first macOS release package fell back to the readback present path and showed a
+    // black window at full frame rate.
+    if (g_metalLayer)
+    {
+        out.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+        out.push_back(VK_EXT_METAL_SURFACE_EXTENSION_NAME);
+        return out;
+    }
+#endif
     unsigned n = 0;
     if (!SDL_Vulkan_GetInstanceExtensions(g_window, &n, nullptr))
     {
