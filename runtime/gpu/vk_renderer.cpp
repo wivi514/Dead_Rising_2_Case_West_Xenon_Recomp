@@ -10199,6 +10199,20 @@ uint32_t UploadTexture(uint8_t* base, const uint32_t* regs, uint32_t constIdx,
     // crowd run reads 0 disagreements AND three runs an arm clear the 0.4 ms kill rule.
     static const bool memoOn = EnvOn("CW_VK_TEXMEMO");
     static const bool verify = EnvOn("CW_VK_TEXMEMO_VERIFY");
+    // THE VERIFIER'S POSITIVE CONTROL (part 122). The verifier had read 0 disagreements
+    // over ~1 billion lookups across two parts and had never once been shown able to
+    // read anything else (gotcha 30). Under this arm a memo hit compares the REAL answer
+    // against the memo's slot + 1, so every verified hit must count as a disagreement;
+    // the answer actually returned is still the real one, so the picture is unaffected.
+    // A run with this set that prints 0 means the verifier is blind.
+    static const bool verifyPoison = [] {
+        const bool o = EnvOn("CW_VK_TEXMEMO_VERIFY_POISON");
+        if (o)
+            fprintf(stderr, "[texmemo] CW_VK_TEXMEMO_VERIFY_POISON=1 — every verified hit "
+                            "is compared against a WRONG slot; disagreements MUST be "
+                            "nonzero or the verifier is blind\n");
+        return o;
+    }();
     if (memoOn && constIdx < 32)
     {
         TexSlotMemo& m = g_texMemo[constIdx];
@@ -10212,7 +10226,7 @@ uint32_t UploadTexture(uint8_t* base, const uint32_t* regs, uint32_t constIdx,
             if (!verify)
                 return m.slot;
             const uint32_t real = UploadTextureUncached(base, regs, constIdx, shaderDim);
-            if (real != m.slot)
+            if (real != m.slot + (verifyPoison ? 1u : 0u))
             {
                 if (g_texMemoDisagree++ < 8)
                     fprintf(stderr, "[texmemo] DISAGREEMENT slot %u dim %u: memo %u real "
