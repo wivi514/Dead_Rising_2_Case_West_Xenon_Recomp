@@ -6193,16 +6193,27 @@ float ShadowBiasFactorThisFrame()
 
 // Scale the bias register's .xyz (c48 here) of a freshly copied pixel window. Shared by the copy and the memo
 // verifier's recompute so the two cannot disagree.
-inline void ApplyShadowBias(uint32_t* window, const ShaderMeta& ps)
+//
+// WRITE-ONLY INTO `window`, READ FROM `src` (part 122). The real copy's `window` is the
+// per-frame arena, which is mapped HOST_VISIBLE|HOST_COHERENT without HOST_CACHED —
+// write-combined, so every READ of it is an uncached DRAM round trip (gotchas 446-447:
+// part 75 found the projection patch doing exactly this for 36% of the frame). The first
+// cut did `c[47*4+i] *= f` in place, three uncached reads on every pixel-constant memo
+// miss, and `perf` put it at ~5% of `cw-draw`. `src` is the register window the copy was
+// taken from (cached), and `window[47*4..]` was copied from `src[47*4..]` verbatim, so
+// scaling the source value and storing it is the same result.
+inline void ApplyShadowBias(uint32_t* window, const uint32_t* src, const ShaderMeta& ps)
 {
     if (!ps.readsShadowBlock)
         return;
     const float f = ShadowBiasFactorThisFrame();
     if (f == 1.0f)
         return;
-    float* c = reinterpret_cast<float*>(window);
+    float scaled[3];
+    memcpy(scaled, src + kShadowBiasReg * 4, sizeof scaled);
     for (int i = 0; i < 3; ++i)
-        c[kShadowBiasReg * 4 + i] *= f;
+        scaled[i] *= f;
+    memcpy(window + kShadowBiasReg * 4, scaled, sizeof scaled);
     COUNT("draw: shadow bias scaled on a pixel constant copy (SHADOW BIAS)");
 }
 
@@ -19689,7 +19700,7 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
             ProfScope _pcp(&g_prof.constPs);
             uint32_t* dst = reinterpret_cast<uint32_t*>(R->arena.mapped + psConstAt);
             CopyConstWindow(dst, regs + xenos::kAluConstantBase + memoPsBase * 4, ps, false);
-            ApplyShadowBias(dst, ps);
+            ApplyShadowBias(dst, regs + xenos::kAluConstantBase + memoPsBase * 4, ps);
             R->constMemoPsFor = &ps;
             R->constMemoPsValid = true;
             R->constMemoPsVersion = psVersion;
@@ -19716,7 +19727,7 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
             if (AspectPatchActive())
                 PatchWideProjection(scratch.data(),
                                     !NoWideFill() && CoverQuadWindow(scratch.data()));
-            ApplyShadowBias(scratch.data() + 256 * 4, ps);
+            ApplyShadowBias(scratch.data() + 256 * 4, scratch.data() + 256 * 4, ps);
             if (g_constMemoVerifyPoison)
             {
                 // POISON A REGISTER THE COMPARE ACTUALLY LOOKS AT. Under the gather the
