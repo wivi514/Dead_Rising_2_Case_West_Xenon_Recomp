@@ -28,7 +28,7 @@ introduce an unimplemented import, and it did not.
 
 ## Status — and where a new conversation starts
 
-> **THE LIVE HAND-OFF IS `docs/part13-kickoff.md`.** Read it first in a new conversation:
+> **THE LIVE HAND-OFF IS `docs/part14-kickoff.md`.** Read it first in a new conversation:
 > it says what already exists (so it is not rebuilt), names where to start, and lists the
 > gates that are run and owed. When a part ends, write the next `part<N>-kickoff.md`,
 > demote this pointer to it, and refresh the memory directory.
@@ -37,6 +37,22 @@ introduce an unimplemented import, and it did not.
 > **`docs/part2-kickoff.md` is superseded** and is kept as the cautionary example: its
 > problem statement was false and part 2 refuted it with the measurement that section
 > itself asked for.
+
+## Status: PART 14 FINISHED THE OCTOBER CASE ZERO IMPORT ROUND (2026-10-14)
+
+The active session continued Claude's Case Zero update pass. The branch already had 43
+commits beyond the v1.1.1 release tag: the October 3 issue-12 diagnostics and §15 import;
+the DR2 modding toolkit's `game_mods/` VFS, PCM sound mods and pool/heap growth; and the
+October 14 renderer, macOS, Windows, detail-setting and shadow-bias changes. The last
+candidate, Case Zero `78632f1`, was checked against this title's own zombie archives and
+adapted as a narrowly scoped body-variant name classifier (`runtime/cpu/zombie_variant_names.cpp`;
+`docs/imported-fixes.md` §16). The third similar-looking `geo_lodShape4Deformed` is outside
+the body-part patterns and remains unclassified pending a measurement.
+
+**No build was run in this part, per the operator's instruction to do the final update
+first and build afterward.** The next work is the release build and its gates, including
+the runtime A/B for §16's `CW_ZOMBIE_NAME_FIX=0` control. The v1.1.1 tag and four staged
+artifacts predate all 43 commits and do not represent this source tree.
 
 ## Status: PART 13 IMPORTED CASE ZERO'S v1.1.1 ROUND AND PARTS 119-120, AND THE F4 DEBUG MENU IS IN (2026-09-17)
 

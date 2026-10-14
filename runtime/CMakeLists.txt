@@ -352,6 +352,7 @@ add_executable(cw_runtime
     cpu/leaderboard_flush.cpp        # Case Zero 8f23fb6 (imported 2026-09-17): the PP board flush timer 360 s -> 2 s (CW_LEADERBOARD_FLUSH_S) + its trace — five addresses and both struct offsets re-derived here (board 0, not 1)
     cpu/shader_pool.cpp              # 2026-10-12 (DR2 modding toolkit, phase 15): the shader constant set pool grown for mods (CW_NO_SHADER_POOL_GROWTH) — Case Zero's module, addresses re-derived here
     cpu/zombie_heap.cpp              # 2026-10-13 (DR2 modding toolkit, phase 15): the Zombie heap +16 MiB from the SW Texture heap (CW_NO_ZOMBIE_HEAP_GROWTH) — Case Zero's module, addresses re-derived here
+    cpu/zombie_variant_names.cpp     # Case Zero 78632f1: classify misplaced zombie body-variant digits; function re-derived here
     cpu/crowd_lod.cpp                # Case Zero 5cb3781 (imported 2026-10-14): ZOMBIE DETAIL — the crowd LOD scale, default 2.0 — the option accessor re-derived here
     cpu/world_lod.cpp                # Case Zero f161cd7 (imported 2026-10-14): WORLD DETAIL — static-geometry LOD distance scale, default 2.0 — the two accessors re-derived here
     kernel/klog.cpp

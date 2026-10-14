@@ -1360,3 +1360,14 @@ first-sight VS not in the dump set were removed so they re-translate with the ep
 * **The debug menu's TIME OF DAY submenu / mission clock** — Case Zero addresses, a feature.
 * **The speedrun block** — a Case Zero feature and published contract.
 * **Gotcha 615** (docs only).
+
+## §16 — Case Zero's far-zombie variant-name fix (2026-10-14)
+
+| | |
+|---|---|
+| **Source** | Case Zero `78632f1` — `zombie_variant_names.cpp`, originally for two misnamed meshes in `zombie_soldier_3.big` |
+| **Why checked here** | The Oct 14 import pass reached the candidate while checking the remaining applicable Case Zero updates; the Case West archives were censused before deciding whether to transplant it |
+| **Finding** | Case West has matching malformed body-part names in `zombie_security.big` (`chestupper_neckShape1Deformed`, `chestupper_neckShape3Deformed`) and `zombie_soldier.big` (`chestupper_neckShape2Deformed`, `headwearShape2Deformed`). Neighboring model names establish the intended convention: the variant digit precedes `Shape` (`chestupper_neck2ShapeDeformed`, `headwear2ShapeDeformed`). The archive also has `geo_lodShape4Deformed`; it is outside the two body-part families covered by this fix, and its classification was not measured. |
+| **Address derivation** | Case Zero's classifier `sub_827A2E10` uniquely matches Case West `sub_8273B160` over 80 instructions; the table builder `sub_827ACF00` uniquely matches `sub_827468F0` over 80 instructions. Both are function starts in `ppc/`. The hook's name pointer remains in `r5`. |
+| **Change** | The classifier wrapper temporarily moves the digit before `Shape` for only `chestupper_neck` and `headwear` names followed by `Deformed`, then restores the original guest string. `CW_ZOMBIE_NAME_FIX=0` is the control. |
+| **Gate** | **Deferred to the next build**, per the operator. The archives and the positive-control classifier shape match are established; the guest hide-mask values and in-game appearance still need the DebugJump default/control A/B. |
