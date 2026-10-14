@@ -38,6 +38,26 @@ introduce an unimplemented import, and it did not.
 > problem statement was false and part 2 refuted it with the measurement that section
 > itself asked for.
 
+## Status: v1.1.2 IS THE OFFICIAL FINAL BUILD AND RELEASED (2026-10-14)
+
+**The v1.1.2 release is published:** https://github.com/wivi514/Dead_Rising_2_Case_West_Xenon_Recomp/releases/tag/v1.1.2
+The maintainer's final build is available for Windows, Linux, Steam Deck, and Apple
+Silicon Mac. Release assets and `SHA256SUMS` are staged at
+`~/Release/Case West/1.1.2/`; platform smoke/package checks passed, Linux desktop and
+Deck matched-build `.text` identity checks passed, and the macOS app signature was
+verified. Source tag `v1.1.2` points to `d9f3ff2`.
+
+**Important release-note detail:** the XenonLive launcher warning belongs at the very
+top of the published release notes: online/co-op, achievements, gamertag, and friends
+require launching through XenonLive; any other launch is offline single-player. This
+was restored to the published notes and `docs/release-notes-v1.1.2.md` in follow-up
+commit `c58860d` (master pushed). No rebuild or retag was needed because only the
+release description and its source documentation changed.
+
+The README marks v1.1.2 as the maintainer's official final build while encouraging
+community forks and contributions. **If continuing work, treat it as community
+maintenance and do not imply a new official maintainer release.**
+
 ## Status: PART 14 FINISHED THE OCTOBER CASE ZERO IMPORT ROUND (2026-10-14)
 
 The active session continued Claude's Case Zero update pass. The branch already had 43
