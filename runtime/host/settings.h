@@ -68,14 +68,6 @@ int           Settings_CrowdLodX10();       // 5..50, step 5; default 20 (2.0), 
                                             // the Deck build (CW_DECK_DEFAULTS)
 void          Settings_SetCrowdLodX10(int); // clamped and snapped to the step
 
-// WORLD DETAIL (Case Zero f161cd7, 2026-10-08, their operator's spec: default 2.0, the title's own 1.0 on the
-// Deck). Scales every static-geometry LOD switch distance — when a building, a rooftop
-// prop or a sign's lettering streams in its detailed version (cpu/world_lod.cpp has the
-// derivation). Tenths, 1.0..4.0 step 0.5. Applies LIVE; CW_WORLD_LOD wins over it.
-int           Settings_WorldLodX10();       // 10..40, step 5; default 20 (2.0), 10 on
-                                            // the Deck build (CW_DECK_DEFAULTS)
-void          Settings_SetWorldLodX10(int); // clamped and snapped to the step
-
 // SHADOW BIAS (Case Zero b6bf4fe, 2026-10-10, operator-verified THERE at 0.25). Scales the
 // title's per-cascade shadow depth bias — pixel constant c48.xyz ON THIS IMAGE, c47 in
 // Case Zero (`gShadowMapPackedParams[3]` in DR2 PC's shaders; Case West's whole shadow

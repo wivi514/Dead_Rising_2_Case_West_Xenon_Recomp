@@ -72,7 +72,7 @@ double Scale()
     const double forced = EnvOverride();
     if (forced == 0.0)
         return 1.0;
-    const double s = forced > 0.0 ? forced : Settings_WorldLodX10() * 0.1;
+    const double s = forced > 0.0 ? forced : 1.0;
     // Printed once per distinct value; the zone streamer may vote from more than one
     // thread, hence the exchange.
     static std::atomic<int> announced{-1};

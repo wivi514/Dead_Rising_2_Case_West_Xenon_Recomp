@@ -334,17 +334,6 @@ void PcOptions_Pump(PPCContext& ctx, uint8_t* base, uint32_t buttons)
             }
             case 9:
             {
-                // WORLD DETAIL (Case Zero f161cd7): the static-geometry LOD switch
-                // distance scale, 1.0..4.0 in steps of 0.5, clamped. 1.0 is the title's
-                // own; 2.0 the default. LIVE: the zone streamer's per-volume vote reads it
-                // (cpu/world_lod.cpp).
-                Settings_SetWorldLodX10(Settings_WorldLodX10() + dir * 5);
-                fprintf(stderr, "[pcopt] world detail %.1f — live\n",
-                        double(Settings_WorldLodX10()) * 0.1);
-                break;
-            }
-            case 10:
-            {
                 // SHADOW BIAS (Case Zero b6bf4fe): 0.25..1.00 in steps of 0.25, clamped.
                 // 1.00 is the title's own cascade depth bias; 0.25 the default. LIVE: the
                 // renderer re-reads it once a frame (vk_renderer.cpp).
@@ -359,7 +348,7 @@ void PcOptions_Pump(PPCContext& ctx, uint8_t* base, uint32_t buttons)
     int sel = Settings_OverlaySelection();
     if (pressed & (kUp | kDown))
     {
-        sel = (sel + ((pressed & kDown) ? 1 : 10)) % 11; // eleven rows since SHADOW BIAS
+        sel = (sel + ((pressed & kDown) ? 1 : 9)) % 10; // ten rows since WORLD DETAIL removal
         Settings_SetOverlaySelection(sel);
     }
     else if (pressed & (kLeft | kRight))
