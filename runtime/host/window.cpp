@@ -705,7 +705,8 @@ const char* Glyph(char c)
 template <typename Rect>
 void EmitSettingsOverlay(int w, int h, Rect&& rect)
 {
-    const int panelW = 640, panelH = 540;   // 540: ten rows since WORLD DETAIL (Case
+    const int panelW = 640, panelH = 580;   // 580: eleven rows since SHADOW BIAS (Case
+                                            // Zero b6bf4fe); 540 at ten — WORLD DETAIL (Case
                                             // Zero f161cd7); 500 at nine — ZOMBIE DETAIL
                                             // (Case Zero 5cb3781, imported 2026-10-14;
                                             // +40 a row — this port has no EXPOSURE row);
@@ -818,7 +819,11 @@ void EmitSettingsOverlay(int w, int h, Rect&& rect)
     // WORLD DETAIL (Case Zero f161cd7): the static-geometry LOD distance scale, 1.0 = the title's.
     char worldName[8];
     snprintf(worldName, sizeof worldName, "%.1f", double(Settings_WorldLodX10()) * 0.1);
-    const char* rows[10][2] = {
+    // SHADOW BIAS (Case Zero b6bf4fe): the scale on the title's cascade depth bias, 1.00 = the
+    // title's own.
+    char biasName[8];
+    snprintf(biasName, sizeof biasName, "%.2f", double(Settings_ShadowBiasX100()) * 0.01);
+    const char* rows[11][2] = {
         { UiText(UiStr::Resolution), resName },
         { UiText(UiStr::DisplayMode), kModeNames[int(Settings_DisplayMode()) % 3] },
         { UiText(UiStr::VSync), kOnOff[Settings_VSync() ? 1 : 0] },
@@ -829,9 +834,10 @@ void EmitSettingsOverlay(int w, int h, Rect&& rect)
         { UiText(UiStr::MouseSens), sensName },
         { UiText(UiStr::ZombieDetail), crowdName },
         { UiText(UiStr::WorldDetail), worldName },
+        { UiText(UiStr::ShadowBias), biasName },
     };
     const int sel = Settings_OverlaySelection();
-    for (int i = 0; i < 10; ++i)
+    for (int i = 0; i < 11; ++i)
     {
         const int y = panelY + 86 + i * 40;
         if (i == sel)

@@ -76,6 +76,17 @@ int           Settings_WorldLodX10();       // 10..40, step 5; default 20 (2.0),
                                             // the Deck build (CW_DECK_DEFAULTS)
 void          Settings_SetWorldLodX10(int); // clamped and snapped to the step
 
+// SHADOW BIAS (Case Zero b6bf4fe, 2026-10-10, operator-verified THERE at 0.25). Scales the
+// title's per-cascade shadow depth bias — pixel constant c48.xyz ON THIS IMAGE, c47 in
+// Case Zero (`gShadowMapPackedParams[3]` in DR2 PC's shaders; Case West's whole shadow
+// block sits one register higher, see vk_renderer.cpp). In the sibling the title's own
+// value ate the shadow a thin caster throws on the surface it is attached to (an awning
+// on its wall) until the camera was close. Hundredths, 0.25..1.00 step 0.25; 1.00 is the
+// title's own, 0.25 the default. Applies LIVE; CW_SHADOW_BIAS wins over it
+// (gpu/vk_renderer.cpp, ShadowBiasFactorThisFrame).
+int           Settings_ShadowBiasX100();       // 25..100, step 25; default 25
+void          Settings_SetShadowBiasX100(int); // clamped and snapped to the step
+
 int           Settings_Aspect();        // LEGACY: 1 when the internal res is wider than
                                         // 16:9. Derived; new code reads Settings_InternalRes
 
