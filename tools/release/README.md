@@ -8,6 +8,11 @@ with the Xbox 360's GPU commands translated to Vulkan.
 **This build ships no game data.** You supply your own copy of the game, and the first
 run turns it into everything else it needs.
 
+**Final release: v1.1.2 (October 2026).** This is the original maintainer's
+official final build; active development has stopped. Community forks,
+improvements, and pull requests are encouraged, though issues and pull requests
+may go unanswered.
+
 **The port is essentially complete**: the single-player game is playable start to
 finish and should look right in nearly all places. A few minor known issues remain;
 none block progress. **Two-player online co-op works (v1.1.0)** through the game's

@@ -10,8 +10,8 @@ run turns it into everything else it needs.
 
 ## What is different about this build
 
-It is v1.1.0 with three changes, all of them for the Deck (the same three Case Zero's
-Steam Deck build made):
+This v1.1.2 build has three Deck-specific changes (the same three Case Zero's Steam
+Deck build made):
 
 * **No launcher.** The desktop build opens a small settings/install window first. On
   SteamOS that window is where Case Zero's reported crash happened, so this build skips it and
@@ -29,8 +29,10 @@ Steam Deck build made):
   ahead of it — a suspected cause of the crash, and the reason this build does not
   bundle it. This is safe on SteamOS specifically, whose copy is newer than ours.
 
-If this build works and the desktop one does not, please say so — it tells us which of
-the three mattered, and the fix goes into the next release for everyone.
+**v1.1.2 is the original maintainer's official final build.** Active development has
+stopped, but community forks, improvements, and pull requests are encouraged. If this
+build behaves differently from the desktop one, sharing what you observe may help
+future contributors.
 
 ## Online and co-op on the Deck
 
