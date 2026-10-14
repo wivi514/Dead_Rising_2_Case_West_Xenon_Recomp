@@ -6271,7 +6271,8 @@ size_t PersistSize()
 //     recycled bindless slot would otherwise be handed out from a stale memo.
 // Miss anything that changes an answer and the symptom is a frozen or wrong texture, so
 // the memo ships with CW_VK_TEXMEMO_VERIFY=1, which computes both answers and counts
-// disagreements.
+// disagreements (and CW_VK_TEXMEMO_VERIFY_POISON=1, which proves the count can fire).
+// On by default since part 122; CW_VK_NO_TEXMEMO=1 is the control.
 uint64_t g_texGen = 1;
 inline void TexGenBump() { ++g_texGen; }
 
@@ -10192,12 +10193,21 @@ uint32_t UploadTexture(uint8_t* base, const uint32_t* regs, uint32_t constIdx,
 #if CW_WHOLEFUNC
     WfScope _wf(&g_wfTexture);   // part 110 A.2 — see CW_WHOLEFUNC
 #endif
-    // OPT-IN UNTIL IT IS VERIFIED AND MEASURED. The memo is built and its verifier arm
-    // works, but no run has yet read 0 disagreements and no A/B has priced it, so HEAD
-    // must behave exactly like the released v1.0.2 build. `CW_VK_TEXMEMO=1` engages it;
-    // flip this to on-by-default (and rename the arm to CW_VK_NO_TEXMEMO) only after a
-    // crowd run reads 0 disagreements AND three runs an arm clear the 0.4 ms kill rule.
-    static const bool memoOn = EnvOn("CW_VK_TEXMEMO");
+    // ON BY DEFAULT SINCE PART 122 (2026-10-11, the operator's call). It shipped OFF from
+    // part 109 because it missed a 0.4 ms single-item bar while the renderer thread was
+    // not the frame's bound. At the 2.0 detail defaults it is: the memo with the scoped
+    // shared zero took cw-draw 11.06 -> 9.97 ms at 10,300 draws (three runs an arm,
+    // `perf-plan-part122.md` §2). Verified on that build: 0 disagreements of 267 million
+    // verified hits, with the verifier's poison arm reading 141 million of 141 million.
+    // `CW_VK_NO_TEXMEMO=1` is the control — the FIRST bisection for a frozen or wrong
+    // texture.
+    static const bool memoOn = [] {
+        const bool off = EnvOn("CW_VK_NO_TEXMEMO");
+        fprintf(stderr, off ? "[texmemo] OFF (CW_VK_NO_TEXMEMO=1, the control)\n"
+                            : "[texmemo] ON (part 122 default; CW_VK_NO_TEXMEMO=1 is the "
+                              "control)\n");
+        return !off;
+    }();
     static const bool verify = EnvOn("CW_VK_TEXMEMO_VERIFY");
     // THE VERIFIER'S POSITIVE CONTROL (part 122). The verifier had read 0 disagreements
     // over ~1 billion lookups across two parts and had never once been shown able to
@@ -19789,15 +19799,22 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
             // POISON, nothing reads those bytes and the skip is safe; if it breaks, the
             // premise is false and the item dies with a reproduction attached. A test
             // that cannot fail proves nothing by passing (gotcha 30).
-            // OPT-IN, BECAUSE IT MISSED ITS OWN KILL RULE. It is correct (its poison
-            // arm is inside the picture null) and it is worth -0.21 ms, and part 109
-            // pre-registered 0.4 ms as the bar. HEAD therefore behaves exactly like the
-            // released v1.0.2 and `CW_VK_SCOPED_SHARED_ZERO=1` engages it; the operator
-            // decides whether a bundle of sub-threshold items is worth taking, because
-            // the decomposition says there is no single large item left and a 2.5 ms gap
-            // closed by sub-threshold items is the only shape still available. Flipping
-            // this to on-by-default is one line and its gates are already run.
-            static const bool fullZero = !EnvOn("CW_VK_SCOPED_SHARED_ZERO");
+            // ON BY DEFAULT SINCE PART 122 (2026-10-11, the operator's call). It was
+            // opt-in from part 109 because it missed that part's 0.4 ms single-item bar
+            // (-0.21 ms) while the renderer thread was not the frame's bound; with the
+            // texture memo it is -1.09 ms on cw-draw at the 2.0 detail defaults, where
+            // cw-draw IS the bound (`perf-plan-part122.md` §2). Its poison arm (below)
+            // was inside the picture null in part 111. `CW_VK_FULL_SHARED_ZERO=1` is
+            // the control: the unconditional 2,192-byte zero every release before this
+            // one carried.
+            static const bool fullZero = [] {
+                const bool full = EnvOn("CW_VK_FULL_SHARED_ZERO");
+                fprintf(stderr, full ? "[vk] shared block: FULL zero (CW_VK_FULL_SHARED_ZERO=1, "
+                                       "the control)\n"
+                                     : "[vk] shared block: SCOPED zero (part 122 default; "
+                                       "CW_VK_FULL_SHARED_ZERO=1 is the control)\n");
+                return full;
+            }();
             static const bool poison = EnvOn("CW_VK_SHARED_ZERO_POISON");
             // B1: already zero, on another core, before this draw asked. Note that this
             // makes the scoped item above REDUNDANT rather than additive — the two are
