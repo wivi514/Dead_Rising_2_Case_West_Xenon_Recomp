@@ -176,12 +176,12 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key><string>cw_runtime</string>
-    <key>CFBundleIdentifier</key><string>io.github.wivi514.casezerorecomp</string>
+    <key>CFBundleIdentifier</key><string>io.github.wivi514.casewestrecomp</string>
     <key>CFBundleName</key><string>Case West Recomp</string>
     <key>CFBundleDisplayName</key><string>Dead Rising 2: Case West (Recomp)</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>1.1.3</string>
-    <key>CFBundleVersion</key><string>1.1.3</string>
+    <key>CFBundleShortVersionString</key><string>1.1.1</string>
+    <key>CFBundleVersion</key><string>1.1.1</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSArchitecturePriority</key><array><string>arm64</string></array>
     <key>NSHighResolutionCapable</key><true/>
@@ -195,8 +195,8 @@ cp "$ROOT/tools/extract_stfs.py" "$STAGE/tools/"
 cat > "$STAGE/assets/package/PUT_YOUR_GAME_HERE.txt" <<'TXT'
 Put your own copy of the Dead Rising 2: Case West XBLA package in this directory.
 It is the file your Xbox 360 downloaded. On the console's storage it lives at
-    Content/0000000000000000/58410A8D/000D0000/<a long hash, no file extension>
-and it is about 825 MB. Copying the whole 58410A8D folder in here works too — the
+    Content/0000000000000000/58410B00/000D0000/<a long hash, no file extension>
+and it is about 1.2 GB. Copying the whole 58410B00 folder in here works too — the
 runtime looks recursively.
 
 This build ships no game data and cannot supply it. Nothing else goes in this
