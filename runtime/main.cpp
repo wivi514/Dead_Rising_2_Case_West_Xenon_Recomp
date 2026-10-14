@@ -54,7 +54,9 @@ extern "C" unsigned int __stdcall timeBeginPeriod(unsigned int uPeriod);
 // The LLVM profiling runtime's flush, resolved only in a -fprofile-instr-generate build
 // (see the SIGTERM handler). Weak, so a normal link leaves it null. GNU-only: the
 // codegen arms are Linux measurements and COFF weak externals are a different mechanism.
-#if !defined(_WIN32)
+// ld64 also rejects an undefined weak reference unless told otherwise, so macOS takes
+// the null spelling too (the PGO arms are Linux measurements).
+#if !defined(_WIN32) && !defined(__APPLE__)
 extern "C" int __llvm_profile_write_file(void) __attribute__((weak));
 #else
 static int (*const __llvm_profile_write_file)(void) = nullptr;
@@ -290,8 +292,75 @@ bool RunDiag()
 
 } // namespace
 
+static std::string g_optionFlagReport;
+
+// PLAYER-FACING OPTION FLAGS, consumed before anything else looks at argv.
+//
+// They are REMOVED from argv as they are recognised, because the normal path reads
+// `argv[1]` as the XEX path and every subcommand below matches on `argv[1]` too — so a
+// flag left in place would either be opened as a game image or mask `--smoke`. Compacting
+// here is what lets a flag be combined with any of them, in any order.
+//
+// Why a flag at all when cw_defaults.env already exists: on Windows a SHORTCUT carries
+// arguments in its Target field but cannot carry environment variables, so a flag is the
+// only way to have a normal icon and a debug icon side by side pointing at ONE install.
+// That was a player's request, and editing a text file to switch back and forth is the
+// thing it replaces.
+//
+// A flag OVERRIDES both cw_defaults.env and the environment — explicit beats ambient, and
+// it happens before the defaults loader, which skips any key that is already set. Every
+// one of them prints, for the same reason the defaults do: a variable the player cannot
+// see being set is a bisection that starts from a lie.
+static void ConsumeOptionFlags(int& argc, char** argv)
+{
+    int out = 1;
+    for (int i = 1; i < argc; ++i)
+    {
+        const char* a = argv[i];
+        const char* key = nullptr;
+        if (strcmp(a, "--debug-menu") == 0)
+            key = "CW_DEBUG_MENU";
+        if (!key)
+        {
+            argv[out++] = argv[i]; // not ours: hand it on untouched
+            continue;
+        }
+#ifdef _WIN32
+        _putenv_s(key, "1");
+#else
+        setenv(key, "1", /*overwrite=*/1);
+#endif
+        // RECORDED, NOT PRINTED YET. This runs before LogFile::Begin, so anything
+        // written here goes to the console and is MISSING from cw_runtime.log — which
+        // is the one channel a player attaches to an issue. Measured: the line was
+        // absent from the file while the guest-side `[debug] CW_DEBUG_MENU=1` landed at
+        // line 123, so "check the top of the log" would have been wrong twice over.
+        g_optionFlagReport += "[option] ";
+        g_optionFlagReport += a;
+        g_optionFlagReport += " -> ";
+        g_optionFlagReport += key;
+        g_optionFlagReport += "=1 (the title's own debug menu: F4 opens it, F2 the "
+                              "DebugJump screen)\n";
+    }
+    argc = out;
+    argv[out] = nullptr;
+}
+
+// Flushed once the log tee exists, so the flags a run was started with are in the file
+// as well as on screen. A subcommand that returns before the tee opens (--smoke and
+// friends) never calls this; none of them read these flags.
+static void ReportOptionFlags()
+{
+    if (g_optionFlagReport.empty())
+        return;
+    fputs(g_optionFlagReport.c_str(), stderr);
+    g_optionFlagReport.clear();
+}
+
 int main(int argc, char** argv)
 {
+    ConsumeOptionFlags(argc, argv);
+
     if (argc > 1 && strcmp(argv[1], "--smoke") == 0)
         return RunSmoke();
 
@@ -324,6 +393,45 @@ int main(int argc, char** argv)
         return ShaderPrebuild::BuildFromDisc(bank, out, {},
                                              bank.parent_path() / "deadrisingepilogue-vs.big",
                                              HostPaths::VsRecipes());
+    }
+
+    // The shader cache's translate-time recipe, and the boot decision that depends on
+    // it (player issue #10). Without this the only observable half of the mechanism is
+    // the rebuild itself — and the half that decides whether a rebuild is ever REACHED
+    // would have no instrument at all, which is how the defect it fixes survived
+    // eighteen parts in Case Zero. It also answers a support question off a player's log: a cache
+    // stamped with anything but this build's recipe is a cache full of stale modules.
+    if (argc > 1 && strcmp(argv[1], "--shader-cache-status") == 0)
+    {
+        HostPaths::Report();
+        const std::filesystem::path dir =
+            argc > 2 ? std::filesystem::path(argv[2]) : HostPaths::ShaderCache();
+        std::string stamped;
+        {
+            std::ifstream f(dir / "shader_recipe.txt");
+            if (f)
+                std::getline(f, stamped);
+        }
+        std::error_code ec;
+        unsigned vs = 0, ps = 0;
+        for (const auto& e : std::filesystem::directory_iterator(dir, ec))
+        {
+            const std::string fn = e.path().filename().string();
+            if (e.path().extension() != ".spv")
+                continue;
+            (fn.rfind("vs_", 0) == 0 ? vs : ps)++;
+        }
+        const bool wanted = ShaderPrebuild::WantedAtBoot(dir, HostPaths::VsRecipes());
+        printf("cache            %s\n", dir.string().c_str());
+        printf("modules          %u vertex, %u pixel\n", vs, ps);
+        printf("stamped recipe   %s\n",
+               stamped.empty() ? "(none — built before 2026-10-03, or a developer cache)"
+                               : stamped.c_str());
+        printf("this build makes %s\n", ShaderTranslator::RecipeId().c_str());
+        printf("first-run pass   %s\n",
+               wanted ? "OWED — the modules will be rebuilt at boot"
+                      : "not owed — this cache is current");
+        return 0;
     }
 
     // Release §2.3 step 2: the extract by hand — what the first-run hook below runs
@@ -380,6 +488,7 @@ int main(int argc, char** argv)
     // the data root — the bundle directory, or beside the .AppImage — rotated once.
     // A player who double-clicked has no console; this is what they attach instead.
     LogFile::Begin(HostPaths::Root(), "cw_runtime.log");
+    ReportOptionFlags();
 
     // Where everything is, decided once and printed once. It used to be
     // "../../assets/game/default.xex" — CWD-relative, which is why every recipe in
@@ -400,7 +509,7 @@ int main(int argc, char** argv)
     // default is printed, because an env var the player cannot see being set is a
     // bisection that starts from a lie.
     {
-        std::ifstream envf(HostPaths::ExeDir() / "cw_defaults.env");
+        std::ifstream envf(HostPaths::ShippedDir() / "cw_defaults.env");
         std::string line;
         while (envf && std::getline(envf, line))
         {

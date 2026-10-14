@@ -68,7 +68,7 @@ void Host_RequestSnapDump()
 void Host_RequestBurstDump()
 {
     g_burstDumpPressed.store(true, std::memory_order_release);
-    BugReport_Request("F8", 3);
+    BugReport_Request("F8", 20);
 }
 
 // The window's pending follow-size, one word so a torn W/H pair cannot exist between
@@ -174,6 +174,7 @@ bool Host_VulkanSwapchainWanted() { return false; }
 std::vector<const char*> Host_VulkanInstanceExtensions() { return {}; }
 bool Host_VulkanCreateSurface(void*, uint64_t*) { return false; }
 void Host_VulkanDrawableSize(uint32_t* w, uint32_t* h) { if (w) *w = 0; if (h) *h = 0; }
+void Host_ShowRendererFailure(const char*) {}
 bool Host_DisplaySize(uint32_t* w, uint32_t* h) { if (w) *w = 0; if (h) *h = 0; return false; }
 int Host_DisplayModeList(uint32_t*, int) { return 0; }
 
@@ -185,6 +186,8 @@ int Host_DisplayModeList(uint32_t*, int) { return 0; }
 #include <cstring>
 #include <algorithm>
 #include <mutex>
+#include <string>
+#include <thread>
 #include <vector>
 
 #include <SDL.h>
@@ -193,6 +196,10 @@ int Host_DisplayModeList(uint32_t*, int) { return 0; }
 // VK_NULL_HANDLE only exists with the real header.
 #include <vulkan/vulkan.h>
 #include <SDL_vulkan.h>
+#if defined(__APPLE__)
+#include <SDL_metal.h>
+#include <vulkan/vulkan_metal.h>
+#endif
 
 #include "../gpu/vk_renderer.h"
 #include "../cpu/gap_probe.h"
@@ -203,9 +210,16 @@ int Host_DisplayModeList(uint32_t*, int) { return 0; }
 #include "../kernel/xlive_overlay_glue.h"
 #include "png_icon.h"
 #include "settings.h"
+#include "ui_strings.h"
 #include "../cpu/native_kbm.h"
 #include "stfs_extract.h"
 #include <filesystem>
+
+#if defined(__APPLE__)
+// The window's CAMetalLayer, made on the main thread at window creation; the renderer
+// thread builds its Vulkan surface from it (Host_VulkanCreateSurface).
+static void* g_metalLayer = nullptr;
+#endif
 
 namespace {
 
@@ -661,6 +675,12 @@ const char* Glyph(char c)
         case '/': return "00001000100001000100010001000010000";
         case '>': return "10000010000010000010001000100010000";
         case '<': return "00001000100010001000001000001000001";
+        case '(': return "00010001000100010001000100001000010";
+        case ')': return "01000001000001000010000100001000100";
+        case '\'': return "00100001000010000000000000000000000";
+        case '+': return "00000001000010011111001000010000000";
+        case '*': return "00000010101011100111010101000000000";
+        case ',': return "00000000000000000000000000110000100";
         default:  return nullptr;
     }
 }
@@ -685,7 +705,11 @@ const char* Glyph(char c)
 template <typename Rect>
 void EmitSettingsOverlay(int w, int h, Rect&& rect)
 {
-    const int panelW = 640, panelH = 460;   // 460: eight rows — MSAA joined in part
+    const int panelW = 640, panelH = 540;   // 540: ten rows since WORLD DETAIL was removed;
+                                            // 500 at nine — ZOMBIE DETAIL
+                                            // (Case Zero 5cb3781, imported 2026-10-14;
+                                            // +40 a row — this port has no EXPOSURE row);
+                                            // was 460 at eight rows — MSAA joined in part
                                             // 108; the MOUSE CAMERA toggle is retired
                                             // (always on); MOUSE SENS stays (part 64
                                             // had merged the RT tiers INTO the shadow
@@ -713,19 +737,19 @@ void EmitSettingsOverlay(int w, int h, Rect&& rect)
         }
     };
 
-    text(panelX + 20, panelY + 16, "PC SETTINGS", 3, 245, 235, 200);
+    text(panelX + 20, panelY + 16, UiText(UiStr::PcSettings), 3, 245, 235, 200);
     // The hint line follows the ACTIVE input path: with the native keyboard on,
     // the panel is driven by arrows/Enter/Esc/X (NativeKbm_PanelButtons) and the
     // words say so — "B CLOSE" on a keyboard screen was the operator's report.
     text(panelX + 20, panelY + 46,
-         NativeKbm_Active()
-             ? "UP/DOWN ROW   LEFT/RIGHT CHANGE   X APPLY   ESC CLOSE"
-             : "UP/DOWN ROW   LEFT/RIGHT CHANGE   X APPLY   B CLOSE",
+         NativeKbm_Active() ? UiText(UiStr::PanelHintKeyboard)
+                            : UiText(UiStr::PanelHintPad),
          2, 160, 160, 170);
 
-    static const char* kModeNames[] = { "WINDOW", "BORDERLESS", "FULLSCREEN" };
-    static const char* kOnOff[] = { "OFF", "ON" };
-    static const char* kTiers[] = { "LOW", "MEDIUM", "HIGH" };
+    // Labels and value names in the game's subtitle language (ui_strings.h).
+    const char* kModeNames[] = { UiText(UiStr::Window), UiText(UiStr::Borderless),
+                                 UiText(UiStr::Fullscreen) };
+    const char* kOnOff[] = { UiText(UiStr::Off), UiText(UiStr::On) };
     const uint32_t scale = Settings_RenderScale();
     // The Resolution row shows the PENDING value when one exists (stepped but not
     // yet applied — part 91's apply-button flow), starred so "shown" and "running"
@@ -744,7 +768,8 @@ void EmitSettingsOverlay(int w, int h, Rect&& rect)
     }
     // The frame cap's display name. Values come from the validated set in
     // settings.cpp, so the fallback only fires on a hand-edited file mid-run.
-    char capName[8] = "OFF";
+    char capName[16];
+    snprintf(capName, sizeof capName, "%s", UiText(UiStr::Off));
     if (const int cap = Settings_FpsCap(); cap > 0)
         snprintf(capName, sizeof capName, "%d", cap);
     // The FOV row shows "OG" at 0 — the plan's language for "exactly the game's own
@@ -761,8 +786,9 @@ void EmitSettingsOverlay(int w, int h, Rect&& rect)
     // On a device without ray query the RT values are not offered at all: the row
     // stops at HIGH and the footer says why. Better than showing values that
     // refuse to move (the gamma-slider rule) when the whole class is unavailable.
-    static const char* kShadowRow[] = { "LOW",    "MEDIUM",    "HIGH",
-                                        "RT LOW", "RT MEDIUM", "RT HIGH" };
+    const char* kShadowRow[] = { UiText(UiStr::Low),   UiText(UiStr::Medium),
+                                 UiText(UiStr::High),  UiText(UiStr::RtLow),
+                                 UiText(UiStr::RtMedium), UiText(UiStr::RtHigh) };
     // WHEN THE RT RUNGS ARE NOT OFFERED, SHOW THE RASTER TIER, not the stored RT one.
     // `Settings_ShadowRow()` reports `2 + rtShadows` whenever a saved `cw_settings.txt`
     // carries a non-zero RT tier, so a file written while the rungs existed would print
@@ -784,19 +810,29 @@ void EmitSettingsOverlay(int w, int h, Rect&& rect)
     const bool msaaPending = msaaRun && (msaaSet ? msaaSet : 1) != msaaRun;
     char msaaName[8];
     snprintf(msaaName, sizeof msaaName, "%s%s",
-             msaaSet == 0 ? "OFF" : msaaSet == 2 ? "2X" : "4X", msaaPending ? " *" : "");
-    const char* rows[8][2] = {
-        { "RESOLUTION", resName },
-        { "DISPLAY MODE", kModeNames[int(Settings_DisplayMode()) % 3] },
-        { "VSYNC", kOnOff[Settings_VSync() ? 1 : 0] },
-        { "SHADOW QUALITY", kShadowRow[shadowRow % 3] },
-        { "MSAA", msaaName },
-        { "FRAME CAP", capName },
-        { "FIELD OF VIEW", fovName },
-        { "MOUSE SENS", sensName },
+             msaaSet == 0 ? UiText(UiStr::Off) : msaaSet == 2 ? "2X" : "4X",
+             msaaPending ? " *" : "");
+    // ZOMBIE DETAIL (Case Zero 5cb3781): the crowd LOD scale, 1.0 = the title's own.
+    char crowdName[8];
+    snprintf(crowdName, sizeof crowdName, "%.1f", double(Settings_CrowdLodX10()) * 0.1);
+    // SHADOW BIAS (Case Zero b6bf4fe): the scale on the title's cascade depth bias, 1.00 = the
+    // title's own.
+    char biasName[8];
+    snprintf(biasName, sizeof biasName, "%.2f", double(Settings_ShadowBiasX100()) * 0.01);
+    const char* rows[10][2] = {
+        { UiText(UiStr::Resolution), resName },
+        { UiText(UiStr::DisplayMode), kModeNames[int(Settings_DisplayMode()) % 3] },
+        { UiText(UiStr::VSync), kOnOff[Settings_VSync() ? 1 : 0] },
+        { UiText(UiStr::Shadow), kShadowRow[shadowRow % 3] },
+        { UiText(UiStr::Msaa), msaaName },
+        { UiText(UiStr::FrameCap), capName },
+        { UiText(UiStr::FieldOfView), fovName },
+        { UiText(UiStr::MouseSens), sensName },
+        { UiText(UiStr::ZombieDetail), crowdName },
+        { UiText(UiStr::ShadowBias), biasName },
     };
     const int sel = Settings_OverlaySelection();
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 10; ++i)
     {
         const int y = panelY + 86 + i * 40;
         if (i == sel)
@@ -819,18 +855,13 @@ void EmitSettingsOverlay(int w, int h, Rect&& rect)
     // the player needs telling what X does — and the resolution note otherwise says
     // LIVE, because it is (part 91: applied at the frame boundary on the X press).
     text(panelX + 20, panelY + panelH - 30,
-         resPending
-             ? "PRESS X TO APPLY THE NEW RESOLUTION"
-         : msaaPending
-             ? "MSAA APPLIES AT THE NEXT LAUNCH"
-         : rtWhy == 3
-             ? "RESOLUTION: X APPLIES LIVE - RT SHADOWS ARE OFF IN THIS BUILD"
-         : rtWhy == 1
-             ? "RESOLUTION: X APPLIES LIVE - NO RAY QUERY: RT UNAVAILABLE"
-         : rtWhy == 2
-             ? "RESOLUTION: X APPLIES LIVE - NO RT SHADER CACHE: SEE THE LOG"
-             : (scale > 1 ? "RESOLUTION: X APPLIES LIVE - SHADOW: LIVE"
-                          : "RESOLUTION: X APPLIES LIVE - SHADOW INERT AT 720P"),
+         resPending  ? UiText(UiStr::FooterApplyResolution)
+         : msaaPending ? UiText(UiStr::FooterMsaaNextLaunch)
+         : rtWhy == 3  ? UiText(UiStr::FooterRtOff)
+         : rtWhy == 1  ? UiText(UiStr::FooterNoRayQuery)
+         : rtWhy == 2  ? UiText(UiStr::FooterNoRtCache)
+         : (scale > 1  ? UiText(UiStr::FooterShadowLive)
+                       : UiText(UiStr::FooterShadowInert)),
          2, resPending ? 255 : 150, resPending ? 220 : 140, resPending ? 120 : 120);
 }
 
@@ -1233,7 +1264,7 @@ HostPadState ReadKeyboard()
         if (f8Down && !f8WasDown)
         {
             g_burstDumpPressed.store(true, std::memory_order_release);
-            BugReport_Request("F8", 3);
+            BugReport_Request("F8", 20);
         }
         f8WasDown = f8Down;
         const bool f9Down = keys[SDL_SCANCODE_F9] != 0;
@@ -1670,6 +1701,37 @@ static bool UnderGamescope()
     return false;
 }
 
+// DPI AWARENESS, BEFORE THE FIRST SDL VIDEO INIT, AND IT IS NOT COSMETIC.
+//
+// A process that has not declared itself DPI-aware is lied to by Windows: every
+// display query returns the desktop divided by the scale factor. On a 2560x1440
+// panel at 160% scaling, SDL_GetDesktopDisplayMode reports 1600x900 — and
+// PublishDisplaySize CLAMPS the settings panel's resolution list to that, so the
+// operator's 1440p screen offered 1600x900 as its maximum and there was no way to
+// ask for more. The renderer was never the limit; the query was.
+//
+// It must run before EVERY first video init, not just Host_WindowInit's: SDL applies
+// the hint when the video subsystem starts, and Windows takes a process's awareness
+// once. The launcher and the first-run progress window start video earlier, so with
+// the hint set only in Host_WindowInit (v1.0.0 to v1.1.3's first build) every
+// launcher boot ran DPI-unaware — czwin at 150% read 1707x960 and offered 1600x900.
+// Hence one function, called beside PreferWaylandWhenOffered at all four init sites.
+//
+// permonitorv2 rather than "system": the size must stay right when the window is
+// dragged to a differently-scaled monitor, which is the case "system" gets wrong
+// and is exactly what a laptop with an external display does.
+//
+// SDL_HINT_WINDOWS_DPI_SCALING is deliberately NOT set. It would make SDL report
+// window sizes in DPI-scaled points; this runtime wants physical pixels everywhere,
+// because the swapchain, the scissor rectangles and every recorded frame time are
+// in pixels.
+static void DeclareDpiAwareness()
+{
+#if defined(_WIN32)
+    SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+#endif
+}
+
 static void PreferWaylandWhenOffered()
 {
 #if !defined(_WIN32) && !defined(__APPLE__)
@@ -1708,6 +1770,7 @@ void Host_DiagVideo()
     for (int i = 0; i < SDL_GetNumVideoDrivers(); i++)
         fprintf(stderr, " %s", SDL_GetVideoDriver(i));
     fprintf(stderr, "\n");
+    DeclareDpiAwareness();
     PreferWaylandWhenOffered();
     if (const char* h = SDL_GetHint(SDL_HINT_VIDEODRIVER))
         fprintf(stderr, "%s video-driver hint: %s\n", T, h);
@@ -1743,6 +1806,7 @@ bool Host_ProgressBegin(const char* title)
         return false;
     if (g_progWindow)
         return true;
+    DeclareDpiAwareness();
     PreferWaylandWhenOffered();
     if (!SDL_WasInit(SDL_INIT_VIDEO) && SDL_InitSubSystem(SDL_INIT_VIDEO) != 0)
     {
@@ -1882,6 +1946,7 @@ bool Host_RunLauncher()
 {
     if (getenv("CW_NO_WINDOW"))
         return true;
+    DeclareDpiAwareness();
     PreferWaylandWhenOffered();
     if (!SDL_WasInit(SDL_INIT_VIDEO) && SDL_InitSubSystem(SDL_INIT_VIDEO) != 0)
     {
@@ -2000,7 +2065,7 @@ bool Host_RunLauncher()
     auto drawProgress = [&](const std::string& line, float f) {
         SDL_SetRenderDrawColor(ren, 20, 22, 26, 255);
         SDL_RenderClear(ren);
-        LauncherText(ren, 24, 24, "INSTALLING", 3, 245, 235, 200);
+        LauncherText(ren, 24, 24, UiText(UiStr::Installing), 3, 245, 235, 200);
         LauncherText(ren, 24, 80, line, 2, 160, 160, 170);
         const int bx = 24, by = 130, bw = 720 - 48, bh = 22;
         SDL_SetRenderDrawColor(ren, 70, 70, 80, 255);
@@ -2018,6 +2083,13 @@ bool Host_RunLauncher()
     int sel = 0;
     std::string notice;
     bool play = false, quit = false;
+    {
+        static const char* kNames[] = { "", "English", "", "", "French", "Spanish",
+                                        "Italian" };
+        fprintf(stderr, "[launcher] labels in %s (the SUBTITLES language, id %d; Japanese "
+                        "and Korean read as English — the bitmap font is Latin-only)\n",
+                kNames[UiTextLanguage()], Settings_Language());
+    }
     while (!play && !quit)
     {
         // ---- state read fresh every frame, through the same API the game uses ----
@@ -2030,10 +2102,17 @@ bool Host_RunLauncher()
         snprintf(fpsBuf, sizeof fpsBuf, "%d", Settings_FpsCap());
         char fovBuf[16];
         snprintf(fovBuf, sizeof fovBuf, "+%d", Settings_Fov());
-        static const char* kShadowNames[] = { "LOW", "MEDIUM", "HIGH" };
-        static const char* kMsaaNames[] = { "OFF", "2X", "4X" };
+        // Every label and value name comes from ui_strings.h in the SUBTITLES
+        // row's language, read each frame so stepping that row re-labels the
+        // launcher at once. (The language NAMES themselves stay in their own
+        // language, as a language picker should.)
+        const char* kShadowNames[] = { UiText(UiStr::Low), UiText(UiStr::Medium),
+                                       UiText(UiStr::High) };
+        const char* kMsaaNames[] = { UiText(UiStr::Off), "2X", "4X" };
         const int msaaIdx = Settings_Msaa() == 0 ? 0 : Settings_Msaa() == 2 ? 1 : 2;
-        static const char* kDispNames[] = { "WINDOW", "BORDERLESS", "FULLSCREEN" };
+        const char* kDispNames[] = { UiText(UiStr::Window), UiText(UiStr::Borderless),
+                                     UiText(UiStr::Fullscreen) };
+        const char* kOnOff[] = { UiText(UiStr::Off), UiText(UiStr::On) };
         // The six Xbox language IDs whose prose banks the disc carries, in the order
         // MEASURED ON THIS IMAGE (part 11: one CW_LANGUAGE=N + CW_FILE_TRACE=1 boot
         // per N=1..8 — each ID opens exactly its own str_XX.bcs, once, at file #40;
@@ -2048,15 +2127,15 @@ bool Host_RunLauncher()
                 langIdx = i;
         struct Row { const char* label; std::string value; };
         const Row rows[] = {
-            { "PLAY", installed ? "" : "(GAME NOT INSTALLED YET)" },
-            { "DISPLAY MODE", kDispNames[int(Settings_DisplayMode()) % 3] },
-            { "RESOLUTION", resBuf },
-            { "VSYNC", Settings_VSync() ? "ON" : "OFF" },
-            { "SHADOWS", kShadowNames[Settings_ShadowTier() % 3] },
-            { "MSAA", kMsaaNames[msaaIdx] },
-            { "FPS CAP", Settings_FpsCap() ? fpsBuf : "OFF" },
-            { "FOV", Settings_Fov() ? fovBuf : "DEFAULT" },
-            { "SUBTITLES", kLangNames[langIdx] },
+            { UiText(UiStr::Play), installed ? "" : UiText(UiStr::NotInstalledYet) },
+            { UiText(UiStr::DisplayMode), kDispNames[int(Settings_DisplayMode()) % 3] },
+            { UiText(UiStr::Resolution), resBuf },
+            { UiText(UiStr::VSync), kOnOff[Settings_VSync() ? 1 : 0] },
+            { UiText(UiStr::Shadows), kShadowNames[Settings_ShadowTier() % 3] },
+            { UiText(UiStr::Msaa), kMsaaNames[msaaIdx] },
+            { UiText(UiStr::FpsCap), Settings_FpsCap() ? fpsBuf : UiText(UiStr::Off) },
+            { UiText(UiStr::Fov), Settings_Fov() ? fovBuf : UiText(UiStr::Default) },
+            { UiText(UiStr::Subtitles), kLangNames[langIdx] },
         };
         constexpr int kRows = int(sizeof(rows) / sizeof(rows[0]));
 
@@ -2064,8 +2143,7 @@ bool Host_RunLauncher()
         SDL_SetRenderDrawColor(ren, 20, 22, 26, 255);
         SDL_RenderClear(ren);
         LauncherText(ren, 24, 20, "DEAD RISING 2 - CASE WEST", 3, 245, 235, 200);
-        LauncherText(ren, 24, 52, "UP/DOWN SELECT   LEFT/RIGHT CHANGE   ENTER PLAY", 2,
-                     130, 130, 140);
+        LauncherText(ren, 24, 52, UiText(UiStr::LauncherHint), 2, 130, 130, 140);
         for (int i = 0; i < kRows; ++i)
         {
             const int y = 96 + i * 34;
@@ -2096,16 +2174,14 @@ bool Host_RunLauncher()
         lastValue = rows[sel].value;
 
         const std::string foot = notice.empty()
-            ? (installed ? "GAME INSTALLED"
-                         : "DROP YOUR XBLA PACKAGE FILE ONTO THIS WINDOW TO INSTALL")
+            ? (installed ? UiText(UiStr::GameInstalled) : UiText(UiStr::DropPackage))
             : notice;
         LauncherText(ren, 24, 96 + kRows * 34 + 14, foot, 2, 160, 160, 170);
         // The control hint names the pad only when one is attached, so a
         // keyboard-only machine is not told about buttons it does not have.
         LauncherText(ren, 24, 96 + kRows * 34 + 36,
-                     g_controller ? "ARROWS / D-PAD MOVE   ENTER / A SELECT   "
-                                    "ESC / B QUIT"
-                                  : "ARROWS MOVE   ENTER SELECT   ESC QUIT",
+                     g_controller ? UiText(UiStr::ControlsPad)
+                                  : UiText(UiStr::ControlsKeyboard),
                      2, 120, 120, 130);
         SDL_RenderPresent(ren);
 
@@ -2188,7 +2264,7 @@ bool Host_RunLauncher()
             const std::string m = magic;
             if (m != "LIVE" && m != "CON " && m != "PIRS")
             {
-                notice = "NOT AN XBOX 360 PACKAGE - IT BEGINS \"" + m + "\"";
+                notice = std::string(UiText(UiStr::NotAPackage)) + "\"" + m + "\"";
                 break;
             }
             // Copy it into assets/package (the layout's contract: your package,
@@ -2197,24 +2273,24 @@ bool Host_RunLauncher()
             const auto pkgDir = HostPaths::Package() / "dropped";
             std::filesystem::create_directories(pkgDir, ec);
             const auto pkgDest = pkgDir / std::filesystem::path(dropped).filename();
-            drawProgress("COPYING PACKAGE...", 0.1f);
+            drawProgress(UiText(UiStr::CopyingPackage), 0.1f);
             std::filesystem::copy_file(dropped, pkgDest,
                 std::filesystem::copy_options::overwrite_existing, ec);
             if (ec)
             {
-                notice = "COULD NOT COPY THE PACKAGE IN: " + ec.message();
+                notice = std::string(UiText(UiStr::CouldNotCopy)) + ec.message();
                 break;
             }
             std::string err;
             const bool ok = StfsExtract::Extract(pkgDest, HostPaths::Game(), err,
                 [&](uint64_t done, uint64_t total) {
                     char l[64];
-                    snprintf(l, sizeof l, "UNPACKING - %u OF %u MB",
+                    snprintf(l, sizeof l, UiText(UiStr::Unpacking),
                              unsigned(done >> 20), unsigned(total >> 20));
                     drawProgress(l, total ? float(double(done) / double(total)) : 1.f);
                 });
-            notice = ok ? "INSTALLED - PRESS ENTER TO PLAY"
-                        : "INSTALL FAILED: " + err.substr(0, 48);
+            notice = ok ? std::string(UiText(UiStr::InstalledPressEnter))
+                        : std::string(UiText(UiStr::InstallFailed)) + err.substr(0, 48);
             break;
         }
         case SDL_CONTROLLERDEVICEADDED:
@@ -2384,6 +2460,7 @@ bool Host_WindowInit()
     // SDL call — `main()` calls this at line 310 and does not spawn the guest thread
     // until line 338.
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+    DeclareDpiAwareness();
     PreferWaylandWhenOffered();
 
     if (getenv("CW_NO_WINDOW"))
@@ -2396,27 +2473,6 @@ bool Host_WindowInit()
 
     // The signal-handler hint is set at the top of this function, above the headless
     // early return, so that a run with no window still gets it — see the comment there.
-
-#if defined(_WIN32)
-    // DPI AWARENESS, BEFORE SDL_Init, AND IT IS NOT COSMETIC.
-    //
-    // A process that has not declared itself DPI-aware is lied to by Windows: every
-    // display query returns the desktop divided by the scale factor. On a 2560x1440
-    // panel at 160% scaling, SDL_GetDesktopDisplayMode reports 1600x900 — and
-    // PublishDisplaySize below CLAMPS the settings panel's resolution list to that, so
-    // the operator's 1440p screen offered 1600x900 as its maximum and there was no way
-    // to ask for more. The renderer was never the limit; the query was.
-    //
-    // permonitorv2 rather than "system": the size must stay right when the window is
-    // dragged to a differently-scaled monitor, which is the case "system" gets wrong
-    // and is exactly what a laptop with an external display does.
-    //
-    // SDL_HINT_WINDOWS_DPI_SCALING is deliberately NOT set. It would make SDL report
-    // window sizes in DPI-scaled points; this runtime wants physical pixels everywhere,
-    // because the swapchain, the scissor rectangles and every recorded frame time are
-    // in pixels.
-    SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
-#endif
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0)
     {
@@ -2587,6 +2643,17 @@ bool Host_WindowInit()
         return false;
     }
     ApplyGameIcon(g_window);
+#if defined(__APPLE__)
+    // The Metal view must be made HERE, on the main thread: AppKit views are main-thread
+    // objects, and Host_VulkanCreateSurface runs on the renderer thread.
+    if (g_wantVulkanSwapchain)
+    {
+        if (SDL_MetalView view = SDL_Metal_CreateView(g_window))
+            g_metalLayer = SDL_Metal_GetLayer(view);
+        if (!g_metalLayer)
+            fprintf(stderr, "[host] SDL_Metal_CreateView failed: %s\n", SDL_GetError());
+    }
+#endif
 
     // The persisted EXCLUSIVE fullscreen upgrades the borderless creation flag here,
     // once the window exists to measure its display against (see the flags comment).
@@ -2853,11 +2920,51 @@ bool Host_VulkanSwapchainWanted()
     return g_active && g_wantVulkanSwapchain;
 }
 
+void Host_ShowRendererFailure(const char* why)
+{
+    if (!g_active || !g_window || getenv("CW_NO_RENDERER_DIALOG"))
+        return;
+    std::string msg =
+        "The game is running, but its renderer could not start, so the window will stay "
+        "blank.\n\n";
+    msg += why ? std::string("What failed: ") + why + "\n\n"
+               : std::string("What failed: see the [vk] lines in the log.\n\n");
+    msg += "The usual fix is the newest graphics driver from AMD, Intel or NVIDIA's own "
+           "website (not Windows Update). On a laptop with two GPUs, update both.\n\n";
+    const std::string log = LogFile::Path().string();
+    if (!log.empty())
+        msg += "Log: " + log + "\n";
+    msg += "Please attach that log to a bug report.";
+    fprintf(stderr, "[host] renderer failure dialog shown: %s\n", why ? why : "(no reason)");
+    // No parent window: the box is raised from the pump thread, and a parent owned by
+    // another thread is one more thing that can wedge. The thread is detached because
+    // the box blocks until dismissed and nothing waits for it.
+    std::thread([msg] {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Dead Rising 2: Case West — renderer failed",
+                                 msg.c_str(), nullptr);
+    }).detach();
+}
+
 std::vector<const char*> Host_VulkanInstanceExtensions()
 {
     std::vector<const char*> out;
     if (!Host_VulkanSwapchainWanted())
         return out;
+#if defined(__APPLE__)
+    // macOS builds its surface itself from the main-thread CAMetalLayer
+    // (Host_VulkanCreateSurface), so the two extensions that needs are known and SDL is
+    // not asked. Asking it FAILED with real SDL2 2.32 — "The specified window isn't a
+    // Vulkan window", after SDL_Metal_CreateView on a window created WITH
+    // SDL_WINDOW_VULKAN — while sdl2-compat (the dev build's Homebrew SDL) answered, so the
+    // first macOS release package fell back to the readback present path and showed a
+    // black window at full frame rate.
+    if (g_metalLayer)
+    {
+        out.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+        out.push_back(VK_EXT_METAL_SURFACE_EXTENSION_NAME);
+        return out;
+    }
+#endif
     unsigned n = 0;
     if (!SDL_Vulkan_GetInstanceExtensions(g_window, &n, nullptr))
     {
@@ -2879,6 +2986,30 @@ bool Host_VulkanCreateSurface(void* instance, uint64_t* outSurface)
 {
     if (!Host_VulkanSwapchainWanted() || !instance || !outSurface)
         return false;
+#if defined(__APPLE__)
+    // macOS: build the surface from the CAMetalLayer the WINDOW THREAD made (see
+    // g_metalLayer). SDL_Vulkan_CreateSurface would create and attach a fresh NSView
+    // here, on the renderer thread, which AppKit does not support: the swapchain filled
+    // correctly (CW_VK_SWAPCHAIN_DUMP read the title picture back) and the window stayed
+    // black.
+    if (g_metalLayer)
+    {
+        auto create = reinterpret_cast<PFN_vkCreateMetalSurfaceEXT>(vkGetInstanceProcAddr(
+            static_cast<VkInstance>(instance), "vkCreateMetalSurfaceEXT"));
+        VkMetalSurfaceCreateInfoEXT mci{ VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT };
+        mci.pLayer = static_cast<const CAMetalLayer*>(g_metalLayer);
+        VkSurfaceKHR ms = VK_NULL_HANDLE;
+        if (create && create(static_cast<VkInstance>(instance), &mci, nullptr, &ms) ==
+                          VK_SUCCESS)
+        {
+            *outSurface = reinterpret_cast<uint64_t>(ms);
+            fprintf(stderr, "[host] Vulkan surface from the main-thread Metal layer\n");
+            return true;
+        }
+        fprintf(stderr, "[host] vkCreateMetalSurfaceEXT failed — falling back to "
+                        "SDL_Vulkan_CreateSurface (expect a black window)\n");
+    }
+#endif
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     if (!SDL_Vulkan_CreateSurface(g_window, static_cast<VkInstance>(instance), &surface))
     {
@@ -2980,7 +3111,8 @@ void Host_WindowRun()
         if (const char* why = g_quitReason.load(std::memory_order_acquire))
             Shutdown(why);
 
-        // Text input follows the overlay's text boxes; off otherwise (above).
+        // Text input follows the overlay's text boxes; off otherwise (the
+        // SDL_StopTextInput at start-up, and why, are above).
         CwOverlay_SyncTextInput();
         SDL_Event e;
         while (SDL_PollEvent(&e))

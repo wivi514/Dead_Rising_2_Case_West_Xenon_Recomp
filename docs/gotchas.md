@@ -3302,3 +3302,129 @@ one-line-per-tid census of who reaches the wait, so the binding is checkable in 
 log rather than trusted once. Corollary of 322 (identify by what the guest itself
 wrote — here, its `ExCreateThread` argument) and of 151 (an arm needs a counter; a
 binding needs a census).
+
+## 328. A 1.000 SHAPE MATCH PROVES THE CODE, NOT THE ENUM — THE SIBLING'S "BOARD 1" IS THIS TITLE'S "BOARD 0"
+
+Case Zero's leaderboard-flush module hooks five functions and names the PP board as
+index 1. Three of the five matched here at 1.000 over their whole length, and a
+reader who stopped there would have carried "board 1" across. The Update's own body
+disagreed: `li r4, 0` where the sibling has `li r4, 1`, `addi r5, r3, 0x20` where it
+has `0x88` — one board's worth of offset, everywhere. The cause is a per-title ENUM:
+this title's leaderboard name table has three boards (PRESTIGE_POINTS first) where
+the sibling's has four (a LEADERBOARD_GAME_1 in front), so every board index, the
+dirty byte (+0x80 vs +0xE8) and the timer (+0x168 vs +0x1D8) all shift by exactly
+one 0x68-byte board record. `shape_match.py` masks every D-form immediate BY DESIGN
+(its own header says so), so a perfect score is silent about exactly the values that
+encode an enum or a struct layout. The rule its header already states and this entry
+makes a gotcha: **after a 1.000 match, diff the immediates** — a `lis/addi` pair that
+differs is a relocated global (fine), a load/store displacement that differs is a
+struct that changed (not fine), and an `li` that differs is an enum value (the
+sibling's constant is WRONG here even though the code is right). Sixth dress of
+gotcha 3 (after a tool's constants, a config's bounds, a cache path, a comment's
+capture, a thread name): a hooked function's ARGUMENT.
+
+## 329. A DESTRUCTOR HOOK THAT NEVER FIRES IS NOT A TEARDOWN THAT NEVER HAPPENS — CHECK THE OBJECT, NOT THE HOOK
+
+The F4 menu keeps the title's startup cDebugMenu alive by refusing its destructor,
+because the sibling's retail destroys it before gameplay. Here the hook never fired
+through a level load. Two readings fit: this title never destroys it, or it destroys
+it through a function that is not the one matched (two candidates scored 1.000). A
+hook that never fires cannot tell those apart (gotcha 151 — an arm with no counter
+cannot be shown to have engaged, and a hook on the wrong function counts nothing).
+What can: the OBJECT. The toggle now reads the object's vtable word and its first
+node's label at every open, and counts destructor calls on ANY object; "INTACT,
+INTACT, 0 objects" is a fact about the menu, "never preserved" was only a fact about
+the hook. Same shape as 30 (a test that has never failed has not been shown able to)
+and 322 (identify things by what the guest itself wrote — here, the vtable it stored).
+
+## 330. A MOD LAYER THAT SERVES WHOLE FILES MUST BE CHECKED FIRST, AND ITS FILES BUILT ON TOP OF THE LAYERS BELOW — OR A MOD SILENTLY UNDOES A RECOMP PATCH
+
+`assets/game_mods/` (the DR2 CZ/CW modding toolkit's deploy target; `runtime/kernel/vfs.cpp`,
+"THE MODS OVERLAY") swaps whole files like every other overlay. Below `game_patched` it could
+never override a patched file; above it, a naive mod copy of a patched archive would drop the
+recomp's own patch without a word. The split: the runtime checks `game_mods` FIRST (exact case,
+then case-insensitive) and stays a whole-file swap; the toolkit (`dr2 mod deploy -g cw`) builds
+each mod file from `game_patched`'s copy when one exists, and warns when a mod carries a
+`game_kbm` file (a run-time toggle layer it cannot build on). `CW_NO_MODS=1` is the off switch,
+independent of `CW_NO_PATCHED_ASSETS`; every served file is logged ("served from the MODS
+overlay").
+
+**Verified 2026-10-08, headless** (`CW_NO_WINDOW=1 CW_VKDRAW=1 CW_VK_FRAME_DUMP`, START,A,A into
+a copy of the save): a recoloured `npcs.big/chest_default.tex/cr_jacket_cm`, inside an
+LZX-compressed `.tex` re-encoded by the toolkit, puts Chuck in a green IJIEK jacket at frame
+6144; `CW_NO_MODS=1` on the same binary shows the shipped yellow one and logs no MODS line. The
+game accepts the toolkit's LZX streams (verbatim blocks only) for a model `.tex`. Same layer,
+same test in Case Zero: its gotcha 634.
+
+## 331. AN AUDIO MOD CANNOT BE "WHICH FILE IS THIS BUFFER FROM?" — MAKE EVERY XMA PACKET SAY WHERE IT IS
+
+The DR2 CZ/CW modding toolkit replaces sounds (no XMA encoder can be shipped), so this runtime
+substitutes PCM: `runtime/kernel/audio.cpp`, block "AUDIO MODS: PCM SUBSTITUTION",
+`XmaSubstApply` after each `Xma_DecodePacket`. Mapping a context's input buffer back to a `.big`
+entry through VFS read tracking breaks on how the title handles audio (streams re-armed in place
+with new pointers, banks read whole and copied, contexts reused). Instead `dr2 mod deploy -g cw`
+writes `game_mods/dr2kit_audio/substitutions.txt` listing EVERY packet of a replaced stream by
+its 64-bit FNV-1a hash with the decoded-sample position its output starts at (the toolkit decodes
+packet by packet through the same ffmpeg decoder, which gives the whole-file samples exactly).
+Each decoded packet is hashed; a hit says which replacement samples overwrite the PCM it just
+produced. No VFS state; loops, streaming and reused contexts need no special case. Packets that
+also occur in another sound are marked `c` (continue only); only unique `u` packets start a
+substitution. The guest sees nothing different but the PCM. Off switch `CW_NO_AUDIO_MODS=1`
+(and `CW_NO_MODS=1`): the table is never read. Logs `[xma] audio mods: …` at decode-thread start
+and when a replaced sound (re)starts.
+
+**Verified 2026-10-09, headless** (`CW_NO_WINDOW=1 CW_VKDRAW=1`, no input, 90 s at the title,
+`SDL_AUDIODRIVER=disk` recording the output): `music.big/PressStartDR2.xma` replaced by
+`MercenariesBattleUnderground`'s audio logs `audio mods: ctx0 plays … from sample 0 (start #1)`
+and the recording follows the replacement at the right positions; `CW_NO_AUDIO_MODS=1` on the
+same binary logs nothing and plays PressStartDR2. (That control run ignored SIGTERM at exit and
+needed SIGKILL; substitution was off, so it is not this change.) Same change, same test in Case
+Zero: its gotcha 635, which also records that an edited audio scene script fails the digest
+check there and faults.
+
+## 332. THE SHADER CONSTANT SET POOL CAPS HOW MANY PIXEL SHADERS A MOD CAN ADD — GROWN TO 4096
+
+The renderer keeps one shader constant set per loaded pixel shader in a pool sized from the
+word at `0x82A00D34` (the second entry of its size table at `0x82A00D30`; read by the pool
+builder `sub_8275A168` at `0x8275AA94`, pool kept at renderer `+3504`). Case West ships 1,337
+pixel shaders against 1,340 sets, so the DR2 CZ/CW modding toolkit could add three of Case
+Zero's before the title asserts `"Shader constant set overflow."`. `runtime/cpu/shader_pool.cpp`
+hooks the builder and raises the size to 4096 just before it reads it (both arrays, the sets
+and the count*8 free list, are allocated from the count). Nothing in this image stores to
+that word (a scan of every store through a `lis 0x82A0` base; the same scan finds Case Zero's
+boot store of 1300, its gotcha 643), but hooking the reader keeps the two ports the same
+shape. Off switch `CW_NO_SHADER_POOL_GROWTH=1`; `CW_SHADER_POOL=N` (1340..65535); logs
+`[shaderpool] shader constant sets: 1340 -> 4096 …`, or `NOT growing` when the word is not 1340.
+
+**A second pool runs out the same way, and it does not assert.** The word before the size table,
+`0x82A00D2C` (also 1340; pool kept at renderer `+3492`, read at `0x8275A9F8`), limits brought pixel
+shaders too: with only `0x82A00D34` grown, 14 brought pixel shaders faulted while the save loaded,
+reading `0x0000001C` after a failed allocation (backtrace in the allocator around `0x827919EC`),
+where one brought pixel shader and four brought vertex shaders loaded. Growing both: the 14 load
+and the game plays. A pool that runs out can show up as a null pointer far from the pool.
+
+**A third: the shader description pool** (`0x82A00D24`, renderer `+3484`): the boot budget
+function `sub_825A6000` stores **231**, exactly the descriptions Case West ships, none free.
+Case Zero's matching pool (228 for 223) ran out with Case West's gas zombie (its gotcha 643),
+so it is grown here too (2026-10-13; logged `231 -> 4096`).
+
+**Verified 2026-10-12, headless** (a copy of the save, Storage Pens): both lines logged; no mod,
+14 brought pixel shaders alone, and Case Zero's Parasol (placed, its 14 pixel shaders) all play
+(frames past 30,000).
+
+## 333. THE ZOMBIE HEAP CAPS HOW MANY ZOMBIE TYPES A MOD CAN LOAD AT ONCE — GROWN BY 16 MiB FROM THE SW TEXTURE HEAP
+
+The title carves its memory into fixed named heaps; the **Zombie heap** (the loaded zombie
+types' models and textures) is a constant 30,177,280 bytes, built at `0x82588978`, the same
+as Case Zero's, where the DR2 CZ/CW modding toolkit's brought zombie types ran it out and
+faulted the load (Case Zero's gotcha 644: how the heap was found with gdb, and the
+measurements). `runtime/cpu/zombie_heap.cpp` takes 16 MiB off the SW Texture heap (its size
+function `sub_82484BF8`, one caller at boot: 205,054,976 → 188,277,760) and gives them to the
+Zombie heap (its block `sub_82792530` and heap `sub_82790278`, only from the return
+addresses `0x82588994` / `0x825889AC` with the title's size, and only after the texture heap
+shrank). Off switch `CW_NO_ZOMBIE_HEAP_GROWTH=1`; `CW_ZOMBIE_HEAP_GROWTH_MB=N` (1..64).
+
+**Verified 2026-10-13, headless** (a copy of the save, Storage Pens, no mods): both
+`[zombieheap]` lines, no fault, zombies drawn in play past frame 24,000. Case West's own
+levels' use of the two heaps is not measured here.
+

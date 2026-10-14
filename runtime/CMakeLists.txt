@@ -154,9 +154,14 @@ target_include_directories(ppc_image PUBLIC
 #
 # -Wno-unused-* silences the recompiler's own temporaries (`ea`, unused `temp`), not
 # our code. They are emitted per-function by design and there are tens of thousands.
+#
+# On arm64 (macOS, milestone C) simde lowers the same intrinsics to NEON with no flag
+# at all, and -msse4.1 is an error there, so the x86 flags are x86-only.
 target_compile_options(ppc_image PRIVATE
-    -msse4.1 -mavx
     -Wno-unused-variable -Wno-unused-but-set-variable)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64" AND NOT CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+    target_compile_options(ppc_image PRIVATE -msse4.1 -mavx)
+endif()
 
 # ---------------------------------------------------------------------------
 # CODEGEN ARMS ON THE RECOMPILED TUs ONLY (docs/perf-plan-part116.md item 3)
@@ -344,6 +349,12 @@ add_executable(cw_runtime
     cpu/fence_wait.cpp               # Case Zero part 107 (imported part 11): the Draw Thread fence wait parked on a futex — addresses re-derived here
     cpu/rumble_guest.cpp             # Case Zero part 108 (imported part 11): the rumble tick at 30 Hz (CW_RUMBLE_TICK_HZ) + the probe (CW_RUMBLE_TRACE) — addresses re-derived here
     cpu/havok_threads.cpp            # Case Zero part 118 (imported part 12): the Havok worker count (CW_HAVOK_WORKERS) — addresses re-derived here
+    cpu/leaderboard_flush.cpp        # Case Zero 8f23fb6 (imported 2026-09-17): the PP board flush timer 360 s -> 2 s (CW_LEADERBOARD_FLUSH_S) + its trace — five addresses and both struct offsets re-derived here (board 0, not 1)
+    cpu/shader_pool.cpp              # 2026-10-12 (DR2 modding toolkit, phase 15): the shader constant set pool grown for mods (CW_NO_SHADER_POOL_GROWTH) — Case Zero's module, addresses re-derived here
+    cpu/zombie_heap.cpp              # 2026-10-13 (DR2 modding toolkit, phase 15): the Zombie heap +16 MiB from the SW Texture heap (CW_NO_ZOMBIE_HEAP_GROWTH) — Case Zero's module, addresses re-derived here
+    cpu/zombie_variant_names.cpp     # Case Zero 78632f1: classify misplaced zombie body-variant digits; function re-derived here
+    cpu/crowd_lod.cpp                # Case Zero 5cb3781 (imported 2026-10-14): ZOMBIE DETAIL — the crowd LOD scale, default 2.0 — the option accessor re-derived here
+    cpu/world_lod.cpp                # Case Zero f161cd7 (imported 2026-10-14): WORLD DETAIL — static-geometry LOD distance scale, default 2.0 — the two accessors re-derived here
     kernel/klog.cpp
     kernel/memory.cpp
     kernel/heap.cpp
@@ -382,6 +393,7 @@ add_executable(cw_runtime
     host/overlay_gen.cpp             # release §0: first-run KB/M overlay generation
     gpu/d3d_draw_stub.cpp
     host/settings.cpp                # the Visuals panel's persistent store (imported from Case Zero part 60)
+    host/ui_strings.cpp              # the launcher's and settings panel's strings in the subtitle language (Case Zero 8c43c27, imported 2026-09-17)
     host/window.cpp                  # phase 3; compiles to stubs without CW_HAVE_SDL
     host/png_icon.cpp                # the window icon from the player's own X_IMAGEID_GAME.PNG
     host/log_file.cpp                # part 105: stderr tee'd to cw_runtime.log beside the root
@@ -657,8 +669,13 @@ endforeach()
 # link cleanly and the gate would pass while proving nothing. --whole-archive forces
 # every object in. Keep this even once the runtime references most of the image on
 # its own: "most" is not "every".
-target_link_options(cw_runtime PRIVATE
-    "-Wl,--whole-archive" "$<TARGET_FILE:ppc_image>" "-Wl,--no-whole-archive")
+# ld64 (macOS) has no --whole-archive; -force_load is its per-archive spelling.
+if(APPLE)
+    target_link_options(cw_runtime PRIVATE "-Wl,-force_load,$<TARGET_FILE:ppc_image>")
+else()
+    target_link_options(cw_runtime PRIVATE
+        "-Wl,--whole-archive" "$<TARGET_FILE:ppc_image>" "-Wl,--no-whole-archive")
+endif()
 
 # CW_BUNDLE_RPATH — look for the bundled libraries beside the executable first
 # (Case Zero release-plan A.4, imported). $ORIGIN is resolved by the loader against

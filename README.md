@@ -157,6 +157,45 @@ all of this runtime:
 Fixes flow both ways between the two, which is why a defect seen on both — like the
 AMD black square above — is worth more than one seen on either alone.
 
+## Debug menu (optional)
+
+The retail disc still carries Blue Castle's own development menu, and this port can
+switch it back on. **F4** opens it; **F2** opens the DebugJump screen, which warps
+straight to any case or mission from the title menu.
+
+It is off by default, so pressing F4 in a normal install does nothing. Pick whichever
+of these suits you — they all do the same thing:
+
+**A shortcut, if you want to switch back and forth.** Right-click `cw_runtime.exe`
+→ **Send to** → **Desktop (create shortcut)**, then right-click the new shortcut →
+**Properties**, and add a space and `--debug-menu` to the end of the **Target** box:
+
+```
+"C:\Games\CaseWestRecomp\cw_runtime.exe" --debug-menu
+```
+
+Keep the normal icon as well and you have one install with two ways to start it —
+ordinary play, and play with the menu. On Linux the same flag works from a
+terminal: `./cw_runtime --debug-menu`.
+
+**A text file, if you want it on permanently.** Open `cw_defaults.env` (next to the
+executable) in any text editor and add one line:
+
+```
+CW_DEBUG_MENU=1
+```
+
+**An environment variable, if you prefer that.** `CW_DEBUG_MENU=1` anywhere the game
+can see it. The command-line flag overrides both of the above; the environment
+overrides the file.
+
+Once it is on, the menu takes **Up/Down** to move, **Enter** to use, **Left/Right** to
+change a value and **F4** to close. The game window has to have keyboard focus.
+
+> This is retained developer scaffolding, not a feature we wrote: some entries do
+> nothing, and a few can leave the game in a strange state. It cannot corrupt a save
+> that is not written, but take a backup if you are attached to one.
+
 ## Building from source
 
 The repository contains no game data, so a build needs your own package plus

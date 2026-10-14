@@ -58,6 +58,27 @@ int           Settings_Fov();           // FIELD OF VIEW (part 61): degrees of
                                         // ADJUSTMENT from the game's own camera,
                                         // -10..+30 in steps of 1; 0 = OG, the
                                         // default and the bit-identical control
+// ZOMBIE DETAIL (Case Zero 5cb3781, imported 2026-10-14; their operator's spec: default
+// 2.0, up to 5.0). The crowd renderer's LOD quality scale, which the 360 left at 1.0: Q
+// multiplies how many zombies get each model and divides the on-screen size each model
+// needs, so 2.0 is twice the close-model count at twice the distance (cpu/crowd_lod.cpp
+// has the derivation). Stored in TENTHS so the store stays integer key=value text.
+// 0.5..5.0 step 0.5; 1.0 is the title's own. Applies LIVE; CW_CROWD_LOD wins over it.
+int           Settings_CrowdLodX10();       // 5..50, step 5; default 20 (2.0), 10 on
+                                            // the Deck build (CW_DECK_DEFAULTS)
+void          Settings_SetCrowdLodX10(int); // clamped and snapped to the step
+
+// SHADOW BIAS (Case Zero b6bf4fe, 2026-10-10, operator-verified THERE at 0.25). Scales the
+// title's per-cascade shadow depth bias — pixel constant c48.xyz ON THIS IMAGE, c47 in
+// Case Zero (`gShadowMapPackedParams[3]` in DR2 PC's shaders; Case West's whole shadow
+// block sits one register higher, see vk_renderer.cpp). In the sibling the title's own
+// value ate the shadow a thin caster throws on the surface it is attached to (an awning
+// on its wall) until the camera was close. Hundredths, 0.25..1.00 step 0.25; 1.00 is the
+// title's own, 0.25 the default. Applies LIVE; CW_SHADOW_BIAS wins over it
+// (gpu/vk_renderer.cpp, ShadowBiasFactorThisFrame).
+int           Settings_ShadowBiasX100();       // 25..100, step 25; default 25
+void          Settings_SetShadowBiasX100(int); // clamped and snapped to the step
+
 int           Settings_Aspect();        // LEGACY: 1 when the internal res is wider than
                                         // 16:9. Derived; new code reads Settings_InternalRes
 

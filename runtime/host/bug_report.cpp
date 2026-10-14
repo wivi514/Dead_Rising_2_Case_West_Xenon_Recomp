@@ -5,8 +5,12 @@
 // key was), and leaves a frame want on the renderer. The renderer, which already arms
 // its present readback for F8/F9's dev instruments, arms it for this too and hands
 // every presented frame's pixels to OfferPixels; the capture keeps the first (and, for
-// F8, two more about half a second apart), copied out of the readback into its own
-// buffer — the readback slot is reused the next frame. A worker thread then sleeps
+// F8, the NINETEEN presented frames that follow it, consecutively — the operator's
+// 2026-09-14 ask: a flicker is a frame-to-frame diff, and three frames half a second
+// apart with a moving camera cannot be diffed), copied out of the readback into its
+// own buffer — the readback slot is reused the next frame. The report keeps what fits
+// the contract; the WHOLE burst is written beside it, full-size and uncapped, as
+// ../bursts/<name>/frame_NN.png, which is what a diff reads. A worker thread then sleeps
 // until T0 + 15 s, asks the log tee for the ring's text between T0 − 60 s and now,
 // gathers the machine, encodes the PNGs, writes <name>.partial/, renames it, prunes
 // the folder, and says so in the log and (when the overlay is up) as a toast.
@@ -45,6 +49,9 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <intrin.h>
+#elif defined(__APPLE__)
+#include <sys/sysctl.h>
+#include <sys/utsname.h>
 #else
 #include <sys/sysinfo.h>
 #include <sys/utsname.h>
@@ -74,7 +81,8 @@ constexpr size_t kLogKeep = 3500u * 1024;           // the log's share, from the
 constexpr unsigned kMaxCaptures = 40;
 constexpr auto kBefore = std::chrono::seconds(60);
 constexpr auto kAfter = std::chrono::seconds(15);
-constexpr uint64_t kBurstSpacingFrames = 30;        // F8: three frames, ~half a second apart
+constexpr uint64_t kBurstSpacingFrames = 1;         // F8: consecutive presented frames
+constexpr unsigned kBurstFrames = 20;
 
 struct Frame
 {
@@ -104,6 +112,7 @@ std::thread g_worker;
 std::atomic<bool> g_quit{ false };
 std::string g_gpu = "unknown", g_driver = "unknown";
 uint32_t g_apiVersion = 0;
+std::string g_renderer = "not started";
 
 // ---- the machine ---------------------------------------------------------------
 
@@ -117,6 +126,11 @@ std::string CpuBrand()
         __cpuid(regs, int(0x80000002u + i));
         memcpy(brand + i * 16, regs, 16);
     }
+#elif defined(__APPLE__)
+    // No CPUID on Apple Silicon; the kernel publishes the brand ("Apple M1").
+    size_t n = sizeof brand - 1;
+    if (sysctlbyname("machdep.cpu.brand_string", brand, &n, nullptr, 0) != 0)
+        return "unknown";
 #else
     unsigned a, b, c, d;
     for (unsigned i = 0; i < 3; i++)
@@ -168,6 +182,13 @@ std::string OsName()
              display, (unsigned long)v.dwMajorVersion, (unsigned long)v.dwMinorVersion,
              (unsigned long)v.dwBuildNumber);
     return out;
+#elif defined(__APPLE__)
+    char ver[64] = "";
+    size_t n = sizeof ver;
+    sysctlbyname("kern.osproductversion", ver, &n, nullptr, 0);
+    utsname u{};
+    uname(&u);
+    return std::string("macOS ") + ver + " (Darwin " + u.release + ")";
 #else
     std::string pretty;
     std::ifstream f("/etc/os-release");
@@ -194,6 +215,12 @@ uint64_t RamMb()
     m.dwLength = sizeof m;
     GlobalMemoryStatusEx(&m);
     return m.ullTotalPhys / (1024 * 1024);
+#elif defined(__APPLE__)
+    uint64_t bytes = 0;
+    size_t n = sizeof bytes;
+    if (sysctlbyname("hw.memsize", &bytes, &n, nullptr, 0) != 0)
+        return 0;
+    return bytes / (1024 * 1024);
 #else
     struct sysinfo si{};
     if (sysinfo(&si) != 0)
@@ -414,7 +441,8 @@ void WriteReport(std::unique_ptr<Pending> p)
         else
         {
             snprintf(fname, sizeof fname, "burst_%zu.png", i + 1);
-            snprintf(what, sizeof what, "%.1f s after the key", double(i) * 0.5);
+            snprintf(what, sizeof what, "%zu presented frame%s after the key", i,
+                     i == 1 ? "" : "s");
         }
         ok = ok && WriteFile(partial / fname, png.data(), png.size());
         files.push_back({ fname, "image/png", what, png.size() });
@@ -423,6 +451,36 @@ void WriteReport(std::unique_ptr<Pending> p)
     if (p->frames.empty())
         fprintf(stderr, "[bugreport] no frame reached the capture (headless, or the renderer "
                         "presented no frame in the window): the report has no picture\n");
+    // THE WHOLE BURST, uncapped and at full size, NEXT TO the captures folder (not in
+    // it: the launcher lists every folder there as a report). The report's caps are
+    // the launcher's contract and keep three or four halved frames of twenty; a flicker
+    // diff wants every frame at the resolution it was rendered. Local, never uploaded,
+    // and not pruned — a full-size burst is ~100 MB, so empty it by hand.
+    if (p->frames.size() > 1)
+    {
+        const fs::path burst = g_dir.parent_path() / "bursts" / name;
+        fs::create_directories(burst, ec);
+        size_t written = 0;
+        for (size_t i = 0; i < p->frames.size() && !ec; i++)
+        {
+            Frame f = p->frames[i];
+            size_t len = 0;
+            void* png = tdefl_write_image_to_png_file_in_memory_ex(
+                f.rgb.data(), int(f.w), int(f.h), 3, &len, 6, MZ_FALSE);
+            if (!png)
+                break;
+            char fname[32];
+            snprintf(fname, sizeof fname, "frame_%02zu.png", i);
+            if (WriteFile(burst / fname, png, len))
+                written++;
+            mz_free(png);
+        }
+        fprintf(stderr, "[bugreport] burst: %zu of %zu consecutive frames (%ux%u, presented "
+                        "frames %llu..%llu) written full-size to %s\n",
+                written, p->frames.size(), p->frames[0].w, p->frames[0].h,
+                (unsigned long long)p->frames.front().frame,
+                (unsigned long long)p->frames.back().frame, burst.string().c_str());
+    }
 
     // The log: the ring's text for [T0 - 60 s, now]. Cut from the FRONT to its share,
     // with a line saying so — the end is the part that matters.
@@ -459,9 +517,14 @@ void WriteReport(std::unique_ptr<Pending> p)
     char vk[32];
     snprintf(vk, sizeof vk, "%u.%u.%u", VK_VERSION_MAJOR_(g_apiVersion), VK_VERSION_MINOR_(g_apiVersion),
              VK_VERSION_PATCH_(g_apiVersion));
+    std::string renderer;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        renderer = g_renderer;
+    }
     std::string sys;
     {
-        char b[1024];
+        char b[1280];
         snprintf(b, sizeof b,
                  "game: Dead Rising 2: Case West (recomp) %s\n"
                  "os: %s\n"
@@ -469,12 +532,14 @@ void WriteReport(std::unique_ptr<Pending> p)
                  "gpu: %s\n"
                  "driver: %s\n"
                  "vulkan: %s\n"
+                 "renderer: %s\n"
                  "ram_mb: %llu\n"
                  "resolution: %ux%u (%s), msaa %d, vsync %s, fps cap %d, shadows %d, fov %d\n"
                  "signed_in: %s\n"
                  "trigger: %s at %s\n",
                  CW_GAME_VERSION, os.c_str(), cpu.c_str(), std::thread::hardware_concurrency(),
-                 g_gpu.c_str(), g_driver.c_str(), vk, (unsigned long long)ram, rw, rh,
+                 g_gpu.c_str(), g_driver.c_str(), vk, renderer.c_str(),
+                 (unsigned long long)ram, rw, rh,
                  DisplayModeName(Settings_DisplayMode()), Settings_Msaa(),
                  Settings_VSync() ? "on" : "off", Settings_FpsCap(), Settings_ShadowTier(),
                  Settings_Fov(), CwXlive_SignedIn() ? "yes" : "no", p->trigger.c_str(),
@@ -489,7 +554,7 @@ void WriteReport(std::unique_ptr<Pending> p)
     std::string j = "{\n  \"version\": 1,\n";
     {
         char b[512];
-        snprintf(b, sizeof b, "  \"title_id\": \"58410a8d\",\n  \"game\": \"Dead Rising 2: Case West\",\n"
+        snprintf(b, sizeof b, "  \"title_id\": \"58410b00\",\n  \"game\": \"Dead Rising 2: Case West\",\n"
                               "  \"game_version\": \"%s\",\n  \"captured_at\": \"%s\",\n"
                               "  \"trigger\": \"%s\",\n  \"files\": [\n",
                  JsonEscape(CW_GAME_VERSION).c_str(), Rfc3339(p->wall).c_str(),
@@ -578,7 +643,7 @@ void BugReport_Init()
         return;
     }
     g_enabled = true;
-    fprintf(stderr, "[bugreport] F9 (one frame) / F8 (three frames) capture a bug report for the "
+    fprintf(stderr, "[bugreport] F9 (one frame) / F8 (twenty consecutive frames) capture a bug report for the "
                     "XenonLive launcher's Issues tab into %s — the picture, the log 60 s before "
                     "and 15 s after, the machine. CW_BUG_REPORTS=0 turns it off.\n",
             g_dir.string().c_str());
@@ -591,6 +656,12 @@ void BugReport_SetGpu(const char* device, const char* driver, uint32_t apiVersio
     g_gpu = device ? device : "unknown";
     g_driver = driver ? driver : "unknown";
     g_apiVersion = apiVersion;
+}
+
+void BugReport_SetRenderer(const char* verdict)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_renderer = verdict ? verdict : "unknown";
 }
 
 void BugReport_Request(const char* trigger, unsigned frames)
@@ -610,7 +681,7 @@ void BugReport_Request(const char* trigger, unsigned frames)
     p->trigger = trigger;
     p->t0 = now;
     p->wall = std::chrono::system_clock::now();
-    p->wantFrames = std::max(1u, std::min(3u, frames));
+    p->wantFrames = std::max(1u, std::min(kBurstFrames, frames));
     p->nextFrame = 0;
     p->pixelDeadline = now + std::chrono::seconds(4);
     fprintf(stderr, "[bugreport] %s pressed: capturing %u frame%s, the log 60 s before and 15 s "

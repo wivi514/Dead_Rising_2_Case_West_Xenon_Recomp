@@ -1,4 +1,4 @@
-// THE BUG-REPORT CAPTURE: F9 (one frame) or F8 (three frames over a second) writes a
+// THE BUG-REPORT CAPTURE: F9 (one frame) or F8 (twenty consecutive frames) writes a
 // directory the XenonLive launcher's Issues tab lists — the picture, the log for the
 // 60 s before the key and the 15 s after, and the machine (OS, CPU, GPU, driver, RAM,
 // the game's version and settings) — so a player's report arrives with everything a
@@ -30,8 +30,16 @@ void BugReport_Init();
 // and version text, the Vulkan version the device reports).
 void BugReport_SetGpu(const char* device, const char* driver, uint32_t apiVersion);
 
+// The renderer's bring-up VERDICT: "up", or "FAILED: <the step and the VkResult>".
+// Written to system.txt as its own line. It exists because issue #12 (a white window
+// with audio, 2026-10-02) arrived with gpu "unknown" and a log whose 60 s window began
+// AFTER bring-up — the report proved the renderer had failed and could not say where.
+// Unset reads "not started" (the pump never reached VkRenderer_Init).
+void BugReport_SetRenderer(const char* verdict);
+
 // The key. `trigger` is what the player pressed ("F9" / "F8"); `frames` how many
-// presented frames to keep (1, or 3 spaced ~half a second apart for F8). The report
+// presented frames to keep (1, or 20 consecutive for F8 — the report keeps what fits
+// its caps, the whole burst goes full-size to ../bursts/<name>/). The report
 // is written 15 s later by a worker thread; a press while one is in flight is folded
 // into it (the log window is what it is) and said so in the log.
 void BugReport_Request(const char* trigger, unsigned frames);

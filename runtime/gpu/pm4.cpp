@@ -170,6 +170,78 @@ constexpr uint32_t kRegScratch0 = 0x0578;
 constexpr uint32_t kRegScratch7 = 0x057F;
 constexpr uint32_t kRegCoherStatusHost = 0x0A31; // bit 31 = coherency action pending
 
+// THE DISPLAY CONTROLLER'S GAMMA LUT (part 119). Indices from Xenia's register_table.inc:
+// DC_LUT_RW_MODE (0 = the 256-entry table, 1 = PWL), DC_LUT_RW_INDEX, DC_LUT_SEQ_COLOR,
+// DC_LUT_PWL_DATA, DC_LUT_30_COLOR (blue 0:9, green 10:19, red 20:29),
+// DC_LUT_WRITE_EN_MASK (bit 0 blue, 1 green, 2 red), DC_LUTA_CONTROL.
+//
+// These are ordinary registers as far as the ring is concerned — Direct3D's
+// SetGammaRamp (`sub_8284D860` in CASE ZERO's image — not re-derived here) emits, per entry, one type-0 write of
+// DC_LUT_30_COLOR and then a COND_WRITE that sets DC_LUT_RW_INDEX to entry+1, i.e. it
+// emulates hardware's auto-increment in software, so the index register is always
+// current at the moment the colour write lands. For 583 gotchas this runtime stored
+// them in g_regs like any other dword and nothing ever read them back: the whole
+// 256-entry table the title loads at boot (B1: packets 468-987) landed in ONE register
+// slot, last write wins. The table is what hardware — and Xenia, at swap — routes the
+// 8-bit front buffer through before the screen sees it.
+constexpr uint32_t kRegDcLutRwMode = 0x1921;
+constexpr uint32_t kRegDcLutRwIndex = 0x1922;
+constexpr uint32_t kRegDcLutSeqColor = 0x1923;
+constexpr uint32_t kRegDcLutPwlData = 0x1924;
+constexpr uint32_t kRegDcLut30Color = 0x1925;
+constexpr uint32_t kRegDcLutWriteEnMask = 0x1927;
+constexpr uint32_t kRegDcLutaControl = 0x1930;
+// The table itself, and a version the present side polls: bumped on every colour
+// write, so a loaded table is version >= 256 and "never loaded" is exactly 0. The
+// walk (cw-pump) writes, the present (cw-draw, or the pump itself without the split)
+// snapshots; a torn read during the 256-write burst at boot is one frame with a
+// half-loaded table, and the snapshot re-reads the version to say so.
+uint32_t g_gammaTable[256];
+std::atomic<uint32_t> g_gammaVersion{ 0 };
+std::atomic<uint64_t> g_gammaWrites256{ 0 };   // DC_LUT_30_COLOR writes, whatever mode
+std::atomic<uint64_t> g_gammaWritesPwl{ 0 };   // DC_LUT_PWL_DATA / SEQ_COLOR: NOT applied
+// A write in PWL mode, or through SEQ_COLOR, is a table this runtime does not model
+// (the PWL table serves 10-bit front buffers; this title's is 8_8_8_8). Counted so the
+// omission is visible, and announced once rather than per dword.
+bool g_gammaSaidUnsupported = false;
+
+inline void GammaRegisterWrite(uint32_t index, uint32_t value)
+{
+    switch (index)
+    {
+        case kRegDcLut30Color:
+        {
+            g_gammaWrites256.fetch_add(1, std::memory_order_relaxed);
+            // The index register is 8 bits wide for this table (Xenia: "the index in
+            // 0:7 is just increased monotonically"; Direct3D leaves it at 0x100 after
+            // the last entry, which is why the mask matters).
+            const uint32_t i = g_regs[kRegDcLutRwIndex] & 0xFF;
+            const uint32_t mask = g_regs[kRegDcLutWriteEnMask] & 7;
+            uint32_t cur = g_gammaTable[i];
+            if (mask & 1) cur = (cur & ~0x3FFu) | (value & 0x3FFu);
+            if (mask & 2) cur = (cur & ~(0x3FFu << 10)) | (value & (0x3FFu << 10));
+            if (mask & 4) cur = (cur & ~(0x3FFu << 20)) | (value & (0x3FFu << 20));
+            g_gammaTable[i] = cur;
+            g_gammaVersion.fetch_add(1, std::memory_order_release);
+            break;
+        }
+        case kRegDcLutPwlData:
+        case kRegDcLutSeqColor:
+            g_gammaWritesPwl.fetch_add(1, std::memory_order_relaxed);
+            if (!g_gammaSaidUnsupported)
+            {
+                g_gammaSaidUnsupported = true;
+                fprintf(stderr, "[pm4] DC_LUT %s written: a gamma table this runtime does "
+                                "not model (the PWL table is for 10-bit front buffers); "
+                                "the present ramp arm ignores it and counts it\n",
+                        index == kRegDcLutPwlData ? "PWL_DATA" : "SEQ_COLOR");
+            }
+            break;
+        default:
+            break;
+    }
+}
+
 // Predicated binning. SET_BIN_MASK_* tags the following packets with the EDRAM bins
 // they touch and SET_BIN_SELECT_* picks the bin being rendered; the hardware ME runs
 // a packet whose header bit 0 is set only when (mask & select) != 0. Both default to
@@ -525,6 +597,17 @@ bool LooksLikeUcode(const uint8_t* p, uint32_t sizeDwords)
 // The currently bound pair. Index 0 = vertex, 1 = pixel, matching the type field the
 // packet itself carries.
 Pm4ShaderBinding g_boundShaders[2];
+// Tile replays whose shader bindings had drifted and were restored (see the
+// INDIRECT_BUFFER case). The engagement gate for the player-issue-#3 fix.
+std::atomic<uint64_t> g_replayRestores{ 0 };
+std::atomic<uint64_t> g_tileOffsetDraws{ 0 };
+// CW_PM4_BIND_CHECK=1 (player issue #3): at every draw, the pixel-shader binding is
+// compared against the last PS load packet the walk SAW — a disagreement means a load
+// was skipped, refused or overwritten between the load and the draw, and the trail of
+// the last 24 type-3 opcodes says by what.
+const bool g_bindCheck = getenv("CW_PM4_BIND_CHECK") != nullptr;
+struct LastPsLoad { uint32_t opcode = 0, va = 0, size = 0; bool pred = false, ran = false; } g_lastPsLoad;
+uint32_t g_opTrail[24]; uint32_t g_opTrailN = 0;
 
 // CW_SHADER_DUMP=<dir> — write one file per distinct microcode blob, named by the same
 // hash the renderer looks up. This is how the SPIR-V cache is built: the dump is taken
@@ -1407,6 +1490,10 @@ void WriteRegister(uint8_t* base, uint32_t index, uint32_t value)
     g_regs[index] = value;
     if (split::g_on)
         split::LogRun(index, 1, &value);   // part 117: D's replica follows every write
+    // The display gamma LUT (part 119) — one range test on the per-dword path, which is
+    // the path the title's SetGammaRamp writer takes (one-reg type-0 packets).
+    if (index >= kRegDcLutRwMode && index <= kRegDcLutaControl)
+        GammaRegisterWrite(index, value);
 
     // Scratch-register writeback: when SCRATCH_UMSK enables a scratch register, each
     // write to it is mirrored to SCRATCH_ADDR + reg*4. This is a real reporting
@@ -1504,6 +1591,7 @@ inline bool RegRunHasSideEffects(uint32_t index, uint32_t count)
 {
     const uint32_t last = index + count - 1;
     return (index <= kRegScratch7 && last >= kRegScratch0) ||
+           (index <= kRegDcLutaControl && last >= kRegDcLutRwMode) ||
            (index <= g_constWatchHi && last >= g_constWatchLo);
 }
 
@@ -1869,9 +1957,14 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t pos, uint32_
         static const char* armMaskEnv = getenv("CW_PM4_BIN_TRACE_ARMMASK");
         static const uint64_t armSelect = armEnv ? strtoull(armEnv, nullptr, 16) : 0;
         static const uint64_t armMask = armMaskEnv ? strtoull(armMaskEnv, nullptr, 16) : 0;
-        static bool armed = !armEnv && !armMaskEnv;
+        // CW_PM4_BIN_TRACE_FRAME=N holds it until swap N (player issue #3's era
+        // begins a minute into a roam, past any line budget spent from boot).
+        static const char* armFrameEnv = getenv("CW_PM4_BIN_TRACE_FRAME");
+        static const uint64_t armFrame = armFrameEnv ? strtoull(armFrameEnv, nullptr, 10) : 0;
+        static bool armed = !armEnv && !armMaskEnv && !armFrameEnv;
         if (!armed && ((armEnv && g_binSelect == armSelect) ||
-                       (armMaskEnv && g_binMask == armMask)))
+                       (armMaskEnv && g_binMask == armMask) ||
+                       (armFrameEnv && g_frames.load(std::memory_order_relaxed) >= armFrame)))
             armed = true;
         if (armed && left > 0)
         {
@@ -1892,14 +1985,30 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t pos, uint32_
                 fprintf(stderr, "[pm4bin] %-15s %08X%s\n", what, fetch(pos + 1),
                         predicated ? "   (SKIPPED)" : "");
             }
+            else if (opcode == 0x27 || opcode == 0x2B)
+            {
+                // The shader loads too (player issue #3): a tile replay that draws
+                // with the previous tile's pixel shader is a load that was skipped
+                // or never issued, and only a trace in stream order can say which.
+                left--;
+                fprintf(stderr, "[pm4bin]     %s %s va=%08X size=%u pred=%u mask=%016llX "
+                                "select=%016llX -> %s\n",
+                        opcode == 0x27 ? "IM_LOAD" : "IM_LOAD_IMM",
+                        (fetch(pos + 1) & 3) == 0 ? "VS" : "PS",
+                        opcode == 0x27 ? (fetch(pos + 1) & ~3u) : 0u,
+                        fetch(pos + 2) & 0xFFFF, header & 1,
+                        (unsigned long long)g_binMask, (unsigned long long)g_binSelect,
+                        predicated ? "SKIP" : "run");
+            }
             else if (opcode == 0x22 || opcode == 0x36)
             {
                 left--;
                 const uint32_t tl = g_regs[xenos::kPaScWindowScissorTl];
                 const uint32_t br = g_regs[xenos::kPaScWindowScissorBr];
                 fprintf(stderr,
-                        "[pm4bin]     DRAW pred=%u mask=%016llX select=%016llX "
+                        "[pm4bin]     DRAW f=%llu pred=%u mask=%016llX select=%016llX "
                         "scissor=%u,%u..%u,%u -> %s\n",
+                        (unsigned long long)g_frames.load(std::memory_order_relaxed),
                         header & 1, (unsigned long long)g_binMask,
                         (unsigned long long)g_binSelect,
                         tl & 0x7FFF, (tl >> 16) & 0x7FFF, br & 0x7FFF, (br >> 16) & 0x7FFF,
@@ -1980,6 +2089,80 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t pos, uint32_
                     (unsigned long long)pred, (unsigned long long)seen);
     }
 
+    // CW_PM4_LOADTRACE_EVERY=N: on every N-th swap, every shader load and every draw
+    // with the binding it will use, in stream order — cheap enough (one frame in N)
+    // not to slow the walk, which the full bin trace does and which HIDES the
+    // player-issue-#3 race (a slow walk never reproduces it).
+    static const uint64_t loadTraceEvery = getenv("CW_PM4_LOADTRACE_EVERY")
+        ? strtoull(getenv("CW_PM4_LOADTRACE_EVERY"), nullptr, 10) : 0;
+    if (loadTraceEvery && (g_frames.load(std::memory_order_relaxed) % loadTraceEvery) == 0)
+    {
+        if (opcode == 0x27 || opcode == 0x2B)
+            fprintf(stderr, "[ldtrace] f=%llu d=%d %s %s va=%08X size=%u start=%u pred=%u -> %s\n",
+                    (unsigned long long)g_frames.load(std::memory_order_relaxed), depth,
+                    opcode == 0x27 ? "IM_LOAD" : "IM_LOAD_IMM",
+                    (fetch(pos + 1) & 3) == 0 ? "VS" : "PS",
+                    opcode == 0x27 ? (fetch(pos + 1) & ~3u) : 0u, fetch(pos + 2) & 0xFFFF,
+                    fetch(pos + 2) >> 16, header & 1, predicated ? "SKIP" : "run");
+        else if (opcode == 0x22 || opcode == 0x36)
+        {
+            const uint32_t tl = g_regs[xenos::kPaScWindowScissorTl];
+            const uint32_t br = g_regs[xenos::kPaScWindowScissorBr];
+            fprintf(stderr, "[ldtrace] f=%llu d=%d DRAW wo=%08X mode=%u prim=%u sc=%u,%u..%u,%u ps=%016llx/%08X/%u "
+                            "vs=%016llx pred=%u -> %s\n",
+                    (unsigned long long)g_frames.load(std::memory_order_relaxed), depth,
+                    g_regs[xenos::kPaScWindowOffset], g_regs[0x2208] & 7,
+                    opcode == 0x22 ? (fetch(pos + 2) & 0x3F) : (fetch(pos + 1) & 0x3F),
+                    tl & 0x7FFF, (tl >> 16) & 0x7FFF, br & 0x7FFF, (br >> 16) & 0x7FFF,
+                    (unsigned long long)g_boundShaders[1].hash, g_boundShaders[1].ucodeVa,
+                    g_boundShaders[1].sizeDwords, (unsigned long long)g_boundShaders[0].hash,
+                    header & 1, predicated ? "SKIP" : "run");
+        }
+        else if (opcode == 0x3F || opcode == 0x37)
+            fprintf(stderr, "[ldtrace] f=%llu d=%d INDIRECT_BUFFER addr=%08X size=%u\n",
+                    (unsigned long long)g_frames.load(std::memory_order_relaxed), depth,
+                    fetch(pos + 1), fetch(pos + 2) & 0xFFFFF);
+        else if (depth == 0)
+        {
+            // Every other RING-level packet, with its first body dwords: what the
+            // driver emits between two tile replays is the whole question.
+            fprintf(stderr, "[ldtrace] f=%llu d=0 op=%02X n=%u pred=%u b0=%08X b1=%08X b2=%08X -> %s\n",
+                    (unsigned long long)g_frames.load(std::memory_order_relaxed), opcode,
+                    bodyCount, header & 1, bodyCount > 0 ? fetch(pos + 1) : 0u,
+                    bodyCount > 1 ? fetch(pos + 2) : 0u, bodyCount > 2 ? fetch(pos + 3) : 0u,
+                    predicated ? "SKIP" : "run");
+        }
+    }
+    if (g_bindCheck)
+    {
+        g_opTrail[g_opTrailN++ % 24] = (opcode << 8) | (predicated ? 1 : 0) | (uint32_t(header & 1) << 1);
+        if ((opcode == 0x27 || opcode == 0x2B) && (fetch(pos + 1) & 3) == 1)
+            g_lastPsLoad = { opcode, opcode == 0x27 ? (fetch(pos + 1) & ~3u) : 0u,
+                             fetch(pos + 2) & 0xFFFF, (header & 1) != 0,
+                             !(predicated && !noPredication) };
+        if ((opcode == 0x22 || opcode == 0x36) && !(predicated && !noPredication) &&
+            g_lastPsLoad.ran && (g_boundShaders[1].sizeDwords != g_lastPsLoad.size ||
+                                 (g_lastPsLoad.opcode == 0x27 &&
+                                  g_boundShaders[1].ucodeVa != PhysToVa(g_lastPsLoad.va))))
+        {
+            static std::atomic<uint32_t> n{ 0 };
+            if (n.fetch_add(1) < 24)
+            {
+                fprintf(stderr, "[pm4] BIND CHECK: draw with PS %016llx (va=%08X size=%u) "
+                                "but the last PS load was %s va=%08X size=%u (pred=%d); trail:",
+                        (unsigned long long)g_boundShaders[1].hash, g_boundShaders[1].ucodeVa,
+                        g_boundShaders[1].sizeDwords,
+                        g_lastPsLoad.opcode == 0x27 ? "IM_LOAD" : "IM_LOAD_IMM", g_lastPsLoad.va,
+                        g_lastPsLoad.size, g_lastPsLoad.pred);
+                for (uint32_t i = 0; i < 24; i++)
+                {
+                    const uint32_t t = g_opTrail[(g_opTrailN + i) % 24];
+                    fprintf(stderr, " %02X%s", t >> 8, (t & 1) ? "s" : ((t & 2) ? "p" : ""));
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+    }
     if (predicated)
     {
         if (opcode == 0x22 || opcode == 0x36)
@@ -2102,6 +2285,33 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t pos, uint32_
             else if (d.indexed)
             {
                 d.indexed = false; // a DMA draw with no address is not one we can honour
+            }
+            // The tile's window offset for an EDRAM-space draw (see Pm4Draw). The
+            // predicated-tiling driver selects each tile's bins before replaying the
+            // buffer, so "same bin select as the last offset-carrying draw" is "same
+            // tile"; the post chain re-selects every bin and is left alone. Per frame,
+            // so a stale tile-1 offset cannot reach the next frame's tile 0.
+            // CW_PM4_NO_TILE_OFFSET=1 is the control arm.
+            {
+                static const bool noTileOffset = getenv("CW_PM4_NO_TILE_OFFSET") != nullptr;
+                static uint32_t tileOffset = 0;
+                static uint64_t tileSelect = 0, tileFrame = ~0ull;
+                const uint64_t fr = g_frames.load(std::memory_order_relaxed);
+                const uint32_t wo = g_regs[xenos::kPaScWindowOffset];
+                if (fr != tileFrame)
+                {
+                    tileFrame = fr;
+                    tileOffset = 0;
+                }
+                if (wo)
+                {
+                    tileOffset = wo;
+                    tileSelect = g_binSelect;
+                }
+                d.tileWindowOffset =
+                    (!noTileOffset && !wo && tileOffset && g_binSelect == tileSelect) ? tileOffset : 0;
+                if (d.tileWindowOffset)
+                    g_tileOffsetDraws.fetch_add(1, std::memory_order_relaxed);
             }
             if (split::g_on)
             {
@@ -2490,6 +2700,64 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t pos, uint32_
                                 "-> addr=%08X size=%u (bodyCount=%u)\n",
                                 header, body(0), body(1), addr, size, bodyCount);
                 }
+                // TILE REPLAYS BEGIN WITH THE STATE THE FIRST REPLAY BEGAN WITH
+                // (player issue #3, "zombies close to the camera are not shaded
+                // correctly on the right side of the screen").
+                //
+                // This title renders the scene in two tiles by replaying one recorded
+                // command buffer per tile (§6f). Its early actor prepass — the first
+                // draws of that buffer, mask 0, alpha test GEQUAL 0 — carries NO pixel
+                // shader load, because the D3D runtime filtered it as redundant when
+                // the buffer was RECORDED: the 9-dword null pixel shader of the shadow
+                // pass was current. So the prepass runs with whatever pixel shader is
+                // bound when the replay STARTS. For tile 0 that is the null shader;
+                // for tile 1 it is the last material shader of tile 0's main pass,
+                // whose alpha output goes through the same alpha test with a different
+                // value — and a near actor's early depth comes out different per tile,
+                // so the world behind it is rejected in one tile and drawn in the
+                // other, and the actor's blended colour pass lands on the clear colour
+                // there. The per-tile draw census (CW_VK_DRAW_CENSUS_EVERY) showed
+                // exactly those 9-18 prepass draws differing and nothing else, in
+                // 15-35% of roam frames; the operator's screenshot is the same shape.
+                //
+                // The 360's D3D restores the GPU state at BeginTiling for every tile,
+                // so the intended binding is the FIRST replay's. This keeps, per frame,
+                // the shader bindings in force when each ring-level indirect buffer
+                // first ran, and restores them when the same buffer runs again — the
+                // bindings only, because the census measured every register and both
+                // constant files identical between the tiles at every draw. A re-entry
+                // after a stall inside the buffer is a resume, not a replay, and is
+                // left alone. Measured: 0 of 116 and 0 of 162 tiled frames asymmetric
+                // with this, 15-35% without. CW_PM4_NO_REPLAY_RESTORE=1 is the control.
+                static const bool noReplayRestore = getenv("CW_PM4_NO_REPLAY_RESTORE") != nullptr;
+                if (!noReplayRestore && depth == 0 && !g_stallPlan.pending)
+                {
+                    struct FirstRun { uint32_t addr; Pm4ShaderBinding vs, ps; };
+                    static std::vector<FirstRun> firstRuns;
+                    static uint64_t firstRunsFrame = ~0ull;
+                    const uint64_t fr = g_frames.load(std::memory_order_relaxed);
+                    if (fr != firstRunsFrame)
+                    {
+                        firstRunsFrame = fr;
+                        firstRuns.clear();
+                    }
+                    bool replay = false;
+                    for (const FirstRun& f : firstRuns)
+                        if (f.addr == addr)
+                        {
+                            replay = true;
+                            if (g_boundShaders[0].hash != f.vs.hash ||
+                                g_boundShaders[1].hash != f.ps.hash)
+                            {
+                                g_boundShaders[0] = f.vs;
+                                g_boundShaders[1] = f.ps;
+                                g_replayRestores.fetch_add(1, std::memory_order_relaxed);
+                            }
+                            break;
+                        }
+                    if (!replay && firstRuns.size() < 256)
+                        firstRuns.push_back({ addr, g_boundShaders[0], g_boundShaders[1] });
+                }
                 if (size && (addr & 0x1FFFFFFFu) + uint64_t(size) * 4 <= 0x20000000ull)
                 {
                     if (g_ibVerify)
@@ -2756,6 +3024,28 @@ Pm4VsPaletteWrites Pm4_TakeVsPaletteWrites()
 
 uint32_t Pm4_VsPaletteHighWater() { return g_vsPalHighWater; }
 
+// The display gamma LUT seam (part 119; state at kRegDcLut30Color's definition).
+uint32_t Pm4_GammaRampSnapshot(uint32_t out[256])
+{
+    // A seqlock without the lock: copy, then confirm nothing moved underneath. The
+    // loader is 256 writes at boot and the consumer polls once a present, so the retry
+    // fires at most a handful of times in a run.
+    for (int attempt = 0; attempt < 8; ++attempt)
+    {
+        const uint32_t v0 = g_gammaVersion.load(std::memory_order_acquire);
+        memcpy(out, g_gammaTable, sizeof g_gammaTable);
+        const uint32_t v1 = g_gammaVersion.load(std::memory_order_acquire);
+        if (v0 == v1)
+            return v1;
+    }
+    return g_gammaVersion.load(std::memory_order_acquire);
+}
+
+uint64_t Pm4_GammaRampWrites(bool pwl)
+{
+    return (pwl ? g_gammaWritesPwl : g_gammaWrites256).load(std::memory_order_relaxed);
+}
+
 void Pm4_SetRingBuffer(uint32_t base, uint32_t sizeBytes)
 {
     g_ringBase = base;
@@ -2955,6 +3245,8 @@ void Pm4_SetRptrPublishSlot(uint32_t va)
     g_rptrPublishSlot.store(va, std::memory_order_relaxed);
 }
 uint64_t Pm4_RptrMidwalkStores() { return g_rptrMidwalkStores.load(); }
+uint64_t Pm4_ReplayRestores() { return g_replayRestores.load(); }
+uint64_t Pm4_TileOffsetDraws() { return g_tileOffsetDraws.load(); }
 uint64_t Pm4_FenceRegressionCount() { return g_fenceRegressions.load(); }
 
 // The census accessors. Under the atomic arm the globals are the live counters; by

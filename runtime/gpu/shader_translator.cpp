@@ -58,12 +58,39 @@
 #include <cctype>
 #include <cstdio>
 #include <fstream>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <thread>
 
 namespace ShaderTranslator
 {
+// THE TRANSLATE-TIME RECIPE. See shader_translator.h for the eighteen parts this was
+// invisible for. Read once: the answer must be the same for every shader in a cache,
+// and a cache half-built under one recipe and half under another is the defect this
+// whole mechanism exists to make impossible.
+bool ClipPlanesWanted()
+{
+    static const bool wanted = []() {
+        const char* off = getenv("CW_NO_CLIP_SHADERS");
+        return !(off && *off && strcmp(off, "0") != 0);
+    }();
+    return wanted;
+}
+
+std::string RecipeId()
+{
+    // Deliberately terse and deliberately NOT a hash: a player reporting a wrong
+    // picture can read this file, and a developer bisecting can write it by hand.
+    //
+    // `vid=c` is not a define but a TRANSLATOR revision, and it belongs here for the
+    // same reason: the per-component vertex-id tracking (2026-10-08, the hair flicker)
+    // changes 12 vertex modules under unchanged names, so a cache built before it has
+    // to be dropped exactly as a define change would. Any future change to what the
+    // translator emits for an existing hash adds a token here.
+    return std::string("clip=") + (ClipPlanesWanted() ? "1" : "0") + " vid=c";
+}
+
 namespace
 {
 static inline uint32_t bits(uint32_t v, uint32_t lo, uint32_t n)
@@ -139,7 +166,13 @@ static bool ParseUcode(const uint8_t* data, size_t size, UcodeInfo& u, std::stri
 
     uint8_t written[64] = {};  // bit c = component c definitely written
     bool seenTf[32] = {};
-    uint64_t vidRegs = 1;      // bit r = register r still holds the auto vertex index
+    // (register, component) pairs still holding the auto vertex index: bit (4*r + c).
+    // The seed is float4(id, 0, 0, 0), so only r0.x starts set, and a partial write
+    // evicts only the components it names — per register, `r0.yz = tfetch` evicted
+    // r0 and every later fetch through r0.x went dependent (the hair flicker,
+    // 2026-10-08; synth_shader_container.py carries the full derivation).
+    uint8_t vidComps[64] = {};
+    vidComps[0] = 1;
     int regProducer[64];
     for (auto& r : regProducer) r = -1;
 
@@ -201,7 +234,7 @@ static bool ParseUcode(const uint8_t* data, size_t size, UcodeInfo& u, std::stri
                     const uint32_t src = bits(w0, 5, 6);
                     vf.srcReg = src;
                     vf.srcSwz = bits(w0, 30, 2);
-                    vf.indirect = int(!((vidRegs >> src) & 1));
+                    vf.indirect = int(!((vidComps[src] >> vf.srcSwz) & 1));
                     vf.addrAttr = vf.indirect ? regProducer[src] : -1;
                     u.vfetch.push_back(vf);
                     regProducer[bits(w0, 12, 6)] = int(u.vfetch.size()) - 1;
@@ -216,9 +249,14 @@ static bool ParseUcode(const uint8_t* data, size_t size, UcodeInfo& u, std::stri
                     }
                     u.tfetchDim[c] = bits(w2, 14, 2);
                 }
-                // Any write kills the vertex id in that register — including a fetch
-                // writing its own source.
-                vidRegs &= ~(1ull << bits(w0, 12, 6));
+                // A write kills the vertex id in the components it names — including a
+                // fetch writing its own source; predicated or not; Keep (7) is no write.
+                {
+                    const uint32_t fdswz = bits(w1, 0, 12);
+                    for (int c = 0; c < 4; c++)
+                        if (((fdswz >> (3 * c)) & 7) != 7)
+                            vidComps[bits(w0, 12, 6)] &= uint8_t(~(1u << c));
+                }
                 // Destination swizzle: 3 bits per component, 7 = Keep (not a write);
                 // a predicated fetch is not a definite write.
                 if (!bits(w1, 31, 1))
@@ -239,7 +277,8 @@ static bool ParseUcode(const uint8_t* data, size_t size, UcodeInfo& u, std::stri
                 const uint32_t predicated = bits(w1, 28, 1), vop = bits(w2, 24, 5);
                 if (!exp)
                 {
-                    vidRegs &= ~(1ull << vdst);
+                    vidComps[vdst] &= uint8_t(~vmask);
+                    vidComps[sdst] &= uint8_t(~smask);
                     regProducer[vdst] = -1;
                 }
                 // Lanes the vector op consumes: the dot family (and cube/max4/setp/kill)
@@ -755,6 +794,9 @@ static void LoadDxcOnce()
     // ffmpeg live), then beside it directly.
     candidates.push_back((HostPaths::ExeDir() / "lib" / libName).string());
     candidates.push_back((HostPaths::ExeDir() / libName).string());
+    // A macOS .app keeps its libraries in Contents/Frameworks (code signing wants code
+    // there, not in a subdirectory of Contents/MacOS).
+    candidates.push_back((HostPaths::ExeDir().parent_path() / "Frameworks" / libName).string());
     // The dev layout: the sibling XenosRecomp checkout's dxc-bin.
     if (const char* home = getenv("HOME"); home && *home)
     {
@@ -842,6 +884,15 @@ static bool CompileSpirv(const std::string& hlsl, bool isVs, uint32_t tag,
         L"-Qstrip_debug",
         L"-D", Widen("XE_SHADER_TAG=" + std::to_string(tag)),
     };
+    // USER CLIP PLANES, ON BY DEFAULT since player issue #10 (see shader_translator.h
+    // for why this was not always so). The epilogue is emitted only in the VERTEX
+    // stage — measured, not assumed (here: 391 of 391 pixel modules byte-identical and
+    // 109 of 109 vertex modules different over the dump set; Case Zero's count was
+    // 345 of 345 pixel modules byte-identical and 104 of 104 vertex modules
+    // different — so the define is passed only for a vs_ translation and a pixel
+    // module's bytes are provably unchanged by this commit.
+    if (isVs && ShaderTranslator::ClipPlanesWanted())
+        args.insert(args.end(), { L"-D", L"XE_USER_CLIP_PLANES=1" });
     // CW_DXC_DEFINES passthrough, same contract as the shell pipeline: extra
     // whitespace-separated tokens, so an arm cache can be built from the same
     // translator into a second directory.
