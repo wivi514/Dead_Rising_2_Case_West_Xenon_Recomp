@@ -859,7 +859,7 @@ struct Paths
 fs::path FindChipsDir()
 {
     std::error_code ec;
-    const fs::path shipped = HostPaths::ExeDir() / "kbm_chips";
+    const fs::path shipped = HostPaths::ShippedDir() / "kbm_chips";
     if (fs::is_directory(shipped, ec))
         return shipped;
     const fs::path dev = HostPaths::Root() / "tools" / "release" / "kbm_chips";

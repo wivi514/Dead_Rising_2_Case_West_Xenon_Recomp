@@ -172,6 +172,21 @@ const std::filesystem::path& ExeDir()
     return dir;
 }
 
+const std::filesystem::path& ShippedDir()
+{
+    static const std::filesystem::path dir = [] {
+#if defined(__APPLE__)
+        const std::filesystem::path& exe = ExeDir();
+        std::error_code ec;
+        if (exe.filename() == "MacOS" && exe.parent_path().filename() == "Contents"
+            && std::filesystem::is_directory(exe.parent_path() / "Resources", ec))
+            return exe.parent_path() / "Resources";
+#endif
+        return ExeDir();
+    }();
+    return dir;
+}
+
 const std::filesystem::path& Root()
 {
     static const std::filesystem::path root = ResolveRoot();
@@ -194,7 +209,7 @@ std::filesystem::path VsRecipes()
 {
     // Shipped beside the exe like prewarm.keys; the dev tree finds the checked-in copy.
     std::error_code ec;
-    const std::filesystem::path shipped = ExeDir() / "vs_recipes.bin";
+    const std::filesystem::path shipped = ShippedDir() / "vs_recipes.bin";
     if (std::filesystem::exists(shipped, ec))
         return shipped;
     return Root() / "tools" / "release" / "vs_recipes.bin";

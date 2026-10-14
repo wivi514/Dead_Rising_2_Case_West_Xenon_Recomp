@@ -49,6 +49,11 @@ namespace HostPaths
 // The directory containing the running executable. Never empty: if the platform query
 // fails, this is "." and Report() says so.
 const std::filesystem::path& ExeDir();
+// Where the files the RELEASE ships beside the executable live (cw_defaults.env,
+// prewarm.keys, vs_recipes.bin, kbm_chips/). ExeDir() everywhere except inside a macOS
+// .app, where it is Contents/Resources: code signing refuses any non-code file in
+// Contents/MacOS ("code object is not signed at all"), so the bundle keeps them there.
+const std::filesystem::path& ShippedDir();
 
 // The installation root, resolved as above. Cached; the first call decides.
 const std::filesystem::path& Root();

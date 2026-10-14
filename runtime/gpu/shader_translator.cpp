@@ -794,6 +794,9 @@ static void LoadDxcOnce()
     // ffmpeg live), then beside it directly.
     candidates.push_back((HostPaths::ExeDir() / "lib" / libName).string());
     candidates.push_back((HostPaths::ExeDir() / libName).string());
+    // A macOS .app keeps its libraries in Contents/Frameworks (code signing wants code
+    // there, not in a subdirectory of Contents/MacOS).
+    candidates.push_back((HostPaths::ExeDir().parent_path() / "Frameworks" / libName).string());
     // The dev layout: the sibling XenosRecomp checkout's dxc-bin.
     if (const char* home = getenv("HOME"); home && *home)
     {

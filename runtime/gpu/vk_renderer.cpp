@@ -8570,7 +8570,7 @@ void PrewarmPipelines()
     std::vector<PipelineKey> keys;
     const bool haveUser = readKeys(path, keys);
     const size_t userN = keys.size();
-    const std::string shipped = (HostPaths::ExeDir() / "prewarm.keys").string();
+    const std::string shipped = (HostPaths::ShippedDir() / "prewarm.keys").string();
     const bool haveShipped = readKeys(shipped, keys);
     if (!haveUser && !haveShipped)
     {
