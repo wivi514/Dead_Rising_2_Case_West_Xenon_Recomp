@@ -1361,11 +1361,12 @@ first-sight VS not in the dump set were removed so they re-translate with the ep
 * **The speedrun block** — a Case Zero feature and published contract.
 * **Gotcha 615** (docs only).
 
-## §16 — Case Zero's far-zombie variant-name fix (2026-10-14)
+## §16 — Case Zero's far-zombie variant-name enhancement (2026-10-14)
 
 | | |
 |---|---|
 | **Source** | Case Zero `78632f1` — `zombie_variant_names.cpp`, originally for two misnamed meshes in `zombie_soldier_3.big` |
+| **Final source status** | Case Zero later retracted the claim that this was a defect: Xenia showed the same LOD behavior. Its operator explicitly chose to keep the behavior change as an enhancement. This import follows that choice; it is not presented as fixing a Case West correctness regression. |
 | **Why checked here** | The Oct 14 import pass reached the candidate while checking the remaining applicable Case Zero updates; the Case West archives were censused before deciding whether to transplant it |
 | **Finding** | Case West has matching malformed body-part names in `zombie_security.big` (`chestupper_neckShape1Deformed`, `chestupper_neckShape3Deformed`) and `zombie_soldier.big` (`chestupper_neckShape2Deformed`, `headwearShape2Deformed`). Neighboring model names establish the intended convention: the variant digit precedes `Shape` (`chestupper_neck2ShapeDeformed`, `headwear2ShapeDeformed`). The archive also has `geo_lodShape4Deformed`; it is outside the two body-part families covered by this fix, and its classification was not measured. |
 | **Address derivation** | Case Zero's classifier `sub_827A2E10` uniquely matches Case West `sub_8273B160` over 80 instructions; the table builder `sub_827ACF00` uniquely matches `sub_827468F0` over 80 instructions. Both are function starts in `ppc/`. The hook's name pointer remains in `r5`. |

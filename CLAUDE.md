@@ -45,7 +45,7 @@ commits beyond the v1.1.1 release tag: the October 3 issue-12 diagnostics and §
 the DR2 modding toolkit's `game_mods/` VFS, PCM sound mods and pool/heap growth; and the
 October 14 renderer, macOS, Windows, detail-setting and shadow-bias changes. The last
 candidate, Case Zero `78632f1`, was checked against this title's own zombie archives and
-adapted as a narrowly scoped body-variant name classifier (`runtime/cpu/zombie_variant_names.cpp`;
+adapted as an optional body-variant presentation enhancement (`runtime/cpu/zombie_variant_names.cpp`;
 `docs/imported-fixes.md` §16). The third similar-looking `geo_lodShape4Deformed` is outside
 the body-part patterns and remains unclassified pending a measurement.
 

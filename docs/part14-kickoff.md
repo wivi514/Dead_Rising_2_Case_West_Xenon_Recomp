@@ -11,7 +11,7 @@ Written 2026-10-14. This is the live handoff; `part13-kickoff.md` is superseded.
   The October 9–14 runtime/toolkit and renderer/macOS/Windows/detail updates are in the
   branch history. The final candidate from that pass, Case Zero `78632f1`, applies to
   Case West's `zombie_security.big` and `zombie_soldier.big` and is recorded in §16.
-* §16's classifier wrapper is implemented at Case West `sub_8273B160`, derived as a
+* §16's optional presentation enhancement is implemented at Case West `sub_8273B160`, derived as a
   unique 1.000 instruction-shape match of Case Zero `sub_827A2E10`. It changes only
   `chestupper_neck` and `headwear` names with a misplaced variant digit. The similar
   `geo_lodShape4Deformed` name is intentionally untouched.
