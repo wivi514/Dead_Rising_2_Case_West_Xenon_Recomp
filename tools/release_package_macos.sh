@@ -86,7 +86,7 @@ rm -rf "$STAGE"
 MACOS=$APP/Contents/MacOS
 LIB=$APP/Contents/Frameworks
 RES=$APP/Contents/Resources
-mkdir -p "$LIB" "$APP/Contents/Resources/vulkan/icd.d" "$STAGE/assets/package" "$STAGE/tools"
+mkdir -p "$MACOS" "$LIB" "$APP/Contents/Resources/vulkan/icd.d" "$STAGE/assets/package" "$STAGE/tools"
 cp "$BUILD/cw_runtime" "$MACOS/"
 strip -S -x "$MACOS/cw_runtime"
 
