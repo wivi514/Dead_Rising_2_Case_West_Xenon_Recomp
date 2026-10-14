@@ -705,7 +705,8 @@ const char* Glyph(char c)
 template <typename Rect>
 void EmitSettingsOverlay(int w, int h, Rect&& rect)
 {
-    const int panelW = 640, panelH = 500;   // 500: nine rows since ZOMBIE DETAIL
+    const int panelW = 640, panelH = 540;   // 540: ten rows since WORLD DETAIL (Case
+                                            // Zero f161cd7); 500 at nine — ZOMBIE DETAIL
                                             // (Case Zero 5cb3781, imported 2026-10-14;
                                             // +40 a row — this port has no EXPOSURE row);
                                             // was 460 at eight rows — MSAA joined in part
@@ -814,7 +815,10 @@ void EmitSettingsOverlay(int w, int h, Rect&& rect)
     // ZOMBIE DETAIL (Case Zero 5cb3781): the crowd LOD scale, 1.0 = the title's own.
     char crowdName[8];
     snprintf(crowdName, sizeof crowdName, "%.1f", double(Settings_CrowdLodX10()) * 0.1);
-    const char* rows[9][2] = {
+    // WORLD DETAIL (Case Zero f161cd7): the static-geometry LOD distance scale, 1.0 = the title's.
+    char worldName[8];
+    snprintf(worldName, sizeof worldName, "%.1f", double(Settings_WorldLodX10()) * 0.1);
+    const char* rows[10][2] = {
         { UiText(UiStr::Resolution), resName },
         { UiText(UiStr::DisplayMode), kModeNames[int(Settings_DisplayMode()) % 3] },
         { UiText(UiStr::VSync), kOnOff[Settings_VSync() ? 1 : 0] },
@@ -824,9 +828,10 @@ void EmitSettingsOverlay(int w, int h, Rect&& rect)
         { UiText(UiStr::FieldOfView), fovName },
         { UiText(UiStr::MouseSens), sensName },
         { UiText(UiStr::ZombieDetail), crowdName },
+        { UiText(UiStr::WorldDetail), worldName },
     };
     const int sel = Settings_OverlaySelection();
-    for (int i = 0; i < 9; ++i)
+    for (int i = 0; i < 10; ++i)
     {
         const int y = panelY + 86 + i * 40;
         if (i == sel)

@@ -65,6 +65,7 @@ enum class UiStr
     FieldOfView,
     MouseSens,
     ZombieDetail,
+    WorldDetail,
     FooterApplyResolution,
     FooterMsaaNextLaunch,
     FooterRtOff,
