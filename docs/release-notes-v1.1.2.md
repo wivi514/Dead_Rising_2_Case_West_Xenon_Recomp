@@ -1,3 +1,17 @@
+> [!WARNING]
+> ## 🌐 WANT ONLINE FEATURES?
+>
+> **Launch the game through the [XenonLive Launcher](https://github.com/wivi514/XenonLive_Launcher).**
+>
+> XenonLive is required for:
+> - 🎮 Online / co-op
+> - 🏆 Achievements
+> - 👤 Gamertag
+> - 👥 Friends
+>
+> **If you start the game any other way, it will run in OFFLINE MODE only.**
+> Single-player will still work normally.
+
 # Dead Rising 2: Case West — Native PC Port v1.1.2
 
 **v1.1.2 is the maintainer's official final build.** The original maintainer has
