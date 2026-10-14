@@ -4,7 +4,8 @@
 
 Play **Dead Rising 2: Case West** (Capcom / Blue Castle Games, 2010 — the Xbox
 360 exclusive epilogue to Dead Rising 2, where Chuck Greene and Frank West break
-into the Phenotrans facility) natively on your Windows or Linux PC.
+into the Phenotrans facility) natively on Windows, Linux, Steam Deck, and Apple
+Silicon Macs.
 
 This is not an emulator: the game's Xbox 360 code was translated ahead of time
 into a native program ([XenonRecomp](https://github.com/hedge-dev/XenonRecomp) /
@@ -12,15 +13,16 @@ into a native program ([XenonRecomp](https://github.com/hedge-dev/XenonRecomp) /
 purpose-built engine with a Vulkan renderer, real XMA audio, and native
 keyboard/mouse support.
 
-> **Status: essentially complete.** The single-player game is **playable start
-> to finish** — it has been completed end to end — and should look right in
-> nearly all places. Verified on both NVIDIA and AMD, on Windows and Linux. A
-> few minor issues remain (listed below); none block progress.
-> **Two-player online co-op works (v1.1.0)** over
+> **Status: finished. v1.1.2 (October 2026) is my official final build.** The
+> single-player game is **playable start to finish**, and two-player online
+> co-op works over
 > [XenonLive](https://github.com/wivi514/XenonLive), through its
 > [launcher](https://github.com/wivi514/XenonLive_Launcher) — the game's own co-op
 > menus, the way the 360 version played it. Started outside the launcher the game
-> is offline and single-player.
+> is offline and single-player. I have stopped active development, but I encourage
+> others to continue improving the port, fork it, and contribute pull requests.
+> Issues and pull requests may go unanswered; the code and development record remain
+> here for anyone who wants to carry it forward.
 
 **No game data is included** in this repository or the downloads. You must own
 Dead Rising 2: Case West and supply your own copy of the game package. This
@@ -33,10 +35,14 @@ project is not affiliated with, or endorsed by, Capcom or Microsoft.
    - Windows: `CaseWestRecomp-windows-x86_64.zip`
    - Linux: `CaseWestRecomp-linux-x86_64.tar.zst`
    - Linux, single file: `CaseWestRecomp-linux-x86_64.AppImage` (same build;
-     `chmod +x` it and run it. The tarball is the better choice on a Steam Deck —
-     see `docs/steam-deck-testing.md` for why)
+     `chmod +x` it and run it)
+   - Steam Deck: `CaseWestRecomp-steamdeck-x86_64.tar.gz`
+   - Mac (Apple Silicon): `CaseWestRecomp-macos-arm64.zip`
 2. **Unpack it anywhere** (Windows: right-click → Extract All; Linux:
-   `tar --zstd -xf CaseWestRecomp-linux-x86_64.tar.zst`).
+   `tar --zstd -xf CaseWestRecomp-linux-x86_64.tar.zst`; Steam Deck:
+   `tar -xzf CaseWestRecomp-steamdeck-x86_64.tar.gz`; Mac: double-click the zip).
+   The Mac build is not notarized; before its first launch, run
+   `xattr -dr com.apple.quarantine <the unzipped folder>` in Terminal.
 3. **Add your copy of the game.** You need the XBLA package file your Xbox 360
    downloaded — about **1.2 GB**, no file extension. On the console's storage
    it is at:
@@ -46,7 +52,8 @@ project is not affiliated with, or endorsed by, Capcom or Microsoft.
    Copy that file into the `assets/package/` folder inside the game folder you
    just unpacked (copying the whole `58410B00` folder in also works — or just
    drag the file onto the launcher window in step 4).
-4. **Run the game** — `cw_runtime.exe` on Windows, `./cw_runtime` on Linux.
+4. **Run the game** — `cw_runtime.exe` on Windows, `./cw_runtime` on Linux or
+   Steam Deck, or `CaseWestRecomp.app` on Mac (keep it beside the `assets` folder).
    The first run sets everything up by itself under a progress bar: it unpacks
    your package, prepares the game's 1,322 shaders (7.5 s on a 16-thread
    desktop, longer on fewer cores — it uses all of them), and generates
@@ -123,29 +130,26 @@ game folder at any time without losing progress.
 
 - A GPU and driver with **Vulkan 1.3** support (tested on NVIDIA and AMD).
 - **Windows**: Windows 10 or later, x86-64.
-- **Linux**: x86-64 with glibc **2.35 or newer** (v1.0.1 and later — Ubuntu 22.04,
-  Debian 12, Fedora 36 and anything newer). **The v1.0.0 download needs 2.43** and
-  will not start on older distributions; take v1.0.1 or later instead.
+- **Linux**: x86-64 with glibc **2.35 or newer** (Ubuntu 22.04, Debian 12,
+  Fedora 36 and newer).
+- **Steam Deck**: use the dedicated Steam Deck archive; it defaults to the Deck's
+  1280×800 display and omits the desktop launcher.
+- **macOS**: Apple Silicon (M1 or newer), macOS 13 or later. Intel Macs are not
+  supported. The app is not notarized; see the install note above.
 - **~3 GB free disk space** after first-run unpacking.
 - **Your own copy of the game** (see above).
 
 ## Known issues (minor — none affect playability)
 
-- The occasional spot may shade slightly differently than original hardware;
-  everything is being tracked and refined.
+- A few spots may shade slightly differently than original hardware.
 - **On some AMD GPUs** (seen on our own RX 6600 test machine; NVIDIA is unaffected):
   a **black square can appear in the middle of the screen** during loading screens and
   cutscenes. **Alt-tab out and back, or press Win+PrintScreen** — either clears it. It
   does not affect gameplay or progress. The sibling port shows the same thing on the
-  same hardware, which points at the code the two share rather than at this game; it is
-  being investigated.
-- **Steam Deck**: never run there by anyone on this project. v1.0.0 provably could not
-  start on SteamOS (it needed glibc 2.43); **v1.0.1 removes that cause** and lets the
-  pad drive the launcher, which Game Mode needs. Everything else about the Deck is
-  **unknown, not known-good**. `docs/steam-deck-testing.md` says exactly what to try
-  and what to send back; a report from a Deck owner is genuinely useful.
-- **No macOS build yet** — nothing blocks it in principle; it awaits test
-  hardware.
+  same hardware, which points at the code the two share rather than at this game.
+- **Steam Deck**: a dedicated build is available, but direct testing on Deck hardware
+  has not been completed. `docs/steam-deck-testing.md` has testing notes; community
+  reports and fixes are welcome.
 - **Co-op needs the XenonLive launcher** — the game only goes online when the
   launcher starts it (see the status note above); a plain launch is single-player.
 
@@ -225,15 +229,19 @@ fix taken across, with its source commit and what re-measuring it here proved.
 Start with `docs/xenia-capture-analysis.md` and `docs/gotchas.md`. The original
 day-1 dev README is preserved at `docs/dev-readme-day1.md`.
 
+**If you want to continue the port**, the notes above and the build instructions
+are the hand-off. Community forks and pull requests are encouraged; the original
+maintainer may not be available to respond.
+
 Its sibling, **[Dead Rising 2: Case Zero — Native PC Port](https://github.com/wivi514/Dead_Rising_2_Case_Zero_Xenon_Recomp)**,
 is also released.
 
 ## Support the project
 
-If this port made your day and you'd like to support the work,
-[**sponsor me on GitHub**](https://github.com/sponsors/wivi514) — it helps keep
-improvements coming, and pays for the next port. Bug reports and issues are
-just as valuable.
+The v1.1.2 build is my final release, and I am no longer maintaining this port. If
+you'd like to support my work, [**sponsor me on GitHub**](https://github.com/sponsors/wivi514)
+— but please don't sponsor expecting further updates from me on Case West. I welcome
+community forks and contributions that carry the project forward.
 
 ## Credits and licensing
 
