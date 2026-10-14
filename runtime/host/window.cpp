@@ -1688,6 +1688,37 @@ static bool UnderGamescope()
     return false;
 }
 
+// DPI AWARENESS, BEFORE THE FIRST SDL VIDEO INIT, AND IT IS NOT COSMETIC.
+//
+// A process that has not declared itself DPI-aware is lied to by Windows: every
+// display query returns the desktop divided by the scale factor. On a 2560x1440
+// panel at 160% scaling, SDL_GetDesktopDisplayMode reports 1600x900 — and
+// PublishDisplaySize CLAMPS the settings panel's resolution list to that, so the
+// operator's 1440p screen offered 1600x900 as its maximum and there was no way to
+// ask for more. The renderer was never the limit; the query was.
+//
+// It must run before EVERY first video init, not just Host_WindowInit's: SDL applies
+// the hint when the video subsystem starts, and Windows takes a process's awareness
+// once. The launcher and the first-run progress window start video earlier, so with
+// the hint set only in Host_WindowInit (v1.0.0 to v1.1.3's first build) every
+// launcher boot ran DPI-unaware — czwin at 150% read 1707x960 and offered 1600x900.
+// Hence one function, called beside PreferWaylandWhenOffered at all four init sites.
+//
+// permonitorv2 rather than "system": the size must stay right when the window is
+// dragged to a differently-scaled monitor, which is the case "system" gets wrong
+// and is exactly what a laptop with an external display does.
+//
+// SDL_HINT_WINDOWS_DPI_SCALING is deliberately NOT set. It would make SDL report
+// window sizes in DPI-scaled points; this runtime wants physical pixels everywhere,
+// because the swapchain, the scissor rectangles and every recorded frame time are
+// in pixels.
+static void DeclareDpiAwareness()
+{
+#if defined(_WIN32)
+    SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+#endif
+}
+
 static void PreferWaylandWhenOffered()
 {
 #if !defined(_WIN32) && !defined(__APPLE__)
@@ -1726,6 +1757,7 @@ void Host_DiagVideo()
     for (int i = 0; i < SDL_GetNumVideoDrivers(); i++)
         fprintf(stderr, " %s", SDL_GetVideoDriver(i));
     fprintf(stderr, "\n");
+    DeclareDpiAwareness();
     PreferWaylandWhenOffered();
     if (const char* h = SDL_GetHint(SDL_HINT_VIDEODRIVER))
         fprintf(stderr, "%s video-driver hint: %s\n", T, h);
@@ -1761,6 +1793,7 @@ bool Host_ProgressBegin(const char* title)
         return false;
     if (g_progWindow)
         return true;
+    DeclareDpiAwareness();
     PreferWaylandWhenOffered();
     if (!SDL_WasInit(SDL_INIT_VIDEO) && SDL_InitSubSystem(SDL_INIT_VIDEO) != 0)
     {
@@ -1900,6 +1933,7 @@ bool Host_RunLauncher()
 {
     if (getenv("CW_NO_WINDOW"))
         return true;
+    DeclareDpiAwareness();
     PreferWaylandWhenOffered();
     if (!SDL_WasInit(SDL_INIT_VIDEO) && SDL_InitSubSystem(SDL_INIT_VIDEO) != 0)
     {
@@ -2413,6 +2447,7 @@ bool Host_WindowInit()
     // SDL call — `main()` calls this at line 310 and does not spawn the guest thread
     // until line 338.
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+    DeclareDpiAwareness();
     PreferWaylandWhenOffered();
 
     if (getenv("CW_NO_WINDOW"))
@@ -2425,27 +2460,6 @@ bool Host_WindowInit()
 
     // The signal-handler hint is set at the top of this function, above the headless
     // early return, so that a run with no window still gets it — see the comment there.
-
-#if defined(_WIN32)
-    // DPI AWARENESS, BEFORE SDL_Init, AND IT IS NOT COSMETIC.
-    //
-    // A process that has not declared itself DPI-aware is lied to by Windows: every
-    // display query returns the desktop divided by the scale factor. On a 2560x1440
-    // panel at 160% scaling, SDL_GetDesktopDisplayMode reports 1600x900 — and
-    // PublishDisplaySize below CLAMPS the settings panel's resolution list to that, so
-    // the operator's 1440p screen offered 1600x900 as its maximum and there was no way
-    // to ask for more. The renderer was never the limit; the query was.
-    //
-    // permonitorv2 rather than "system": the size must stay right when the window is
-    // dragged to a differently-scaled monitor, which is the case "system" gets wrong
-    // and is exactly what a laptop with an external display does.
-    //
-    // SDL_HINT_WINDOWS_DPI_SCALING is deliberately NOT set. It would make SDL report
-    // window sizes in DPI-scaled points; this runtime wants physical pixels everywhere,
-    // because the swapchain, the scissor rectangles and every recorded frame time are
-    // in pixels.
-    SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
-#endif
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0)
     {
