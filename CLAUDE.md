@@ -58,6 +58,22 @@ The README marks v1.1.2 as the maintainer's official final build while encouragi
 community forks and contributions. **If continuing work, treat it as community
 maintenance and do not imply a new official maintainer release.**
 
+**Contributor issues filed on the Case West GitHub repository (2026-10-14):**
+- [#1: Expand the level table](https://github.com/wivi514/Dead_Rising_2_Case_West_Xenon_Recomp/issues/1)
+  — 10 level slots, with `w_mall` the only free slot; the detailed layout and consumers
+  remain to be reverse-engineered before supporting additional maps.
+- [#2: Expand the zombie type table](https://github.com/wivi514/Dead_Rising_2_Case_West_Xenon_Recomp/issues/2)
+  — Case West's 10 entries are all occupied. The table cannot grow in place, and the
+  manager has inline per-type arrays requiring a full layout/access census. The 32-type
+  engine maximum is unproven. Zombie heap +16 MiB is already implemented; separately,
+  the 13-types-per-load-set fault was measured in Case Zero, not confirmed for Case West.
+- [#3: Research special enemy/boss behavior portability](https://github.com/wivi514/Dead_Rising_2_Case_West_Xenon_Recomp/issues/3)
+  — Case West's `security_heavy` / `security_lab` use `HazardUnit` / `ZombieController`
+  AI absent from Case Zero; behavior data alone cannot supply that code. Case Zero's
+  soldier fallback is the safe current mapping. Cross-title boss support (including the
+  Commander, Mechanic, and DR2/OTR psychopaths) remains untested; retain the appearance-
+  only fallback unless native behavior is proven.
+
 ## Status: PART 14 FINISHED THE OCTOBER CASE ZERO IMPORT ROUND (2026-10-14)
 
 The active session continued Claude's Case Zero update pass. The branch already had 43
