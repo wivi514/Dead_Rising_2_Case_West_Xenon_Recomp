@@ -705,7 +705,10 @@ const char* Glyph(char c)
 template <typename Rect>
 void EmitSettingsOverlay(int w, int h, Rect&& rect)
 {
-    const int panelW = 640, panelH = 460;   // 460: eight rows — MSAA joined in part
+    const int panelW = 640, panelH = 500;   // 500: nine rows since ZOMBIE DETAIL
+                                            // (Case Zero 5cb3781, imported 2026-10-14;
+                                            // +40 a row — this port has no EXPOSURE row);
+                                            // was 460 at eight rows — MSAA joined in part
                                             // 108; the MOUSE CAMERA toggle is retired
                                             // (always on); MOUSE SENS stays (part 64
                                             // had merged the RT tiers INTO the shadow
@@ -808,7 +811,10 @@ void EmitSettingsOverlay(int w, int h, Rect&& rect)
     snprintf(msaaName, sizeof msaaName, "%s%s",
              msaaSet == 0 ? UiText(UiStr::Off) : msaaSet == 2 ? "2X" : "4X",
              msaaPending ? " *" : "");
-    const char* rows[8][2] = {
+    // ZOMBIE DETAIL (Case Zero 5cb3781): the crowd LOD scale, 1.0 = the title's own.
+    char crowdName[8];
+    snprintf(crowdName, sizeof crowdName, "%.1f", double(Settings_CrowdLodX10()) * 0.1);
+    const char* rows[9][2] = {
         { UiText(UiStr::Resolution), resName },
         { UiText(UiStr::DisplayMode), kModeNames[int(Settings_DisplayMode()) % 3] },
         { UiText(UiStr::VSync), kOnOff[Settings_VSync() ? 1 : 0] },
@@ -817,9 +823,10 @@ void EmitSettingsOverlay(int w, int h, Rect&& rect)
         { UiText(UiStr::FrameCap), capName },
         { UiText(UiStr::FieldOfView), fovName },
         { UiText(UiStr::MouseSens), sensName },
+        { UiText(UiStr::ZombieDetail), crowdName },
     };
     const int sel = Settings_OverlaySelection();
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 9; ++i)
     {
         const int y = panelY + 86 + i * 40;
         if (i == sel)

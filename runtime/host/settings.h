@@ -58,6 +58,16 @@ int           Settings_Fov();           // FIELD OF VIEW (part 61): degrees of
                                         // ADJUSTMENT from the game's own camera,
                                         // -10..+30 in steps of 1; 0 = OG, the
                                         // default and the bit-identical control
+// ZOMBIE DETAIL (Case Zero 5cb3781, imported 2026-10-14; their operator's spec: default
+// 2.0, up to 5.0). The crowd renderer's LOD quality scale, which the 360 left at 1.0: Q
+// multiplies how many zombies get each model and divides the on-screen size each model
+// needs, so 2.0 is twice the close-model count at twice the distance (cpu/crowd_lod.cpp
+// has the derivation). Stored in TENTHS so the store stays integer key=value text.
+// 0.5..5.0 step 0.5; 1.0 is the title's own. Applies LIVE; CW_CROWD_LOD wins over it.
+int           Settings_CrowdLodX10();       // 5..50, step 5; default 20 (2.0), 10 on
+                                            // the Deck build (CW_DECK_DEFAULTS)
+void          Settings_SetCrowdLodX10(int); // clamped and snapped to the step
+
 int           Settings_Aspect();        // LEGACY: 1 when the internal res is wider than
                                         // 16:9. Derived; new code reads Settings_InternalRes
 

@@ -44,6 +44,16 @@ struct State
     int rtShadows = 0;          // 0 = none (default), 1/2/3 = RT LOW/MED/HIGH.
                                 // Non-zero REPLACES the raster cascade (part 64,
                                 // operator's spec).
+    // ZOMBIE DETAIL, in tenths: 5..50 step 5 (Case Zero's operator's spec, 2026-10-08). The crowd
+    // LOD scale; the title's own is 1.0 (cpu/crowd_lod.cpp). 2.0 on the desktop, 1.0 on
+    // the Deck "for performance reason" — twice the close-model zombies is twice their
+    // draws, and the Deck is the GPU that cannot spare them. A setting the player has
+    // saved wins over either default.
+#ifdef CW_DECK_DEFAULTS
+    int crowdLodX10 = 10;
+#else
+    int crowdLodX10 = 20;
+#endif
     int mouseSens = 5;          // 1..10, the panel's MOUSE SENS row.
                                 // (mouse_cam retired 2026-09-05: the mouse camera
                                 //  is always on, so there is no longer a toggle to
@@ -100,11 +110,13 @@ void SaveLocked()
             "fov=%d\n"             // field-of-view adjustment in degrees, -10..+30, 0 = OG
             "aspect=%d\n"          // 0 = 16:9, 1 = 21:9 (applies at next launch)
             "rt_shadows=%d\n"     // 0 = OG, 1 = RT LOW (needs a ray-query device)
+            "crowd_lod_x10=%d\n"  // ZOMBIE DETAIL in tenths: 5..50 step 5, 20 = 2.0
             "mouse_sens=%d\n"     // 1..10
             "language=%d\n",      // Xbox ID: 1=en 2=ja 4=fr 5=es 6=it 7=ko
             int(g_state.displayMode), g_state.resW, g_state.resH, g_state.renderScale,
             g_state.vsync ? 1 : 0, g_state.shadowTier, g_state.msaa, g_state.fpsCap,
-            g_state.fov, g_state.aspect, g_state.rtShadows, g_state.mouseSens,
+            g_state.fov, g_state.aspect, g_state.rtShadows, g_state.crowdLodX10,
+            g_state.mouseSens,
             g_state.language);
     fclose(f);
 }
@@ -210,6 +222,16 @@ void Settings_Load(const std::string& path)
             else
                 fprintf(stderr, "[settings] fps_cap=%ld is not one of "
                                 "0/30/60/90/120/240/480 — using OFF\n", v);
+        }
+        else if (!strcmp(key, "crowd_lod_x10"))
+        {
+            // Clamped AND snapped to the 0.5 step, loudly: a hand-edited value the panel could
+            // never show is a value it could never step away from.
+            if (v >= 5 && v <= 50)
+                g_state.crowdLodX10 = int(v - (v % 5));
+            else
+                fprintf(stderr, "[settings] crowd_lod_x10=%ld is outside 5..50 — "
+                                "keeping %d\n", v, g_state.crowdLodX10);
         }
         else if (!strcmp(key, "fov"))
         {
@@ -541,4 +563,22 @@ int Settings_OverlaySelection()
 void Settings_SetOverlaySelection(int row)
 {
     g_overlaySelection.store(row, std::memory_order_release);
+}
+
+int Settings_CrowdLodX10()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_state.crowdLodX10;
+}
+
+void Settings_SetCrowdLodX10(int tenths)
+{
+    if (tenths < 5)
+        tenths = 5;
+    if (tenths > 50)
+        tenths = 50;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_state.crowdLodX10 = tenths - (tenths % 5);
+    SaveLocked();
+    // Applied LIVE: the crowd renderer looks the scale up every frame (crowd_lod.cpp).
 }

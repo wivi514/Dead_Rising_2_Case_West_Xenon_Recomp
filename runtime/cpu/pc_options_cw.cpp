@@ -322,13 +322,23 @@ void PcOptions_Pump(PPCContext& ctx, uint8_t* base, uint32_t buttons)
                 fprintf(stderr, "[pcopt] mouse sensitivity %d — live\n", sv);
                 break;
             }
+            case 8:
+            {
+                // ZOMBIE DETAIL (Case Zero 5cb3781): the crowd LOD scale, 0.5..5.0 in
+                // steps of 0.5, clamped. 1.0 is the title's own; 2.0 the default. LIVE:
+                // the crowd renderer reads it every frame (cpu/crowd_lod.cpp).
+                Settings_SetCrowdLodX10(Settings_CrowdLodX10() + dir * 5);
+                fprintf(stderr, "[pcopt] zombie detail %.1f — live\n",
+                        double(Settings_CrowdLodX10()) * 0.1);
+                break;
+            }
         }
     };
 
     int sel = Settings_OverlaySelection();
     if (pressed & (kUp | kDown))
     {
-        sel = (sel + ((pressed & kDown) ? 1 : 7)) % 8;   // eight rows since the MSAA row (part 11)
+        sel = (sel + ((pressed & kDown) ? 1 : 8)) % 9;   // nine rows since ZOMBIE DETAIL
         Settings_SetOverlaySelection(sel);
     }
     else if (pressed & (kLeft | kRight))
