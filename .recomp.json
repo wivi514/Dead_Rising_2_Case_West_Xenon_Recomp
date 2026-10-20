@@ -1,0 +1,9 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "Dead Rising 2: Case West",
+  "system": "Xbox 360",
+  "type": "recomp",
+  "status": "complete",
+  "targets": ["Windows", "Linux", "Steam Deck", "macOS"],
+  "toolchain": "XenonRecomp"
+}
